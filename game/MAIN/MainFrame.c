@@ -683,6 +683,70 @@ static void MainFrame_VisMemAddDriverPVS(struct GameTracker *gGT, int playerInde
 #define CTR_NATIVE_VIS_OFFPATH_FALLBACK 0
 #endif
 
+// Diagnostic: announce when the fallback engages and releases, so a playtest can
+// tell "the fix fired and helped" from "the fix never fired". Defaults on for
+// CTR_INTERNAL builds that have the fallback enabled; -DCTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG=0
+// silences it.
+#ifndef CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG
+#if defined(CTR_INTERNAL) && CTR_NATIVE_VIS_OFFPATH_FALLBACK
+#define CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG 1
+#else
+#define CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG 0
+#endif
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG
+#define CTR_NATIVE_VIS_FALLBACK_LOG_MAX 200
+
+// Diagnostic state only. Nothing here is ever read by game logic, so it cannot
+// influence behavior or replays.
+static u8 s_visFallbackEngaged[4];
+static int s_visFallbackFrames[4];
+static int s_visFallbackLogCount;
+
+static void MainFrame_VisFallbackReport(int playerIndex, int engaged)
+{
+	if ((playerIndex < 0) || (playerIndex >= 4))
+	{
+		return;
+	}
+
+	if (engaged)
+	{
+		s_visFallbackFrames[playerIndex]++;
+
+		if (!s_visFallbackEngaged[playerIndex])
+		{
+			s_visFallbackEngaged[playerIndex] = 1;
+			s_visFallbackFrames[playerIndex] = 1;
+
+			if (s_visFallbackLogCount < CTR_NATIVE_VIS_FALLBACK_LOG_MAX)
+			{
+				s_visFallbackLogCount++;
+				Platform_LogWarn("[vis-fallback] ENGAGED  p%d - camera has no PVS source, drawing all-visible\n", playerIndex);
+			}
+		}
+	}
+	else if (s_visFallbackEngaged[playerIndex])
+	{
+		s_visFallbackEngaged[playerIndex] = 0;
+
+		if (s_visFallbackLogCount < CTR_NATIVE_VIS_FALLBACK_LOG_MAX)
+		{
+			s_visFallbackLogCount++;
+			Platform_LogWarn("[vis-fallback] released p%d after %d frames\n", playerIndex, s_visFallbackFrames[playerIndex]);
+
+			if (s_visFallbackLogCount == CTR_NATIVE_VIS_FALLBACK_LOG_MAX)
+			{
+				Platform_LogWarn("[vis-fallback] log limit reached, staying quiet from here\n");
+			}
+		}
+
+		s_visFallbackFrames[playerIndex] = 0;
+	}
+}
+#endif
+
 #if defined(CTR_NATIVE) && CTR_NATIVE_VIS_OFFPATH_FALLBACK
 // Fill a packed visibility bitset so every index reads as visible. Both
 // consumers test the sign bit after a variable left shift -- RenderLists_IsVisible
@@ -726,6 +790,9 @@ void MainFrame_VisMemFullFrame(struct GameTracker *gGT, struct Level *level)
 		struct Driver *driver = gGT->drivers[playerIndex];
 		struct QuadBlock *driverQuad = driver->underDriver;
 		struct PVS *driverPVS = NULL;
+#if defined(CTR_NATIVE) && CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG
+		int visFallbackFired = 0;
+#endif
 
 		if (driverQuad != NULL)
 		{
@@ -751,6 +818,9 @@ void MainFrame_VisMemFullFrame(struct GameTracker *gGT, struct Level *level)
 				// all-visible fill for the rest of the race.
 				visMem->visLeafSrc[playerIndex] = NULL;
 				MainFrame_VisMemSetAllVisible(visMem->visLeafList[playerIndex], ((mesh->numBspNodes + 0x1f) >> 5) << 2);
+#if CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG
+				visFallbackFired = 1;
+#endif
 			}
 #endif
 		}
@@ -773,6 +843,9 @@ void MainFrame_VisMemFullFrame(struct GameTracker *gGT, struct Level *level)
 				// Same reasoning as the visLeafSrc fallback above.
 				visMem->visFaceSrc[playerIndex] = NULL;
 				MainFrame_VisMemSetAllVisible(visMem->visFaceList[playerIndex], ((mesh->numQuadBlock + 0x1f) >> 5) << 2);
+#if CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG
+				visFallbackFired = 1;
+#endif
 			}
 #endif
 		}
@@ -848,6 +921,10 @@ void MainFrame_VisMemFullFrame(struct GameTracker *gGT, struct Level *level)
 				memcpy(visMem->visSCVertList[playerIndex], level->visSCVertSrc, ((level->numSCVert + 0x1f) >> 5) << 2);
 			}
 		}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG
+		MainFrame_VisFallbackReport(playerIndex, visFallbackFired);
+#endif
 	}
 }
 
