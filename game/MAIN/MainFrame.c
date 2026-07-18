@@ -653,6 +653,48 @@ static void MainFrame_VisMemAddDriverPVS(struct GameTracker *gGT, int playerInde
 	}
 }
 
+// Off-path visibility fallback (native-only enhancement, default off).
+//
+// Retail visibility comes from a baked PVS: the camera adopts the checklist of
+// the quadblock beneath it. When that search fails, game/CAM.c:2373-2377 zeroes
+// cDC->visLeafSrc/visFaceSrc. If the driver has no quadblock PVS either -- the
+// off-path/shortcut case, e.g. the Hot Air Skyway vanishing track -- the loop
+// below just skips its update. It does not clear the packed lists, so
+// visLeafList/visFaceList keep their last-good contents while the camera keeps
+// moving, and already-loaded geometry silently stops being drawn.
+//
+// This never reaches the render choke points as a NULL list, even though both
+// already handle one (RenderLists_IsVisible returns "visible" for a NULL list;
+// DrawLevelOvr1P early-outs on one). visLeafList[]/visFaceList[] are allocated
+// buffers that are never reset to NULL after load, so the starvation is stale
+// bits rather than an absent list -- which is why the fallback belongs here,
+// where the staleness originates, and not at those choke points.
+//
+// With CTR_NATIVE_VIS_OFFPATH_FALLBACK=1 the lists are filled with "all
+// visible" in exactly that no-source case, leaving the existing frustum and
+// bounding-box culling to do the real work. On-path frames have a source and
+// never reach this path.
+//
+// Cost to watch: drawing more geometry pushes more primitives through the
+// per-level PrimMem budget (MainInit_GetPrimMemSize, data.primMem_SizePerLEV_*).
+// If that overflows, geometry drops again; CTR_NATIVE_MEMPACK_RETAIL_PRESSURE=0
+// in platform/native_memory.c opens an 8 MiB arena if headroom is needed.
+#ifndef CTR_NATIVE_VIS_OFFPATH_FALLBACK
+#define CTR_NATIVE_VIS_OFFPATH_FALLBACK 0
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_VIS_OFFPATH_FALLBACK
+// Fill a packed visibility bitset so every index reads as visible. Both
+// consumers test the sign bit after a variable left shift -- RenderLists_IsVisible
+// (game/RenderLevel/RenderLists.c:28) and Ovr226_800a0f34_ConsumeFullDynamicVisibilityBit
+// (game/226/226_00_DrawLevelOvr1P.c) -- so an all-ones word reads as visible for
+// every bit index it covers.
+static void MainFrame_VisMemSetAllVisible(int *dst, int byteCount)
+{
+	memset(dst, 0xff, (size_t)byteCount);
+}
+#endif
+
 // NOTE(aalhendi): ASM-verified NTSC-U 926 0x800357b8-0x80035d30.
 void MainFrame_VisMemFullFrame(struct GameTracker *gGT, struct Level *level)
 {
@@ -699,6 +741,18 @@ void MainFrame_VisMemFullFrame(struct GameTracker *gGT, struct Level *level)
 				visMem->visLeafSrc[playerIndex] = driverPVS->visLeafSrc;
 				MainFrame_ReplacePackedVisList(visMem->visLeafList[playerIndex], driverPVS->visLeafSrc, ((mesh->numBspNodes + 0x1f) >> 5) << 2);
 			}
+#if defined(CTR_NATIVE) && CTR_NATIVE_VIS_OFFPATH_FALLBACK
+			else if ((mesh != NULL) && (visMem->visLeafList[playerIndex] != NULL))
+			{
+				// No PVS source at all this frame. Clearing the "last merged
+				// source" cache matters: leaving it stale would let the
+				// pointer-equality test in the else-branch below skip the
+				// re-merge on the frame the camera recovers, stranding the
+				// all-visible fill for the rest of the race.
+				visMem->visLeafSrc[playerIndex] = NULL;
+				MainFrame_VisMemSetAllVisible(visMem->visLeafList[playerIndex], ((mesh->numBspNodes + 0x1f) >> 5) << 2);
+			}
+#endif
 		}
 		else if (visMem->visLeafSrc[playerIndex] != camDC->visLeafSrc)
 		{
@@ -713,6 +767,14 @@ void MainFrame_VisMemFullFrame(struct GameTracker *gGT, struct Level *level)
 				visMem->visFaceSrc[playerIndex] = driverPVS->visFaceSrc;
 				MainFrame_ReplacePackedVisList(visMem->visFaceList[playerIndex], driverPVS->visFaceSrc, ((mesh->numQuadBlock + 0x1f) >> 5) << 2);
 			}
+#if defined(CTR_NATIVE) && CTR_NATIVE_VIS_OFFPATH_FALLBACK
+			else if ((mesh != NULL) && (visMem->visFaceList[playerIndex] != NULL))
+			{
+				// Same reasoning as the visLeafSrc fallback above.
+				visMem->visFaceSrc[playerIndex] = NULL;
+				MainFrame_VisMemSetAllVisible(visMem->visFaceList[playerIndex], ((mesh->numQuadBlock + 0x1f) >> 5) << 2);
+			}
+#endif
 		}
 		else if (visMem->visFaceSrc[playerIndex] != camDC->visFaceSrc)
 		{

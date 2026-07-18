@@ -89,6 +89,17 @@ target_compile_definitions(ctr_native PRIVATE
     CTR_NATIVE_VERSION=\"${CTR_NATIVE_VERSION}\"
     CTR_NATIVE_BUILD_ID=\"${CTR_NATIVE_BUILD_ID}\"
 )
+# Optional native enhancements. Retail behavior is the default; each one is a
+# single switch away, e.g. cmake -DCTR_NATIVE_VIS_OFFPATH_FALLBACK=ON ...
+# The source-level defaults live next to the code they gate, so leaving these
+# OFF reproduces retail exactly.
+option(CTR_NATIVE_VIS_OFFPATH_FALLBACK
+    "Fall back to all-visible when the camera quadblock search finds no PVS source (fixes off-path vanishing track)"
+    OFF)
+if(CTR_NATIVE_VIS_OFFPATH_FALLBACK)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_VIS_OFFPATH_FALLBACK=1)
+endif()
+
 target_compile_options(ctr_native PRIVATE -O2)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ctr_native PRIVATE -Wenum-conversion -Wenum-compare -Wswitch-enum -Wformat -Wparentheses)
