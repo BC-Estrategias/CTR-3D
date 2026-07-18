@@ -93,11 +93,36 @@ target_compile_definitions(ctr_native PRIVATE
 # single switch away, e.g. cmake -DCTR_NATIVE_VIS_OFFPATH_FALLBACK=ON ...
 # The source-level defaults live next to the code they gate, so leaving these
 # OFF reproduces retail exactly.
-option(CTR_NATIVE_VIS_OFFPATH_FALLBACK
-    "Fall back to all-visible when the camera quadblock search finds no PVS source (fixes off-path vanishing track)"
+#   0 = retail (baked PVS decides everything)
+#   1 = all-visible only when the camera has no PVS source at all
+#   2 = always draw all track geometry, ignoring the baked PVS
+set(CTR_NATIVE_VIS_OFFPATH_FALLBACK "0" CACHE STRING
+    "Off-path visibility mode: 0 retail, 1 fallback when no PVS source, 2 always all-visible")
+set_property(CACHE CTR_NATIVE_VIS_OFFPATH_FALLBACK PROPERTY STRINGS 0 1 2)
+
+# Accept the boolean spelling too, so -D...=ON still means mode 1 rather than
+# silently expanding to a non-numeric token that #if would treat as 0.
+if(CTR_NATIVE_VIS_OFFPATH_FALLBACK STREQUAL "ON")
+    set(CTR_NATIVE_VIS_OFFPATH_FALLBACK "1")
+elseif(CTR_NATIVE_VIS_OFFPATH_FALLBACK STREQUAL "OFF")
+    set(CTR_NATIVE_VIS_OFFPATH_FALLBACK "0")
+endif()
+
+if(NOT CTR_NATIVE_VIS_OFFPATH_FALLBACK MATCHES "^[0-2]$")
+    message(FATAL_ERROR "CTR_NATIVE_VIS_OFFPATH_FALLBACK must be 0, 1 or 2 (got '${CTR_NATIVE_VIS_OFFPATH_FALLBACK}')")
+endif()
+
+if(NOT CTR_NATIVE_VIS_OFFPATH_FALLBACK STREQUAL "0")
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_VIS_OFFPATH_FALLBACK=${CTR_NATIVE_VIS_OFFPATH_FALLBACK})
+endif()
+
+# Log how close the per-frame primitive/OT buffers come to their per-level
+# budget. Overflow is otherwise silent and mimics the vanishing-geometry bug.
+option(CTR_NATIVE_PRIMMEM_WATERMARK
+    "Log peak PrimMem/OTMem usage per frame and warn on guard-band overflow"
     OFF)
-if(CTR_NATIVE_VIS_OFFPATH_FALLBACK)
-    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_VIS_OFFPATH_FALLBACK=1)
+if(CTR_NATIVE_PRIMMEM_WATERMARK)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_PRIMMEM_WATERMARK=1)
 endif()
 
 target_compile_options(ctr_native PRIVATE -O2)

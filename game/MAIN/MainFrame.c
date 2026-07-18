@@ -48,6 +48,54 @@ void MainFrame_TogglePauseAudio(b32 bool_pause)
 	return;
 }
 
+// Report how close the per-frame primitive and ordering-table buffers came to
+// their per-level budget. This is the measurement that says whether an
+// always-visible mode is affordable: overflow is otherwise *silent* -- the
+// ~20 "cursor <= guardEnd" checks scattered through the draw code simply stop
+// emitting primitives, which looks exactly like the vanishing geometry we are
+// trying to fix. Diagnostic only, never read by game logic.
+// Opt-in only: CTR_INTERNAL is always defined in this build, so defaulting this
+// on would compile diagnostic code into the retail-default binary and cost the
+// "flag off means byte-identical to the untouched baseline" guarantee.
+#ifndef CTR_NATIVE_PRIMMEM_WATERMARK
+#define CTR_NATIVE_PRIMMEM_WATERMARK 0
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_PRIMMEM_WATERMARK
+static u32 s_primMemPeak;
+static u32 s_otMemPeak;
+static int s_primMemOverflowed;
+
+static void MainFrame_PrimMemWatermarkSample(struct DB *db)
+{
+	// Sampled immediately before the per-frame reset below, so the cursors still
+	// hold this frame's high-water mark.
+	u32 primUsed = (u32)((char *)db->primMem.cursor - (char *)db->primMem.start);
+	u32 otUsed = (u32)((char *)db->otMem.cursor - (char *)db->otMem.start);
+
+	if ((db->primMem.guardEnd != NULL) && (db->primMem.cursor > db->primMem.guardEnd) && !s_primMemOverflowed)
+	{
+		s_primMemOverflowed = 1;
+		Platform_LogWarn("[primmem] OVERFLOW - hit the guard band; primitives are being dropped this frame\n");
+	}
+
+	// Report only meaningful climbs so a race does not produce a line per frame.
+	if (primUsed > (s_primMemPeak + 4096u))
+	{
+		s_primMemPeak = primUsed;
+		Platform_LogWarn("[primmem] peak %u KiB of %u KiB (%u%%)\n", primUsed >> 10, db->primMem.capacityBytes >> 10,
+		                 db->primMem.capacityBytes ? (primUsed / (db->primMem.capacityBytes / 100u)) : 0u);
+	}
+
+	if (otUsed > (s_otMemPeak + 4096u))
+	{
+		s_otMemPeak = otUsed;
+		Platform_LogWarn("[otmem]  peak %u KiB of %u KiB (%u%%)\n", otUsed >> 10, db->otMem.capacityBytes >> 10,
+		                 db->otMem.capacityBytes ? (otUsed / (db->otMem.capacityBytes / 100u)) : 0u);
+	}
+}
+#endif
+
 // NOTE(aalhendi): ASM-verified NTSC-U 926 0x80034bbc-0x80034d54 for the retail path.
 void MainFrame_ResetDB(struct GameTracker *gGT)
 {
@@ -68,6 +116,11 @@ void MainFrame_ResetDB(struct GameTracker *gGT)
 	otSwapchainDB = (int)gGT->otSwapchainDB[gGT->swapchainIndex];
 
 	db = gGT->backBuffer;
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_PRIMMEM_WATERMARK
+	MainFrame_PrimMemWatermarkSample(db);
+#endif
+
 	db->blurCameraMask = 0;
 	db->primMem.cursor = db->primMem.start;
 	db->primMem.primitiveCount = 0;
@@ -679,6 +732,16 @@ static void MainFrame_VisMemAddDriverPVS(struct GameTracker *gGT, int playerInde
 // per-level PrimMem budget (MainInit_GetPrimMemSize, data.primMem_SizePerLEV_*).
 // If that overflows, geometry drops again; CTR_NATIVE_MEMPACK_RETAIL_PRESSURE=0
 // in platform/native_memory.c opens an 8 MiB arena if headroom is needed.
+// Modes:
+//   0 - retail. The baked PVS decides everything.
+//   1 - fall back to all-visible only when neither the camera nor the driver's
+//       quadblock supplies a PVS source (the "camera search failed" case).
+//   2 - always draw all track geometry, ignoring the baked PVS entirely, and
+//       leave culling to the existing frustum/bounding-box tests. This is the
+//       mode that covers the *other* failure mode: the search succeeds but the
+//       checklist it returns never anticipated an off-path vantage point, which
+//       is what Hot Air Skyway actually does. Costs the most CPU/GPU and the
+//       most PrimMem; see CTR_NATIVE_PRIMMEM_WATERMARK for measuring it.
 #ifndef CTR_NATIVE_VIS_OFFPATH_FALLBACK
 #define CTR_NATIVE_VIS_OFFPATH_FALLBACK 0
 #endif
@@ -921,6 +984,31 @@ void MainFrame_VisMemFullFrame(struct GameTracker *gGT, struct Level *level)
 				memcpy(visMem->visSCVertList[playerIndex], level->visSCVertSrc, ((level->numSCVert + 0x1f) >> 5) << 2);
 			}
 		}
+
+#if defined(CTR_NATIVE) && (CTR_NATIVE_VIS_OFFPATH_FALLBACK >= 2)
+		// Always-visible mode. The retail merge above is deliberately left to run
+		// untouched so every camera flag (0x2000/0x4000) and the visInstSrc
+		// handoff behave exactly as retail; only the final contents of the two
+		// packed lists are overridden. The source caches are not disturbed, so
+		// retail's "re-merge only when the source pointer changed" logic keeps
+		// working and simply gets overwritten each frame.
+		if (mesh != NULL)
+		{
+			if (visMem->visLeafList[playerIndex] != NULL)
+			{
+				MainFrame_VisMemSetAllVisible(visMem->visLeafList[playerIndex], ((mesh->numBspNodes + 0x1f) >> 5) << 2);
+			}
+
+			if (visMem->visFaceList[playerIndex] != NULL)
+			{
+				MainFrame_VisMemSetAllVisible(visMem->visFaceList[playerIndex], ((mesh->numQuadBlock + 0x1f) >> 5) << 2);
+			}
+
+#if CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG
+			visFallbackFired = 1;
+#endif
+		}
+#endif
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_VIS_OFFPATH_FALLBACK_LOG
 		MainFrame_VisFallbackReport(playerIndex, visFallbackFired);
