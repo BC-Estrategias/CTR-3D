@@ -125,6 +125,23 @@ if(CTR_NATIVE_PRIMMEM_WATERMARK)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_PRIMMEM_WATERMARK=1)
 endif()
 
+# Log every growth/reset of the decoded-voice PCM arena in the audio mixer.
+option(CTR_NATIVE_AUDIO_ARENA_LOG
+    "Log decoded-voice PCM arena growth and resets"
+    OFF)
+if(CTR_NATIVE_AUDIO_ARENA_LOG)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_AUDIO_ARENA_LOG=1)
+endif()
+
+# Reset that arena on the LOAD_RESTART fast path (Time Trial "Retry"), which
+# reloads no audio banks and so never hits the only unconditional reset.
+option(CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART
+    "Drop decoded voice PCM on race restart (fixes unbounded arena growth across retries)"
+    OFF)
+if(CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART=1)
+endif()
+
 target_compile_options(ctr_native PRIVATE -O2)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ctr_native PRIVATE -Wenum-conversion -Wenum-compare -Wswitch-enum -Wformat -Wparentheses)

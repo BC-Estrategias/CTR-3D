@@ -6,6 +6,17 @@
 #include <platform/native_savestate.h>
 #endif
 
+// Drop the native decoded-voice PCM arena on the LOAD_RESTART fast path, which
+// reloads no audio banks and therefore never reaches SpuWrite. Off by default so
+// the retail-default build stays byte-identical to the untouched baseline.
+#ifndef CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART
+#define CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART 0
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART
+#include <platform/native_audio.h>
+#endif
+
 #if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
 static struct NativePerfFrameInfo MainPerf_FrameInfo(struct GameTracker *gGT)
 {
@@ -164,6 +175,17 @@ u32 main(void)
 		case 2:
 			Audio_SetState_Safe(1);
 			MEMPACK_PopState();
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART
+			// This fast restart reloads no audio banks, so SpuWrite -- the only
+			// unconditional reset of the native decoded-PCM arena -- never runs
+			// here, and the idle-based reclaim cannot fire while music holds a
+			// voice active. Without this the arena doubles on every retry until
+			// each regrow's memcpy stalls the main loop through the shared audio
+			// stream lock. Retail needed no equivalent: the PS1 had no host-side
+			// decode cache to go stale.
+			NativeAudio_ResetVoicePcmArena();
+#endif
 
 			// ignore threads, because we PopState,
 			// so the threadpool will reset anyway

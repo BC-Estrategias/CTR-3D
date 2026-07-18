@@ -27,6 +27,10 @@ int NativeAudio_GetXAMaxSample(void);
 int NativeAudio_GetXAMaxSampleAtOffset(int xaCurrOffset);
 void NativeAudio_SetXAVolume(int volumeLeft, int volumeRight);
 void NativeAudio_StopXA(void);
+// Drops all decoded voice PCM and resets the decode arena. Needed on restart
+// paths that reload no audio banks; see the comment on the definition.
+void NativeAudio_ResetVoicePcmArena(void);
+
 void NativeAudio_StepVBlank(void);
 int NativeAudio_RenderFrames(s16 *out, int frameCount);
 void NativeAudio_SetDeterministicRenderMode(int enabled);

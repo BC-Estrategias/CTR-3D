@@ -164,6 +164,16 @@ struct NativeAudioOutput
 #endif
 };
 
+// Diagnostics for the decoded-voice PCM arena. This arena grows by doubling and
+// is only fully reclaimed by SpuWrite (audio-bank load) or when all 24 SPU
+// voices happen to be idle at once -- a condition background music prevents.
+// A Time Trial "Retry" takes the LOAD_RESTART fast path, which reloads no audio
+// banks, so neither reset fires and decoded PCM accumulates across retries.
+// Set to 1 to log every growth step and every reset.
+#ifndef CTR_NATIVE_AUDIO_ARENA_LOG
+#define CTR_NATIVE_AUDIO_ARENA_LOG 0
+#endif
+
 struct NativeAudioDecodeArena
 {
 	// NOTE(aalhendi): Native rebuildable cache memory. Do not snapshot this;
@@ -1430,6 +1440,13 @@ internal int NativeAudio_VoiceArenaEnsureCapacityNoLock(int capacity)
 	free(oldMemory);
 	arena->memory = newMemory;
 	arena->capacity = newCapacity;
+
+#if CTR_NATIVE_AUDIO_ARENA_LOG
+	// Growth is by doubling, so this fires rarely (about once per size class) and
+	// will not perturb the timing it is measuring.
+	Platform_LogWarn("[audio-arena] grew to %d KiB (in use %d KiB)\n", arena->capacity >> 10, arena->used >> 10);
+#endif
+
 	return 1;
 }
 
@@ -1592,6 +1609,14 @@ internal void NativeAudio_ResetVoicePcmArenaNoLock(int markDirty)
 {
 	int i;
 
+#if CTR_NATIVE_AUDIO_ARENA_LOG
+	if (s_audio.voicePcmArena.used > 0)
+	{
+		Platform_LogWarn("[audio-arena] reset (was %d KiB in use of %d KiB)\n", s_audio.voicePcmArena.used >> 10,
+		                 s_audio.voicePcmArena.capacity >> 10);
+	}
+#endif
+
 	NativeAudio_ArenaReset(&s_audio.voicePcmArena);
 	for (i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
 	{
@@ -1603,6 +1628,20 @@ internal void NativeAudio_ResetVoicePcmArenaNoLock(int markDirty)
 			s_audio.voices[i].sampleDirty = 1;
 		}
 	}
+}
+
+// Public entry point so the game side can drop the decoded-PCM cache on paths
+// that skip an audio-bank reload. Retail had no host-side decode cache, so the
+// PS1 fast-restart never needed an equivalent; on native it is what stops the
+// arena growing without bound across repeated Time Trial retries.
+//
+// markDirty is set so any voice still sounding re-decodes on its next update
+// rather than reading through a freed pointer.
+void NativeAudio_ResetVoicePcmArena(void)
+{
+	NativeAudio_LockOutput();
+	NativeAudio_ResetVoicePcmArenaNoLock(1);
+	NativeAudio_UnlockOutput();
 }
 
 internal void NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock(void)
