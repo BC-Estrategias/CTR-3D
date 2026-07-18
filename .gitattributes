@@ -1,0 +1,7 @@
+# Preserve the vendor drop byte-for-byte.
+#
+# Git for Windows ships with core.autocrlf=true, which would rewrite the
+# LF-terminated release sources to CRLF on checkout and make the working tree
+# drift from ../ctr-native-beta-7.1. Disable all end-of-line translation so a
+# fresh clone reproduces the original tree exactly.
+* -text
