@@ -1,4 +1,6 @@
 build/
+# Side-by-side configs for the optional enhancement flags, e.g. build-vis/
+build-*/
 dist/
 assets/
 debug/
