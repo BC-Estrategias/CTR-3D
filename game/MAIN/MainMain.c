@@ -180,10 +180,17 @@ u32 main(void)
 			// This fast restart reloads no audio banks, so SpuWrite -- the only
 			// unconditional reset of the native decoded-PCM arena -- never runs
 			// here, and the idle-based reclaim cannot fire while music holds a
-			// voice active. Without this the arena doubles on every retry until
-			// each regrow's memcpy stalls the main loop through the shared audio
-			// stream lock. Retail needed no equivalent: the PS1 had no host-side
-			// decode cache to go stale.
+			// voice active. Retail needed no equivalent: the PS1 had no
+			// host-side decode cache to go stale.
+			//
+			// NOTE: this was written to explain a session-long memory climb, and
+			// an instrumented playtest showed it is NOT the cause. The voice PCM
+			// arena plateaus at 128 MiB and reset 10 times over 15 minutes while
+			// process memory kept growing to 710 MB. The real growth is the XA
+			// arena pair (xaPcmArena / xaPendingPcmArena), whose capacity
+			// ratchets up and is never released -- see
+			// BUGREPORT_audio_arena_growth.md. Keeping this reset is defensible
+			// tidiness, but do not mistake it for the fix.
 			NativeAudio_ResetVoicePcmArena();
 #endif
 
