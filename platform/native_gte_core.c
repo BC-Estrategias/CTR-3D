@@ -7,6 +7,11 @@
 #include <macros.h>
 #include <psx/gtereg.h>
 #include <psx/libgte.h>
+#include "platform/native_gte_capture.h"
+
+#ifndef CTR_NATIVE_GTE_CAPTURE
+#define CTR_NATIVE_GTE_CAPTURE 0
+#endif
 
 GTERegisters gteRegs;
 
@@ -302,6 +307,9 @@ internal int Lm_H(s64 value, int sf)
 internal int GTE_RotTransPers(int idx, int lm)
 {
 	int h_over_sz3;
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	s64 sxFull, syFull;
+#endif
 
 	C2_MAC1 = A1(/*int44*/ (s64)((s64)C2_TRX << 12) + (C2_R11 * VX(idx)) + (C2_R12 * VY(idx)) + (C2_R13 * VZ(idx)));
 	C2_MAC2 = A2(/*int44*/ (s64)((s64)C2_TRY << 12) + (C2_R21 * VX(idx)) + (C2_R22 * VY(idx)) + (C2_R23 * VZ(idx)));
@@ -316,8 +324,28 @@ internal int GTE_RotTransPers(int idx, int lm)
 	h_over_sz3 = Lm_E(gte_divide(C2_H, C2_SZ3));
 	C2_SXY0 = C2_SXY1;
 	C2_SXY1 = C2_SXY2;
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	// Same expressions as the retail path below, just named so the
+	// pre-truncation fraction survives past the >>16. F() must still be
+	// called X-then-Y, exactly once each, since it also writes m_mac0 as a
+	// side effect -- do not collapse this into one shared local.
+	sxFull = F((s64)C2_OFX + ((s64)C2_IR1 * h_over_sz3));
+	syFull = F((s64)C2_OFY + ((s64)C2_IR2 * h_over_sz3));
+	C2_SX2 = Lm_G1(sxFull >> 16);
+	C2_SY2 = Lm_G2(syFull >> 16);
+
+	// Lm_G1/Lm_G2 themselves stay untouched; re-derive their clamp bounds
+	// read-only here and skip capture on either axis clamping -- the
+	// coordinate is off-screen and the fraction is meaningless.
+	if ((sxFull >> 16) >= -0x400 && (sxFull >> 16) <= 0x3ff && (syFull >> 16) >= -0x400 && (syFull >> 16) <= 0x3ff)
+	{
+		GTECapture_Store((s16)C2_SX2, (s16)C2_SY2, sxFull, syFull, (u16)C2_SZ3, h_over_sz3);
+	}
+#else
 	C2_SX2 = Lm_G1(F((s64)C2_OFX + ((s64)C2_IR1 * h_over_sz3)) >> 16);
 	C2_SY2 = Lm_G2(F((s64)C2_OFY + ((s64)C2_IR2 * h_over_sz3)) >> 16);
+#endif
 
 	return h_over_sz3;
 }

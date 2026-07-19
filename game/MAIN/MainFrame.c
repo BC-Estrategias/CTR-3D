@@ -1,4 +1,5 @@
 #include <common.h>
+#include <platform/native_gte_capture.h>
 
 #if defined(CTR_NATIVE)
 static void MainFrame_RegisterGpuLinkRanges(struct GameTracker *gGT)
@@ -96,6 +97,17 @@ static void MainFrame_PrimMemWatermarkSample(struct DB *db)
 }
 #endif
 
+// Per-frame clear for the GTE sub-pixel capture table (docs/GTE_CAPTURE_DESIGN.md).
+// This is the right place: it runs before any of this frame's GTE_RotTransPers
+// calls and after the previous frame's rendering already consumed the table,
+// so every capture this frame is looked up before it goes stale. Deliberately
+// NOT in ClearSplits() -- that runs per-OT-draw, after this frame's captures
+// and before this frame's vertex builds, so a clear there would make every
+// lookup miss its own frame's data.
+#ifndef CTR_NATIVE_GTE_CAPTURE
+#define CTR_NATIVE_GTE_CAPTURE 0
+#endif
+
 // NOTE(aalhendi): ASM-verified NTSC-U 926 0x80034bbc-0x80034d54 for the retail path.
 void MainFrame_ResetDB(struct GameTracker *gGT)
 {
@@ -128,6 +140,15 @@ void MainFrame_ResetDB(struct GameTracker *gGT)
 
 #if defined(CTR_NATIVE)
 	MainFrame_RegisterGpuLinkRanges(gGT);
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	GTECapture_Clear();
+	// The swapchain OT's first six entries (terminator + pushBuffer_UI's OT,
+	// set up below) are the UI band: the DrawOTag walk crosses into them after
+	// all world geometry, and every packet from there on is UI, whose
+	// coordinates never come from this frame's GTE writes.
+	GTECapture_SetUIBand((const void *)(uintptr_t)otSwapchainDB, (const void *)((uintptr_t)otSwapchainDB + 0x18u));
 #endif
 
 	CTR_EmptyFunc_MainFrame_ResetDB();

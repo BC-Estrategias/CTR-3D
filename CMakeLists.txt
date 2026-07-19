@@ -142,6 +142,33 @@ if(CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART=1)
 endif()
 
+# Populate + clear a per-frame side table of GTE sub-pixel fractions, keyed by
+# the exact truncated screen coordinate the GTE writes to the packet. No
+# visible effect alone -- see docs/GTE_CAPTURE_DESIGN.md. Shared
+# infrastructure for CTR_NATIVE_VERTEX_DESNAP and later stereo/perspective-UV.
+option(CTR_NATIVE_GTE_CAPTURE
+    "Populate the GTE sub-pixel capture side table (infrastructure only, no visible effect)"
+    OFF)
+
+# Consume the capture table in the vertex builders and vertex shader to draw
+# geometry at its true sub-pixel position instead of PS1-style whole-pixel
+# rounding. Game logic reads unchanged truncated integers either way.
+option(CTR_NATIVE_VERTEX_DESNAP
+    "Draw geometry at true GTE sub-pixel position instead of snapping to whole pixels"
+    OFF)
+
+if(CTR_NATIVE_VERTEX_DESNAP AND NOT CTR_NATIVE_GTE_CAPTURE)
+    message(STATUS "CTR_NATIVE_VERTEX_DESNAP implies CTR_NATIVE_GTE_CAPTURE; enabling it")
+    set(CTR_NATIVE_GTE_CAPTURE ON CACHE BOOL "Populate the GTE sub-pixel capture side table" FORCE)
+endif()
+
+if(CTR_NATIVE_GTE_CAPTURE)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_GTE_CAPTURE=1)
+endif()
+if(CTR_NATIVE_VERTEX_DESNAP)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_VERTEX_DESNAP=1)
+endif()
+
 target_compile_options(ctr_native PRIVATE -O2)
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ctr_native PRIVATE -Wenum-conversion -Wenum-compare -Wswitch-enum -Wformat -Wparentheses)

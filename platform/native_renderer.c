@@ -575,7 +575,27 @@ const char *gte_shader_32_rgba = "	uniform sampler2D s_texture;\n"
                                  "		fragColor.a = float(psxDrawMaskSet);\n"
                                  "	}\n";
 
+// De-snapped variant reconstructs the GTE's discarded sub-pixel fraction from
+// a_extra.zw (GrVertex._p0/_p1, carried unnormalized -- see MakeVertexTriangle
+// /Quad in native_gpu.c and docs/GTE_CAPTURE_DESIGN.md) and adds it to
+// a_position.xy, in the same pixel-space units, before the Projection
+// multiply. _p0/_p1 hold a u8 fraction bit-reinterpreted into a signed byte;
+// mod(...,256) undoes that reinterpretation losslessly (e.g. a shader-side
+// -1.0 unwraps back to 255.0) before scaling to a [0,1) pixel offset.
+// Vertices with no capture (miss, or built by MakeVertexRect/MakeLineArray,
+// which never write _p0/_p1) get a_extra.zw == 0, i.e. no offset -- today's
+// exact snapped position.
+#ifndef CTR_NATIVE_VERTEX_DESNAP
+#define CTR_NATIVE_VERTEX_DESNAP 0
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
+#define GTE_PERSPECTIVE_CORRECTION                                                                     \
+	"	vec2 desnapFrac = mod(a_extra.zw, 256.0) * (1.0 / 256.0);\n"                                        \
+	"	gl_Position = Projection * vec4(a_position.xy + desnapFrac, 0.0, 1.0);\n"
+#else
 #define GTE_PERSPECTIVE_CORRECTION "	gl_Position = Projection * vec4(a_position.xy, 0.0, 1.0);\n"
+#endif
 
 #define GTE_VERTEX_SHADER                                                                                          \
 	"	attribute vec4 a_position;\n"                                                                                \

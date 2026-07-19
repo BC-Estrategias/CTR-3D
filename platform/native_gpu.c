@@ -11,6 +11,7 @@
 
 #include <SDL3/SDL.h>
 
+#include "platform/native_gte_capture.h"
 #include "platform/native_log.h"
 #include "platform/native_perf.h"
 #include "platform/native_renderer.h"
@@ -130,6 +131,9 @@ int NativeGpu_HasPendingSplits(void)
 
 void ClearSplits(void)
 {
+	// NOTE: the GTE capture table (native_gte_capture.c) is deliberately NOT
+	// cleared here -- this runs per-OT-draw, after this frame's captures and
+	// before this frame's vertex builds. Its clear lives in MainFrame_ResetDB.
 	s_gpu.currentSplitDebugText = NULL;
 	s_gpu.vertexIndex = 0;
 	s_gpu.splitIndex = 0;
@@ -296,6 +300,16 @@ void MakeLineArray(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1)
 	} // TODO diagonal line alignment
 }
 
+// Draws geometry at its true GTE sub-pixel position instead of snapping to
+// whole pixels, by looking up the fraction GTE_RotTransPers discarded (see
+// docs/GTE_CAPTURE_DESIGN.md) and carrying it in the otherwise-dead
+// GrVertex._p0/_p1 padding bytes. A miss (table cleared, or these vertices
+// were never captured -- e.g. built from a synthesized/HUD coordinate) just
+// leaves _p0/_p1 at the memset default of 0, i.e. today's exact behavior.
+#ifndef CTR_NATIVE_VERTEX_DESNAP
+#define CTR_NATIVE_VERTEX_DESNAP 0
+#endif
+
 void MakeVertexTriangle(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2)
 {
 	assert(p0);
@@ -315,6 +329,23 @@ void MakeVertexTriangle(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *
 
 	vertex[2].x = p2[0] + ofsX;
 	vertex[2].y = p2[1] + ofsY;
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
+	if (!GTECapture_LookupSuppressed())
+	{
+		VERTTYPE *srcs[3] = {p0, p1, p2};
+		int i;
+		for (i = 0; i < 3; i++)
+		{
+			u8 fracX8, fracY8;
+			if (GTECapture_Lookup(srcs[i][0], srcs[i][1], &fracX8, &fracY8))
+			{
+				vertex[i]._p0 = (s8)fracX8;
+				vertex[i]._p1 = (s8)fracY8;
+			}
+		}
+	}
+#endif
 }
 
 void MakeVertexQuad(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, VERTTYPE *p3)
@@ -340,6 +371,37 @@ void MakeVertexQuad(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, 
 
 	vertex[3].x = p3[0] + ofsX;
 	vertex[3].y = p3[1] + ofsY;
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
+	{
+		// 2D UI quads (font glyphs, panels) must not consult the table: the key
+		// is only a screen position, so a UI corner coincidentally sharing a
+		// pixel with some projected world vertex falsely HITs and inherits that
+		// vertex's fraction (visible as UI shimmer tracking background motion).
+		// Discriminator: every 2D-affine transform of a rectangle (CTR's menu
+		// text waves/rocks/scales its glyph quads) stays an exact integer
+		// parallelogram (p1-p0 == p3-p2 in the PSX TL,TR,BL,BR corner order),
+		// while a perspective-projected world quad only forms one when it is
+		// screen-parallel. Misclassifying such a world quad just draws it
+		// snapped for that frame -- the safe fallback by construction.
+		int parallelogram = ((p1[0] - p0[0]) == (p3[0] - p2[0])) && ((p1[1] - p0[1]) == (p3[1] - p2[1]));
+
+		if (!parallelogram && !GTECapture_LookupSuppressed())
+		{
+			VERTTYPE *srcs[4] = {p0, p1, p2, p3};
+			int i;
+			for (i = 0; i < 4; i++)
+			{
+				u8 fracX8, fracY8;
+				if (GTECapture_Lookup(srcs[i][0], srcs[i][1], &fracX8, &fracY8))
+				{
+					vertex[i]._p0 = (s8)fracX8;
+					vertex[i]._p1 = (s8)fracY8;
+				}
+			}
+		}
+	}
+#endif
 }
 
 void MakeVertexRect(GrVertex *vertex, VERTTYPE *p0, s16 w, s16 h)
@@ -1103,9 +1165,18 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 	{
 		// walk OT_TAG linked list
 		u8 *basePacket = (u8 *)p;
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
+		GTECapture_BeginOTWalk();
+#endif
+
 		while (true)
 		{
 			const int tagLength = getlen(basePacket);
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
+			GTECapture_MarkOTNode(basePacket);
+#endif
 			if (tagLength > 0)
 			{
 				if (tagLength > 32)
