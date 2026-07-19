@@ -7,14 +7,20 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 set(CTR_NATIVE_VERSION "0.1.0-beta.7.1")
 
-if(NOT CMAKE_C_COMPILER_TARGET MATCHES "i.86" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "i.86")
-    set(CMAKE_C_FLAGS "-m32 ${CMAKE_C_FLAGS}")
-    set(CMAKE_EXE_LINKER_FLAGS "-m32 ${CMAKE_EXE_LINKER_FLAGS}")
-endif()
+# Host builds target x86-32 with SSE. On the 3DS the devkitPro platform module
+# supplies the ARM11 arch flags (-march=armv6k -mtune=mpcore -mfloat-abi=hard),
+# and the find-root overrides below must not fire: devkitARM relies on the find
+# root to locate libctru/citro3d under $DEVKITPRO.
+if(NOT NINTENDO_3DS)
+    if(NOT CMAKE_C_COMPILER_TARGET MATCHES "i.86" AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "i.86")
+        set(CMAKE_C_FLAGS "-m32 ${CMAKE_C_FLAGS}")
+        set(CMAKE_EXE_LINKER_FLAGS "-m32 ${CMAKE_EXE_LINKER_FLAGS}")
+    endif()
 
-set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY NEVER)
-set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE NEVER)
+    set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE NEVER)
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY NEVER)
+    set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE NEVER)
+endif()
 
 execute_process(
     COMMAND git rev-parse --short=12 HEAD
@@ -40,7 +46,16 @@ else()
     set(CTR_NATIVE_BUILD_ID "${CTR_NATIVE_GIT_HASH}-dirty-${CTR_NATIVE_BUILD_TIMESTAMP}")
 endif()
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse -Wno-error -g")
+if(NINTENDO_3DS)
+    # The ARM EABI defaults to -fshort-enums, sizing each enum to the smallest
+    # type that holds it. The decomp's layouts assume 4-byte enums and assert on
+    # it (CTR_STATIC_ASSERT(sizeof(enum X) == 0x4)), and those enums sit inside
+    # structs parsed from on-disc game data, so a narrower enum silently shifts
+    # field offsets. Force the wide form.
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fno-short-enums -Wno-error -g")
+else()
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msse -Wno-error -g")
+endif()
 
 function(ctr_native_add_label_warning_if_supported target warning flag_check)
     set(saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
@@ -56,7 +71,8 @@ function(ctr_native_add_label_warning_if_supported target warning flag_check)
     endif()
 endfunction()
 
-# SDL3
+# SDL3 -- host only. The 3DS backend targets libctru/citro3d directly.
+if(NOT NINTENDO_3DS)
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
@@ -78,9 +94,28 @@ set(SDL_SNDIO_SHARED OFF CACHE BOOL "" FORCE)
 set(SDL_X11_XSCRNSAVER OFF CACHE BOOL "" FORCE)
 set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)
 add_subdirectory(externals/SDL)
+endif()
 
 # CTR Native
-add_executable(ctr_native main.c)
+#
+# main.c is a unity build: it #includes every other .c directly. The 3DS backend
+# is the one exception -- it must be its own translation unit so libctru's
+# headers never meet the decomp's (see platform/n3ds/n3ds_backend.h).
+set(CTR_NATIVE_SOURCES main.c)
+if(NINTENDO_3DS)
+    list(APPEND CTR_NATIVE_SOURCES platform/n3ds/n3ds_backend.c)
+endif()
+
+add_executable(ctr_native ${CTR_NATIVE_SOURCES})
+
+if(NINTENDO_3DS)
+    # The backend TU talks to libctru, which was built with the ARM EABI's
+    # default short enums. Nothing enum-typed crosses n3ds_backend.h -- it
+    # exposes only plain scalars -- so this file can match libctru's ABI while
+    # the game TU keeps the 4-byte enums its struct layouts require.
+    set_source_files_properties(platform/n3ds/n3ds_backend.c
+        PROPERTIES COMPILE_OPTIONS "-fshort-enums")
+endif()
 target_include_directories(ctr_native PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_definitions(ctr_native PRIVATE
     CTR_NATIVE
@@ -179,8 +214,20 @@ if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
 elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
     ctr_native_add_label_warning_if_supported(ctr_native -Wc23-extensions CTR_HAS_WC23_EXTENSIONS)
 endif()
-target_link_libraries(ctr_native SDL3::SDL3)
-target_link_options(ctr_native PRIVATE -static-libgcc)
-if(WIN32)
-    target_link_options(ctr_native PRIVATE -static)
+if(NINTENDO_3DS)
+    # citro3d before ctru: the linker resolves left to right and citro3d pulls
+    # symbols out of ctru.
+    target_link_libraries(ctr_native citro3d ctru)
+    ctr_generate_smdh(ctr_native.smdh
+        NAME "CTR-Native"
+        DESCRIPTION "Crash Team Racing (native port) ${CTR_NATIVE_VERSION}"
+        AUTHOR "CTR-tools"
+    )
+    ctr_create_3dsx(ctr_native SMDH ctr_native.smdh)
+else()
+    target_link_libraries(ctr_native SDL3::SDL3)
+    target_link_options(ctr_native PRIVATE -static-libgcc)
+    if(WIN32)
+        target_link_options(ctr_native PRIVATE -static)
+    endif()
 endif()

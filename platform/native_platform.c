@@ -12,8 +12,10 @@
 #include "platform/native_replay_scheduler.h"
 #include "platform/native_savestate.h"
 
+#if !defined(__3DS__)
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
+#endif
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +156,10 @@ internal void Platform_UpdateHostAltKeyState(const s32 key, const s8 down)
 #if defined(CTR_INTERNAL)
 internal void Platform_TakeScreenshot(void)
 {
+#if defined(__3DS__)
+	// Reads back the GL default framebuffer, which the 3DS backend does not have.
+	// Reinstate against a citro3d render target when one exists.
+#else
 	u8 *pixels = (u8 *)malloc(g_windowWidth * g_windowHeight * 4);
 
 	glReadPixels(0, 0, g_windowWidth, g_windowHeight, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
@@ -164,6 +170,7 @@ internal void Platform_TakeScreenshot(void)
 	SDL_DestroySurface(surface);
 
 	free(pixels);
+#endif
 }
 #endif
 
@@ -622,6 +629,18 @@ internal void Native_EmitVBlank(void)
 
 	NativeAudio_StepVBlank();
 	s_nativeVBlankCount++;
+
+#if defined(__3DS__)
+	// Proof-of-life on the vblank clock rather than the render path, so the
+	// main loop is observable while it is still loading and drawing nothing.
+	if ((s_nativeVBlankCount % 120) == 0)
+	{
+		char line[80];
+
+		snprintf(line, sizeof(line), "[CTR-3DS] vblank=%d state=%d", s_nativeVBlankCount, (int)sdata->mainGameState);
+		N3DS_DebugLog(line);
+	}
+#endif
 }
 
 internal int Native_CatchUpDueVBlanks(void)

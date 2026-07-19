@@ -7,7 +7,9 @@
 #include "platform/native_log.h"
 #include "platform/native_path.h"
 
+#if !defined(__3DS__)
 #include <SDL3/SDL.h>
+#endif
 
 #include <errno.h>
 #include <stdio.h>
@@ -109,9 +111,10 @@ global_variable u64 s_frameStartCounter;
 global_variable u64 s_scopeStartCounter[NATIVE_PERF_BUCKET_COUNT];
 global_variable s32 s_scopeDepth[NATIVE_PERF_BUCKET_COUNT];
 global_variable struct NativePerfFrameInfo s_frameBeginInfo;
-global_variable s32 s_beginUnderrunFrames;
-global_variable s32 s_beginOverflowFrames;
-global_variable s32 s_beginQueuedFrames;
+/* int, not s32: these are written through NativeAudio_GetOutputStats(int *...). */
+global_variable int s_beginUnderrunFrames;
+global_variable int s_beginOverflowFrames;
+global_variable int s_beginQueuedFrames;
 global_variable char s_outputDir[NATIVE_PERF_PATH_MAX];
 global_variable char s_csvPath[NATIVE_PERF_PATH_MAX];
 global_variable char s_summaryPath[NATIVE_PERF_PATH_MAX];
@@ -486,9 +489,9 @@ void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 	f64 workOverBudgetMs;
 	f64 dominantMs;
 	enum NativePerfBucket dominantBucket;
-	s32 endUnderrunFrames = 0;
-	s32 endOverflowFrames = 0;
-	s32 endQueuedFrames = 0;
+	int endUnderrunFrames = 0;
+	int endOverflowFrames = 0;
+	int endQueuedFrames = 0;
 	struct NativePerfWorstFrame worstFrame;
 	const struct NativePerfFrameInfo *rowInfo;
 

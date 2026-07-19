@@ -11,7 +11,18 @@
 #include <unistd.h>
 #endif
 
-#if __GNUC__
+#if defined(__3DS__)
+/*
+ * The 3DS build does not link SDL. This header supplies the handful of SDL
+ * types and entry points the platform layer still names, backed by libctru
+ * where the behaviour is load-bearing (timing) and by stubs elsewhere.
+ */
+#include "platform/n3ds/n3ds_backend.h"
+#include "platform/n3ds/sdl3_compat_3ds.h"
+#define _EnterCriticalSection(x)
+#define EnterCriticalSection(x)
+#define ExitCriticalSection()
+#elif __GNUC__
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #define _EnterCriticalSection(x)
@@ -40,6 +51,10 @@
 
 #undef RECT
 
+#if defined(__3DS__)
+#include "platform/n3ds/sdl3_compat_3ds.c"
+#endif
+
 #include "platform/native_disc_image.c"
 #include "platform/native_assets.c"
 #include "platform/native_audio.c"
@@ -51,7 +66,10 @@
 #include "platform/native_gte_capture.c"
 #include "platform/native_gpu.c"
 #include "platform/native_gte_core.c"
+#if !defined(__3DS__)
+// OpenGL function loader. The PICA200 has no GL driver to load.
 #include "platform/native_glad.c"
+#endif
 #include "platform/native_input.c"
 #include "platform/native_inline_c.c"
 #include "platform/native_libapi.c"
@@ -66,7 +84,11 @@
 #include "platform/native_perf.c"
 #include "platform/native_platform.c"
 #include "platform/native_replay_scheduler.c"
+#if defined(__3DS__)
+#include "platform/n3ds/native_renderer_3ds.c"
+#else
 #include "platform/native_renderer.c"
+#endif
 #include "platform/native_savestate.c"
 #include "platform/native_state.c"
 #include "platform/native_str.c"
@@ -152,6 +174,14 @@ int main(int argc, char *argv[])
 		}
 	}
 
+#if defined(__3DS__)
+	// Route stderr to the console debug service before anything can fail: the
+	// screen console does not exist until the renderer starts, and startup
+	// errors below report through stderr.
+	N3DS_EarlyInit();
+	N3DS_DebugLog("[CTR-3DS] main() entered");
+#endif
+
 	printf("[CTR Native] Starting...\n");
 	fflush(stdout);
 
@@ -162,8 +192,16 @@ int main(int argc, char *argv[])
 	if (!NativeAssets_Init(sdlBasePath))
 	{
 		fprintf(stderr, "[CTR Native] Failed to initialize asset paths.\n");
+#if defined(__3DS__)
+		N3DS_DebugLog("[CTR-3DS] FAIL: NativeAssets_Init");
+#endif
 		return NativeConsole_Return(1);
 	}
+#if defined(__3DS__)
+	N3DS_DebugLog("[CTR-3DS] assets init ok");
+	N3DS_DebugLog(NativeAssets_GetBaseDir());
+	N3DS_DebugLog(NativeAssets_GetAssetDir());
+#endif
 
 	printf("[CTR Native] Version: %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
 	printf("[CTR Native] Built with: " CC "\n");
@@ -174,13 +212,22 @@ int main(int argc, char *argv[])
 	if (chdir(NativeAssets_GetBaseDir()) != 0)
 	{
 		fprintf(stderr, "[CTR Native] Failed to enter base directory: %s\n", NativeAssets_GetBaseDir());
+#if defined(__3DS__)
+		N3DS_DebugLog("[CTR-3DS] FAIL: chdir to base dir");
+#endif
 		return NativeConsole_Return(1);
 	}
 
 	if (!NativeAssets_Validate())
 	{
+#if defined(__3DS__)
+		N3DS_DebugLog("[CTR-3DS] FAIL: NativeAssets_Validate (disc image missing?)");
+#endif
 		return NativeConsole_Return(1);
 	}
+#if defined(__3DS__)
+	N3DS_DebugLog("[CTR-3DS] assets validated; entering Platform_Init");
+#endif
 
 #if defined(CTR_INTERNAL)
 	if (NativeReplayScheduler_PrepareReportFromArgs(argc, argv) != 0)

@@ -3,7 +3,9 @@
 #include <macros.h>
 #include "psx/libpad.h"
 
+#if !defined(__3DS__)
 #include <SDL3/SDL.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -716,7 +718,7 @@ internal void NativeInput_OpenController(SDL_JoystickID instanceId, s32 slot)
 internal void NativeInput_OpenKnownControllers(void)
 {
 	SDL_JoystickID *gamepads;
-	s32 count = 0;
+	int count = 0; /* int, not s32: SDL_GetGamepads writes through an int*. */
 	s32 i;
 
 	gamepads = SDL_GetGamepads(&count);

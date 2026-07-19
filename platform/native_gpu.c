@@ -9,7 +9,9 @@
 
 #include <platform.h>
 
+#if !defined(__3DS__)
 #include <SDL3/SDL.h>
+#endif
 
 #include "platform/native_gte_capture.h"
 #include "platform/native_log.h"

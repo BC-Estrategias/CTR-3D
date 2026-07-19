@@ -3,7 +3,9 @@
 #include <platform/native_assets.h>
 #include <platform/native_perf.h>
 
+#if !defined(__3DS__)
 #include <SDL3/SDL.h>
+#endif
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1534,7 +1536,7 @@ internal int NativeAudio_DecodeAdpcmNibble(u8 soundParameter, int nibble, int *o
 	return sample;
 }
 
-internal int NativeAudio_DecodeSpuSample(u32 addr, u32 loopAddr, struct NativeAudioPcmBuffer *pcm, int *loopStart, int *loopEnd, int *loopEnabled)
+internal int NativeAudio_DecodeSpuSample(u32 addr, u32 loopAddr, struct NativeAudioPcmBuffer *pcm, int *loopStart, int *loopEnd, b32 *loopEnabled)
 {
 	int old = 0;
 	int older = 0;
@@ -3323,6 +3325,17 @@ s32 NativeAudio_SpuInit(void)
 	}
 
 	s_audio.init = 1;
+
+#if defined(__3DS__)
+	// Without a real output device nothing ever pulls PCM, and in the normal
+	// mode the SPU/XA clocks only advance inside that pull callback -- so XA
+	// playback would never progress and the boot sequence's
+	// "while (XA_State != 0)" wait would spin forever. Advancing from the
+	// VBlank clock is the correct model here, and matches how the 3DS renderer
+	// is paced. Revisit when ndsp is wired up and a real callback exists.
+	NativeAudio_SetDeterministicRenderMode(1);
+#endif
+
 	return 1;
 }
 

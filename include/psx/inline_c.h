@@ -11,24 +11,30 @@
 
 /* Psy-X specific calls */
 
+/*
+ * These spell their 32-bit types u32/s32 to match the definitions in
+ * platform/native_inline_c.c. On ARM, s32 is `long int` rather than `int`, so
+ * the plain-int spelling these used to carry was a hard type conflict there.
+ */
+
 /* sets cop2 data register value. LWC2 is the same kind*/
-extern void MTC2(unsigned int value, int reg);
-extern void MTC2_S(int value, int reg);
+extern void MTC2(u32 value, s32 reg);
+extern void MTC2_S(s32 value, s32 reg);
 
 /* sets cop2 control register value */
-extern void CTC2(unsigned int value, int reg);
-extern void CTC2_S(int value, int reg);
+extern void CTC2(u32 value, s32 reg);
+extern void CTC2_S(s32 value, s32 reg);
 
 /* returns cop2 register value. SWC2 is the same kind */
-extern unsigned int MFC2(int reg);
-extern int MFC2_S(int reg);
+extern u32 MFC2(s32 reg);
+extern s32 MFC2_S(s32 reg);
 
 /* returns cop2 control register value */
-extern unsigned int CFC2(int reg);
-extern int CFC2_S(int reg);
+extern u32 CFC2(s32 reg);
+extern s32 CFC2_S(s32 reg);
 
 /* performs cop2 opcode */
-extern int doCOP2(int op);
+extern s32 doCOP2(s32 op);
 
 
 /*

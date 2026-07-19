@@ -16,6 +16,14 @@
 
 typedef uint64_t u64;
 typedef int64_t s64;
+/*
+ * NOTE: int32_t is `int` on x86-32 but `long int` on ARM EABI -- same width,
+ * distinct type. So on ARM, s32 and int are NOT interchangeable, and any
+ * declaration that spells a 32-bit value `int` while its definition spells it
+ * `s32` becomes a hard type conflict. The headers overwhelmingly use the
+ * stdint spelling, so s32/u32 stay bound to it and the handful of `int`
+ * declarations are the ones that get corrected.
+ */
 typedef uint32_t u32;
 typedef int32_t s32;
 typedef s32 b32;

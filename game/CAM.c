@@ -1815,7 +1815,7 @@ void CAM_ThTick(struct Thread *t)
 	u32 uVar9;
 	u32 uVar10;
 	struct PVS *psVar11;
-	s32 *piVar12;
+	int *piVar12;
 	struct Instance **ppsVar13;
 	struct SpawnType1 *psVar14;
 	struct CheckpointNode *psVar15;

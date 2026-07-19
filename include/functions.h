@@ -12,9 +12,9 @@ void MM_EndOfFile(void);
 
 void CAM_ClearScreen(struct GameTracker *gGT);
 void CAM_Init(struct CameraDC *cDC, s32 cameraID, struct Driver *d, struct PushBuffer *pb);
-int CAM_Path_GetNumPoints(void);
-u8 CAM_Path_Move(int frameIndex, s16 *position, s16 *rotation, s16 *pathFlagsOut);
-int CAM_MapRange_PosPoints(SVec3 *pos1, SVec3 *pos2, SVec3 *currPos);
+s32 CAM_Path_GetNumPoints(void);
+u8 CAM_Path_Move(s32 frameIndex, s16 *position, s16 *rotation, s16 *pathFlagsOut);
+s32 CAM_MapRange_PosPoints(SVec3 *pos1, SVec3 *pos2, SVec3 *currPos);
 void CAM_SetDesiredPosRot(struct CameraDC *cDC, const SVec3 *pos, const SVec3 *rot);
 
 void BOTS_Adv_AdjustDifficulty(void);
@@ -467,7 +467,7 @@ void Unknown_8006c49c(u32 *r0, u32 *r1, u32 *r2, u32 *r3, u32 *r4);
 void MATRIX_SET_r11r12r13r14r15(u32 r0, u32 r1, u32 r2, u32 r3, u32 r4);
 void Unknown_8006c558(u32 *r0, u32 *r1, u32 *r2, u32 *r3, u32 *r4);
 void Unknown_8006c600(u32 r0, u32 r1, u32 r2, u32 r3, u32 r4);
-int SquareRoot0_stub(int param_1);
+s32 SquareRoot0_stub(s32 param_1);
 VECTOR *Unknown_8006c6c8(VECTOR *input, VECTOR *output, MATRIX *matrix);
 VECTOR *ApplyMatrixLV_stub(VECTOR *input, VECTOR *output);
 void MATH_MatrixMul(MATRIX *output, MATRIX *input, MATRIX *transform);

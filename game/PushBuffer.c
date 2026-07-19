@@ -576,9 +576,9 @@ void PushBuffer_UpdateFrustum(struct PushBuffer *pb)
 
 	int iVar19;
 
-	int tx;
-	int ty;
-	int tz;
+	s32 tx;
+	s32 ty;
+	s32 tz;
 
 	int posX;
 	int posY;
@@ -819,9 +819,9 @@ void PushBuffer_UpdateFrustum(struct PushBuffer *pb)
 	PushBuffer_UpdateFrustum_LoadV0(0, 0x1000);
 	gte_llv0();
 
-	int retX;
-	int retY;
-	int retZ;
+	s32 retX;
+	s32 retY;
+	s32 retZ;
 	PushBuffer_UpdateFrustum_ReadMAC(&retX, &retY, &retZ);
 
 	pb->frustumPlanes[4].normal.x = -retX;
