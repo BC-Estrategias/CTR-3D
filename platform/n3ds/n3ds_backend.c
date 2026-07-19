@@ -4,6 +4,7 @@
  */
 
 #include <3ds.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -135,6 +136,18 @@ unsigned int N3DS_ReadButtons(void)
 	}
 
 	return out;
+}
+
+unsigned long N3DS_HeapUsedBytes(void)
+{
+	struct mallinfo mi = mallinfo();
+
+	return (unsigned long)mi.uordblks;
+}
+
+unsigned long N3DS_LinearFreeBytes(void)
+{
+	return (unsigned long)linearSpaceFree();
 }
 
 int N3DS_MainLoopActive(void)

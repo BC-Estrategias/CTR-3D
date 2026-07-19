@@ -41,6 +41,8 @@ int g_cfg_bilinearFiltering = 0;
 
 global_variable int s_rendererInitialised = 0;
 global_variable u32 s_frameCounter = 0;
+global_variable unsigned long s_lastStatFrames = 0;
+global_variable unsigned long s_lastStatVblanks = 0;
 
 internal u16 NativeRenderer3DS_PackBGR555(u8 r, u8 g, u8 b)
 {
@@ -125,22 +127,45 @@ void NativeRenderer_SwapWindow(void)
 		 */
 		const unsigned long vblanks = (unsigned long)Platform_GetVBlankCount();
 		const unsigned long frames = (unsigned long)s_frameCounter;
-		unsigned long fpsX10 = 0;
-		char line[96];
+		const unsigned long heapKiB = N3DS_HeapUsedBytes() / 1024UL;
+		unsigned long avgX10 = 0;
+		unsigned long nowX10 = 0;
+		char line[128];
 
 		if (vblanks > 0)
 		{
 			// The retail gate is two vblanks per flip, i.e. 30fps.
-			fpsX10 = (600UL * frames) / vblanks;
+			avgX10 = (600UL * frames) / vblanks;
 		}
 
-		printf("\x1b[17;1H---- 3DS port stats ----------------\n");
-		printf("frames  %-10lu vblanks %-10lu\n", frames, vblanks);
-		printf("fps     %lu.%lu  (retail target 30)      \n", fpsX10 / 10UL, fpsX10 % 10UL);
-		printf("state   %-4d vram[0] %04x            \n", (int)sdata->mainGameState, (unsigned)vram[0]);
+		/*
+		 * Report the rate over the last window as well as the average since
+		 * boot. A falling average hides how bad the current rate is, because
+		 * every earlier good frame keeps dragging it up.
+		 */
+		if (vblanks > s_lastStatVblanks)
+		{
+			nowX10 = (600UL * (frames - s_lastStatFrames)) / (vblanks - s_lastStatVblanks);
+		}
+		s_lastStatFrames = frames;
+		s_lastStatVblanks = vblanks;
 
-		snprintf(line, sizeof(line), "[CTR-3DS] frames=%lu vblanks=%lu fps=%lu.%lu state=%d",
-		         frames, vblanks, fpsX10 / 10UL, fpsX10 % 10UL, (int)sdata->mainGameState);
+		printf("\x1b[16;1H---- 3DS port stats ----------------\n");
+		printf("frames %-8lu vblanks %-8lu\n", frames, vblanks);
+		printf("fps    %lu.%lu now / %lu.%lu avg (target 30)   \n",
+		       nowX10 / 10UL, nowX10 % 10UL, avgX10 / 10UL, avgX10 % 10UL);
+		/* Break the heap down by arena: the XA decode arenas are the suspected
+		 * source of unbounded growth, so show them next to the total. */
+		printf("heap   %-6lu  xa %-5d +%-5d  voice %-5d KiB\n", heapKiB,
+		       s_audio.xaPcmArena.capacity / 1024, s_audio.xaPendingPcmArena.capacity / 1024,
+		       s_audio.voicePcmArena.capacity / 1024);
+		printf("state  %-4d vram[0] %04x            \n", (int)sdata->mainGameState, (unsigned)vram[0]);
+
+		snprintf(line, sizeof(line),
+		         "[CTR-3DS] frames=%lu vbl=%lu fps_now=%lu.%lu heapKiB=%lu xaKiB=%d+%d voiceKiB=%d state=%d",
+		         frames, vblanks, nowX10 / 10UL, nowX10 % 10UL, heapKiB,
+		         s_audio.xaPcmArena.capacity / 1024, s_audio.xaPendingPcmArena.capacity / 1024,
+		         s_audio.voicePcmArena.capacity / 1024, (int)sdata->mainGameState);
 		N3DS_DebugLog(line);
 	}
 

@@ -66,6 +66,12 @@ void N3DS_DebugLog(const char *msg);
  * exist until the renderer initialises. */
 void N3DS_EarlyInit(void);
 
+/* ---------------------------------------------------------------- memory --- */
+/* Bytes currently handed out by malloc, and free space in the linear heap.
+ * Reported on screen so runaway allocation is visible as it happens. */
+unsigned long N3DS_HeapUsedBytes(void);
+unsigned long N3DS_LinearFreeBytes(void);
+
 /* ------------------------------------------------------------------ app --- */
 /* Zero once the user has closed the applet (HOME/power), meaning the process
  * should shut down. */
