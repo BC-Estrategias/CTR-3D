@@ -1,6 +1,7 @@
 #include <macros.h>
 #include <platform/native_audio.h>
 #include <platform/native_assets.h>
+#include <platform/native_disc_image.h>
 #include <platform/native_perf.h>
 
 #if !defined(__3DS__)
@@ -61,6 +62,21 @@
 #define XA_SUBFRAMES_PER_FRAME              8
 #define XA_SAMPLE_RATE_37800                37800
 #define XA_SAMPLE_RATE_18900                18900
+
+// NOTE(aalhendi): Streaming ring for decoded XA PCM (replaces the old
+// whole-track arenas, see BUGREPORT_audio_arena_growth.md for history).
+// One physical sector's worth of ring-slot capacity: 18*8*28 = 4032. This is
+// the MONO decode count (DecodeXASectorMono pushes 18*8*28 raw mono samples,
+// which after L=R duplication become 4032 output frames). A STEREO sector
+// only fills the first 2016 of those 4032 slots (DecodeXASectorStereo already
+// interleaves L/R while decoding: 18*4*28 = 2016 output frames). Sizing the
+// slot for the mono (larger) case and pinning the real per-track stride in
+// struct NativeAudioXaStream.framesPerSector keeps both formats correct --
+// see the session report for why a single hardcoded stride would corrupt
+// stereo frameIndex<->sector math.
+#define NATIVE_AUDIO_XA_SECTOR_FRAMES      4032  // 18*8*28, one ring slot's worst-case (mono) capacity in stereo output frames
+#define NATIVE_AUDIO_XA_RING_SECTORS       6     // resident sector-slots per stream (~94.5 KiB @ mono capacity)
+#define NATIVE_AUDIO_XA_RING_AHEAD_TARGET  4     // refill ceiling, sectors kept ahead of playback
 
 enum
 {
@@ -205,10 +221,63 @@ struct NativeAudioVoice
 	u8 adsrPhase;
 };
 
+struct NativeAudioXaDecodeState
+{
+	int old[2];
+	int older[2];
+};
+
+// NOTE(aalhendi): Resolved once per track-open; disc-image OR host-file
+// backed. Mirrors struct NativeCDOpenFile's tag-plus-one-member-per-backing
+// idiom (platform/native_cd.c), the established pattern in this codebase for
+// "open from host file, else fall back to the disc image" resources.
+struct NativeAudioXaSource
+{
+	b32 useDiscImage;
+	struct NativeDiscImageFile discFile;   // valid iff useDiscImage; via NativeDiscImage_FindFile
+	struct NativeAssetsHostRange hostFile; // valid iff !useDiscImage
+	int sectorSize, sectorBase, totalSectors, channelFilter;
+};
+
+// NOTE(aalhendi): Fixed-size streaming ring for one XA track's decoded PCM.
+// Replaces the old ever-growing xaPcmArena/xaPendingPcmArena (see
+// BUGREPORT_audio_arena_growth.md). ringPcm points at a static backing array
+// (not inline -- see s_xaRingPcmLive/s_xaRingPcmPending), assigned once,
+// lazily, by NativeAudio_XAStreamInitRingBackingIfNeeded.
+//
+// framesPerSector and decodedSectorCount are deviations from the plan's
+// literal struct shape, both required for correctness (see session report):
+//   - framesPerSector: a physical sector decodes to NATIVE_AUDIO_XA_SECTOR_FRAMES
+//     (4032) output frames if the source is mono, but only half that (2016)
+//     if stereo (DecodeXASectorStereo already interleaves L/R while
+//     decoding). This is pinned from the first matching sector, same as
+//     sampleRate, and used for all frameIndex<->sector arithmetic instead of
+//     the compile-time constant.
+//   - decodedSectorCount: a logical count of sectors actually decoded into
+//     the ring so far, distinct from nextPhysicalSector (the raw read/scan
+//     cursor into the source, which also advances across skipped non-audio
+//     sectors in multiplexed files, e.g. TEST.STR's interleaved MDEC video).
+//     Ring-slot assignment and frameIndex math must use the logical count,
+//     not the physical cursor, or playback desyncs from the ring on any file
+//     with non-audio sectors interspersed.
+struct NativeAudioXaStream
+{
+	s16 *ringPcm;
+	struct NativeAudioXaSource source;
+	struct NativeAudioXaDecodeState decodeState; // ADPCM predictor history; persists sector-to-sector
+	int nextPhysicalSector;
+	int decodedSectorCount;
+	int sampleRate;      // pinned from first matching sector
+	int framesPerSector; // pinned from first matching sector: 2016 (stereo) or 4032 (mono)
+	b32 open, endOfStream;
+	u32 underrunEvents; // diagnostic counter, see stats update in native_renderer_3ds.c
+};
+
+internal int NativeAudio_XARingReadSampleNoLock(struct NativeAudioXaStream *stream, int channel, u64 frameIndex);
+internal void NativeAudio_XAStreamClearNoLock(struct NativeAudioXaStream *stream);
+
 struct NativeAudioXA
 {
-	// NOTE(aalhendi): Points into xaPcmArena; rebuild from the XA file identity during restore.
-	s16 *pcm;
 	int frameCount;
 	int sampleRate;
 	int categoryID;
@@ -241,8 +310,8 @@ struct NativeAudioState
 	struct NativeAudioDecodeArena voicePcmArena;
 	struct NativeAudioVoice voices[NATIVE_AUDIO_SPU_VOICE_COUNT];
 	struct NativeAudioXA xa;
-	struct NativeAudioDecodeArena xaPcmArena;
-	struct NativeAudioDecodeArena xaPendingPcmArena;
+	struct NativeAudioXaStream xaStream;
+	struct NativeAudioXaStream xaPendingStream;
 	struct NativeAudioOutput output;
 };
 
@@ -264,12 +333,6 @@ struct NativeAudioXaTrackInfo
 	int fileNumber;
 	int channelFilter;
 	int numSectors;
-};
-
-struct NativeAudioXaDecodeState
-{
-	int old[2];
-	int older[2];
 };
 
 struct NativeAudioVoiceState
@@ -329,6 +392,15 @@ struct NativeAudioSnapshot
 };
 
 global_variable struct NativeAudioState s_audio;
+
+// NOTE(aalhendi): Fixed backing storage for the two XA streaming rings (live +
+// pending). Not stack-allocated: no confirmed 3DS thread stack size for this
+// project, and this matches how the SPU sample memory arena is already
+// embedded as a static-lifetime member of s_audio. ~94.5 KiB each, ~189 KiB
+// total, constant for the process lifetime -- versus the old arenas' measured
+// 32 MiB and climbing.
+global_variable s16 s_xaRingPcmLive[NATIVE_AUDIO_XA_RING_SECTORS * NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS];
+global_variable s16 s_xaRingPcmPending[NATIVE_AUDIO_XA_RING_SECTORS * NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS];
 
 internal b32 NativeAudio_OutputOpen(void)
 {
@@ -900,12 +972,7 @@ internal void NativeAudio_AdvanceXAOutputFrameNoLock(void)
 
 internal int NativeAudio_GetXAPcmSampleAtFrameNoLock(int channel, u64 frameIndex)
 {
-	if ((s_audio.xa.pcm == NULL) || (frameIndex >= (u64)s_audio.xa.frameCount))
-	{
-		return 0;
-	}
-
-	return s_audio.xa.pcm[(size_t)frameIndex * NATIVE_AUDIO_CHANNELS + (size_t)channel];
+	return NativeAudio_XARingReadSampleNoLock(&s_audio.xaStream, channel, frameIndex);
 }
 
 internal int NativeAudio_GetXAPseudo37800SampleNoLock(int channel, s64 pseudoFrameIndex)
@@ -1303,44 +1370,6 @@ internal void NativeAudio_ArenaReset(struct NativeAudioDecodeArena *arena)
 	arena->used = 0;
 }
 
-internal int NativeAudio_ArenaEnsureCapacity(struct NativeAudioDecodeArena *arena, int capacity)
-{
-	u8 *newMemory;
-	int newCapacity;
-
-	if (capacity < 0)
-	{
-		return 0;
-	}
-	if (capacity <= arena->capacity)
-	{
-		return 1;
-	}
-
-	newCapacity = arena->capacity > 0 ? arena->capacity : (256 * 1024);
-	while (newCapacity < capacity)
-	{
-		if (newCapacity > (INT_MAX / 2))
-		{
-			newCapacity = capacity;
-			break;
-		}
-		newCapacity *= 2;
-	}
-
-	newMemory = (u8 *)malloc((size_t)newCapacity);
-	if (newMemory == NULL)
-	{
-		return 0;
-	}
-
-	free(arena->memory);
-	arena->memory = newMemory;
-	arena->capacity = newCapacity;
-	arena->used = 0;
-	return 1;
-}
-
 internal void *NativeAudio_ArenaPush(struct NativeAudioDecodeArena *arena, int size, int align, int *markerOut)
 {
 	int marker;
@@ -1377,14 +1406,6 @@ internal void NativeAudio_ArenaRewind(struct NativeAudioDecodeArena *arena, int 
 	{
 		arena->used = marker;
 	}
-}
-
-internal void NativeAudio_ArenaSwap(struct NativeAudioDecodeArena *a, struct NativeAudioDecodeArena *b)
-{
-	struct NativeAudioDecodeArena tmp = *a;
-
-	*a = *b;
-	*b = tmp;
 }
 
 internal int NativeAudio_VoiceArenaEnsureCapacityNoLock(int capacity)
@@ -1761,10 +1782,22 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 	return 1;
 }
 
-internal void NativeAudio_FreeXA(void)
+// NOTE(aalhendi): Assumes the caller already holds NativeAudio_LockOutput(),
+// exactly like the old memset-only version did -- every existing call site
+// (StopXA, PlayXATrack, PlayXAFile, RestoreState) already calls this from
+// inside its own lock/unlock bracket. Captures and clears the live stream
+// in place (cheap: a small struct copy) and hands it back so the caller can
+// close its underlying file handle *after* unlocking, per the plan's
+// "expensive/blocking work outside the lock" rule -- fclose() while holding
+// the SDL audio lock would block the mixer thread on file-system I/O.
+internal struct NativeAudioXaStream NativeAudio_FreeXA(void)
 {
+	struct NativeAudioXaStream closed = s_audio.xaStream;
+
+	NativeAudio_XAStreamClearNoLock(&s_audio.xaStream);
 	memset(&s_audio.xa, 0, sizeof(s_audio.xa));
-	NativeAudio_ArenaReset(&s_audio.xaPcmArena);
+
+	return closed;
 }
 
 internal void NativeAudio_CopyVoiceToState(struct NativeAudioVoiceState *dst, const struct NativeAudioVoice *src)
@@ -2092,40 +2125,6 @@ internal int NativeAudio_IsXAAudioSector(const u8 *sector, int sectorBase, int c
 	return ((subMode & 0x04) != 0) && (header[0] == 1) && (header[1] == channelFilter) && (bpsBits == 0);
 }
 
-internal int NativeAudio_CountXAAudioSectors(const u8 *bytes, int byteCount, int channelFilter, int *audioSectorsOut, int *totalSectorsOut)
-{
-	int sectorSize;
-	int sectorBase;
-	int totalSectors;
-	int audioSectors = 0;
-	int sector;
-
-	*audioSectorsOut = 0;
-	*totalSectorsOut = 0;
-
-	if ((bytes == NULL) || (channelFilter < 0) || (channelFilter > 0xff))
-	{
-		return 0;
-	}
-	if (!NativeAudio_GetXASectorLayout(byteCount, &sectorSize, &sectorBase, &totalSectors))
-	{
-		return 0;
-	}
-
-	for (sector = 0; sector < totalSectors; sector++)
-	{
-		const u8 *src = &bytes[sector * sectorSize];
-		if (NativeAudio_IsXAAudioSector(src, sectorBase, channelFilter))
-		{
-			audioSectors++;
-		}
-	}
-
-	*audioSectorsOut = audioSectors;
-	*totalSectorsOut = totalSectors;
-	return audioSectors > 0;
-}
-
 internal int NativeAudio_DecodeXA28Nibbles(const u8 *sector, int frameOff, int block, int nibble, int channel, struct NativeAudioXaDecodeState *state,
                                            struct NativeAudioPcmBuffer *out)
 {
@@ -2270,127 +2269,345 @@ internal int NativeAudio_DecodeXASectorStereo(const u8 *sector, int sectorBase, 
 	return 1;
 }
 
-internal int NativeAudio_DecodeXAFile(const u8 *bytes, int byteCount, int channelFilter, int maxSectors, struct NativeAudioPcmBuffer *pcm, int *sampleRate,
-                                      int *numChannels)
+internal void NativeAudio_XAStreamInitRingBackingIfNeeded(void)
 {
+	if (s_audio.xaStream.ringPcm == NULL)
+	{
+		s_audio.xaStream.ringPcm = s_xaRingPcmLive;
+	}
+	if (s_audio.xaPendingStream.ringPcm == NULL)
+	{
+		s_audio.xaPendingStream.ringPcm = s_xaRingPcmPending;
+	}
+}
+
+// Preserves the assigned ring backing array across the clear -- ringPcm is
+// assigned once, lazily (see above), and never freed or reassigned again for
+// the rest of the process lifetime.
+internal void NativeAudio_XAStreamClearNoLock(struct NativeAudioXaStream *stream)
+{
+	s16 *ringPcm = stream->ringPcm;
+
+	memset(stream, 0, sizeof(*stream));
+	stream->ringPcm = ringPcm;
+}
+
+internal void NativeAudio_XAStreamSwap(struct NativeAudioXaStream *a, struct NativeAudioXaStream *b)
+{
+	struct NativeAudioXaStream tmp = *a;
+
+	*a = *b;
+	*b = tmp;
+}
+
+internal int NativeAudio_XASourceOpen(struct NativeAudioXaSource *source, const char *path, int channelFilter)
+{
+	struct NativeAssetsHostRange hostFile;
+	struct NativeDiscImageFile discFile;
 	int sectorSize;
 	int sectorBase;
 	int totalSectors;
-	int sectorsToScan;
-	struct NativeAudioXaDecodeState state;
-	int sector;
 
-	if ((bytes == NULL) || (maxSectors <= 0))
-	{
-		return 0;
-	}
-	if (!NativeAudio_GetXASectorLayout(byteCount, &sectorSize, &sectorBase, &totalSectors))
+	memset(source, 0, sizeof(*source));
+
+	if ((channelFilter < 0) || (channelFilter > 0xff))
 	{
 		return 0;
 	}
 
-	sectorsToScan = maxSectors < totalSectors ? maxSectors : totalSectors;
-	memset(&state, 0, sizeof(state));
-
-	*sampleRate = XA_SAMPLE_RATE_37800;
-	*numChannels = 1;
-
-	for (sector = 0; sector < sectorsToScan; sector++)
+	// Host-file-first, then disc-image fallback -- mirrors NativeCD_OpenFile's
+	// idiom (platform/native_cd.c) and NativeAssets_ReadBytes's precedence
+	// (platform/native_assets.c:722-733).
+	if (NativeAssets_OpenHostRange(path, &hostFile))
 	{
-		const u8 *src = &bytes[sector * sectorSize];
-		const u8 *header = &src[sectorBase];
-		int coding = header[3];
-		int isStereo = (coding & 0x03) != 0;
-		int srBits = (coding >> 2) & 0x03;
-
-		if (!NativeAudio_IsXAAudioSector(src, sectorBase, channelFilter))
+		if ((hostFile.size <= 0) || (hostFile.size > INT_MAX) ||
+		    !NativeAudio_GetXASectorLayout((int)hostFile.size, &sectorSize, &sectorBase, &totalSectors))
 		{
-			continue;
-		}
-
-		*sampleRate = (srBits == 0) ? XA_SAMPLE_RATE_37800 : XA_SAMPLE_RATE_18900;
-		*numChannels = isStereo ? 2 : 1;
-
-		if (isStereo)
-		{
-			if (!NativeAudio_DecodeXASectorStereo(src, sectorBase, &state, pcm))
-			{
-				return 0;
-			}
-		}
-		else if (!NativeAudio_DecodeXASectorMono(src, sectorBase, &state, pcm))
-		{
+			NativeAssets_CloseHostRange(&hostFile);
 			return 0;
 		}
+
+		source->useDiscImage = 0;
+		source->hostFile = hostFile;
+		source->sectorSize = sectorSize;
+		source->sectorBase = sectorBase;
+		source->totalSectors = totalSectors;
+		source->channelFilter = channelFilter;
+		return 1;
 	}
 
-	return pcm->count > 0;
+	if (!NativeDiscImage_FindFile(path, &discFile) || (discFile.size == 0))
+	{
+		return 0;
+	}
+
+	// Ground truth verified this session: NativeDiscImage_ReadRawSectors
+	// always normalizes to NATIVE_DISC_IMAGE_MODE2_USER_SIZE (2336) bytes per
+	// sector, so hardcode the disc-image layout instead of autodetecting via
+	// NativeAudio_GetXASectorLayout (that autodetection is for raw host-file
+	// byte layouts, which can genuinely be either 2352 or 2336).
+	source->useDiscImage = 1;
+	source->discFile = discFile;
+	source->sectorSize = XA_FORM2_SECTOR_SIZE;
+	source->sectorBase = 0;
+	source->totalSectors = (int)(discFile.size / XA_FORM2_SECTOR_SIZE);
+	source->channelFilter = channelFilter;
+	return source->totalSectors > 0;
 }
 
-internal int NativeAudio_GetXAMaxStereoSamples(int numSectors, int *sampleCountOut)
+internal int NativeAudio_XASourceReadSector(struct NativeAudioXaSource *source, int sectorIndex, u8 *dst)
 {
-	int samplesPerSector;
-
-	if (numSectors <= 0)
+	if ((sectorIndex < 0) || (sectorIndex >= source->totalSectors))
 	{
 		return 0;
 	}
 
-	samplesPerSector = XA_FRAMES_PER_SECTOR * XA_SUBFRAMES_PER_FRAME * XA_SAMPLES_PER_SOUND_UNIT * NATIVE_AUDIO_CHANNELS;
-	if (numSectors > (INT_MAX / samplesPerSector))
+	if (source->useDiscImage)
+	{
+		return NativeDiscImage_ReadRawSectors(&source->discFile, (u32)sectorIndex, 1, dst);
+	}
+
+	return NativeAssets_ReadHostRange(&source->hostFile, (long)sectorIndex * source->sectorSize, dst, (size_t)source->sectorSize);
+}
+
+internal void NativeAudio_XASourceClose(struct NativeAudioXaSource *source)
+{
+	if (!source->useDiscImage)
+	{
+		NativeAssets_CloseHostRange(&source->hostFile);
+	}
+	memset(source, 0, sizeof(*source));
+}
+
+// Header-only pass (no ADPCM decode, no whole-file malloc) counting sectors
+// that match this source's channelFilter. Needed only for the arbitrary-path
+// API (NativeAudio_XAStreamOpenFile): unlike the category-based track path,
+// which trusts the XNF metadata's declared sector count exactly like the old
+// LoadXATrackPcm did, an arbitrary file can multiplex XA audio with other
+// content (e.g. TEST.STR's interleaved MDEC video -- see MM_Scrapbook.c, the
+// one real caller of NativeAudio_PlayXAFile), so the physical sector count is
+// not a safe proxy for decodable frame count.
+internal int NativeAudio_XAStreamCountAudioSectors(struct NativeAudioXaSource *source)
+{
+	local_persist u8 s_countSectorBuf[XA_FULL_SECTOR_SIZE];
+	int count = 0;
+	int sector;
+
+	for (sector = 0; sector < source->totalSectors; sector++)
+	{
+		if (!NativeAudio_XASourceReadSector(source, sector, s_countSectorBuf))
+		{
+			break;
+		}
+		if (NativeAudio_IsXAAudioSector(s_countSectorBuf, source->sectorBase, source->channelFilter))
+		{
+			count++;
+		}
+	}
+
+	return count;
+}
+
+// Core streaming primitive: reads and decodes exactly one more matching XA
+// sector into the ring, entirely outside the lock, then takes
+// NativeAudio_LockOutput() only for the final memcpy + counter bump. Skips
+// non-audio sectors (multiplexed files) at negligible cost -- the shared
+// ADPCM predictor state (decodeState) is untouched by skipped sectors,
+// exactly like the old whole-file DecodeXAFile's per-sector "continue".
+internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *stream)
+{
+	local_persist u8 s_sectorBuf[XA_FULL_SECTOR_SIZE];
+	local_persist s16 s_tempFrames[NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS];
+	struct NativeAudioPcmBuffer pcm;
+	const u8 *header;
+	int coding;
+	int isStereo;
+	int srBits;
+	int sampleRate;
+	int framesThisSector;
+	int slot;
+
+	if (!stream->open || stream->endOfStream)
 	{
 		return 0;
 	}
 
-	*sampleCountOut = numSectors * samplesPerSector;
+	for (;;)
+	{
+		if (stream->nextPhysicalSector >= stream->source.totalSectors)
+		{
+			stream->endOfStream = 1;
+			return 0;
+		}
+
+		if (!NativeAudio_XASourceReadSector(&stream->source, stream->nextPhysicalSector, s_sectorBuf))
+		{
+			stream->endOfStream = 1;
+			return 0;
+		}
+
+		if (NativeAudio_IsXAAudioSector(s_sectorBuf, stream->source.sectorBase, stream->source.channelFilter))
+		{
+			break;
+		}
+
+		stream->nextPhysicalSector++;
+	}
+
+	header = &s_sectorBuf[stream->source.sectorBase];
+	coding = header[3];
+	isStereo = (coding & 0x03) != 0;
+	srBits = (coding >> 2) & 0x03;
+	sampleRate = (srBits == 0) ? XA_SAMPLE_RATE_37800 : XA_SAMPLE_RATE_18900;
+
+	memset(&pcm, 0, sizeof(pcm));
+	pcm.samples = s_tempFrames;
+	pcm.capacity = NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS;
+
+	if (isStereo)
+	{
+		if (!NativeAudio_DecodeXASectorStereo(s_sectorBuf, stream->source.sectorBase, &stream->decodeState, &pcm))
+		{
+			stream->endOfStream = 1;
+			return 0;
+		}
+		framesThisSector = pcm.count / NATIVE_AUDIO_CHANNELS; // 2016: stereo decode already interleaves L/R
+	}
+	else
+	{
+		int i;
+
+		if (!NativeAudio_DecodeXASectorMono(s_sectorBuf, stream->source.sectorBase, &stream->decodeState, &pcm))
+		{
+			stream->endOfStream = 1;
+			return 0;
+		}
+		framesThisSector = pcm.count; // 4032: duplicated below, count stays the frame count
+		for (i = pcm.count; i-- > 0;)
+		{
+			s_tempFrames[i * 2] = s_tempFrames[i];
+			s_tempFrames[i * 2 + 1] = s_tempFrames[i];
+		}
+	}
+
+	if (stream->sampleRate == 0)
+	{
+		// Pin format from the first matching sector -- real tracks are
+		// uniformly mono or stereo throughout, so later sectors just reuse
+		// this instead of re-deriving it (which the old DecodeXAFile did
+		// per-sector, harmlessly, since the value never actually changed).
+		stream->sampleRate = sampleRate;
+		stream->framesPerSector = framesThisSector;
+	}
+
+	slot = stream->decodedSectorCount % NATIVE_AUDIO_XA_RING_SECTORS;
+
+	NativeAudio_LockOutput();
+	memcpy(&stream->ringPcm[(size_t)slot * NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS], s_tempFrames,
+	       (size_t)stream->framesPerSector * NATIVE_AUDIO_CHANNELS * sizeof(s16));
+	stream->nextPhysicalSector++;
+	stream->decodedSectorCount++;
+	NativeAudio_UnlockOutput();
+
 	return 1;
 }
 
-internal int NativeAudio_PrepareXAPcmBuffer(struct NativeAudioDecodeArena *arena, int numSectors, struct NativeAudioPcmBuffer *pcm, int *markerOut)
+// Replaces direct PCM indexing everywhere. sector is a LOGICAL (decoded-so-
+// far) sector index, not the physical read cursor -- see decodedSectorCount's
+// comment on struct NativeAudioXaStream for why the two can diverge. Out of
+// the resident window returns silence (same graceful contract as the old
+// pcm==NULL / frameIndex>=frameCount guard) and bumps underrunEvents.
+internal int NativeAudio_XARingReadSampleNoLock(struct NativeAudioXaStream *stream, int channel, u64 frameIndex)
 {
-	int maxSamples;
-	int maxBytes;
+	int sector;
+	int frameInSector;
+	int oldestResidentSector;
+	int slot;
 
-	if (!NativeAudio_GetXAMaxStereoSamples(numSectors, &maxSamples))
-	{
-		return 0;
-	}
-	if (maxSamples > (INT_MAX / (int)sizeof(s16)))
-	{
-		return 0;
-	}
-
-	maxBytes = maxSamples * (int)sizeof(s16);
-	NativeAudio_ArenaReset(arena);
-	if (!NativeAudio_ArenaEnsureCapacity(arena, maxBytes))
+	if (!stream->open || (stream->framesPerSector <= 0))
 	{
 		return 0;
 	}
 
-	pcm->samples = (s16 *)NativeAudio_ArenaPush(arena, maxBytes, NATIVE_AUDIO_ARENA_ALIGN, markerOut);
-	if (pcm->samples == NULL)
+	sector = (int)(frameIndex / (u64)stream->framesPerSector);
+	frameInSector = (int)(frameIndex % (u64)stream->framesPerSector);
+
+	oldestResidentSector = stream->decodedSectorCount - NATIVE_AUDIO_XA_RING_SECTORS;
+	if ((sector < oldestResidentSector) || (sector >= stream->decodedSectorCount))
 	{
+		stream->underrunEvents++;
 		return 0;
 	}
 
-	pcm->count = 0;
-	pcm->capacity = maxSamples;
-	return 1;
+	slot = sector % NATIVE_AUDIO_XA_RING_SECTORS;
+	return stream->ringPcm[((size_t)slot * NATIVE_AUDIO_XA_SECTOR_FRAMES + (size_t)frameInSector) * NATIVE_AUDIO_CHANNELS + (size_t)channel];
 }
 
-internal int NativeAudio_LoadXATrackPcm(struct NativeAudioDecodeArena *arena, int categoryID, int xaID, s16 **pcmOut, int *frameCountOut, int *sampleRateOut)
+internal int NativeAudio_XAStreamAheadCountNoLock(const struct NativeAudioXaStream *stream)
+{
+	int currentSector;
+	int ahead;
+
+	if (!stream->open || (stream->framesPerSector <= 0))
+	{
+		return 0;
+	}
+
+	currentSector = (int)((s_audio.xa.positionFp >> NATIVE_AUDIO_FP_SHIFT) / (u64)stream->framesPerSector);
+	ahead = stream->decodedSectorCount - currentSector;
+	return (ahead < 0) ? 0 : ahead;
+}
+
+// Called once per NativeAudio_StepVBlank, right after its existing
+// NativeAudio_UnlockOutput(): reads the current playback sector under a brief
+// lock, and if resident-ahead count is below NATIVE_AUDIO_XA_RING_AHEAD_TARGET,
+// decodes exactly one more sector. Only drives xaStream (the live one) --
+// xaPendingStream is only filled by the priming/seek bursts in the Open*
+// functions below.
+internal void NativeAudio_XAStreamPump(void)
+{
+	int active;
+	int ahead;
+
+	NativeAudio_LockOutput();
+	active = s_audio.xa.active;
+	ahead = NativeAudio_XAStreamAheadCountNoLock(&s_audio.xaStream);
+	NativeAudio_UnlockOutput();
+
+	if (!active || (ahead >= NATIVE_AUDIO_XA_RING_AHEAD_TARGET))
+	{
+		return;
+	}
+
+	NativeAudio_XAStreamDecodeNextSector(&s_audio.xaStream);
+}
+
+#if defined(__3DS__)
+// Diagnostic helper for the 3DS stats block (native_renderer_3ds.c); reads
+// without a lock, same as that block's pre-existing (unlocked) reads of
+// s_audio.voicePcmArena.capacity -- a best-effort periodic counter, not a
+// correctness-sensitive read. Guarded like NativeAudio_SetDeterministicRenderMode's
+// 3DS-only call above: native_renderer.c (the PC backend) has no equivalent
+// stats block, so this would otherwise be an unused-function warning on PC.
+internal int NativeAudio_XAStreamSectorsBuffered(void)
+{
+	int ahead = NativeAudio_XAStreamAheadCountNoLock(&s_audio.xaStream);
+
+	return (ahead > NATIVE_AUDIO_XA_RING_SECTORS) ? NATIVE_AUDIO_XA_RING_SECTORS : ahead;
+}
+#endif
+
+// Opens + synchronously primes up to NATIVE_AUDIO_XA_RING_AHEAD_TARGET
+// sectors (the one remaining bounded synchronous burst, now a small constant
+// instead of a whole track). categoryID/xaID resolve via the XNF metadata,
+// same as the old NativeAudio_LoadXATrackPcm.
+internal int NativeAudio_XAStreamOpenTrack(struct NativeAudioXaStream *stream, int categoryID, int xaID, int *frameCountOut, int *sampleRateOut)
 {
 	struct NativeAudioXaTrackInfo info;
-	struct NativeAudioByteBuffer data;
-	struct NativeAudioPcmBuffer pcm;
 	char path[128];
-	int sampleRate;
-	int numChannels;
-	int frameCount;
+	int audioSectors;
 	int i;
-	int arenaMarker = 0;
 
-	*pcmOut = NULL;
 	*frameCountOut = 0;
 	*sampleRateOut = 0;
 
@@ -2402,70 +2619,71 @@ internal int NativeAudio_LoadXATrackPcm(struct NativeAudioDecodeArena *arena, in
 	{
 		return 0;
 	}
-	if (!NativeAudio_ReadFileBytes(path, &data))
+
+	NativeAudio_XAStreamInitRingBackingIfNeeded();
+	NativeAudio_XAStreamClearNoLock(stream);
+
+	if (!NativeAudio_XASourceOpen(&stream->source, path, info.channelFilter))
 	{
 		return 0;
 	}
-
-	memset(&pcm, 0, sizeof(pcm));
-	if (!NativeAudio_PrepareXAPcmBuffer(arena, info.numSectors, &pcm, &arenaMarker))
+	if ((info.numSectors > 0) && (info.numSectors < stream->source.totalSectors))
 	{
-		NativeAudio_FreeByteBuffer(&data);
-		return 0;
+		stream->source.totalSectors = info.numSectors;
 	}
 
-	if (!NativeAudio_DecodeXAFile(data.data, data.size, info.channelFilter, info.numSectors, &pcm, &sampleRate, &numChannels))
+	// NOTE(aalhendi): info.numSectors (just clamped above) bounds the
+	// PHYSICAL scan range, but some categories share one physical file across
+	// many xaIDs, interleaved by channel (e.g. CDSYS_XA_TYPE_EXTRA voice
+	// lines) -- exactly like MM_Scrapbook.c's TEST.STR case below, just
+	// reached through the XNF/category path instead of an explicit path.
+	// Measured case: a boot voice line's file scanned 827 physical sectors
+	// for only 51 actual channelFilter matches. Assuming every scanned
+	// sector is audio (frameCount = totalSectors * framesPerSector) made the
+	// track appear ~16x longer than its real content, so once the true 51
+	// sectors were exhausted the ring sat on endOfStream while outputFrame
+	// climbed toward a frameCount that was never going to be reached on any
+	// reasonable timescale -- indistinguishable from a hang in
+	// deterministicRenderMode. Count real audio sectors instead, exactly
+	// like NativeAudio_XAStreamOpenFile already does.
+	audioSectors = NativeAudio_XAStreamCountAudioSectors(&stream->source);
+	if (audioSectors <= 0)
 	{
-		NativeAudio_FreeByteBuffer(&data);
-		NativeAudio_ArenaRewind(arena, arenaMarker);
+		NativeAudio_XASourceClose(&stream->source);
+		NativeAudio_XAStreamClearNoLock(stream);
 		return 0;
 	}
+	stream->open = 1;
 
-	NativeAudio_FreeByteBuffer(&data);
-
-	if (numChannels == 1)
+	for (i = 0; i < NATIVE_AUDIO_XA_RING_AHEAD_TARGET; i++)
 	{
-		if (pcm.count > (INT_MAX / 2))
+		if (!NativeAudio_XAStreamDecodeNextSector(stream))
 		{
-			NativeAudio_ArenaRewind(arena, arenaMarker);
-			return 0;
+			break;
 		}
-
-		for (i = pcm.count; i-- > 0;)
-		{
-			pcm.samples[i * 2] = pcm.samples[i];
-			pcm.samples[i * 2 + 1] = pcm.samples[i];
-		}
-
-		frameCount = pcm.count;
-		pcm.count *= 2;
 	}
-	else
+
+	if (stream->decodedSectorCount == 0)
 	{
-		frameCount = pcm.count / 2;
+		NativeAudio_XASourceClose(&stream->source);
+		NativeAudio_XAStreamClearNoLock(stream);
+		return 0;
 	}
 
-	NativeAudio_ArenaRewind(arena, arenaMarker + pcm.count * (int)sizeof(s16));
-	*pcmOut = pcm.samples;
-	*frameCountOut = frameCount;
-	*sampleRateOut = sampleRate;
+	*frameCountOut = audioSectors * stream->framesPerSector;
+	*sampleRateOut = stream->sampleRate;
 	return 1;
 }
 
-internal int NativeAudio_LoadXAFilePcm(struct NativeAudioDecodeArena *arena, const char *relativePath, int channelFilter, s16 **pcmOut, int *frameCountOut,
-                                       int *sampleRateOut)
+// Same as NativeAudio_XAStreamOpenTrack, but for an explicit relative path +
+// channelFilter (used by MM_Scrapbook.c's TEST.STR playback) instead of
+// resolving through the XNF track metadata.
+internal int NativeAudio_XAStreamOpenFile(struct NativeAudioXaStream *stream, const char *relativePath, int channelFilter, int *frameCountOut,
+                                          int *sampleRateOut)
 {
-	struct NativeAudioByteBuffer data;
-	struct NativeAudioPcmBuffer pcm;
 	int audioSectors;
-	int totalSectors;
-	int sampleRate;
-	int numChannels;
-	int frameCount;
 	int i;
-	int arenaMarker = 0;
 
-	*pcmOut = NULL;
 	*frameCountOut = 0;
 	*sampleRateOut = 0;
 
@@ -2473,58 +2691,120 @@ internal int NativeAudio_LoadXAFilePcm(struct NativeAudioDecodeArena *arena, con
 	{
 		return 0;
 	}
-	if (!NativeAudio_ReadFileBytes(relativePath, &data))
+
+	NativeAudio_XAStreamInitRingBackingIfNeeded();
+	NativeAudio_XAStreamClearNoLock(stream);
+
+	if (!NativeAudio_XASourceOpen(&stream->source, relativePath, channelFilter))
 	{
 		return 0;
 	}
-	if (!NativeAudio_CountXAAudioSectors(data.data, data.size, channelFilter, &audioSectors, &totalSectors))
+
+	audioSectors = NativeAudio_XAStreamCountAudioSectors(&stream->source);
+	if (audioSectors <= 0)
 	{
-		NativeAudio_FreeByteBuffer(&data);
+		NativeAudio_XASourceClose(&stream->source);
+		NativeAudio_XAStreamClearNoLock(stream);
 		return 0;
 	}
+	stream->open = 1;
 
-	memset(&pcm, 0, sizeof(pcm));
-	if (!NativeAudio_PrepareXAPcmBuffer(arena, audioSectors, &pcm, &arenaMarker))
+	for (i = 0; i < NATIVE_AUDIO_XA_RING_AHEAD_TARGET; i++)
 	{
-		NativeAudio_FreeByteBuffer(&data);
-		return 0;
-	}
-
-	if (!NativeAudio_DecodeXAFile(data.data, data.size, channelFilter, totalSectors, &pcm, &sampleRate, &numChannels))
-	{
-		NativeAudio_FreeByteBuffer(&data);
-		NativeAudio_ArenaRewind(arena, arenaMarker);
-		return 0;
-	}
-
-	NativeAudio_FreeByteBuffer(&data);
-
-	if (numChannels == 1)
-	{
-		if (pcm.count > (INT_MAX / 2))
+		if (!NativeAudio_XAStreamDecodeNextSector(stream))
 		{
-			NativeAudio_ArenaRewind(arena, arenaMarker);
-			return 0;
+			break;
 		}
-
-		for (i = pcm.count; i-- > 0;)
-		{
-			pcm.samples[i * 2] = pcm.samples[i];
-			pcm.samples[i * 2 + 1] = pcm.samples[i];
-		}
-
-		frameCount = pcm.count;
-		pcm.count *= 2;
 	}
-	else
+
+	if (stream->decodedSectorCount == 0)
 	{
-		frameCount = pcm.count / 2;
+		NativeAudio_XASourceClose(&stream->source);
+		NativeAudio_XAStreamClearNoLock(stream);
+		return 0;
 	}
 
-	NativeAudio_ArenaRewind(arena, arenaMarker + pcm.count * (int)sizeof(s16));
-	*pcmOut = pcm.samples;
-	*frameCountOut = frameCount;
-	*sampleRateOut = sampleRate;
+	*frameCountOut = audioSectors * stream->framesPerSector;
+	*sampleRateOut = stream->sampleRate;
+	return 1;
+}
+
+// Used only by RestoreState: opens and decodes sequentially from sector 0
+// (required -- ADPCM predictor state is sequential) until the saved
+// targetSourceFrame's sector is resident plus the normal ahead-cushion. A
+// rare, load-time-only synchronous burst, not a steady-state cost.
+internal int NativeAudio_XAStreamOpenTrackSeek(struct NativeAudioXaStream *stream, int categoryID, int xaID, u64 targetSourceFrame, int *frameCountOut,
+                                               int *sampleRateOut)
+{
+	struct NativeAudioXaTrackInfo info;
+	char path[128];
+	int audioSectors;
+	int targetSector;
+
+	*frameCountOut = 0;
+	*sampleRateOut = 0;
+
+	if (!NativeAudio_LookupXATrackInfo(categoryID, xaID, &info))
+	{
+		return 0;
+	}
+	if (!NativeAudio_BuildXAPath(path, sizeof(path), categoryID, info.fileNumber))
+	{
+		return 0;
+	}
+
+	NativeAudio_XAStreamInitRingBackingIfNeeded();
+	NativeAudio_XAStreamClearNoLock(stream);
+
+	if (!NativeAudio_XASourceOpen(&stream->source, path, info.channelFilter))
+	{
+		return 0;
+	}
+	if ((info.numSectors > 0) && (info.numSectors < stream->source.totalSectors))
+	{
+		stream->source.totalSectors = info.numSectors;
+	}
+
+	// See the matching NOTE in NativeAudio_XAStreamOpenTrack: this file may
+	// multiplex several xaIDs by channel, so the true frame count has to come
+	// from an actual audio-sector count, not stream->source.totalSectors
+	// (the physical scan boundary). Counted independently of how far the
+	// seek loop below actually decodes.
+	audioSectors = NativeAudio_XAStreamCountAudioSectors(&stream->source);
+	if (audioSectors <= 0)
+	{
+		NativeAudio_XASourceClose(&stream->source);
+		NativeAudio_XAStreamClearNoLock(stream);
+		return 0;
+	}
+	stream->open = 1;
+
+	targetSector = -1;
+	for (;;)
+	{
+		if (!NativeAudio_XAStreamDecodeNextSector(stream))
+		{
+			break;
+		}
+		if ((targetSector < 0) && (stream->framesPerSector > 0))
+		{
+			targetSector = (int)(targetSourceFrame / (u64)stream->framesPerSector);
+		}
+		if ((targetSector >= 0) && (stream->decodedSectorCount > targetSector + NATIVE_AUDIO_XA_RING_AHEAD_TARGET))
+		{
+			break;
+		}
+	}
+
+	if (stream->decodedSectorCount == 0)
+	{
+		NativeAudio_XASourceClose(&stream->source);
+		NativeAudio_XAStreamClearNoLock(stream);
+		return 0;
+	}
+
+	*frameCountOut = audioSectors * stream->framesPerSector;
+	*sampleRateOut = stream->sampleRate;
 	return 1;
 }
 
@@ -2890,11 +3170,12 @@ int NativeAudio_CaptureState(void *dst, int dstSize)
 int NativeAudio_RestoreState(const void *src, int srcSize)
 {
 	const struct NativeAudioSnapshot *snapshot = (const struct NativeAudioSnapshot *)src;
-	s16 *xaPcm = NULL;
+	struct NativeAudioXaStream closed;
 	int xaFrameCount = 0;
 	int xaSampleRate = 0;
 	int i;
 	int restoreInit;
+	int haveNewStream = 0;
 
 	if ((src == NULL) || (srcSize < (int)sizeof(*snapshot)))
 	{
@@ -2936,16 +3217,24 @@ int NativeAudio_RestoreState(const void *src, int srcSize)
 
 	if (snapshot->xa.active && snapshot->xa.hasTrackIdentity)
 	{
-		if (!NativeAudio_LoadXATrackPcm(&s_audio.xaPendingPcmArena, snapshot->xa.categoryID, snapshot->xa.xaID, &xaPcm, &xaFrameCount, &xaSampleRate))
+		// NOTE(aalhendi): outputFrame is in 44100Hz output-frame units; convert
+		// to the native/source-frame domain the ring is indexed in, the same
+		// way NativeAudio_UpdateXAPositionFromOutputFrameNoLock does.
+		u64 targetPositionFp = ((snapshot->xa.outputFrame * (u64)snapshot->xa.sampleRate) << NATIVE_AUDIO_FP_SHIFT) / NATIVE_AUDIO_SAMPLE_RATE;
+		u64 targetSourceFrame = targetPositionFp >> NATIVE_AUDIO_FP_SHIFT;
+
+		if (!NativeAudio_XAStreamOpenTrackSeek(&s_audio.xaPendingStream, snapshot->xa.categoryID, snapshot->xa.xaID, targetSourceFrame, &xaFrameCount,
+		                                       &xaSampleRate))
 		{
 			return 0;
 		}
+		haveNewStream = 1;
 	}
 
 	NativeAudio_LockOutput();
 
 	NativeAudio_ResetVoicePcmArenaNoLock(0);
-	NativeAudio_FreeXA();
+	closed = NativeAudio_FreeXA();
 
 	s_audio.init = restoreInit;
 	s_audio.muted = snapshot->muted;
@@ -2967,10 +3256,9 @@ int NativeAudio_RestoreState(const void *src, int srcSize)
 		NativeAudio_CopyStateToVoice(&s_audio.voices[i], &snapshot->voices[i]);
 	}
 
-	if (snapshot->xa.active && snapshot->xa.hasTrackIdentity)
+	if (haveNewStream)
 	{
-		NativeAudio_ArenaSwap(&s_audio.xaPcmArena, &s_audio.xaPendingPcmArena);
-		s_audio.xa.pcm = xaPcm;
+		NativeAudio_XAStreamSwap(&s_audio.xaStream, &s_audio.xaPendingStream);
 		s_audio.xa.frameCount = xaFrameCount;
 		s_audio.xa.sampleRate = xaSampleRate;
 		s_audio.xa.categoryID = snapshot->xa.categoryID;
@@ -3002,6 +3290,13 @@ int NativeAudio_RestoreState(const void *src, int srcSize)
 
 	NativeAudio_UnlockOutput();
 
+	// The old stream is captured+closed regardless of which branch above ran
+	// -- a restore can replace a track that was playing with one that wasn't.
+	if (closed.open)
+	{
+		NativeAudio_XASourceClose(&closed.source);
+	}
+
 	return 1;
 }
 
@@ -3016,7 +3311,7 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 	int voiceStopped = 0;
 	int i;
 
-	if (s_audio.xa.active && s_audio.xa.pcm != NULL)
+	if (s_audio.xa.active)
 	{
 		u64 outputFrameCount = NativeAudio_GetXAOutputFrameCount(s_audio.xa.frameCount, s_audio.xa.sampleRate);
 
@@ -3206,6 +3501,9 @@ void NativeAudio_StepVBlank(void)
 #endif
 
 	NativeAudio_UnlockOutput();
+
+	NativeAudio_XAStreamPump();
+
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_AUDIO_VBLANK);
 
 #ifdef CTR_INTERNAL
@@ -3701,11 +3999,18 @@ int NativeAudio_GetXATrackLength(int categoryID, int xaID)
 
 void NativeAudio_StopXA(void)
 {
+	struct NativeAudioXaStream closed;
+
 	NativeAudio_LockOutput();
 
-	NativeAudio_FreeXA();
+	closed = NativeAudio_FreeXA();
 
 	NativeAudio_UnlockOutput();
+
+	if (closed.open)
+	{
+		NativeAudio_XASourceClose(&closed.source);
+	}
 }
 
 void NativeAudio_SetXAVolume(int volumeLeft, int volumeRight)
@@ -3736,7 +4041,7 @@ int NativeAudio_IsXAPlaying(void)
 
 int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volumeRight)
 {
-	s16 *pcm;
+	struct NativeAudioXaStream closed;
 	int sampleRate;
 	int frameCount;
 
@@ -3745,16 +4050,15 @@ int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volume
 		return 0;
 	}
 
-	if (!NativeAudio_LoadXATrackPcm(&s_audio.xaPendingPcmArena, categoryID, xaID, &pcm, &frameCount, &sampleRate))
+	if (!NativeAudio_XAStreamOpenTrack(&s_audio.xaPendingStream, categoryID, xaID, &frameCount, &sampleRate))
 	{
 		return 0;
 	}
 
 	NativeAudio_LockOutput();
 
-	NativeAudio_FreeXA();
-	NativeAudio_ArenaSwap(&s_audio.xaPcmArena, &s_audio.xaPendingPcmArena);
-	s_audio.xa.pcm = pcm;
+	closed = NativeAudio_FreeXA();
+	NativeAudio_XAStreamSwap(&s_audio.xaStream, &s_audio.xaPendingStream);
 	s_audio.xa.frameCount = frameCount;
 	s_audio.xa.sampleRate = sampleRate;
 	s_audio.xa.categoryID = categoryID;
@@ -3772,12 +4076,17 @@ int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volume
 
 	NativeAudio_UnlockOutput();
 
+	if (closed.open)
+	{
+		NativeAudio_XASourceClose(&closed.source);
+	}
+
 	return 1;
 }
 
 int NativeAudio_PlayXAFile(const char *relativePath, int channelFilter, int volumeLeft, int volumeRight)
 {
-	s16 *pcm;
+	struct NativeAudioXaStream closed;
 	int sampleRate;
 	int frameCount;
 
@@ -3786,16 +4095,15 @@ int NativeAudio_PlayXAFile(const char *relativePath, int channelFilter, int volu
 		return 0;
 	}
 
-	if (!NativeAudio_LoadXAFilePcm(&s_audio.xaPendingPcmArena, relativePath, channelFilter, &pcm, &frameCount, &sampleRate))
+	if (!NativeAudio_XAStreamOpenFile(&s_audio.xaPendingStream, relativePath, channelFilter, &frameCount, &sampleRate))
 	{
 		return 0;
 	}
 
 	NativeAudio_LockOutput();
 
-	NativeAudio_FreeXA();
-	NativeAudio_ArenaSwap(&s_audio.xaPcmArena, &s_audio.xaPendingPcmArena);
-	s_audio.xa.pcm = pcm;
+	closed = NativeAudio_FreeXA();
+	NativeAudio_XAStreamSwap(&s_audio.xaStream, &s_audio.xaPendingStream);
 	s_audio.xa.frameCount = frameCount;
 	s_audio.xa.sampleRate = sampleRate;
 	s_audio.xa.categoryID = 0;
@@ -3812,6 +4120,11 @@ int NativeAudio_PlayXAFile(const char *relativePath, int channelFilter, int volu
 	s_audio.xa.active = 1;
 
 	NativeAudio_UnlockOutput();
+
+	if (closed.open)
+	{
+		NativeAudio_XASourceClose(&closed.source);
+	}
 
 	return 1;
 }
@@ -3852,7 +4165,7 @@ internal int NativeAudio_GetXAMaxSampleAtSourceFrameNoLock(u64 frameIndex)
 	int max = 0;
 	int frame;
 
-	if (s_audio.xa.active && s_audio.xa.pcm != NULL)
+	if (s_audio.xa.active)
 	{
 		for (frame = 0; frame < 0x80; frame++)
 		{
@@ -3864,8 +4177,8 @@ internal int NativeAudio_GetXAMaxSampleAtSourceFrameNoLock(u64 frameIndex)
 				break;
 			}
 
-			left = s_audio.xa.pcm[((size_t)frameIndex + (size_t)frame) * 2];
-			right = s_audio.xa.pcm[((size_t)frameIndex + (size_t)frame) * 2 + 1];
+			left = NativeAudio_GetXAPcmSampleAtFrameNoLock(0, frameIndex + (u64)frame);
+			right = NativeAudio_GetXAPcmSampleAtFrameNoLock(1, frameIndex + (u64)frame);
 
 			if (left < 0)
 			{
@@ -3916,7 +4229,7 @@ int NativeAudio_GetXAMaxSampleAtOffset(int xaCurrOffset)
 
 	NativeAudio_LockOutput();
 
-	if ((s_audio.xa.active != 0) && (s_audio.xa.pcm != NULL) && (s_audio.xa.sampleRate > 0))
+	if ((s_audio.xa.active != 0) && (s_audio.xa.sampleRate > 0))
 	{
 		outputFrame = (u64)xaCurrOffset << 8;
 		sourceFrame = (outputFrame * (u64)s_audio.xa.sampleRate) / NATIVE_AUDIO_SAMPLE_RATE;

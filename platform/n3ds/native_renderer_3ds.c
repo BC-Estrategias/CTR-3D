@@ -154,17 +154,21 @@ void NativeRenderer_SwapWindow(void)
 		printf("frames %-8lu vblanks %-8lu\n", frames, vblanks);
 		printf("fps    %lu.%lu now / %lu.%lu avg (target 30)   \n",
 		       nowX10 / 10UL, nowX10 % 10UL, avgX10 / 10UL, avgX10 % 10UL);
-		/* Break the heap down by arena: the XA decode arenas are the suspected
-		 * source of unbounded growth, so show them next to the total. */
-		printf("heap   %-6lu  xa %-5d +%-5d  voice %-5d KiB\n", heapKiB,
-		       s_audio.xaPcmArena.capacity / 1024, s_audio.xaPendingPcmArena.capacity / 1024,
+		/* Break the heap down: XA now reports ring occupancy (sectors buffered
+		 * / ring depth) and underrun count instead of arena KiB -- this is the
+		 * same instrumentation that originally proved the old arena-growth bug
+		 * (BUGREPORT_audio_arena_growth.md); after the fix it should show a
+		 * small number that stays flat across track transitions instead of
+		 * one that doubles over a session. */
+		printf("heap   %-6lu  xaBuf %d/%d underrun %-4lu voice %-5d KiB\n", heapKiB,
+		       NativeAudio_XAStreamSectorsBuffered(), NATIVE_AUDIO_XA_RING_SECTORS, s_audio.xaStream.underrunEvents,
 		       s_audio.voicePcmArena.capacity / 1024);
 		printf("state  %-4d vram[0] %04x            \n", (int)sdata->mainGameState, (unsigned)vram[0]);
 
 		snprintf(line, sizeof(line),
-		         "[CTR-3DS] frames=%lu vbl=%lu fps_now=%lu.%lu heapKiB=%lu xaKiB=%d+%d voiceKiB=%d state=%d",
+		         "[CTR-3DS] frames=%lu vbl=%lu fps_now=%lu.%lu heapKiB=%lu xaBuf=%d/%d underrun=%lu voiceKiB=%d state=%d",
 		         frames, vblanks, nowX10 / 10UL, nowX10 % 10UL, heapKiB,
-		         s_audio.xaPcmArena.capacity / 1024, s_audio.xaPendingPcmArena.capacity / 1024,
+		         NativeAudio_XAStreamSectorsBuffered(), NATIVE_AUDIO_XA_RING_SECTORS, s_audio.xaStream.underrunEvents,
 		         s_audio.voicePcmArena.capacity / 1024, (int)sdata->mainGameState);
 		N3DS_DebugLog(line);
 	}

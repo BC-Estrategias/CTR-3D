@@ -186,11 +186,12 @@ u32 main(void)
 			// NOTE: this was written to explain a session-long memory climb, and
 			// an instrumented playtest showed it is NOT the cause. The voice PCM
 			// arena plateaus at 128 MiB and reset 10 times over 15 minutes while
-			// process memory kept growing to 710 MB. The real growth is the XA
-			// arena pair (xaPcmArena / xaPendingPcmArena), whose capacity
-			// ratchets up and is never released -- see
-			// BUGREPORT_audio_arena_growth.md. Keeping this reset is defensible
-			// tidiness, but do not mistake it for the fix.
+			// process memory kept growing to 710 MB. The real growth was the XA
+			// arena pair (xaPcmArena / xaPendingPcmArena), whose capacity used to
+			// ratchet up and never release -- it has since been replaced by a
+			// fixed-size streaming ring in native_audio.c, see
+			// BUGREPORT_audio_arena_growth.md for history. Keeping this reset is
+			// defensible tidiness, but do not mistake it for the fix.
 			NativeAudio_ResetVoicePcmArena();
 #endif
 

@@ -719,6 +719,79 @@ internal int NativeAssets_ReadHostBytes(const char *path, struct NativeAssetsByt
 	return 1;
 }
 
+int NativeAssets_OpenHostRange(const char *relativePath, struct NativeAssetsHostRange *range)
+{
+	FILE *file;
+	long size;
+
+	range->file = NULL;
+	range->size = 0;
+
+	file = NativeAssets_OpenHost(relativePath, "rb");
+	if (file == NULL)
+	{
+		return 0;
+	}
+
+	if (fseek(file, 0, SEEK_END) != 0)
+	{
+		fclose(file);
+		return 0;
+	}
+
+	size = ftell(file);
+	if ((size <= 0) || (size > 0x7fffffff))
+	{
+		fclose(file);
+		return 0;
+	}
+
+	if (fseek(file, 0, SEEK_SET) != 0)
+	{
+		fclose(file);
+		return 0;
+	}
+
+	range->file = file;
+	range->size = size;
+	return 1;
+}
+
+int NativeAssets_ReadHostRange(struct NativeAssetsHostRange *range, long offset, void *dst, size_t size)
+{
+	if ((range == NULL) || (range->file == NULL) || (dst == NULL) || (offset < 0) || (size == 0) || (size > 0x7fffffffu))
+	{
+		return 0;
+	}
+
+	if ((range->size > 0) && (offset > range->size - (long)size))
+	{
+		return 0;
+	}
+
+	if (fseek(range->file, offset, SEEK_SET) != 0)
+	{
+		return 0;
+	}
+
+	return NativeAssets_ReadExact(range->file, dst, size);
+}
+
+void NativeAssets_CloseHostRange(struct NativeAssetsHostRange *range)
+{
+	if (range == NULL)
+	{
+		return;
+	}
+
+	if (range->file != NULL)
+	{
+		fclose(range->file);
+	}
+	range->file = NULL;
+	range->size = 0;
+}
+
 int NativeAssets_ReadBytes(const char *path, int readMode, struct NativeAssetsByteBuffer *bytes)
 {
 	bytes->data = NULL;

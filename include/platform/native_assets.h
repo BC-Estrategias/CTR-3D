@@ -18,6 +18,15 @@ struct NativeAssetsByteBuffer
 	int size;
 };
 
+// NOTE(aalhendi): Open-once, seek+read-many-times handle for callers that need
+// bounded ranges out of a host file (e.g. one XA sector at a time) instead of
+// NativeAssets_ReadBytes's whole-file malloc.
+struct NativeAssetsHostRange
+{
+	FILE *file;
+	long size;
+};
+
 int NativeAssets_Init(const char *executableBasePath);
 const char *NativeAssets_GetBaseDir(void);
 const char *NativeAssets_GetAssetDir(void);
@@ -30,6 +39,9 @@ FILE *NativeAssets_OpenHost(const char *relativePath, const char *mode);
 FILE *NativeAssets_OpenHostBigfile(const char *mode);
 int NativeAssets_ReadBytes(const char *path, int readMode, struct NativeAssetsByteBuffer *bytes);
 void NativeAssets_FreeBytes(struct NativeAssetsByteBuffer *bytes);
+int NativeAssets_OpenHostRange(const char *relativePath, struct NativeAssetsHostRange *range);
+int NativeAssets_ReadHostRange(struct NativeAssetsHostRange *range, long offset, void *dst, size_t size);
+void NativeAssets_CloseHostRange(struct NativeAssetsHostRange *range);
 int NativeAssets_Validate(void);
 
 #endif
