@@ -115,13 +115,32 @@ void NativeRenderer_SwapWindow(void)
 	 * a second vblank source or the 30fps gate would be paced twice.
 	 */
 	s_frameCounter++;
-	if ((s_frameCounter & 63) == 0)
+	if ((s_frameCounter & 31) == 0)
 	{
+		/*
+		 * On-screen stats block. Getting files off the console is awkward (the
+		 * SD is under the backplate and only one homebrew app runs at a time,
+		 * so an FTP server cannot be up while this is), and a photo of the top
+		 * screen carries everything worth knowing. Also mirrored to the log.
+		 */
+		const unsigned long vblanks = (unsigned long)Platform_GetVBlankCount();
+		const unsigned long frames = (unsigned long)s_frameCounter;
+		unsigned long fpsX10 = 0;
 		char line[96];
 
-		snprintf(line, sizeof(line), "[CTR-3DS] frames=%lu vram[0]=%04x",
-			(unsigned long)s_frameCounter, (unsigned)vram[0]);
-		printf("\x1b[18;1H%s   ", line);
+		if (vblanks > 0)
+		{
+			// The retail gate is two vblanks per flip, i.e. 30fps.
+			fpsX10 = (600UL * frames) / vblanks;
+		}
+
+		printf("\x1b[17;1H---- 3DS port stats ----------------\n");
+		printf("frames  %-10lu vblanks %-10lu\n", frames, vblanks);
+		printf("fps     %lu.%lu  (retail target 30)      \n", fpsX10 / 10UL, fpsX10 % 10UL);
+		printf("state   %-4d vram[0] %04x            \n", (int)sdata->mainGameState, (unsigned)vram[0]);
+
+		snprintf(line, sizeof(line), "[CTR-3DS] frames=%lu vblanks=%lu fps=%lu.%lu state=%d",
+		         frames, vblanks, fpsX10 / 10UL, fpsX10 % 10UL, (int)sdata->mainGameState);
 		N3DS_DebugLog(line);
 	}
 
