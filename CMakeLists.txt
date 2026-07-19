@@ -215,6 +215,45 @@ elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
     ctr_native_add_label_warning_if_supported(ctr_native -Wc23-extensions CTR_HAS_WC23_EXTENSIONS)
 endif()
 if(NINTENDO_3DS)
+    # PICA200 vertex shader: platform/n3ds/shaders/ctr.v.pica -> ctr.shbin
+    # (picasso) -> embedded ctr_shbin.S/.h (bin2s), so native_renderer_3ds.c
+    # can #include the compiled shader like the citro3d examples do. Hand-
+    # rolled as two build-time custom commands rather than
+    # dkp_add_embedded_binary_library: that helper's dkp_resolve_file requires
+    # its input to already exist on disk at *configure* time, which a file
+    # this build generates can't satisfy on a clean tree, and would force a
+    # reconfigure (not just a rebuild) on every shader edit.
+    set(CTR_N3DS_SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/platform/n3ds/shaders/ctr.v.pica")
+    set(CTR_N3DS_SHADER_GEN "${CMAKE_CURRENT_BINARY_DIR}/n3ds-shaders")
+    set(CTR_N3DS_SHADER_SHBIN "${CTR_N3DS_SHADER_GEN}/ctr.shbin")
+
+    add_custom_command(
+        OUTPUT "${CTR_N3DS_SHADER_SHBIN}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CTR_N3DS_SHADER_GEN}"
+        COMMAND ${CTR_PICASSO_EXE} -o "${CTR_N3DS_SHADER_SHBIN}" "${CTR_N3DS_SHADER_SRC}"
+        DEPENDS "${CTR_N3DS_SHADER_SRC}"
+        COMMENT "picasso: ctr.v.pica -> ctr.shbin"
+    )
+    add_custom_command(
+        OUTPUT "${CTR_N3DS_SHADER_GEN}/ctr_shbin.S" "${CTR_N3DS_SHADER_GEN}/ctr_shbin.h"
+        COMMAND ${DKP_BIN2S} -a ${DKP_BIN2S_ALIGNMENT} -H "${CTR_N3DS_SHADER_GEN}/ctr_shbin.h"
+                "${CTR_N3DS_SHADER_SHBIN}" > "${CTR_N3DS_SHADER_GEN}/ctr_shbin.S"
+        DEPENDS "${CTR_N3DS_SHADER_SHBIN}"
+        COMMENT "bin2s: embedding ctr.shbin"
+    )
+    # Tried tagging this LANGUAGE C on the theory that devkitARM's gcc
+    # dispatches .S by file extension regardless -- it doesn't: CMake's C
+    # compile rule forces the C frontend (-x c) rather than letting gcc's own
+    # extension sniffing run, so cc1 tried to parse ".section ..." as C and
+    # failed. Enabling the real ASM language is what dkp_add_embedded_binary_library
+    # actually relies on; do the same here instead of the "C" fallback.
+    enable_language(ASM)
+    set_source_files_properties("${CTR_N3DS_SHADER_GEN}/ctr_shbin.S"
+        PROPERTIES LANGUAGE ASM)
+
+    target_sources(ctr_native PRIVATE "${CTR_N3DS_SHADER_GEN}/ctr_shbin.S")
+    target_include_directories(ctr_native PRIVATE "${CTR_N3DS_SHADER_GEN}")
+
     # citro3d before ctru: the linker resolves left to right and citro3d pulls
     # symbols out of ctru.
     target_link_libraries(ctr_native citro3d ctru)

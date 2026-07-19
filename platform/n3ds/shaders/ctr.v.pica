@@ -1,0 +1,45 @@
+; CTR-Native PICA200 vertex shader -- phase 2a (static/opaque geometry, mono).
+;
+; Positions arrive already projected to PSX screen-pixel space -- the GTE does
+; that on the CPU, same as the PC renderer's GTE_VERTEX_SHADER
+; (platform/native_renderer.c). This shader's job is only the screen-pixel ->
+; clip-space remap (the "projection" uniform is an orthographic matrix, not a
+; camera), plus passthrough of texcoord and color. No page/clut reaches the
+; GPU at all -- texture resolution happens on the CPU before binding (see
+; docs/CITRO3D_RENDERER_DESIGN.md, sections 1 and 6). No blending, no stereo
+; eye offset yet -- both staged for later phases in the same doc.
+
+; Uniforms
+.fvec projection[4]
+
+; Constants
+.constf constants(0.0, 1.0, -1.0, 0.0)
+.alias  zeros constants.xxxx
+.alias  ones  constants.yyyy
+
+; Outputs
+.out outpos position
+.out outtc0 texcoord0
+.out outclr color
+
+; Inputs (regId order must match C3D_AttrInfo setup in native_renderer_3ds.c)
+.alias inpos v0 ; x, y
+.alias intc  v1 ; u, v
+.alias inclr v2 ; r, g, b, a
+
+.proc main
+	; Force z=0, w=1 -- position is 2D screen space, not a 3D camera-space point.
+	mov r0.xy, inpos.xy
+	mov r0.z,  zeros
+	mov r0.w,  ones
+
+	dp4 outpos.x, projection[0], r0
+	dp4 outpos.y, projection[1], r0
+	dp4 outpos.z, projection[2], r0
+	dp4 outpos.w, projection[3], r0
+
+	mov outtc0.xy, intc.xy
+	mov outclr, inclr
+
+	end
+.end

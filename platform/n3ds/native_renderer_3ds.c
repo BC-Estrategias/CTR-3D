@@ -1,21 +1,27 @@
 /*
- * Nintendo 3DS renderer backend -- phase 1 scaffold.
+ * Nintendo 3DS renderer backend -- phase 2a in progress.
  *
  * Replaces platform/native_renderer.c (OpenGL 3.3 + glad), which cannot run on
  * the PICA200. This file satisfies every signature in
  * include/platform/native_renderer.h so the rest of the unity build compiles
- * unmodified.
+ * unmodified. Design: docs/CITRO3D_RENDERER_DESIGN.md.
  *
  * What is REAL here: the CPU-side PSX VRAM mirror and every operation that only
- * touches it (clear/copy/read/save-state). That code is pure memory work, it is
- * what the boot splash path uploads into, and phase 1c presents from it -- so it
- * is implemented properly rather than stubbed.
+ * touches it (clear/copy/read/save-state); citro3d init, the compiled vertex
+ * shader, and the top-screen render target (all behind n3ds_backend.h -- this
+ * file is part of the unity build and can never see libctru/citro3d types
+ * directly, same reason as everything else that crosses that boundary).
  *
- * What is STUBBED here: everything that would talk to a GPU (textures, shaders,
- * blend/stencil state, triangle submission). Those become citro3d in phase 2.
+ * What is STILL STUBBED here: the CPU texture decode cache and the real
+ * GrVertex -> N3DS_Vertex conversion (design doc sections 1 and 6) --
+ * NativeRenderer_SwapWindow currently draws one hardcoded test triangle each
+ * frame instead, to verify the citro3d pipeline itself (shader compile,
+ * attribute/buffer setup, draw, present) independent of the real data path.
+ * Textures, blending, stencil, offscreen, framebuffer readback, and stereo
+ * are all still stubbed/deferred per the design doc's staging.
  *
- * The top screen currently hosts a libctru text console so that a running main
- * loop is observable before any real pixels exist.
+ * The bottom screen hosts a libctru text console (the stats block) so a
+ * running main loop stays observable while the top screen is citro3d's.
  */
 
 #include <stdio.h>
@@ -44,6 +50,19 @@ global_variable u32 s_frameCounter = 0;
 global_variable unsigned long s_lastStatFrames = 0;
 global_variable unsigned long s_lastStatVblanks = 0;
 
+/*
+ * TEMPORARY (phase 2a pipeline verification only -- see the file header).
+ * A fixed triangle in PSX screen-pixel space, drawn every frame through the
+ * real N3DS_C3DUploadVertices/DrawTriangles path so that path is exercised
+ * before the real GrVertex conversion (design doc section 6) replaces this.
+ * Remove once that lands.
+ */
+global_variable const N3DS_Vertex s_testTriangle[3] = {
+	{200.0f, 40.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
+	{100.0f, 200.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f},
+	{300.0f, 200.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f},
+};
+
 internal u16 NativeRenderer3DS_PackBGR555(u8 r, u8 g, u8 b)
 {
 	return (u16)(((r >> 3) & 31) | (((g >> 3) & 31) << 5) | (((b >> 3) & 31) << 10));
@@ -55,6 +74,12 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 
 	N3DS_GfxInit();
 
+	if (!N3DS_C3DInit())
+	{
+		N3DS_DebugLog("[CTR-3DS] citro3d init FAILED");
+		return 0;
+	}
+
 	s_rendererInitialised = 1;
 
 	printf("\x1b[2J");
@@ -63,9 +88,9 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 	printf("%s\n", (windowName != NULL) ? windowName : "(no title)");
 	printf("PSX display: %dx%d\n", width, height);
 	printf("VRAM mirror: %d KiB\n", (int)(sizeof(vram) / 1024));
-	printf("\nRenderer is a phase-1 stub: no geometry\nis drawn yet. VRAM mirror is live.\n\n");
+	printf("\nPhase 2a: citro3d is live on the top\nscreen (see file header for scope).\n\n");
 
-	N3DS_DebugLog("[CTR-3DS] renderer init ok");
+	N3DS_DebugLog("[CTR-3DS] renderer init ok, citro3d ready");
 
 	return 1;
 }
@@ -84,6 +109,7 @@ void NativeRenderer_Shutdown(void)
 	}
 
 	s_rendererInitialised = 0;
+	N3DS_C3DExit();
 	N3DS_GfxExit();
 }
 
@@ -117,6 +143,13 @@ void NativeRenderer_SwapWindow(void)
 	 * a second vblank source or the 30fps gate would be paced twice.
 	 */
 	s_frameCounter++;
+
+	/* TEMPORARY -- see s_testTriangle's comment. Real path replaces this. */
+	N3DS_C3DBeginFrame();
+	N3DS_C3DUploadVertices(s_testTriangle, 3);
+	N3DS_C3DDrawTriangles(0, 1);
+	N3DS_C3DEndFrame();
+
 	if ((s_frameCounter & 31) == 0)
 	{
 		/*

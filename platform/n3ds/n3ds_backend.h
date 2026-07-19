@@ -36,6 +36,46 @@ void N3DS_GfxExit(void);
  * frame pacing belongs to VSync() in the platform layer. */
 void N3DS_GfxPresent(void);
 
+/* -------------------------------------------------------------- render --- */
+/* citro3d lives entirely behind this boundary too, for the same reason as
+ * everything else here -- see the file comment. Types crossing it are plain
+ * scalars only. This is the mechanical GPU boundary for
+ * docs/CITRO3D_RENDERER_DESIGN.md; it grows as native_renderer_3ds.c needs
+ * new operations, phase by phase, rather than being designed complete
+ * up front. */
+
+/* Plain-scalar mirror of the vertex layout the 3DS GPU consumes. Narrower
+ * than the shared GrVertex (include/platform/native_renderer_types.h):
+ * page/clut never reach the GPU here -- texture resolution happens on the
+ * CPU side of native_renderer_3ds.c before a draw call (design doc section
+ * 1). All-float for now, matching every local citro3d example's attribute
+ * format; see design doc section 6 for the packed-format follow-up this
+ * deliberately defers. */
+typedef struct
+{
+	float x, y;
+	float u, v;
+	float r, g, b, a;
+} N3DS_Vertex;
+
+/* One-time setup: citro3d itself, the top-screen render target, the
+ * compiled vertex shader, attribute layout, and the vertex buffer. Must be
+ * called after N3DS_GfxInit (needs gfxInitDefault already done). Returns 0
+ * on failure. */
+int N3DS_C3DInit(void);
+void N3DS_C3DExit(void);
+
+void N3DS_C3DBeginFrame(void);
+void N3DS_C3DEndFrame(void);
+
+/* Mirrors the shared NativeRenderer contract's own pattern: one upload per
+ * accumulation cycle, then many small draws at different offsets into it
+ * with different bound state between them. count above the internal cap is
+ * silently clamped -- the cap is a placeholder, not a measured real number;
+ * see the design doc's open question on real per-frame vertex counts. */
+void N3DS_C3DUploadVertices(const N3DS_Vertex *vertices, int count);
+void N3DS_C3DDrawTriangles(int startVertex, int triangleCount);
+
 /* ---------------------------------------------------------------- input --- */
 
 #define N3DS_BTN_A      (1u << 0)
