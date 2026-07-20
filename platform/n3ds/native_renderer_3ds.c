@@ -199,6 +199,9 @@ global_variable u32 s_drawCallCount = 0;
  * all, rather than DrawTriangles running and bailing. See the stats block. */
 global_variable u32 s_updateVertexBufferCalls = 0;
 global_variable u32 s_drawTrianglesCalls = 0;
+/* Last DISPENV the projection was built for; -1 forces it on the first frame. */
+global_variable int s_projectionDispW = -1;
+global_variable int s_projectionDispH = -1;
 global_variable u32 s_lastStatDrawCallCount = 0;
 
 /* Scratch for one decoded+tiled page; reused every decode, never persisted. */
@@ -571,6 +574,44 @@ void NativeRenderer_BeginScene(void)
 	}
 
 	s_beginSceneCount++;
+
+	/*
+	 * Fit the game's own display area to the panel. CTR runs a 512x216 DISPENV
+	 * while the top screen is 400x240, so the previous 1:1 passthrough showed
+	 * only the left 400 columns and left the bottom 24 rows empty.
+	 *
+	 * Read from the live DISPENV rather than hardcoding 512x216: the game
+	 * double-buffers two dispEnvs and could change modes, and this costs two
+	 * integer compares a frame.
+	 *
+	 * Aspect: the PSX frame is meant to fill a 4:3 display, but the 3DS top
+	 * screen is 5:3. Preserving 4:3 means drawing into a 320x240 centre with
+	 * pillarbox bars, which the wider-than-source ortho below produces. To
+	 * stretch to the full width instead -- no bars, ~25% too wide -- use
+	 * (0, dispW, dispH).
+	 */
+	{
+		const int dispW = (activeDispEnv.disp.w > 0) ? activeDispEnv.disp.w : 512;
+		const int dispH = (activeDispEnv.disp.h > 0) ? activeDispEnv.disp.h : 216;
+
+		if ((dispW != s_projectionDispW) || (dispH != s_projectionDispH))
+		{
+			/* Panel is 400 wide; a 4:3 area inside it is 240*4/3 = 320 wide, so
+			 * the full panel spans dispW * 400/320 PSX units, centred. */
+			const float orthoW = (float)dispW * (400.0f / 320.0f);
+			const float margin = (orthoW - (float)dispW) * 0.5f;
+			char line[96];
+
+			s_projectionDispW = dispW;
+			s_projectionDispH = dispH;
+			N3DS_C3DSetProjection(-margin, (float)dispW + margin, (float)dispH);
+
+			snprintf(line, sizeof(line), "[CTR-3DS] projection: disp %dx%d -> ortho %d..%d x 0..%d", dispW, dispH, (int)-margin, (int)((float)dispW + margin),
+			         dispH);
+			N3DS_DebugLog(line);
+		}
+	}
+
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);
 	N3DS_C3DBeginFrame();
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);

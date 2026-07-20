@@ -72,6 +72,12 @@ void N3DS_C3DExit(void);
  * happens earlier, via DrawAllSplits (DrawOTag, and potentially again mid-
  * frame via DrawSync), so the frame bracket has to open before that, not at
  * present time. */
+/*
+ * Orthographic extents in PSX screen coordinates, not 3DS panel pixels. top is
+ * always 0 and bottom > top, reproducing the PSX Y-down convention.
+ */
+void N3DS_C3DSetProjection(float left, float right, float bottom);
+
 void N3DS_C3DBeginFrame(void);
 void N3DS_C3DEndFrame(void);
 

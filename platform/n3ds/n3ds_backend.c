@@ -112,6 +112,24 @@ static int s_vertexCursor = 0;
 static int s_vertexHighWater = 0;
 static C3D_Tex s_atlasTextures[N3DS_ATLAS_COUNT];
 
+void N3DS_C3DSetProjection(float left, float right, float bottom)
+{
+	/*
+	 * PSX screen space -> clip space. There is no camera: the GTE already
+	 * projected to 2D on the CPU, so this is a pure orthographic remap, and
+	 * bottom/top are inverted (bottom > top) to reproduce PSX/PC's Y-down
+	 * convention where Y=0 is the top of the image.
+	 *
+	 * This used to be hardcoded to the 3DS panel's own 400x240, which silently
+	 * assumed PSX coordinates were already screen pixels. They are not: CTR
+	 * runs a 512x216 DISPENV (SetDefDispEnv(..., 0x200, 0xd8) in MainMain.c),
+	 * so a 1:1 passthrough cropped 112 columns -- 22% of the picture -- off the
+	 * right edge and left a dead strip along the bottom. The extents now come
+	 * from the game's live DISPENV instead; see NativeRenderer_BeginScene.
+	 */
+	Mtx_OrthoTilt(&s_projection, left, right, bottom, 0.0f, 0.0f, 1.0f, true);
+}
+
 int N3DS_C3DInit(void)
 {
 	C3D_AttrInfo *attrInfo;
@@ -141,13 +159,11 @@ int N3DS_C3DInit(void)
 	s_uLocProjection = shaderInstanceGetUniformLocation(s_shaderProgram.vertexShader, "projection");
 
 	/*
-	 * Screen-pixel space -> clip space, matching native_renderer.c's own
-	 * Projection uniform in spirit: PSX screen coordinates go straight in,
-	 * there is no camera. bottom=240/top=0 (inverted from the usual
-	 * math convention) reproduces PSX/PC's Y-down screen convention -- Y=0
-	 * is the top of the image, Y increases downward.
+	 * Placeholder until the first N3DS_C3DSetProjection call, which derives
+	 * the real extents from the game's own DISPENV. See that function for why
+	 * hardcoding screen pixels here was wrong.
 	 */
-	Mtx_OrthoTilt(&s_projection, 0.0f, 400.0f, 240.0f, 0.0f, 0.0f, 1.0f, true);
+	N3DS_C3DSetProjection(0.0f, 400.0f, 240.0f);
 
 	attrInfo = C3D_GetAttrInfo();
 	AttrInfo_Init(attrInfo);
