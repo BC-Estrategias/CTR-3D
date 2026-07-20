@@ -111,6 +111,7 @@ static void *s_vertexBufferMem = NULL;
 static int s_vertexCursor = 0;
 static int s_vertexHighWater = 0;
 static C3D_Tex s_atlasTextures[N3DS_ATLAS_COUNT];
+static C3D_Tex s_vramDisplayTex[N3DS_VRAM_DISPLAY_TEX_COUNT];
 
 void N3DS_C3DSetProjection(float left, float right, float bottom)
 {
@@ -251,12 +252,35 @@ int N3DS_C3DInit(void)
 		}
 	}
 
+	/* Boot-splash present texture pool -- see the header comment on
+	 * N3DS_C3DUploadVramDisplayChunk for why this is a small pool, not one
+	 * shared texture like this loop might suggest. */
+	{
+		int slot;
+
+		for (slot = 0; slot < N3DS_VRAM_DISPLAY_TEX_COUNT; slot++)
+		{
+			if (!C3D_TexInit(&s_vramDisplayTex[slot], N3DS_VRAM_DISPLAY_TEX_DIM, N3DS_VRAM_DISPLAY_TEX_DIM, GPU_RGBA5551))
+			{
+				N3DS_DebugLog("[CTR-3DS] VRAM display texture FAILED to allocate");
+				return 0;
+			}
+			C3D_TexSetFilter(&s_vramDisplayTex[slot], GPU_NEAREST, GPU_NEAREST);
+			C3D_TexSetWrap(&s_vramDisplayTex[slot], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+		}
+	}
+
 	return 1;
 }
 
 void N3DS_C3DExit(void)
 {
 	int i;
+
+	for (i = 0; i < N3DS_VRAM_DISPLAY_TEX_COUNT; i++)
+	{
+		C3D_TexDelete(&s_vramDisplayTex[i]);
+	}
 
 	for (i = 0; i < N3DS_ATLAS_COUNT; i++)
 	{
@@ -449,6 +473,26 @@ void N3DS_C3DBindAtlas(int atlasIndex)
 	}
 
 	C3D_TexBind(0, &s_atlasTextures[atlasIndex]);
+}
+
+void N3DS_C3DUploadVramDisplayChunk(int slotIndex, const void *tiled256)
+{
+	if ((slotIndex < 0) || (slotIndex >= N3DS_VRAM_DISPLAY_TEX_COUNT))
+	{
+		return;
+	}
+
+	C3D_TexUpload(&s_vramDisplayTex[slotIndex], tiled256);
+}
+
+void N3DS_C3DBindVramDisplayTex(int slotIndex)
+{
+	if ((slotIndex < 0) || (slotIndex >= N3DS_VRAM_DISPLAY_TEX_COUNT))
+	{
+		return;
+	}
+
+	C3D_TexBind(0, &s_vramDisplayTex[slotIndex]);
 }
 
 #ifdef CTR_INTERNAL

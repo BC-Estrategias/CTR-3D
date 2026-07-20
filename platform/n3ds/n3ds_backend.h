@@ -219,6 +219,33 @@ void N3DS_C3DBindAtlas(int atlasIndex);
  * headroom and darkens everything textured. */
 void N3DS_C3DSetColorDoubling(int enable);
 
+/* ------------------------------------------------------ VRAM display --- */
+/* Dedicated (not atlas-shared) textures backing NativeRenderer_PresentVRAMRect/
+ * PresentVRAMDisplay -- the boot-time SCEA/copyright VRAM-mirror blit. This
+ * is boot-only content that never competes with the decode cache for atlas
+ * capacity, so it gets its own small C3D_Tex pool rather than a shared cell.
+ * tiled256 is a whole 256x256 RGBA5551 buffer, uploaded via the real
+ * C3D_TexUpload -- unlike N3DS_C3DUploadDecodedCell's manual sub-rect write,
+ * these textures are never sub-addressed, so the plain whole-texture wrapper
+ * applies.
+ *
+ * A POOL, not one shared texture: citro3d defers GPU command execution to
+ * C3D_FrameEnd, but C3D_TexUpload is an immediate CPU memcpy (same hazard
+ * N3DS_C3DUploadDecodedCell's eviction policy avoids for the atlas, see its
+ * header comment above). A single present call chunks a wide rect into
+ * multiple pieces uploaded and drawn in the same still-open frame -- with one
+ * shared texture, chunk 2's upload would overwrite chunk 1's texture memory
+ * before chunk 1's already-queued draw actually executes, so both draws
+ * would sample chunk 2's content. slotIndex selects which pool texture a
+ * given chunk uses; the caller is responsible for giving each chunk drawn
+ * within the same present call a distinct slot. 4 slots covers a 2x2 grid,
+ * i.e. up to 512x512 -- comfortable headroom over the ~512x216 DISPENV this
+ * is actually used for. */
+#define N3DS_VRAM_DISPLAY_TEX_DIM   256
+#define N3DS_VRAM_DISPLAY_TEX_COUNT 4
+void N3DS_C3DUploadVramDisplayChunk(int slotIndex, const void *tiled256);
+void N3DS_C3DBindVramDisplayTex(int slotIndex);
+
 /* ---------------------------------------------------------------- input --- */
 
 #define N3DS_BTN_A      (1u << 0)

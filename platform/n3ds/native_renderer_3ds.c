@@ -1057,13 +1057,147 @@ void NativeRenderer_StoreFrameBuffer(int x, int y, int w, int h)
 	(void)x; (void)y; (void)w; (void)h;
 }
 
-void NativeRenderer_PresentVRAMDisplay(void)
+/* Scratch for one tiled VRAM-display chunk; reused every call, never
+ * persisted across frames. Mirrors s_decodeScratch's role for
+ * N3DS_DecodeAndTilePage above. */
+global_variable u16 s_vramDisplayScratch[N3DS_VRAM_DISPLAY_TEX_DIM * N3DS_VRAM_DISPLAY_TEX_DIM];
+
+/*
+ * Tiles a [x,y,w,h) rect of the emulated VRAM into a 256x256 RGBA5551 buffer
+ * for NativeRenderer_PresentVRAMRect below. Reuses N3DS_DecodeAndTilePage's
+ * Morton/Z-order tile addressing and BGR555->RGBA5551 channel packing
+ * verbatim -- same bug class a byte-order fix already landed in for that
+ * function, not worth re-deriving here. Alpha is forced always-opaque
+ * (bit set) rather than PSX's conditional punch-through test: this is a
+ * straight present of a VRAM rect, not a masked game texture, matching PC's
+ * NativeRenderer_BuildDisplayChunkRGBA's unconditional 0xff.
+ */
+internal void N3DS_TileVRAMDisplayChunk(int srcX, int srcY, int w, int h, u16 *outTiled256)
 {
+	int v;
+
+	for (v = 0; v < N3DS_VRAM_DISPLAY_TEX_DIM; v++)
+	{
+		int u;
+
+		for (u = 0; u < N3DS_VRAM_DISPLAY_TEX_DIM; u++)
+		{
+			u16 color16 = 0;
+			int morton, tileIndex, dstIndex;
+
+			if ((u < w) && (v < h))
+			{
+				color16 = vram[(srcY + v) * VRAM_WIDTH + (srcX + u)];
+			}
+
+			morton = (u & 1) | ((v & 1) << 1) | ((u & 2) << 1) | ((v & 2) << 2) | ((u & 4) << 2) | ((v & 4) << 3);
+			tileIndex = ((v >> 3) * (N3DS_VRAM_DISPLAY_TEX_DIM / 8) + (u >> 3)) * 64;
+			dstIndex = tileIndex + morton;
+
+			outTiled256[dstIndex] = (u16)(((color16 & 0x001Fu) << 11) |      /* R */
+			                              (((color16 >> 5) & 0x1Fu) << 6) |   /* G */
+			                              (((color16 >> 10) & 0x1Fu) << 1) |  /* B */
+			                              1u);                                /* always opaque */
+		}
+	}
 }
 
-void NativeRenderer_PresentVRAMRect(int x, int y, int w, int h)
+void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, int displayH)
 {
-	(void)x; (void)y; (void)w; (void)h;
+	const int maxChunk = N3DS_VRAM_DISPLAY_TEX_DIM;
+	int y;
+	int chunkSlot = 0;
+
+	if ((displayW <= 0) || (displayH <= 0))
+	{
+		return;
+	}
+
+	N3DS_C3DSetColorDoubling(0);
+
+	for (y = 0; y < displayH; y += maxChunk)
+	{
+		const int chunkH = ((displayH - y) > maxChunk) ? maxChunk : (displayH - y);
+		int x;
+
+		for (x = 0; x < displayW; x += maxChunk)
+		{
+			const int chunkW = ((displayW - x) > maxChunk) ? maxChunk : (displayW - x);
+			const float u1 = (float)chunkW / (float)maxChunk;
+			const float v1 = (float)chunkH / (float)maxChunk;
+			/* Which pool texture this chunk uploads to and draws from. Must
+			 * be distinct per chunk within this call -- see the header
+			 * comment on N3DS_C3DUploadVramDisplayChunk for why reusing one
+			 * texture across chunks in the same still-open frame silently
+			 * makes every chunk's draw sample whichever chunk uploaded last.
+			 * Wraps defensively rather than assuming displayW/H never
+			 * exceeds the pool's 2x2-chunk (512x512) coverage. */
+			const int slot = chunkSlot % N3DS_VRAM_DISPLAY_TEX_COUNT;
+			N3DS_Vertex verts[6];
+			int baseVertex;
+			int i;
+
+			chunkSlot++;
+
+			N3DS_TileVRAMDisplayChunk(displayX + x, displayY + y, chunkW, chunkH, s_vramDisplayScratch);
+			N3DS_C3DUploadVramDisplayChunk(slot, s_vramDisplayScratch);
+
+			/* v0.0 experiment (2026-07-20): source top-of-rect landed on
+			 * screen bottom on real output despite the quad's own screen-
+			 * space Y matching the same proven per-frame projection every
+			 * other draw uses, and despite the tile-address math being a
+			 * verbatim copy of N3DS_DecodeAndTilePage's proven-correct
+			 * formula. Swapping which screen edge samples V=0 vs V=v1 is the
+			 * most localized place left to try a fix, since everything else
+			 * here mirrors already-proven code; NOT independently confirmed
+			 * against a citro3d whole-texture-upload precedent (there isn't
+			 * one elsewhere in this codebase to check against). If this
+			 * looks wrong on the next capture, revert this V swap and look
+			 * upstream of this function instead. */
+			verts[0].x = (float)x;
+			verts[0].y = (float)y;
+			verts[0].u = 0.0f;
+			verts[0].v = v1;
+
+			verts[1].x = (float)x;
+			verts[1].y = (float)(y + chunkH);
+			verts[1].u = 0.0f;
+			verts[1].v = 0.0f;
+
+			verts[2].x = (float)(x + chunkW);
+			verts[2].y = (float)(y + chunkH);
+			verts[2].u = u1;
+			verts[2].v = 0.0f;
+
+			verts[3] = verts[0];
+			verts[4] = verts[2];
+
+			verts[5].x = (float)(x + chunkW);
+			verts[5].y = (float)y;
+			verts[5].u = u1;
+			verts[5].v = v1;
+
+			for (i = 0; i < 6; i++)
+			{
+				verts[i].r = 1.0f;
+				verts[i].g = 1.0f;
+				verts[i].b = 1.0f;
+				verts[i].a = 1.0f;
+			}
+
+			N3DS_C3DBindVramDisplayTex(slot);
+			baseVertex = N3DS_C3DAppendVertices(verts, 6);
+			if (baseVertex >= 0)
+			{
+				N3DS_C3DDrawTriangles(baseVertex, 2);
+			}
+		}
+	}
+}
+
+void NativeRenderer_PresentVRAMDisplay(void)
+{
+	NativeRenderer_PresentVRAMRect(activeDispEnv.disp.x, activeDispEnv.disp.y, activeDispEnv.disp.w, activeDispEnv.disp.h);
 }
 
 void NativeRenderer_SaveVRAM(const char *outputFileName, int x, int y, int width, int height, int readFromFramebuffer)
