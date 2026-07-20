@@ -199,18 +199,29 @@ global_variable u32 s_lastStatDrawCallCount = 0;
 /* Scratch for one decoded+tiled page; reused every decode, never persisted. */
 global_variable u8 s_decodeScratch[N3DS_DECODE_TEXTURE_DIM * N3DS_DECODE_TEXTURE_DIM * 4];
 
-/* Scratch for one converted atlas-run; sized to the whole per-frame vertex
- * buffer (not just one batch) so a run can never silently exceed what's
- * actually there -- a single run can in principle span as much of a frame
- * as one atlas covers. */
-global_variable N3DS_Vertex s_convertScratch[N3DS_MAX_FRAME_VERTICES];
+/* Scratch for one converted atlas-run. Bounded by N3DS_MAX_RUN_VERTICES,
+ * NOT the whole-frame budget: a run is flushed whenever the atlas changes
+ * or this fills, so it only ever stages one run at a time, and sizing it
+ * per-frame would cost megabytes of BSS for space no single run can use. */
+global_variable N3DS_Vertex s_convertScratch[N3DS_MAX_RUN_VERTICES];
 
-internal float N3DS_Clamp01(float v)
-{
-	if (v < 0.0f) { return 0.0f; }
-	if (v > 1.0f) { return 1.0f; }
-	return v;
-}
+/*
+ * citro3d frame brackets actually opened/closed, versus s_frameCounter's
+ * count of SwapWindow calls. These three should track each other 1:1:1.
+ * They are counted because Azahar's own host-side readout said "App: 1 FPS"
+ * while the in-guest counter reported ~13 -- a 13x gap that means either the
+ * top screen is being presented far less often than the game believes it is
+ * drawing, or the in-guest number is measuring the wrong thing. Guessing
+ * which is exactly the mistake this port keeps paying for; count it instead.
+ */
+global_variable u32 s_beginSceneCount = 0;
+global_variable u32 s_endSceneCount = 0;
+
+/* Runs dropped because the frame's vertex budget was exhausted. This is
+ * silent geometry loss -- whole draws vanish with nothing on screen to say
+ * so -- which is exactly how a too-small budget hid for a session. Any
+ * nonzero value here means content is missing. */
+global_variable u32 s_droppedRuns = 0;
 
 /*
  * Decodes PSX texture page `texPage` (through CLUT `clut` for 4/8-bit) into
@@ -246,6 +257,18 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u8
 	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
 	const int clutOriginX = (clut & 0x3F) * 16;
 	const int clutOriginY = clut >> 6;
+	/*
+	 * Decode only the columns this format can actually address. u/v reach the
+	 * full 0-255 at 4bpp, but a texture page is 64 VRAM words wide, so 8bpp
+	 * can only address u=0..127 and 16bpp only u=0..63 -- the game authors
+	 * texcoords format-aware and never samples beyond that. Decoding a fixed
+	 * 256 columns regardless was doing 2x the necessary work for 8bpp and 4x
+	 * for 16bpp, on the hottest path in the renderer (a cache miss decodes
+	 * 65,536 texels, and real track content was missing ~77 times a frame).
+	 * Columns past this bound keep whatever a previous decode left in them
+	 * and are never sampled.
+	 */
+	const int decodeWidth = (format == TF_4_BIT) ? 256 : ((format == TF_8_BIT) ? 128 : 64);
 	int v;
 
 	for (v = 0; v < N3DS_DECODE_TEXTURE_DIM; v++)
@@ -253,7 +276,7 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u8
 		const int wordRow = pageOriginY + v;
 		int u;
 
-		for (u = 0; u < N3DS_DECODE_TEXTURE_DIM; u++)
+		for (u = 0; u < decodeWidth; u++)
 		{
 			u16 color16;
 			u8 r, g, b, a;
@@ -432,11 +455,12 @@ internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 	baseVertex = N3DS_C3DAppendVertices(s_convertScratch, vertCount);
 	if (baseVertex < 0)
 	{
-		/* Frame vertex buffer full (N3DS_MAX_FRAME_VERTICES, a headroom
-		 * ceiling, not a measured real number) -- drop this run rather than
-		 * draw from a wrong/stale offset. Silent geometry loss is a real
-		 * regression, but not a currently expected one; revisit with real
-		 * instrumentation if it's ever hit in practice. */
+		/* Frame vertex budget exhausted -- drop this run rather than draw
+		 * from a wrong/stale offset. Counted and reported, never silent:
+		 * the budget was previously sized from PC's PER-PASS ceiling while
+		 * covering a whole frame of up to three passes, and the resulting
+		 * dropped draws looked like missing models rather than an error. */
+		s_droppedRuns++;
 		return;
 	}
 
@@ -541,6 +565,7 @@ void NativeRenderer_BeginScene(void)
 		return;
 	}
 
+	s_beginSceneCount++;
 	N3DS_C3DBeginFrame();
 }
 
@@ -551,6 +576,7 @@ void NativeRenderer_EndScene(void)
 		return;
 	}
 
+	s_endSceneCount++;
 	N3DS_C3DEndFrame();
 }
 
@@ -658,6 +684,27 @@ void NativeRenderer_SwapWindow(void)
 			         "[CTR-3DS] cache hits=%lu misses=%lu missesWindow=%lu evictions=%lu evictionsWindow=%lu draws=%lu drawsWindow=%lu",
 			         (unsigned long)s_decodeCacheHits, (unsigned long)s_decodeCacheMisses, missesWindow,
 			         (unsigned long)s_decodeCacheEvictions, evictionsWindow, (unsigned long)s_drawCallCount, drawsWindow);
+			N3DS_DebugLog(cacheLine);
+
+			/*
+			 * Vertex budget occupancy. dropped != 0 means whole draws were
+			 * discarded for want of buffer space, i.e. geometry is missing
+			 * from the screen -- the failure that previously had no symptom
+			 * other than absent models. peak approaching the ceiling is the
+			 * early warning for the same thing.
+			 */
+			printf("verts  peak %-7d /%-7d  dropped %-6lu\n", N3DS_C3DFrameVertexHighWater(),
+			       (int)N3DS_MAX_FRAME_VERTICES, (unsigned long)s_droppedRuns);
+
+			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] vertsPeak=%d/%d droppedRuns=%lu",
+			         N3DS_C3DFrameVertexHighWater(), (int)N3DS_MAX_FRAME_VERTICES, (unsigned long)s_droppedRuns);
+			N3DS_DebugLog(cacheLine);
+
+			printf("scene  begin %-8lu end %-8lu (vs %lu swaps)\n", (unsigned long)s_beginSceneCount,
+			       (unsigned long)s_endSceneCount, frames);
+
+			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] beginScene=%lu endScene=%lu swaps=%lu",
+			         (unsigned long)s_beginSceneCount, (unsigned long)s_endSceneCount, frames);
 			N3DS_DebugLog(cacheLine);
 		}
 	}
@@ -921,6 +968,11 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	 * exactly, which matters because this renderer has no depth test enabled
 	 * (matching PC) and relies on draw order alone for correct layering.
 	 */
+	/* bright is 2 for every textured primitive and 1 for every untextured
+	 * one, without exception (native_gpu.c), so the split's texture sentinel
+	 * determines it for the whole call -- no need to inspect each vertex. */
+	N3DS_C3DSetColorDoubling(untextured ? 0 : 1);
+
 	for (i = 0; i < triangles; i++)
 	{
 		const GrVertex *triVerts = &s_pendingVertices[startVertex + (i * 3)];
@@ -938,7 +990,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			                            &cellX, &cellY);
 		}
 
-		if ((atlasIdx != currentAtlas) || ((vertsInRun + 3) > N3DS_MAX_FRAME_VERTICES))
+		if ((atlasIdx != currentAtlas) || ((vertsInRun + 3) > N3DS_MAX_RUN_VERTICES))
 		{
 			N3DS_FlushRun(currentAtlas, vertsInRun);
 			currentAtlas = atlasIdx;
@@ -949,11 +1001,14 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		{
 			const GrVertex *src = &triVerts[v];
 			N3DS_Vertex *dst = &s_convertScratch[vertsInRun + v];
-			/* MakeTexcoordZero* (untextured) sets bright=1; MakeTexcoordQuad/
-			 * Triangle/Rect (textured) always set bright=2 -- see native_gpu.c.
-			 * PC's shader computes v_color.xyz = (color/255) * bright; baked
-			 * here CPU-side since bright isn't a GPU attribute on 3DS. */
-			const float brightScale = (src->bright != 0) ? (float)src->bright : 1.0f;
+			/* Vertex colour is the raw PSX colour only. The "bright" x2
+			 * multiplier (MakeTexcoordQuad/Triangle/Rect set bright=2 for
+			 * every textured primitive, MakeTexcoordZero* set 1 for every
+			 * untextured one -- native_gpu.c) is applied by the TEV output
+			 * scale instead, AFTER the texture modulate, matching PC. Baking
+			 * it here clamped the colour to 1.0 before the multiply and lost
+			 * all the headroom above it, which is what made textured surfaces
+			 * render darker than PC. See N3DS_C3DSetColorDoubling. */
 
 			dst->x = (float)src->x;
 			dst->y = (float)src->y;
@@ -972,9 +1027,9 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 				dst->v = ((float)cellY * N3DS_DECODE_TEXTURE_DIM + (float)src->v) / (float)N3DS_ATLAS_DIM;
 			}
 
-			dst->r = N3DS_Clamp01(((float)src->r / 255.0f) * brightScale);
-			dst->g = N3DS_Clamp01(((float)src->g / 255.0f) * brightScale);
-			dst->b = N3DS_Clamp01(((float)src->b / 255.0f) * brightScale);
+			dst->r = (float)src->r / 255.0f;
+			dst->g = (float)src->g / 255.0f;
+			dst->b = (float)src->b / 255.0f;
 			dst->a = 1.0f;
 		}
 

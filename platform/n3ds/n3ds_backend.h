@@ -94,19 +94,48 @@ void N3DS_C3DEndFrame(void);
  * only happens after ALL of a frame's CPU-side writes are already done.)
  * N3DS_C3DBeginFrame resets the write cursor to 0 every frame.
  *
- * N3DS_MAX_FRAME_VERTICES is a headroom ceiling, not a measured real number
- * -- matches the PC renderer's own MAX_VERTEX_BUFFER_SIZE (65536) rather
- * than guessing a 3DS-specific figure, since real per-frame vertex counts
- * are still unmeasured on this port (see the design doc's own open question
- * on this). Also used to size native_renderer_3ds.c's per-run conversion
- * scratch, since a single run can never need more space than a whole frame.
+ * SIZING -- corrected 2026-07-19. This budget covers a whole FRAME, but the
+ * PC ceiling it was originally copied from (MAX_VERTEX_BUFFER_SIZE, 65536)
+ * is per DrawAllSplits PASS, not per frame. DrawOTag calls DrawAllSplits
+ * once (native_gpu.c:856) and DrawSync can call it twice more (:1934,
+ * :1954); every pass refills s_gpu.vertexBuffer from scratch and calls
+ * UpdateVertexBuffer again, so PC's ceiling resets up to three times a
+ * frame where this cursor resets only once. Matching PC's number therefore
+ * under-budgeted a frame by up to 3x -- and the overflow was SILENT:
+ * N3DS_C3DAppendVertices returns -1 and N3DS_FlushRun drops the run, so
+ * geometry vanished with no error, no log line, nothing on screen. Budget
+ * the true worst case instead, and report a high-water mark so the real
+ * figure stops being a guess.
+ *
+ * MEASURED 2026-07-19: peak occupancy in menu/attract content is 2937
+ * vertices -- about 4% of the figure below, with zero dropped runs. So the
+ * under-budgeting described above was real in principle but never actually
+ * fired, and it is NOT the cause of any missing geometry seen so far.
+ * Keeping PC's own 65536 (22x the observed peak) rather than inflating to
+ * the 3x worst case, which would cost 4MB of linear memory to buy headroom
+ * nothing has ever needed. The real defect was that overflow was SILENT;
+ * droppedRuns below makes it loud, so if race content ever does exceed
+ * this, it reports itself instead of quietly deleting models.
+ *
+ * Do NOT "fix" a future overflow by resetting the cursor per pass. Every
+ * draw queued this frame is still unexecuted until C3D_FrameEnd, so reusing
+ * offsets within one frame reintroduces exactly the aliasing bug above.
  */
 #define N3DS_MAX_FRAME_VERTICES 65536
+/* Largest single atlas-run, i.e. the size of native_renderer_3ds.c's
+ * conversion scratch. A run flushes whenever the atlas changes or this
+ * fills, so it bounds one staging buffer rather than a frame. Stays at PC's
+ * per-pass ceiling: no single run can exceed one pass's total geometry. */
+#define N3DS_MAX_RUN_VERTICES 65536
 /* Returns the vertex offset this call's data was written at (pass to
  * N3DS_C3DDrawTriangles), or -1 if the frame buffer is full -- caller must
  * skip drawing in that case, not draw from a stale/wrong offset. */
 int N3DS_C3DAppendVertices(const N3DS_Vertex *vertices, int count);
 void N3DS_C3DDrawTriangles(int startVertex, int triangleCount);
+/* Highest vertex count reached in any single frame so far. Reported in the
+ * stats block: if this ever approaches N3DS_MAX_FRAME_VERTICES the budget
+ * above is too small for real content and geometry is about to disappear. */
+int N3DS_C3DFrameVertexHighWater(void);
 
 /* ---------------------------------------------------- decoded textures --- */
 /* CPU-decoded-texture cache backing store (design doc section 1), organised
@@ -143,14 +172,32 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount);
  * for the verified tile-order derivation this extends). tiledRGBA8 (the
  * per-call input) must already be tiled the same way a whole-texture upload
  * would need to be. */
+/*
+ * CAPACITY, measured 2026-07-19. With 2 atlases (32 cells, 31 usable) real
+ * track content evicted 2472 cells in a single 32-frame window -- 77 per
+ * frame, i.e. the whole cache replaced ~2.5x every frame. That one number
+ * caused BOTH visible problems at once: ~5M texel decodes/frame (the ~1fps),
+ * and -- because an evicted cell is overwritten while draws referencing it
+ * are still only queued -- nearly every textured triangle sampling some
+ * other triangle's texture, which is what the red/green speckle was.
+ * The working set is simply far larger than 31 entries, so give it room.
+ */
 #define N3DS_DECODE_TEXTURE_DIM    256
-#define N3DS_ATLAS_COUNT           2
+/* 8 atlases (32MB) does NOT allocate -- C3D_TexInit fails and C3DInit returns
+ * 0. 4 is the working figure; the real linear-memory ceiling is logged at
+ * init so this stops being guesswork. */
+#define N3DS_ATLAS_COUNT           4
 #define N3DS_ATLAS_DIM             1024
 #define N3DS_ATLAS_CELLS_PER_ROW   (N3DS_ATLAS_DIM / N3DS_DECODE_TEXTURE_DIM)
 #define N3DS_ATLAS_CELLS_PER_ATLAS (N3DS_ATLAS_CELLS_PER_ROW * N3DS_ATLAS_CELLS_PER_ROW)
 
 void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256RGBA8);
 void N3DS_C3DBindAtlas(int atlasIndex);
+/* Enables PC's x2 "bright" multiplier on RGB, applied after the texture
+ * modulate the way PC's fragment shader does it. Must not be folded into the
+ * vertex colour instead -- see the implementation comment for why that loses
+ * headroom and darkens everything textured. */
+void N3DS_C3DSetColorDoubling(int enable);
 
 /* ---------------------------------------------------------------- input --- */
 

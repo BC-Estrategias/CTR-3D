@@ -109,6 +109,7 @@ static C3D_RenderTarget *s_renderTarget = NULL;
 static C3D_Mtx s_projection;
 static void *s_vertexBufferMem = NULL;
 static int s_vertexCursor = 0;
+static int s_vertexHighWater = 0;
 static C3D_Tex s_atlasTextures[N3DS_ATLAS_COUNT];
 
 int N3DS_C3DInit(void)
@@ -188,12 +189,43 @@ int N3DS_C3DInit(void)
 
 	C3D_CullFace(GPU_CULL_NONE);
 
+	/*
+	 * No depth testing, matching the PC renderer's explicit
+	 * glDisable(GL_DEPTH_TEST) (native_renderer.c ~1880). This renderer is
+	 * pure painter's algorithm: the PS1 ordering table sorts whole polygons
+	 * on the CPU and draw order alone decides layering, which is why
+	 * DrawTriangles is careful never to reorder triangles.
+	 *
+	 * Setting this explicitly is load-bearing, not tidiness. Every vertex
+	 * leaves the shader at the SAME depth (ctr.v.pica forces z=0), so if
+	 * citro3d's default happened to enable testing with GPU_GREATER, every
+	 * fragment after the first at a given pixel would compare equal, fail,
+	 * and be discarded -- silently inverting layering so that whatever drew
+	 * FIRST wins instead of last. Relying on an unverified library default
+	 * for that is not worth it when PC states the intent outright.
+	 */
+	C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
+
 	{
 		int i;
+		char msg[128];
+
+		/* Atlases are the single largest linear-memory consumer here
+		 * (N3DS_ATLAS_DIM^2 * 4 bytes each). Log the budget before and after
+		 * so cache capacity can be sized from the real ceiling instead of
+		 * guessed -- 8 atlases was tried and failed outright. */
+		snprintf(msg, sizeof(msg), "[CTR-3DS] linear free before atlases: %lu KiB (want %d x %d KiB)",
+		         (unsigned long)(linearSpaceFree() / 1024), N3DS_ATLAS_COUNT,
+		         (N3DS_ATLAS_DIM * N3DS_ATLAS_DIM * 4) / 1024);
+		N3DS_DebugLog(msg);
+
 		for (i = 0; i < N3DS_ATLAS_COUNT; i++)
 		{
 			if (!C3D_TexInit(&s_atlasTextures[i], N3DS_ATLAS_DIM, N3DS_ATLAS_DIM, GPU_RGBA8))
 			{
+				snprintf(msg, sizeof(msg), "[CTR-3DS] atlas %d of %d FAILED to allocate; linear free %lu KiB", i,
+				         N3DS_ATLAS_COUNT, (unsigned long)(linearSpaceFree() / 1024));
+				N3DS_DebugLog(msg);
 				return 0;
 			}
 			C3D_TexSetFilter(&s_atlasTextures[i], GPU_NEAREST, GPU_NEAREST);
@@ -262,7 +294,17 @@ int N3DS_C3DAppendVertices(const N3DS_Vertex *vertices, int count)
 	memcpy(dst, vertices, (size_t)count * sizeof(N3DS_Vertex));
 	s_vertexCursor += count;
 
+	if (s_vertexHighWater < s_vertexCursor)
+	{
+		s_vertexHighWater = s_vertexCursor;
+	}
+
 	return base;
+}
+
+int N3DS_C3DFrameVertexHighWater(void)
+{
+	return s_vertexHighWater;
 }
 
 void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
@@ -310,6 +352,37 @@ void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void 
 
 		memcpy(dstRow, srcRow, (size_t)cellTilesPerRow * N3DS_TILE_BYTES);
 	}
+}
+
+void N3DS_C3DSetColorDoubling(int enable)
+{
+	/*
+	 * PC's "bright" multiplier, done the way PC does it. Its vertex shader
+	 * computes v_color.xyz = (color/255) * bright with NO clamp, and the
+	 * fragment shader clamps only at the final write, AFTER multiplying by
+	 * the texel (native_renderer.c: "v_color.xyz *= a_texcoord.z", then
+	 * "fragColor = dither(color * v_color)").
+	 *
+	 * Baking bright into the vertex colour CPU-side cannot reproduce that:
+	 * a vertex colour is clamped to 1.0 before it ever reaches the multiply,
+	 * so all the headroom above 1.0 is lost and every lit textured surface
+	 * comes out darker than on PC. The TEV output scale is applied AFTER the
+	 * modulate, which restores PC's exact ordering.
+	 *
+	 * RGB only -- deliberately NOT C3D_Both. PC scales only .xyz; doubling
+	 * alpha as well would push the 128 "opaque" sentinel to 255 and break
+	 * the punch-through alpha test in n3ds_backend.c's C3D_AlphaTest.
+	 */
+	C3D_TexEnv *env = C3D_GetTexEnv(0);
+
+	C3D_TexEnvScale(env, C3D_RGB, enable ? GPU_TEVSCALE_2 : GPU_TEVSCALE_1);
+	/* Explicit, not redundant-by-inspection: C3D_TexEnvScale is a plain
+	 * inline struct write, and citro3d exposes C3D_DirtyTexEnv precisely
+	 * because a modified env is not always flagged for re-emission. Without
+	 * a dirty flag the change never reaches the GPU and this whole function
+	 * is a silent no-op. Cheap to state outright rather than depend on
+	 * C3D_GetTexEnv's internals, which aren't visible from the headers. */
+	C3D_DirtyTexEnv(env);
 }
 
 void N3DS_C3DBindAtlas(int atlasIndex)
