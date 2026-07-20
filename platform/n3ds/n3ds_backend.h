@@ -147,7 +147,8 @@ int N3DS_C3DFrameVertexHighWater(void);
 /* CPU-decoded-texture cache backing store (design doc section 1), organised
  * as a small number of shared texture atlases rather than one dedicated
  * texture per decoded (page,clut,format) combo. Each atlas is a fixed
- * GPU_RGBA8 texture, nearest-filtered, clamped, holding a grid of
+ * GPU_RGBA5551 texture (2026-07-20, was GPU_RGBA8 -- see N3DS_TILE_BYTES in
+ * n3ds_backend.c), nearest-filtered, clamped, holding a grid of
  * N3DS_DECODE_TEXTURE_DIM-sized cells; native_renderer_3ds.c owns cache-
  * replacement policy (which (page,clut,format) is decoded into which
  * (atlas,cell)) and calls UploadDecodedCell to overwrite one cell's content.
@@ -189,15 +190,28 @@ int N3DS_C3DFrameVertexHighWater(void);
  * The working set is simply far larger than 31 entries, so give it room.
  */
 #define N3DS_DECODE_TEXTURE_DIM    256
-/* 8 atlases (32MB) does NOT allocate -- C3D_TexInit fails and C3DInit returns
- * 0. 4 is the working figure; the real linear-memory ceiling is logged at
- * init so this stops being guesswork. */
-#define N3DS_ATLAS_COUNT           4
+/*
+ * 8 atlases at 2MB each (GPU_RGBA5551) = 16MB -- exactly what 4 RGBA8 atlases
+ * cost before, so this is 2x the cells for the same memory. See N3DS_TILE_BYTES
+ * in n3ds_backend.c for why RGBA8 was buying nothing.
+ *
+ * The old note here said "8 atlases (32MB) does NOT allocate": true, and still
+ * true, but that was 8 RGBA8 atlases. The real constraint is the ~28MB linear
+ * ceiling logged at init, not the atlas count -- keep reading that log line
+ * rather than trusting either number.
+ *
+ * Why cells and not something cleverer: playing the menu measured a SATURATED
+ * 63/63 working set with ~45 capacity misses per frame and 2052 evictions of
+ * cells that a queued draw still pointed at. Cell count was the binding
+ * constraint on both the corruption and the decode cost.
+ */
+#define N3DS_ATLAS_COUNT           8
 #define N3DS_ATLAS_DIM             1024
 #define N3DS_ATLAS_CELLS_PER_ROW   (N3DS_ATLAS_DIM / N3DS_DECODE_TEXTURE_DIM)
 #define N3DS_ATLAS_CELLS_PER_ATLAS (N3DS_ATLAS_CELLS_PER_ROW * N3DS_ATLAS_CELLS_PER_ROW)
 
-void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256RGBA8);
+/* tiled256 buffer is RGBA5551 (2 bytes/texel), not RGBA8 -- see N3DS_TILE_BYTES. */
+void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256);
 void N3DS_C3DBindAtlas(int atlasIndex);
 /* Enables PC's x2 "bright" multiplier on RGB, applied after the texture
  * modulate the way PC's fragment shader does it. Must not be folded into the
@@ -219,6 +233,8 @@ void N3DS_C3DSetColorDoubling(int enable);
 #define N3DS_BTN_DOWN   (1u << 9)
 #define N3DS_BTN_LEFT   (1u << 10)
 #define N3DS_BTN_RIGHT  (1u << 11)
+#define N3DS_BTN_ZL     (1u << 12) /* PSX L2, see native_input.c kc_l2 */
+#define N3DS_BTN_ZR     (1u << 13) /* PSX R2, see native_input.c kc_r2 */
 
 /* Samples the pad and returns held buttons as N3DS_BTN_* bits. D-pad and
  * circle pad are folded together. */

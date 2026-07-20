@@ -84,18 +84,42 @@ internal u16 NativeRenderer3DS_PackBGR555(u8 r, u8 g, u8 b)
 global_variable TextureID s_currentTextureId = N3DS_TEXTURE_ID_VRAM;
 global_variable TexFormat s_currentTexFormat = TF_16_BIT;
 
+/*
+ * Debug-only, mirrors PC's g_dbg_texturelessMode (native_renderer.c:79,
+ * F2 key). No keyboard here -- toggled by ZL, see n3ds_backend.c's
+ * N3DS_ReadButtons. Forces every draw through the same untextured/white
+ * path real Gouraud splits already use (see NativeRenderer_SetTexture),
+ * so it also zeroes decode-cache activity -- useful for isolating whether
+ * a slow frame is texture-related at all.
+ */
+int g_dbg_texturelessMode = 0;
+
 global_variable const GrVertex *s_pendingVertices = NULL;
 global_variable int s_pendingVertexCount = 0;
 
 /*
- * VRAM is 1024x512 = exactly 4x2 page-sized (256x256) dirty-generation
- * cells (design doc section 1). A decode cache entry records the cell
+ * VRAM is 1024x512 = 16x8 64x64 dirty-generation cells (2026-07-20,
+ * shrunk from the original 4x2 256x256 page-sized grid -- design doc
+ * section 1 still describes the coarse version). With only 8 cells
+ * covering all of VRAM, any write anywhere in an eighth of it staled
+ * every decoded page sourced from that eighth, unrelated or not; race
+ * content measured stale=6418 (+272/w) against that grid. This is a
+ * diagnostic experiment to see how much of that is genuine per-texture
+ * animation vs. collateral invalidation from cells coarser than the
+ * pages decoded from them. A decode cache entry records the cell
  * generation(s) it was decoded against and is stale if any has since moved.
  */
-#define N3DS_VRAM_CELL_COLS  4
-#define N3DS_VRAM_CELL_ROWS  2
-#define N3DS_VRAM_CELL_DIM   256
+#define N3DS_VRAM_CELL_COLS  16
+#define N3DS_VRAM_CELL_ROWS  8
+#define N3DS_VRAM_CELL_DIM   64
 global_variable u32 s_vramCellGen[N3DS_VRAM_CELL_ROWS * N3DS_VRAM_CELL_COLS];
+
+/*
+ * Times N3DS_DirtyVRAMRect actually bumped a generation. Read with the
+ * capacity/stale miss split below: if this stays ~0 then stale misses are
+ * impossible by construction, and any thrashing is purely a capacity problem.
+ */
+global_variable u32 s_vramDirtyBumps = 0;
 
 internal int N3DS_VRAMCellIndex(int x, int y)
 {
@@ -133,6 +157,7 @@ internal void N3DS_DirtyVRAMRect(int x, int y, int w, int h)
 		for (cx = x / N3DS_VRAM_CELL_DIM; cx <= x1 / N3DS_VRAM_CELL_DIM; cx++)
 		{
 			s_vramCellGen[N3DS_VRAMCellIndex(cx * N3DS_VRAM_CELL_DIM, cy * N3DS_VRAM_CELL_DIM)]++;
+			s_vramDirtyBumps++;
 		}
 	}
 }
@@ -190,6 +215,66 @@ global_variable u32 s_decodeCacheEvictions = 0;
 global_variable u32 s_lastStatCacheMisses = 0;
 global_variable u32 s_lastStatCacheEvictions = 0;
 
+/*
+ * WHY a miss happened, which the counters above cannot distinguish and which
+ * decides the whole architecture (2026-07-20). Menu content measures ~1151
+ * misses / 1088 evictions per 32-frame window -- nearly one eviction per miss
+ * -- but "the cache is too small" and "the cache keeps being invalidated" look
+ * IDENTICAL in that pair, and they have opposite fixes:
+ *
+ *   - CAPACITY: no entry for this (page,clut,format) at all. The working set
+ *     genuinely exceeds N3DS_TOTAL_CELLS. Fix = more/smaller cells, or decode
+ *     a level's set once at load into persistent atlases.
+ *   - STALE: an entry for exactly this (page,clut,format) IS resident, but a
+ *     VRAM cell generation moved under it, so it re-decodes. Fix = dirty VRAM
+ *     at finer granularity than 256x256, or stop the mutator. Decoding once at
+ *     load would be WRONG here -- the source pixels really are changing.
+ *
+ * Decode-once-at-load is only viable if STALE is near zero. Measure before
+ * committing to it: this project has already paid twice for optimising against
+ * a premise that was never isolated (the atlas rework, and session 6's
+ * "ruled out by measurement" list).
+ */
+global_variable u32 s_decodeCacheStaleMisses = 0;
+global_variable u32 s_decodeCacheCapacityMisses = 0;
+global_variable u32 s_lastStatStaleMisses = 0;
+global_variable u32 s_lastStatCapacityMisses = 0;
+
+/*
+ * Distinct atlas cells touched in one frame -- an estimate of the live working
+ * set, to compare against N3DS_TOTAL_CELLS (63 usable). Counted by noticing an
+ * entry whose lastUsedFrame was not already this frame, so it SATURATES at the
+ * cache size when capacity binds: reading 63 means "at least 63", not "exactly
+ * 63". Read it together with the capacity/stale split, not alone.
+ */
+global_variable u32 s_frameTouchedCells = 0;
+global_variable u32 s_frameTouchedPeak = 0;
+
+/*
+ * Last cell that satisfied a lookup. Checked before the full scan because
+ * consecutive triangles in a split overwhelmingly share one (page,clut) --
+ * MakeTexcoordTriangle/Quad emit runs of primitives off the same texture --
+ * so this turns the common case from a 63-entry scan into one compare.
+ *
+ * Measured 2026-07-20, and this is why it exists: renderer_draw_triangles_ms
+ * was 16-18ms of a 36-63ms frame (~70% of render_submit_ms, the top bucket)
+ * at ~2040 triangles/frame, i.e. ~8us per triangle -- while the cache was
+ * hitting 362,396 times against 1,326 misses. The cost was never decoding;
+ * it was the linear scan on the way to a hit. Safe against eviction without
+ * any invalidation step: the memo re-checks the full key, so a stale index
+ * just falls through to the scan.
+ */
+global_variable int s_lastCellHit = 0;
+
+/*
+ * Misses that had to evict a cell already referenced by a draw QUEUED earlier
+ * this same frame. citro3d executes nothing until C3D_FrameEnd, but the cell
+ * upload is an immediate CPU memcpy, so overwriting such a cell silently
+ * changes the texture an already-queued triangle will sample. Nonzero here
+ * means on-screen corruption; see the victim search in FindOrDecodeTexture.
+ */
+global_variable u32 s_evictHazards = 0;
+
 /* One increment per actual C3D_DrawArrays call (N3DS_FlushRun, called from
  * DrawTriangles) -- checks the design doc's own predicted "more, smaller
  * draw calls than PC" risk directly; measured ~150-290/frame before the
@@ -204,8 +289,9 @@ global_variable int s_projectionDispW = -1;
 global_variable int s_projectionDispH = -1;
 global_variable u32 s_lastStatDrawCallCount = 0;
 
-/* Scratch for one decoded+tiled page; reused every decode, never persisted. */
-global_variable u8 s_decodeScratch[N3DS_DECODE_TEXTURE_DIM * N3DS_DECODE_TEXTURE_DIM * 4];
+/* Scratch for one decoded+tiled page; reused every decode, never persisted.
+ * One u16 per texel (GPU_RGBA5551) -- see N3DS_TILE_BYTES in n3ds_backend.c. */
+global_variable u16 s_decodeScratch[N3DS_DECODE_TEXTURE_DIM * N3DS_DECODE_TEXTURE_DIM];
 
 /* Scratch for one converted atlas-run. Bounded by N3DS_MAX_RUN_VERTICES,
  * NOT the whole-frame budget: a run is flushed whenever the atlas changes
@@ -259,7 +345,7 @@ global_variable u32 s_droppedRuns = 0;
  * n3ds_backend.c); the 128/255 split is decoded now so 2b's STP 2-pass
  * doesn't need to touch this function at all.
  */
-internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u8 *outTiled256)
+internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u16 *outTiled256)
 {
 	const int pageOriginX = (texPage & 0xF) * 64;
 	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
@@ -287,7 +373,6 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u8
 		for (u = 0; u < decodeWidth; u++)
 		{
 			u16 color16;
-			u8 r, g, b, a;
 			int morton, tileIndex, dstIndex;
 
 			switch (format)
@@ -325,42 +410,37 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u8
 				break;
 			}
 
-			r = (u8)((color16 & 31) << 3);
-			g = (u8)(((color16 >> 5) & 31) << 3);
-			b = (u8)(((color16 >> 10) & 31) << 3);
-
-			if (color16 == 0)
-			{
-				a = 0;
-			}
-			else if (color16 & 0x8000)
-			{
-				a = 255;
-			}
-			else
-			{
-				a = 128;
-			}
-
 			morton = (u & 1) | ((v & 1) << 1) | ((u & 2) << 1) | ((v & 2) << 2) | ((u & 4) << 2) | ((v & 4) << 3);
 			tileIndex = ((v >> 3) * (N3DS_DECODE_TEXTURE_DIM / 8) + (u >> 3)) * 64;
 			dstIndex = tileIndex + morton;
 
 			/*
-			 * PICA200 GPU_RGBA8 texels run A,B,G,R in increasing byte order,
-			 * not R,G,B,A -- the format name describes which channels it
-			 * carries, not their memory layout. Verified empirically against
-			 * devkitPro's own tex3ds: converting a solid (R=AA,G=BB,B=CC,A=DD)
-			 * image with `tex3ds -r -z none -f rgba8` emits `dd cc bb aa` per
-			 * texel. Writing R,G,B,A here put alpha in the sampled red channel
-			 * (a near-constant 128/255, hence a uniform red cast), swapped
-			 * green and blue, and fed the sampled alpha -- and therefore the
-			 * punch-through alpha test -- from the red channel.
+			 * PSX BGR555 -> PICA200 GPU_RGBA5551. Both are 16-bit and both keep
+			 * 5 bits per channel, so this is a bit shuffle with no expansion or
+			 * loss -- unlike the previous RGBA8 path, which widened every
+			 * channel to 8 bits and wrote four separate bytes.
+			 *
+			 * Source (PSX): bit 15 = STP, 14-10 = B, 9-5 = G, 4-0 = R.
+			 * Dest (PICA):  15-11 = R, 10-6 = G, 5-1 = B, 0 = A.
+			 *
+			 * Destination layout verified EMPIRICALLY, not inferred from the
+			 * format name -- inferring is precisely what made session 6 rule
+			 * out a byte-order bug that turned out to be the bug. Converting a
+			 * solid R=0xF8,A=0xFF PNG with `tex3ds -r -z none -f rgba5551`
+			 * emits `01 f8` per texel, i.e. 0xF801 little-endian = R=31, G=0,
+			 * B=0, A=1. That pins R to the top 5 bits and alpha to bit 0.
+			 *
+			 * Alpha is now one bit: 0 for the PS1 "pure black is invisible"
+			 * punch-through case, 1 otherwise. That is exactly what the single
+			 * C3D_AlphaTest(GPU_GEQUAL, 1) consumes. The old three-level
+			 * 0/128/255 encoding existed for phase 2b's STP two-pass blend,
+			 * which is not built and which can recover the STP bit straight
+			 * from VRAM (bit 15, still right there) when it is.
 			 */
-			outTiled256[dstIndex * 4 + 0] = a;
-			outTiled256[dstIndex * 4 + 1] = b;
-			outTiled256[dstIndex * 4 + 2] = g;
-			outTiled256[dstIndex * 4 + 3] = r;
+			outTiled256[dstIndex] = (u16)(((color16 & 0x001Fu) << 11) |        /* R */
+			                              (((color16 >> 5) & 0x1Fu) << 6) |     /* G */
+			                              (((color16 >> 10) & 0x1Fu) << 1) |    /* B */
+			                              ((color16 != 0) ? 1u : 0u));          /* punch-through */
 		}
 	}
 }
@@ -388,20 +468,105 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 	 * 4-bit CLUT is only 16 wide and can never cross one). Track the far
 	 * edge's cell too so a change there isn't missed. */
 	const int clutCellB = N3DS_VRAMCellIndex(clutOriginX + 255, clutOriginY);
-	int i, oldestSlot = 1;
-	u32 oldestFrame = 0xFFFFFFFFu;
+	/* Hoisted out of the scan: these three were re-read from s_vramCellGen on
+	 * every one of up to 63 iterations, per triangle. */
+	const u32 pageGen = s_vramCellGen[pageCell];
+	const u32 clutGenA = s_vramCellGen[clutCellA];
+	const u32 clutGenB = s_vramCellGen[clutCellB];
+	int i, oldestSlot;
+	u32 oldestFrame;
+	/* Set when a cell holds exactly this (page,clut,format) but its source VRAM
+	 * generation has moved -- i.e. the texture IS resident and we are re-decoding
+	 * it anyway. Separates the two miss causes; see s_decodeCacheStaleMisses. */
+	int sawStaleKeyMatch = 0;
+
+	/* Fast path: the cell that answered the previous lookup. See s_lastCellHit. */
+	if (s_lastCellHit > 0)
+	{
+		N3DS_DecodeCacheEntry *e = &s_decodeCache[s_lastCellHit];
+
+		if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) && (e->pageGen == pageGen) &&
+		    (e->clutGenA == clutGenA) && (e->clutGenB == clutGenB))
+		{
+			if (e->lastUsedFrame != s_frameCounter)
+			{
+				s_frameTouchedCells++;
+			}
+			e->lastUsedFrame = s_frameCounter;
+			s_decodeCacheHits++;
+			return s_lastCellHit;
+		}
+	}
 
 	for (i = 1; i < N3DS_TOTAL_CELLS; i++)
 	{
 		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
 
-		if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) &&
-		    (e->pageGen == s_vramCellGen[pageCell]) && (e->clutGenA == s_vramCellGen[clutCellA]) &&
-		    (e->clutGenB == s_vramCellGen[clutCellB]))
+		/* Key first, cheapest rejection first. The LRU victim search that used
+		 * to share this loop has moved below: it is only needed on a miss, and
+		 * misses are rare (measured 0-25 per 32-frame window against ~65,000
+		 * lookups), so it was pure overhead on every hit. */
+		if (!e->used || (e->page != texPage) || (e->clut != clut) || (e->format != format))
 		{
+			continue;
+		}
+
+		if ((e->pageGen == pageGen) && (e->clutGenA == clutGenA) && (e->clutGenB == clutGenB))
+		{
+			if (e->lastUsedFrame != s_frameCounter)
+			{
+				s_frameTouchedCells++;
+			}
 			e->lastUsedFrame = s_frameCounter;
 			s_decodeCacheHits++;
+			s_lastCellHit = i;
 			return i;
+		}
+
+		sawStaleKeyMatch = 1;
+	}
+
+	s_decodeCacheMisses++;
+	if (sawStaleKeyMatch)
+	{
+		s_decodeCacheStaleMisses++;
+	}
+	else
+	{
+		s_decodeCacheCapacityMisses++;
+	}
+
+	/*
+	 * Pick the victim. Skip any cell already stamped with this frame: a draw
+	 * referencing it is queued but unexecuted (citro3d runs the whole command
+	 * list at C3D_FrameEnd) while N3DS_C3DUploadDecodedCell memcpys over it
+	 * immediately, so evicting one silently repoints an already-queued triangle
+	 * at a different texture. That is the mid-frame eviction hazard, and it is
+	 * the same class of bug as the vertex-buffer aliasing fixed in session 6.
+	 *
+	 * The old code could not avoid it and made it worse: it initialised
+	 * oldestSlot=1 and compared with strict <, so once every cell carried the
+	 * current frame's stamp, every further miss re-evicted slot 1 specifically.
+	 *
+	 * Must also check `used`: an entry that has never been decoded into can
+	 * never be referenced by a queued draw, so it is always a safe victim
+	 * regardless of its lastUsedFrame value. Without this, frame 0 breaks --
+	 * s_frameCounter starts at 0 and every entry's zero-initialised
+	 * lastUsedFrame also reads 0, so EVERY cell (not just genuinely-touched
+	 * ones) matches the skip condition on the very first frame, oldestSlot
+	 * never gets set, and the code falls into the "every cell spoken for"
+	 * hazard branch below on every miss that frame -- exactly the same-slot
+	 * re-eviction bug this rewrite was meant to fix, reintroduced for frame 0.
+	 */
+	oldestSlot = -1;
+	oldestFrame = 0xFFFFFFFFu;
+	for (i = 1; i < N3DS_TOTAL_CELLS; i++)
+	{
+		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
+
+		if (e->used && (e->lastUsedFrame == s_frameCounter))
+		{
+			continue;
 		}
 
 		if (e->lastUsedFrame < oldestFrame)
@@ -411,11 +576,28 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 		}
 	}
 
-	s_decodeCacheMisses++;
+	if (oldestSlot < 0)
+	{
+		/*
+		 * Every cell is spoken for by a queued draw. Corruption is unavoidable
+		 * without splitting the frame (C3D_FrameSplit, which would flush the
+		 * queued draws first); that is the real fix and is not done here. Count
+		 * it so the condition is visible rather than silent -- if this stays 0
+		 * in real content, the frame split is not worth building.
+		 */
+		s_evictHazards++;
+		oldestSlot = 1;
+	}
+
 	if (s_decodeCache[oldestSlot].used)
 	{
 		s_decodeCacheEvictions++;
 	}
+	if (s_decodeCache[oldestSlot].lastUsedFrame != s_frameCounter)
+	{
+		s_frameTouchedCells++;
+	}
+	s_lastCellHit = oldestSlot;
 
 	N3DS_DecodeAndTilePage(texPage, clut, format, s_decodeScratch);
 	{
@@ -521,21 +703,19 @@ int NativeRenderer_InitialisePSX(void)
 	}
 
 	/*
-	 * White cell: flat opaque texel (r=g=b=255, a=128 -- the "opaque" alpha
-	 * sentinel, see N3DS_DecodeAndTilePage) for untextured/Gouraud splits.
-	 * Uniform colour makes the 8x8 tile swizzle a no-op (every permutation of
-	 * identical values is identical), so this just fills linearly. Uploaded
-	 * once here into atlas 0's cell (0,0); that cell is never entered into
-	 * the LRU cache and never re-decoded. Byte order is A,B,G,R to match
-	 * N3DS_DecodeAndTilePage -- writing it R,G,B,A here would land alpha in
-	 * the sampled red channel and tint every untextured primitive.
+	 * White cell: flat opaque texel for untextured/Gouraud splits. Uniform
+	 * colour makes the 8x8 tile swizzle a no-op (every permutation of identical
+	 * values is identical), so this just fills linearly. Uploaded once here
+	 * into atlas 0's cell (0,0); that cell is never entered into the LRU cache
+	 * and never re-decoded.
+	 *
+	 * Must use the same GPU_RGBA5551 layout as N3DS_DecodeAndTilePage -- it
+	 * feeds every untextured primitive, so a mismatch here inverts the bug onto
+	 * flat-shaded geometry instead of textured. 0xFFFF = R,G,B all 31, alpha 1.
 	 */
 	for (i = 0; i < (N3DS_DECODE_TEXTURE_DIM * N3DS_DECODE_TEXTURE_DIM); i++)
 	{
-		s_decodeScratch[i * 4 + 0] = 128;
-		s_decodeScratch[i * 4 + 1] = 255;
-		s_decodeScratch[i * 4 + 2] = 255;
-		s_decodeScratch[i * 4 + 3] = 255;
+		s_decodeScratch[i] = 0xFFFFu;
 	}
 	N3DS_C3DUploadDecodedCell(N3DS_WHITE_ATLAS, N3DS_WHITE_CELL_X, N3DS_WHITE_CELL_Y, s_decodeScratch);
 
@@ -575,20 +755,31 @@ void NativeRenderer_BeginScene(void)
 
 	s_beginSceneCount++;
 
+	/* Working-set estimate is per frame, so latch its peak and restart the
+	 * count at the frame boundary. BeginScene is guarded against re-entry by
+	 * Platform_BeginScene, so this runs exactly once per frame. */
+	if (s_frameTouchedCells > s_frameTouchedPeak)
+	{
+		s_frameTouchedPeak = s_frameTouchedCells;
+	}
+	s_frameTouchedCells = 0;
+
 	/*
-	 * Fit the game's own display area to the panel. CTR runs a 512x216 DISPENV
-	 * while the top screen is 400x240, so the previous 1:1 passthrough showed
-	 * only the left 400 columns and left the bottom 24 rows empty.
+	 * Fit the game's own display area to the panel, cropped to the PSX's
+	 * intended 4:3 aspect rather than widened to the top screen's 5:3
+	 * (2026-07-20). CTR runs a 512x216 DISPENV; previously this widened the
+	 * ortho range to fill the full 400px panel width, which showed ~40 extra
+	 * PSX-space columns of world per edge that were never meant to be on
+	 * screen -- the source of the "can see past the edge of the track"
+	 * jaggies. That's gone now: the range below is unwidened (native dispW),
+	 * matched by a viewport crop in N3DS_C3DBeginFrame (n3ds_backend.c) so
+	 * this native range isn't just re-stretched across the full 400px
+	 * instead (which would trade the extra-content problem for a
+	 * ~25%-too-wide distortion problem).
 	 *
 	 * Read from the live DISPENV rather than hardcoding 512x216: the game
 	 * double-buffers two dispEnvs and could change modes, and this costs two
 	 * integer compares a frame.
-	 *
-	 * Aspect: the PSX frame is meant to fill a 4:3 display, but the 3DS top
-	 * screen is 5:3. Preserving 4:3 means drawing into a 320x240 centre with
-	 * pillarbox bars, which the wider-than-source ortho below produces. To
-	 * stretch to the full width instead -- no bars, ~25% too wide -- use
-	 * (0, dispW, dispH).
 	 */
 	{
 		const int dispW = (activeDispEnv.disp.w > 0) ? activeDispEnv.disp.w : 512;
@@ -596,18 +787,13 @@ void NativeRenderer_BeginScene(void)
 
 		if ((dispW != s_projectionDispW) || (dispH != s_projectionDispH))
 		{
-			/* Panel is 400 wide; a 4:3 area inside it is 240*4/3 = 320 wide, so
-			 * the full panel spans dispW * 400/320 PSX units, centred. */
-			const float orthoW = (float)dispW * (400.0f / 320.0f);
-			const float margin = (orthoW - (float)dispW) * 0.5f;
 			char line[96];
 
 			s_projectionDispW = dispW;
 			s_projectionDispH = dispH;
-			N3DS_C3DSetProjection(-margin, (float)dispW + margin, (float)dispH);
+			N3DS_C3DSetProjection(0.0f, (float)dispW, (float)dispH);
 
-			snprintf(line, sizeof(line), "[CTR-3DS] projection: disp %dx%d -> ortho %d..%d x 0..%d", dispW, dispH, (int)-margin, (int)((float)dispW + margin),
-			         dispH);
+			snprintf(line, sizeof(line), "[CTR-3DS] projection: disp %dx%d -> ortho 0..%d x 0..%d (4:3, viewport-cropped)", dispW, dispH, dispW, dispH);
 			N3DS_DebugLog(line);
 		}
 	}
@@ -737,12 +923,29 @@ void NativeRenderer_SwapWindow(void)
 			const unsigned long drawsPerFrameAvgX10 = (drawsWindow * 10UL) / 32UL;
 			char cacheLine[128];
 
+			const unsigned long staleWindow = (unsigned long)(s_decodeCacheStaleMisses - s_lastStatStaleMisses);
+			const unsigned long capacityWindow = (unsigned long)(s_decodeCacheCapacityMisses - s_lastStatCapacityMisses);
+
 			s_lastStatCacheMisses = s_decodeCacheMisses;
 			s_lastStatCacheEvictions = s_decodeCacheEvictions;
 			s_lastStatDrawCallCount = s_drawCallCount;
+			s_lastStatStaleMisses = s_decodeCacheStaleMisses;
+			s_lastStatCapacityMisses = s_decodeCacheCapacityMisses;
 
 			printf("cache  hits %-8lu miss %-6lu (+%-4lu/w) evict %-4lu (+%-4lu/w)\n", (unsigned long)s_decodeCacheHits,
 			       (unsigned long)s_decodeCacheMisses, missesWindow, (unsigned long)s_decodeCacheEvictions, evictionsWindow);
+			/* WHY the misses happened. cap = working set exceeds the cache;
+			 * stale = the texture was resident but its VRAM moved. These have
+			 * opposite fixes, so never read the miss count without this split.
+			 * set = distinct cells touched in the worst frame (saturates at
+			 * N3DS_TOTAL_CELLS-1); dirty = generation bumps since boot. */
+			printf("miss   cap %-6lu (+%-4lu/w) stale %-6lu (+%-4lu/w)\n", (unsigned long)s_decodeCacheCapacityMisses,
+			       capacityWindow, (unsigned long)s_decodeCacheStaleMisses, staleWindow);
+			printf("set    peak %-4lu /%-4d cells   vramDirty %-8lu\n", (unsigned long)s_frameTouchedPeak,
+			       (int)(N3DS_TOTAL_CELLS - 1), (unsigned long)s_vramDirtyBumps);
+			/* Nonzero = a cell was overwritten while a queued draw still
+			 * referenced it, i.e. visible texture corruption. */
+			printf("hazard evictInUse %-8lu\n", (unsigned long)s_evictHazards);
 			printf("draws  total %-8lu +%-6lu/w  ~%lu.%lu draws/frame        \n", (unsigned long)s_drawCallCount, drawsWindow,
 			       drawsPerFrameAvgX10 / 10UL, drawsPerFrameAvgX10 % 10UL);
 
@@ -750,6 +953,16 @@ void NativeRenderer_SwapWindow(void)
 			         "[CTR-3DS] cache hits=%lu misses=%lu missesWindow=%lu evictions=%lu evictionsWindow=%lu draws=%lu drawsWindow=%lu",
 			         (unsigned long)s_decodeCacheHits, (unsigned long)s_decodeCacheMisses, missesWindow,
 			         (unsigned long)s_decodeCacheEvictions, evictionsWindow, (unsigned long)s_drawCallCount, drawsWindow);
+			N3DS_DebugLog(cacheLine);
+
+			snprintf(cacheLine, sizeof(cacheLine),
+			         "[CTR-3DS] miss capacity=%lu capacityWindow=%lu stale=%lu staleWindow=%lu setPeak=%lu/%d vramDirty=%lu",
+			         (unsigned long)s_decodeCacheCapacityMisses, capacityWindow, (unsigned long)s_decodeCacheStaleMisses,
+			         staleWindow, (unsigned long)s_frameTouchedPeak, (int)(N3DS_TOTAL_CELLS - 1),
+			         (unsigned long)s_vramDirtyBumps);
+			N3DS_DebugLog(cacheLine);
+
+			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] hazard evictInUse=%lu", (unsigned long)s_evictHazards);
 			N3DS_DebugLog(cacheLine);
 
 			/*
@@ -1007,6 +1220,12 @@ void NativeRenderer_SetupClipMode(const RECT16 *clipRect, const DISPENV *display
 
 void NativeRenderer_SetTexture(TextureID texture, TexFormat texFormat)
 {
+#ifdef CTR_INTERNAL
+	if (g_dbg_texturelessMode)
+	{
+		texture = N3DS_TEXTURE_ID_WHITE;
+	}
+#endif
 	s_currentTextureId = texture;
 	s_currentTexFormat = texFormat;
 }
@@ -1161,9 +1380,20 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 				dst->v = ((float)cellY * N3DS_DECODE_TEXTURE_DIM + (float)src->v) / (float)N3DS_ATLAS_DIM;
 			}
 
-			dst->r = (float)src->r / 255.0f;
-			dst->g = (float)src->g / 255.0f;
-			dst->b = (float)src->b / 255.0f;
+			/*
+			 * Multiply by the reciprocal rather than divide. GCC cannot make
+			 * this substitution itself without -ffast-math, because 1/255 is
+			 * not exactly representable in binary float -- but a VFP divide on
+			 * ARM11 is ~14-19 cycles and does not pipeline, and this ran three
+			 * times per vertex, nine times per triangle, ~2040 triangles a
+			 * frame, inside the top profiler bucket. The rounding difference is
+			 * at most one ULP on a value that ends up in an 8-bit channel.
+			 * (The UV divides above are by 1024, a power of two and therefore
+			 * exact, so the compiler already folds those to a multiply.)
+			 */
+			dst->r = (float)src->r * (1.0f / 255.0f);
+			dst->g = (float)src->g * (1.0f / 255.0f);
+			dst->b = (float)src->b * (1.0f / 255.0f);
 			dst->a = 1.0f;
 		}
 

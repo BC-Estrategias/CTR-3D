@@ -226,6 +226,8 @@ static void N3DS_PumpInput(void)
 
 	N3DS_SetKey(SDL_SCANCODE_LSHIFT, (held & N3DS_BTN_L) != 0); /* L1 */
 	N3DS_SetKey(SDL_SCANCODE_RSHIFT, (held & N3DS_BTN_R) != 0); /* R1 */
+	N3DS_SetKey(SDL_SCANCODE_LCTRL, (held & N3DS_BTN_ZL) != 0); /* L2, see native_input.c kc_l2 */
+	N3DS_SetKey(SDL_SCANCODE_RCTRL, (held & N3DS_BTN_ZR) != 0); /* R2, see native_input.c kc_r2 */
 
 	N3DS_SetKey(SDL_SCANCODE_UP, (held & N3DS_BTN_UP) != 0);
 	N3DS_SetKey(SDL_SCANCODE_DOWN, (held & N3DS_BTN_DOWN) != 0);

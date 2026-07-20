@@ -194,9 +194,11 @@ int N3DS_C3DInit(void)
 	C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
 
 	/*
-	 * Punch-through sentinel (design doc section 2): the decode cache encodes
-	 * alpha as 0 = "PS1 pure-black-is-invisible" texel, 128 = opaque, 255 =
-	 * STP-on. Phase 2a is single-pass only (no STP 2-pass blending yet, that's
+	 * Punch-through sentinel. As of the GPU_RGBA5551 conversion (2026-07-20,
+	 * see N3DS_TILE_BYTES) the decode cache encodes alpha as a single bit: 0 =
+	 * "PS1 pure-black-is-invisible" texel, 1 = opaque or STP-on (no longer
+	 * distinguished -- that needs the STP bit recovered from VRAM directly
+	 * when 2b lands). Phase 2a is single-pass only (no STP 2-pass blending yet, that's
 	 * 2b), so one GEQUAL-1 test rejects exactly the punch-through case and
 	 * passes everything else -- exactly the design doc's "single-pass" mode.
 	 * Set once here rather than per-draw since 2a never needs a different test.
@@ -232,12 +234,12 @@ int N3DS_C3DInit(void)
 		 * guessed -- 8 atlases was tried and failed outright. */
 		snprintf(msg, sizeof(msg), "[CTR-3DS] linear free before atlases: %lu KiB (want %d x %d KiB)",
 		         (unsigned long)(linearSpaceFree() / 1024), N3DS_ATLAS_COUNT,
-		         (N3DS_ATLAS_DIM * N3DS_ATLAS_DIM * 4) / 1024);
+		         (N3DS_ATLAS_DIM * N3DS_ATLAS_DIM * 2) / 1024);
 		N3DS_DebugLog(msg);
 
 		for (i = 0; i < N3DS_ATLAS_COUNT; i++)
 		{
-			if (!C3D_TexInit(&s_atlasTextures[i], N3DS_ATLAS_DIM, N3DS_ATLAS_DIM, GPU_RGBA8))
+			if (!C3D_TexInit(&s_atlasTextures[i], N3DS_ATLAS_DIM, N3DS_ATLAS_DIM, GPU_RGBA5551))
 			{
 				snprintf(msg, sizeof(msg), "[CTR-3DS] atlas %d of %d FAILED to allocate; linear free %lu KiB", i,
 				         N3DS_ATLAS_COUNT, (unsigned long)(linearSpaceFree() / 1024));
@@ -282,6 +284,25 @@ void N3DS_C3DBeginFrame(void)
 	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 	C3D_RenderTargetClear(s_renderTarget, C3D_CLEAR_ALL, 0x000000FF, 0);
 	C3D_FrameDrawOn(s_renderTarget);
+
+	/*
+	 * Pillarbox the top screen to the bottom screen's 4:3-equivalent width
+	 * (2026-07-20). Top panel is 400 wide, bottom is 320 -- PSX content is
+	 * meant for 4:3, and letting it fill the full 400 (what the ortho range
+	 * alone can't prevent, see NativeRenderer_BeginScene) shows ~40 extra PSX
+	 * columns of world per edge that were never meant to be on screen.
+	 *
+	 * The render target is stored sideways, 240x400 (see
+	 * C3D_RenderTargetCreate above), for the 3DS's rotated panel, so
+	 * screen-X is this buffer's Y axis, not X. A *centred* crop is symmetric
+	 * either way that rotation runs, so which physical edge is which doesn't
+	 * matter here: (400-320)/2 = 40px margin, full 240 untouched on the
+	 * buffer's other axis (both screens are 240 tall, no vertical crop).
+	 * Fixed hardware constants, not DISPENV-dependent, so set once a frame
+	 * here rather than threaded through as a parameter.
+	 */
+	C3D_SetViewport(0, 40, 240, 320);
+
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
 
 	/* Every draw this frame appends into the SAME persistent buffer at a
@@ -328,10 +349,28 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
 	C3D_DrawArrays(GPU_TRIANGLES, startVertex, triangleCount * 3);
 }
 
-/* 8x8 texels * 4 bytes/texel (RGBA8) -- one PICA200 tile, tiled contiguously. */
-#define N3DS_TILE_BYTES (64 * 4)
+/*
+ * 8x8 texels * 2 bytes/texel (RGBA5551) -- one PICA200 tile, tiled
+ * contiguously.
+ *
+ * Was RGBA8 until 2026-07-20. The decode cache encoded a three-level alpha
+ * (0 punch-through / 128 opaque / 255 STP-on) but NOTHING ever read the
+ * 128-vs-255 distinction: the only alpha test in this file is a single
+ * C3D_AlphaTest(true, GPU_GEQUAL, 1), i.e. zero-vs-nonzero, because the STP
+ * two-pass blend is phase 2b and is not built. So half of every cell's memory
+ * was carrying a distinction no code consumed.
+ *
+ * Halving the texel doubles the number of cache cells the same linear memory
+ * buys, and cell COUNT was the measured bottleneck: playing the menu showed
+ * 1441 capacity misses per 32-frame window (~45/frame) against a saturated
+ * 63/63 working set, plus 2052 evictions of cells a queued draw still
+ * referenced -- which is the visible texture corruption. When 2b arrives it
+ * needs the STP bit back; recover it from VRAM then rather than paying for it
+ * on every cell now.
+ */
+#define N3DS_TILE_BYTES (64 * 2)
 
-void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256RGBA8)
+void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256)
 {
 	/*
 	 * Manual sub-rect write -- see the header comment for why C3D_TexUpload
@@ -349,7 +388,7 @@ void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void 
 	const int cellTilesPerRow = N3DS_DECODE_TEXTURE_DIM / 8;
 	const int cellBaseTileRow = cellY * cellTilesPerRow;
 	const int cellBaseTileCol = cellX * cellTilesPerRow;
-	const u8 *src = (const u8 *)tiled256RGBA8;
+	const u8 *src = (const u8 *)tiled256;
 	u8 *atlasData;
 	int localTileRow;
 
@@ -386,8 +425,9 @@ void N3DS_C3DSetColorDoubling(int enable)
 	 * modulate, which restores PC's exact ordering.
 	 *
 	 * RGB only -- deliberately NOT C3D_Both. PC scales only .xyz; doubling
-	 * alpha as well would push the 128 "opaque" sentinel to 255 and break
-	 * the punch-through alpha test in n3ds_backend.c's C3D_AlphaTest.
+	 * alpha as well would push the punch-through-vs-opaque bit from 1 to 2,
+	 * i.e. out of range for the 1-bit alpha channel (see N3DS_TILE_BYTES),
+	 * corrupting the punch-through alpha test in n3ds_backend.c's C3D_AlphaTest.
 	 */
 	C3D_TexEnv *env = C3D_GetTexEnv(0);
 
@@ -411,6 +451,10 @@ void N3DS_C3DBindAtlas(int atlasIndex)
 	C3D_TexBind(0, &s_atlasTextures[atlasIndex]);
 }
 
+#ifdef CTR_INTERNAL
+extern int g_dbg_texturelessMode;
+#endif
+
 unsigned int N3DS_ReadButtons(void)
 {
 	unsigned int out = 0;
@@ -418,6 +462,18 @@ unsigned int N3DS_ReadButtons(void)
 
 	hidScanInput();
 	held = hidKeysHeld();
+
+#ifdef CTR_INTERNAL
+	/* SELECT, not ZL: ZL already changes camera angle in CTR's own controls
+	 * (2026-07-20). SELECT still also feeds N3DS_BTN_SELECT below for the
+	 * game as normal; requested this pairing anyway. Mirrors PC's F2
+	 * (native_platform.c:198). */
+	if (hidKeysDown() & KEY_SELECT)
+	{
+		g_dbg_texturelessMode ^= 1;
+		N3DS_DebugLog(g_dbg_texturelessMode ? "[CTR-3DS] textureless mode: 1" : "[CTR-3DS] textureless mode: 0");
+	}
+#endif
 
 	if (held & KEY_A)
 	{
@@ -442,6 +498,14 @@ unsigned int N3DS_ReadButtons(void)
 	if (held & KEY_R)
 	{
 		out |= N3DS_BTN_R;
+	}
+	if (held & KEY_ZL)
+	{
+		out |= N3DS_BTN_ZL;
+	}
+	if (held & KEY_ZR)
+	{
+		out |= N3DS_BTN_ZR;
 	}
 	if (held & KEY_START)
 	{
