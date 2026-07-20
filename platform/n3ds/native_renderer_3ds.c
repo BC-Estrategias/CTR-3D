@@ -195,6 +195,10 @@ global_variable u32 s_lastStatCacheEvictions = 0;
  * draw calls than PC" risk directly; measured ~150-290/frame before the
  * atlas rework above, which is what motivated it. */
 global_variable u32 s_drawCallCount = 0;
+/* Reached only through DrawAllSplits, so uvb==0 means the OT walk never ran at
+ * all, rather than DrawTriangles running and bailing. See the stats block. */
+global_variable u32 s_updateVertexBufferCalls = 0;
+global_variable u32 s_drawTrianglesCalls = 0;
 global_variable u32 s_lastStatDrawCallCount = 0;
 
 /* Scratch for one decoded+tiled page; reused every decode, never persisted. */
@@ -757,6 +761,25 @@ void NativeRenderer_SwapWindow(void)
 			 * output that can be read at all -- a photo of it should answer
 			 * "where did the frame go", not just "how fast was it".
 			 */
+			/*
+			 * Why-is-nothing-drawn diagnostics. A hardware run showed draws=0,
+			 * cache 0/0, verts=0 while scene begin/end still ran every frame --
+			 * so the citro3d bracket opens and closes around nothing, and the
+			 * blank top screen is upstream of the renderer entirely.
+			 *
+			 * MainMain's case 3 can `break` out before Platform_BeginFrame when
+			 * Loading.stage != LOAD_IDLE and the VLC table has not arrived,
+			 * which would skip the whole render path AND the perf bracket --
+			 * matching the observed perf=0.0ms. stage/vlc below say whether
+			 * that is what is happening. LOAD_IDLE is -1; LOAD_VLC is -6.
+			 *
+			 * uvb/dtri separate "the OT walk never ran" from "it ran and
+			 * DrawTriangles bailed": uvb counts UpdateVertexBuffer (reached
+			 * only via DrawAllSplits), dtri counts DrawTriangles entries.
+			 */
+			printf("load   stage %-4d vlc %-4d           \n", (int)sdata->Loading.stage, (int)sdata->bool_IsLoaded_VlcTable);
+			printf("call   uvb %-8lu dtri %-8lu    \n", (unsigned long)s_updateVertexBufferCalls, (unsigned long)s_drawTrianglesCalls);
+
 			printf("perf   frame %lu.%lums  work %lu.%lums        \n", (unsigned long)s_perfConsoleTotalUs / 1000UL,
 			       ((unsigned long)s_perfConsoleTotalUs % 1000UL) / 100UL, (unsigned long)s_perfConsoleWorkUs / 1000UL,
 			       ((unsigned long)s_perfConsoleWorkUs % 1000UL) / 100UL);
@@ -979,6 +1002,7 @@ void NativeRenderer_UpdateVertexBuffer(const GrVertex *vertices, int count)
 	 * DrawTriangles, which is where texFormat (from SetTexture) and each
 	 * triangle's own page/clut are actually known.
 	 */
+	s_updateVertexBufferCalls++;
 	s_pendingVertices = vertices;
 	s_pendingVertexCount = count;
 }
@@ -989,6 +1013,8 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	int currentAtlas = -1;
 	int vertsInRun = 0;
 	const int untextured = (s_currentTextureId == N3DS_TEXTURE_ID_WHITE);
+
+	s_drawTrianglesCalls++;
 
 	if (!s_rendererInitialised || (s_pendingVertices == NULL) || (triangles <= 0))
 	{
