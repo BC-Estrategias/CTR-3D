@@ -33,6 +33,24 @@
 #define NATIVE_PERF_FRAME_WARN_40_MS 40.0
 #define NATIVE_PERF_FRAME_WARN_50_MS 50.0
 
+#if defined(__3DS__)
+/*
+ * The 3DS has no command line, so there is no --perf flag to opt in with, and
+ * no host-side place to drop a CSV: writing one would mean a formatted SD-card
+ * write every frame, which is itself expensive enough to distort what we came
+ * to measure. So on 3DS the profiler self-enables and reports a WINDOWED
+ * summary to the existing sdmc:/ctr3ds.log instead.
+ *
+ * Windowed, not cumulative, on purpose: a running average since boot smears
+ * the loading phase into the steady state and hides exactly the phase changes
+ * we are hunting. Reporting is also the only output path that survives the
+ * usual end of a session -- the app is killed, so NativePerf_Shutdown never
+ * runs and a shutdown-only summary would produce nothing at all.
+ */
+#define NATIVE_PERF_3DS_REPORT_FRAMES 64
+#define NATIVE_PERF_3DS_TOP_BUCKETS   6
+#endif
+
 struct NativePerfBucketInfo
 {
 	const char *name;
@@ -90,6 +108,8 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
     {"swap_window_ms", 1},
     {"vsync_wait_ms", 0},
     {"audio_vblank_ms", 1},
+    {"n3ds_c3d_frame_end_ms", 1},
+    {"n3ds_gfx_present_ms", 1},
 };
 
 global_variable FILE *s_csvFile;
@@ -120,6 +140,12 @@ global_variable char s_csvPath[NATIVE_PERF_PATH_MAX];
 global_variable char s_summaryPath[NATIVE_PERF_PATH_MAX];
 global_variable struct NativePerfWorstFrame s_worstFrames[NATIVE_PERF_TOP_FRAME_COUNT];
 global_variable s32 s_worstFrameCount;
+#if defined(__3DS__)
+global_variable u32 s_windowFrames;
+global_variable f64 s_windowTotalMs;
+global_variable f64 s_windowWorkMs;
+global_variable f64 s_windowBucketMs[NATIVE_PERF_BUCKET_COUNT];
+#endif
 
 internal f64 NativePerf_CounterToMs(u64 counterDelta)
 {
@@ -143,6 +169,12 @@ internal const char *NativePerf_BucketName(enum NativePerfBucket bucket)
 	return s_bucketInfo[bucket].name;
 }
 
+#if !defined(__3DS__)
+/*
+ * CSV plumbing and argument parsing, all PC-only: the 3DS build self-enables
+ * and reports through the log, so leaving these visible there is just an
+ * unused-function warning per helper.
+ */
 internal s32 NativePerf_PathExists(const char *path)
 {
 	struct stat st;
@@ -259,6 +291,7 @@ internal void NativePerf_WriteCsvHeader(FILE *file)
 
 	fprintf(file, "\n");
 }
+#endif /* !__3DS__ */
 
 internal enum NativePerfBucket NativePerf_FindDominantBucket(f64 *dominantMsOut)
 {
@@ -312,6 +345,91 @@ internal void NativePerf_InsertWorstFrame(const struct NativePerfWorstFrame *fra
 	}
 }
 
+#if defined(__3DS__)
+/*
+ * Integer microseconds throughout, never %f: devkitARM's newlib only links
+ * float formatting when explicitly asked to, and a silently-blank %f would
+ * cost a whole build-and-run cycle to notice. %d always works.
+ */
+internal void NativePerf_Report3DSWindow(void)
+{
+	char header[96];
+	char acc[192];
+	char out[224];
+	s32 taken[NATIVE_PERF_BUCKET_COUNT];
+	s32 offset = 0;
+	s32 emitted = 0;
+	f64 toAvgUs;
+
+	if (s_windowFrames == 0)
+	{
+		return;
+	}
+
+	toAvgUs = 1000.0 / (f64)s_windowFrames;
+
+	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d", s_windowFrames, (int)(s_windowTotalMs * toAvgUs),
+	         (int)(s_windowWorkMs * toAvgUs));
+	N3DS_DebugLog(header);
+
+	memset(taken, 0, sizeof(taken));
+	acc[0] = '\0';
+
+	for (s32 rank = 0; rank < NATIVE_PERF_3DS_TOP_BUCKETS; rank++)
+	{
+		s32 best = -1;
+		f64 bestMs = 0.0;
+		int written;
+
+		for (s32 bucket = 0; bucket < NATIVE_PERF_BUCKET_COUNT; bucket++)
+		{
+			if ((taken[bucket] == 0) && (s_windowBucketMs[bucket] > bestMs))
+			{
+				best = bucket;
+				bestMs = s_windowBucketMs[bucket];
+			}
+		}
+
+		if (best < 0)
+		{
+			break;
+		}
+
+		taken[best] = 1;
+		written = snprintf(acc + offset, sizeof(acc) - (size_t)offset, " %s=%d", NativePerf_BucketName((enum NativePerfBucket)best),
+		                   (int)(bestMs * toAvgUs));
+		if ((written > 0) && ((size_t)(offset + written) < sizeof(acc)))
+		{
+			offset += written;
+		}
+		emitted++;
+
+		// Three buckets per line: every N3DS_DebugLog call is an fflush to the
+		// SD card, so the report costs less the fewer lines it takes.
+		if (emitted == 3)
+		{
+			snprintf(out, sizeof(out), "[PERF] avgUs%s", acc);
+			N3DS_DebugLog(out);
+			offset = 0;
+			acc[0] = '\0';
+			emitted = 0;
+		}
+	}
+
+	if (emitted > 0)
+	{
+		snprintf(out, sizeof(out), "[PERF] avgUs%s", acc);
+		N3DS_DebugLog(out);
+	}
+
+	s_windowFrames = 0;
+	s_windowTotalMs = 0.0;
+	s_windowWorkMs = 0.0;
+	memset(s_windowBucketMs, 0, sizeof(s_windowBucketMs));
+}
+#endif
+
+#if !defined(__3DS__)
 internal void NativePerf_WriteSummary(FILE *file)
 {
 	f64 averageMs = (s_frameIndex == 0) ? 0.0 : s_totalFrameMs / (f64)s_frameIndex;
@@ -376,9 +494,21 @@ internal s32 NativePerf_ArgPresent(int argc, char **argv, const char *name)
 
 	return 0;
 }
+#endif /* !__3DS__ */
 
 int NativePerf_ConfigureFromArgs(int argc, char **argv)
 {
+#if defined(__3DS__)
+	// A .3dsx launched from the homebrew menu gets no arguments, so the --perf
+	// opt-in below can never fire here. Self-enable instead, and leave
+	// s_csvFile NULL so the per-frame CSV row is skipped -- output goes to the
+	// log via NativePerf_Report3DSWindow.
+	(void)argc;
+	(void)argv;
+	s_enabled = 1;
+	N3DS_DebugLog("[PERF] frame profiler enabled (windowed report every 64 frames)");
+	return 0;
+#else
 	const char *outputDir = NativePerf_ArgValue(argc, argv, "--perf-dir");
 	const s32 perfEnabled = NativePerf_ArgPresent(argc, argv, "--perf") || (outputDir != NULL);
 
@@ -417,6 +547,7 @@ int NativePerf_ConfigureFromArgs(int argc, char **argv)
 
 	Platform_Log("[CTR Perf] capturing frame times: %s\n", s_csvPath);
 	return 0;
+#endif
 }
 
 void NativePerf_Shutdown(void)
@@ -433,6 +564,14 @@ void NativePerf_Shutdown(void)
 		NativePerf_EndFrame(&s_frameBeginInfo);
 	}
 
+#if defined(__3DS__)
+	// No CSV and no summary file here -- flush whatever the last partial
+	// window held and stop. In practice this rarely runs at all: the app is
+	// usually killed rather than exited, which is why reporting is windowed.
+	NativePerf_Report3DSWindow();
+	s_enabled = 0;
+	return;
+#else
 	if (s_csvFile != NULL)
 	{
 		fflush(s_csvFile);
@@ -457,6 +596,7 @@ void NativePerf_Shutdown(void)
 	Platform_Log("[CTR Perf] summary: %s\n", s_summaryPath);
 
 	s_enabled = 0;
+#endif
 }
 
 void NativePerf_BeginFrame(const struct NativePerfFrameInfo *info)
@@ -515,25 +655,52 @@ void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 
 	rowInfo = (info != NULL) ? info : &s_frameBeginInfo;
 
-	fprintf(s_csvFile, "%u,%.3f,%.3f,%.3f,%.3f,%s,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", s_frameIndex, totalMs, workMs, overBudgetMs,
-	        workOverBudgetMs, NativePerf_BucketName(dominantBucket), dominantMs, rowInfo->frameCounter, rowInfo->timer, rowInfo->levelID, rowInfo->gameMode1,
-	        rowInfo->loadingStage, rowInfo->boolDemoMode, rowInfo->numPlyrCurrGame, rowInfo->elapsedTimeMS, rowInfo->vsyncTillFlip,
-	        rowInfo->vSync_between_drawSync, rowInfo->frameTimer_VsyncCallback, endUnderrunFrames - s_beginUnderrunFrames,
-	        endOverflowFrames - s_beginOverflowFrames, endQueuedFrames);
+	// s_csvFile is NULL on 3DS, which reports through the log instead; the
+	// bucket accounting below still has to run either way.
+	if (s_csvFile != NULL)
+	{
+		fprintf(s_csvFile, "%u,%.3f,%.3f,%.3f,%.3f,%s,%.3f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", s_frameIndex, totalMs, workMs, overBudgetMs,
+		        workOverBudgetMs, NativePerf_BucketName(dominantBucket), dominantMs, rowInfo->frameCounter, rowInfo->timer, rowInfo->levelID,
+		        rowInfo->gameMode1, rowInfo->loadingStage, rowInfo->boolDemoMode, rowInfo->numPlyrCurrGame, rowInfo->elapsedTimeMS, rowInfo->vsyncTillFlip,
+		        rowInfo->vSync_between_drawSync, rowInfo->frameTimer_VsyncCallback, endUnderrunFrames - s_beginUnderrunFrames,
+		        endOverflowFrames - s_beginOverflowFrames, endQueuedFrames);
+	}
 
 	for (s32 bucket = 0; bucket < NATIVE_PERF_BUCKET_COUNT; bucket++)
 	{
-		fprintf(s_csvFile, ",%.3f", s_frameBucketMs[bucket]);
+		if (s_csvFile != NULL)
+		{
+			fprintf(s_csvFile, ",%.3f", s_frameBucketMs[bucket]);
+		}
 		s_bucketTotals[bucket] += s_frameBucketMs[bucket];
 	}
-	fprintf(s_csvFile, "\n");
 
-	s_rowsSinceFlush++;
-	if (s_rowsSinceFlush >= NATIVE_PERF_FLUSH_INTERVAL)
+	if (s_csvFile != NULL)
 	{
-		fflush(s_csvFile);
-		s_rowsSinceFlush = 0;
+		fprintf(s_csvFile, "\n");
+
+		s_rowsSinceFlush++;
+		if (s_rowsSinceFlush >= NATIVE_PERF_FLUSH_INTERVAL)
+		{
+			fflush(s_csvFile);
+			s_rowsSinceFlush = 0;
+		}
 	}
+
+#if defined(__3DS__)
+	s_windowFrames++;
+	s_windowTotalMs += totalMs;
+	s_windowWorkMs += workMs;
+	for (s32 bucket = 0; bucket < NATIVE_PERF_BUCKET_COUNT; bucket++)
+	{
+		s_windowBucketMs[bucket] += s_frameBucketMs[bucket];
+	}
+
+	if (s_windowFrames >= NATIVE_PERF_3DS_REPORT_FRAMES)
+	{
+		NativePerf_Report3DSWindow();
+	}
+#endif
 
 	s_totalFrameMs += totalMs;
 	s_totalWorkMs += workMs;

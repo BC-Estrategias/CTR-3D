@@ -40,6 +40,16 @@ enum NativePerfBucket
 	NATIVE_PERF_BUCKET_SWAP_WINDOW,
 	NATIVE_PERF_BUCKET_VSYNC_WAIT,
 	NATIVE_PERF_BUCKET_AUDIO_VBLANK,
+	/*
+	 * 3DS-only. The citro3d renderer replaces platform/native_renderer.c
+	 * wholesale on 3DS, so none of the framebuffer_* buckets above ever fire
+	 * there and its two most interesting costs -- the GPU submit at
+	 * C3D_FrameEnd and the bottom-screen console present -- had nowhere to
+	 * land. Appended rather than inserted: s_bucketInfo in native_perf.c is
+	 * indexed by this enum and must stay in the same order.
+	 */
+	NATIVE_PERF_BUCKET_N3DS_FRAME_END,
+	NATIVE_PERF_BUCKET_N3DS_GFX_PRESENT,
 	NATIVE_PERF_BUCKET_COUNT
 };
 

@@ -3469,6 +3469,18 @@ int NativeAudio_RenderFrames(s16 *out, int frameCount)
 	return framesRendered;
 }
 
+#if defined(__3DS__)
+/*
+ * Read by the 3DS stats block in native_renderer_3ds.c. Same translation unit
+ * (main.c includes native_audio.c before native_renderer_3ds.c), so these stay
+ * file-scope rather than growing the platform header for a diagnostic.
+ */
+global_variable unsigned long s_audioShapeVoiceAccum;
+global_variable unsigned long s_audioShapeVblanks;
+global_variable int s_audioShapeReverbSamples;
+global_variable int s_audioShapeXaActive;
+#endif
+
 void NativeAudio_StepVBlank(void)
 {
 #ifdef CTR_INTERNAL
@@ -3485,6 +3497,32 @@ void NativeAudio_StepVBlank(void)
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_AUDIO_VBLANK);
 	NativeAudio_LockOutput();
+
+#if defined(__3DS__)
+	/*
+	 * Shape of the mixer's workload, sampled once per vblank rather than per
+	 * sample so it costs nothing measurable. NativeAudio_MixFrame runs the
+	 * 24-voice loop AND the reverb chain for every one of the 735 sample
+	 * frames in a vblank, so "how many voices are actually live" and "is the
+	 * reverb engine configured at all" together decide most of that cost.
+	 */
+	{
+		int liveVoices = 0;
+
+		for (int v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
+		{
+			if (s_audio.voices[v].active && (s_audio.voices[v].adsrPhase != NATIVE_AUDIO_ADSR_OFF))
+			{
+				liveVoices++;
+			}
+		}
+
+		s_audioShapeVoiceAccum += (unsigned long)liveVoices;
+		s_audioShapeVblanks++;
+		s_audioShapeReverbSamples = s_audio.reverb.sizeSamples;
+		s_audioShapeXaActive = s_audio.xa.active;
+	}
+#endif
 
 	if (s_audio.output.deterministicRenderMode)
 	{

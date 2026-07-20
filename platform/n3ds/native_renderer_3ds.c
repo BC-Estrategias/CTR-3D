@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include <macros.h>
+#include <platform/native_perf.h>
 #include <platform/native_renderer.h>
 
 #include "n3ds_backend.h"
@@ -566,7 +567,9 @@ void NativeRenderer_BeginScene(void)
 	}
 
 	s_beginSceneCount++;
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);
 	N3DS_C3DBeginFrame();
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);
 }
 
 void NativeRenderer_EndScene(void)
@@ -577,7 +580,11 @@ void NativeRenderer_EndScene(void)
 	}
 
 	s_endSceneCount++;
+	// C3D_FrameEnd: the whole frame's queued GPU commands actually execute
+	// here, so this is where any GPU-side stall or submit cost shows up.
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_N3DS_FRAME_END);
 	N3DS_C3DEndFrame();
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_N3DS_FRAME_END);
 }
 
 void NativeRenderer_UpdateSwapIntervalState(int swapInterval)
@@ -591,6 +598,8 @@ void NativeRenderer_SwapWindow(void)
 	{
 		return;
 	}
+
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_SWAP_WINDOW);
 
 	/*
 	 * Frame pacing lives in VSync() (platform/native_platform.c), which runs off
@@ -706,10 +715,36 @@ void NativeRenderer_SwapWindow(void)
 			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] beginScene=%lu endScene=%lu swaps=%lu",
 			         (unsigned long)s_beginSceneCount, (unsigned long)s_endSceneCount, frames);
 			N3DS_DebugLog(cacheLine);
+
+			/*
+			 * Audio mixer workload shape. The profiler showed audio_vblank_ms
+			 * taking 48-81% of the frame, and NativeAudio_MixFrame runs both
+			 * the 24-voice loop and the reverb chain once per sample frame
+			 * (735 of them per vblank) -- so voicesX10 and reverbSamples say
+			 * which of those two is actually carrying the cost.
+			 */
+			{
+				const unsigned long shapeVblanks = s_audioShapeVblanks;
+				const unsigned long voicesX10 = (shapeVblanks > 0) ? ((s_audioShapeVoiceAccum * 10UL) / shapeVblanks) : 0UL;
+
+				s_audioShapeVoiceAccum = 0;
+				s_audioShapeVblanks = 0;
+
+				printf("audio  voices ~%lu.%lu  reverbSmp %-6d xa %d\n", voicesX10 / 10UL, voicesX10 % 10UL,
+				       s_audioShapeReverbSamples, s_audioShapeXaActive);
+
+				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] audio voicesX10=%lu vblanks=%lu reverbSamples=%d xaActive=%d",
+				         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive);
+				N3DS_DebugLog(cacheLine);
+			}
 		}
 	}
 
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_N3DS_GFX_PRESENT);
 	N3DS_GfxPresent();
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_N3DS_GFX_PRESENT);
+
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_SWAP_WINDOW);
 }
 
 void NativeRenderer_StoreFrameBuffer(int x, int y, int w, int h)
@@ -947,6 +982,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		return;
 	}
 
+	// Opened only after every early return above, so the scope is always
+	// balanced without an end on each bail-out path.
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
+
 	/*
 	 * PC's AddSplit coalesces draw calls by blend/format/textureId/mask/
 	 * STP/clip/dfe but never by page or CLUT (native_gpu.c:895-901, a
@@ -1037,6 +1076,8 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	}
 
 	N3DS_FlushRun(currentAtlas, vertsInRun);
+
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
 }
 
 void NativeRenderer_PushDebugLabel(const char *label)
