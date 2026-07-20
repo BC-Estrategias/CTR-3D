@@ -1,24 +1,33 @@
 /*
- * Nintendo 3DS renderer backend -- phase 2a in progress.
+ * Nintendo 3DS renderer backend -- phase 2a real data path.
  *
  * Replaces platform/native_renderer.c (OpenGL 3.3 + glad), which cannot run on
  * the PICA200. This file satisfies every signature in
  * include/platform/native_renderer.h so the rest of the unity build compiles
  * unmodified. Design: docs/CITRO3D_RENDERER_DESIGN.md.
  *
- * What is REAL here: the CPU-side PSX VRAM mirror and every operation that only
- * touches it (clear/copy/read/save-state); citro3d init, the compiled vertex
- * shader, and the top-screen render target (all behind n3ds_backend.h -- this
- * file is part of the unity build and can never see libctru/citro3d types
- * directly, same reason as everything else that crosses that boundary).
+ * What is REAL here: the CPU-side PSX VRAM mirror and every operation that
+ * only touches it (clear/copy/read/save-state); citro3d init, the compiled
+ * vertex shader, and the top-screen render target (behind n3ds_backend.h --
+ * this file is part of the unity build and can never see libctru/citro3d
+ * types directly, same reason as everything else that crosses that
+ * boundary); the CPU texture decode cache (design doc section 1, all three
+ * VRAM-CLUT formats plus the untextured/flat-color fast path); and the real
+ * GrVertex -> N3DS_Vertex conversion with per-(page,clut) draw batching
+ * (design doc section 6) that DrawAllSplits/DrawSplit (native_gpu.c) now
+ * actually drives every frame via UpdateVertexBuffer/DrawTriangles.
  *
- * What is STILL STUBBED here: the CPU texture decode cache and the real
- * GrVertex -> N3DS_Vertex conversion (design doc sections 1 and 6) --
- * NativeRenderer_SwapWindow currently draws one hardcoded test triangle each
- * frame instead, to verify the citro3d pipeline itself (shader compile,
- * attribute/buffer setup, draw, present) independent of the real data path.
- * Textures, blending, stencil, offscreen, framebuffer readback, and stereo
- * are all still stubbed/deferred per the design doc's staging.
+ * What is STILL STUBBED here, per the design doc's own staging: blending
+ * beyond BM_NONE and the STP 2-pass (2b), stencil (real no-op, provably dead
+ * code -- section 3), offscreen render targets (section 4, deferred),
+ * framebuffer readback (section 5, deferred), stereo (2c), clip/scissor
+ * (SetupClipMode -- not staged into 2a by the design doc, not touched this
+ * pass), the background clear color (NativeRenderer_Clear -- BeginScene
+ * always clears to opaque black regardless of the game's DRAWENV clear
+ * color), and the 32-bit RGBA override-texture path (TF_32_BIT_RGBA --
+ * provably unreachable from any real game/ code path today, zero DR_PSYX_TEX
+ * call sites; DrawTriangles skips a split entirely rather than guess at an
+ * untested path).
  *
  * The bottom screen hosts a libctru text console (the stats block) so a
  * running main loop stays observable while the top screen is citro3d's.
@@ -50,22 +59,390 @@ global_variable u32 s_frameCounter = 0;
 global_variable unsigned long s_lastStatFrames = 0;
 global_variable unsigned long s_lastStatVblanks = 0;
 
-/*
- * TEMPORARY (phase 2a pipeline verification only -- see the file header).
- * A fixed triangle in PSX screen-pixel space, drawn every frame through the
- * real N3DS_C3DUploadVertices/DrawTriangles path so that path is exercised
- * before the real GrVertex conversion (design doc section 6) replaces this.
- * Remove once that lands.
- */
-global_variable const N3DS_Vertex s_testTriangle[3] = {
-	{200.0f, 40.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f},
-	{100.0f, 200.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f},
-	{300.0f, 200.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f},
-};
-
 internal u16 NativeRenderer3DS_PackBGR555(u8 r, u8 g, u8 b)
 {
 	return (u16)(((r >> 3) & 31) | (((g >> 3) & 31) << 5) | (((b >> 3) & 31) << 10));
+}
+
+/*
+ * ------------------------------------------------------------------------
+ * CPU texture decode cache (design doc section 1) and real vertex
+ * submission (section 6).
+ * ------------------------------------------------------------------------
+ *
+ * TextureID is a sentinel, not a GPU handle -- SetTexture only ever receives
+ * NativeRenderer_GetVRAMTexture() (real page/CLUT content, decode-cached) or
+ * NativeRenderer_GetWhiteTexture() (untextured Gouraud/flat-color splits;
+ * see native_gpu.c's AddSplit) in every reachable path. Both sentinels must
+ * be distinct and non-zero -- the previous stub returned 0 for both, which
+ * would have made them indistinguishable.
+ */
+#define N3DS_TEXTURE_ID_VRAM  ((TextureID)1)
+#define N3DS_TEXTURE_ID_WHITE ((TextureID)2)
+
+global_variable TextureID s_currentTextureId = N3DS_TEXTURE_ID_VRAM;
+global_variable TexFormat s_currentTexFormat = TF_16_BIT;
+
+global_variable const GrVertex *s_pendingVertices = NULL;
+global_variable int s_pendingVertexCount = 0;
+
+/*
+ * VRAM is 1024x512 = exactly 4x2 page-sized (256x256) dirty-generation
+ * cells (design doc section 1). A decode cache entry records the cell
+ * generation(s) it was decoded against and is stale if any has since moved.
+ */
+#define N3DS_VRAM_CELL_COLS  4
+#define N3DS_VRAM_CELL_ROWS  2
+#define N3DS_VRAM_CELL_DIM   256
+global_variable u32 s_vramCellGen[N3DS_VRAM_CELL_ROWS * N3DS_VRAM_CELL_COLS];
+
+internal int N3DS_VRAMCellIndex(int x, int y)
+{
+	int col = x / N3DS_VRAM_CELL_DIM;
+	int row = y / N3DS_VRAM_CELL_DIM;
+
+	if (col < 0) { col = 0; } else if (col >= N3DS_VRAM_CELL_COLS) { col = N3DS_VRAM_CELL_COLS - 1; }
+	if (row < 0) { row = 0; } else if (row >= N3DS_VRAM_CELL_ROWS) { row = N3DS_VRAM_CELL_ROWS - 1; }
+
+	return row * N3DS_VRAM_CELL_COLS + col;
+}
+
+/*
+ * Bumps the generation of every cell touched by a [x, x+w) x [y, y+h) VRAM
+ * write, so any decode cache entry sourced from that region re-decodes on
+ * next use. Called from the only two currently-real VRAM mutators
+ * (ClearVRAM, CopyVRAM) -- UpdateVRAM/framebuffer readback are still stubs,
+ * so they cannot dirty anything yet; wire this in alongside them when they
+ * become real (design doc section 5).
+ */
+internal void N3DS_DirtyVRAMRect(int x, int y, int w, int h)
+{
+	int x1, y1, cx, cy;
+
+	if ((w <= 0) || (h <= 0))
+	{
+		return;
+	}
+
+	x1 = x + w - 1;
+	y1 = y + h - 1;
+
+	for (cy = y / N3DS_VRAM_CELL_DIM; cy <= y1 / N3DS_VRAM_CELL_DIM; cy++)
+	{
+		for (cx = x / N3DS_VRAM_CELL_DIM; cx <= x1 / N3DS_VRAM_CELL_DIM; cx++)
+		{
+			s_vramCellGen[N3DS_VRAMCellIndex(cx * N3DS_VRAM_CELL_DIM, cy * N3DS_VRAM_CELL_DIM)]++;
+		}
+	}
+}
+
+typedef struct
+{
+	int used;         /* 0 = empty cell, never decoded into */
+	s16 page;
+	s16 clut;
+	TexFormat format;
+	u32 pageGen;
+	u32 clutGenA;
+	u32 clutGenB;      /* == clutGenA when the CLUT doesn't straddle two VRAM cells */
+	u32 lastUsedFrame;
+} N3DS_DecodeCacheEntry;
+
+/*
+ * The decode cache is addressed as a flat array of atlas cells (2026-07-19,
+ * switched from one dedicated texture per entry to atlas cells -- see the
+ * header comment on N3DS_C3DUploadDecodedCell in n3ds_backend.h for why).
+ * Flat index 0 is reserved for a permanent flat opaque-white texel
+ * (untextured/Gouraud primitives -- N3DS_WHITE_ATLAS/CELL_X/CELL_Y below),
+ * never entered into the LRU cache; indices 1..N3DS_TOTAL_CELLS-1 are real.
+ */
+#define N3DS_TOTAL_CELLS (N3DS_ATLAS_COUNT * N3DS_ATLAS_CELLS_PER_ATLAS)
+#define N3DS_WHITE_ATLAS  0
+#define N3DS_WHITE_CELL_X 0
+#define N3DS_WHITE_CELL_Y 0
+
+global_variable N3DS_DecodeCacheEntry s_decodeCache[N3DS_TOTAL_CELLS];
+
+/* Flat cell index -> which atlas texture, and which cell within its grid. */
+internal void N3DS_CellIndexToAtlasCoord(int cellIndex, int *outAtlas, int *outCellX, int *outCellY)
+{
+	const int within = cellIndex % N3DS_ATLAS_CELLS_PER_ATLAS;
+
+	*outAtlas = cellIndex / N3DS_ATLAS_CELLS_PER_ATLAS;
+	*outCellX = within % N3DS_ATLAS_CELLS_PER_ROW;
+	*outCellY = within / N3DS_ATLAS_CELLS_PER_ROW;
+}
+
+/*
+ * Cache diagnostics (2026-07-19, added to investigate a real/reported-fps
+ * mismatch -- SwapWindow's own fps_now is a frames-per-emulated-vblank
+ * ratio, which can look fine on average even when per-frame cost is spiky;
+ * a decode is only expensive on a miss, so these numbers say directly
+ * whether the cache is thrashing rather than leaving it a guess).
+ * s_decodeCacheEvictions counts only misses that discarded a still-valid,
+ * different entry -- i.e. genuine thrashing -- as opposed to a miss that
+ * just filled a never-yet-used slot (expected once, during cache warm-up).
+ */
+global_variable u32 s_decodeCacheHits = 0;
+global_variable u32 s_decodeCacheMisses = 0;
+global_variable u32 s_decodeCacheEvictions = 0;
+global_variable u32 s_lastStatCacheMisses = 0;
+global_variable u32 s_lastStatCacheEvictions = 0;
+
+/* One increment per actual C3D_DrawArrays call (N3DS_FlushRun, called from
+ * DrawTriangles) -- checks the design doc's own predicted "more, smaller
+ * draw calls than PC" risk directly; measured ~150-290/frame before the
+ * atlas rework above, which is what motivated it. */
+global_variable u32 s_drawCallCount = 0;
+global_variable u32 s_lastStatDrawCallCount = 0;
+
+/* Scratch for one decoded+tiled page; reused every decode, never persisted. */
+global_variable u8 s_decodeScratch[N3DS_DECODE_TEXTURE_DIM * N3DS_DECODE_TEXTURE_DIM * 4];
+
+/* Scratch for one converted atlas-run; sized to the whole per-frame vertex
+ * buffer (not just one batch) so a run can never silently exceed what's
+ * actually there -- a single run can in principle span as much of a frame
+ * as one atlas covers. */
+global_variable N3DS_Vertex s_convertScratch[N3DS_MAX_FRAME_VERTICES];
+
+internal float N3DS_Clamp01(float v)
+{
+	if (v < 0.0f) { return 0.0f; }
+	if (v > 1.0f) { return 1.0f; }
+	return v;
+}
+
+/*
+ * Decodes PSX texture page `texPage` (through CLUT `clut` for 4/8-bit) into
+ * a 256x256 RGBA8 buffer, applying the PICA200 8x8 Z-order (Morton) tile
+ * swizzle inline -- citro3d's C3D_TexLoadImage is a raw memcpy and does not
+ * tile for you (verified directly against citro3d's upstream source, see
+ * docs/CITRO3D_RENDERER_DESIGN.md section 1). The intra-tile bit-interleave
+ * below (x supplies the even bits, y the odd bits) was cross-checked
+ * position-by-position against tex3ds's own reference swizzle table
+ * (source/swizzle.cpp) rather than assumed.
+ *
+ * Addressing matches native_gpu.c exactly: page origin in VRAM word/pixel
+ * coordinates is ((texPage & 0xF) * 64, (texPage & 0x10) ? 256 : 0) --
+ * GetTPageBase/NativeGpu_TPageOverlapsActiveDrawPage agree, and the PC
+ * fragment shader's v_page_clut derivation (native_renderer.c:613-616)
+ * reduces to the same formula. CLUT origin is ((clut & 0x3F) * 16,
+ * clut >> 6), same as the GET_CLUT_X/GET_CLUT_Y macros (native_gpu.c:43-44).
+ * u/v (0-255) are native-texel coordinates within the page, already
+ * format-aware as authored by the game (4bpp uses the full 0-255 range,
+ * 8bpp only 0-127, 16bpp only 0-63) -- decoding a fixed 256x256 regardless
+ * of format just leaves the unaddressed columns unused, never sampled.
+ *
+ * Alpha is the same 3-level encoding NativeRenderer_InitRG8LUT's channel
+ * expansion feeds the PC shader (native_renderer.c:828-843): 0 = PS1
+ * punch-through (raw value 0x0000), 128 = opaque, 255 = STP-on. Phase 2a
+ * only consumes the 0-vs-nonzero distinction (single alpha test, see
+ * n3ds_backend.c); the 128/255 split is decoded now so 2b's STP 2-pass
+ * doesn't need to touch this function at all.
+ */
+internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u8 *outTiled256)
+{
+	const int pageOriginX = (texPage & 0xF) * 64;
+	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
+	const int clutOriginX = (clut & 0x3F) * 16;
+	const int clutOriginY = clut >> 6;
+	int v;
+
+	for (v = 0; v < N3DS_DECODE_TEXTURE_DIM; v++)
+	{
+		const int wordRow = pageOriginY + v;
+		int u;
+
+		for (u = 0; u < N3DS_DECODE_TEXTURE_DIM; u++)
+		{
+			u16 color16;
+			u8 r, g, b, a;
+			int morton, tileIndex, dstIndex;
+
+			switch (format)
+			{
+			case TF_4_BIT:
+			{
+				const int wordCol = pageOriginX + (u >> 2);
+				const u16 word = vram[wordRow * VRAM_WIDTH + wordCol];
+				const int nibble = (word >> ((u & 3) * 4)) & 0xF;
+				/* Wrap within the CLUT's own VRAM row. PC's VRAM sampler
+				 * inherits GL_REPEAT and wraps S independently of T, so it
+				 * can never walk into the next scanline; a flat array index
+				 * silently would. A 4-bit CLUT (16 entries, 16-aligned
+				 * origin) can't actually overflow -- masked for symmetry
+				 * with the 8-bit case below, which can. */
+				color16 = vram[clutOriginY * VRAM_WIDTH + ((clutOriginX + nibble) & (VRAM_WIDTH - 1))];
+				break;
+			}
+			case TF_8_BIT:
+			{
+				const int wordCol = pageOriginX + (u >> 1);
+				const u16 word = vram[wordRow * VRAM_WIDTH + wordCol];
+				const int index = (word >> ((u & 1) * 8)) & 0xFF;
+				/* 256 entries from a 16-aligned origin reaches column 1263 of
+				 * a 1024-wide row, i.e. 239 texels into the NEXT scanline.
+				 * Wrap instead, matching PC's GL_REPEAT S-wrap (see the 4-bit
+				 * case above). */
+				color16 = vram[clutOriginY * VRAM_WIDTH + ((clutOriginX + index) & (VRAM_WIDTH - 1))];
+				break;
+			}
+			case TF_16_BIT:
+			case TF_32_BIT_RGBA: /* unreachable -- DrawTriangles never calls this path for it, see file header */
+			default:
+				color16 = vram[wordRow * VRAM_WIDTH + pageOriginX + u];
+				break;
+			}
+
+			r = (u8)((color16 & 31) << 3);
+			g = (u8)(((color16 >> 5) & 31) << 3);
+			b = (u8)(((color16 >> 10) & 31) << 3);
+
+			if (color16 == 0)
+			{
+				a = 0;
+			}
+			else if (color16 & 0x8000)
+			{
+				a = 255;
+			}
+			else
+			{
+				a = 128;
+			}
+
+			morton = (u & 1) | ((v & 1) << 1) | ((u & 2) << 1) | ((v & 2) << 2) | ((u & 4) << 2) | ((v & 4) << 3);
+			tileIndex = ((v >> 3) * (N3DS_DECODE_TEXTURE_DIM / 8) + (u >> 3)) * 64;
+			dstIndex = tileIndex + morton;
+
+			/*
+			 * PICA200 GPU_RGBA8 texels run A,B,G,R in increasing byte order,
+			 * not R,G,B,A -- the format name describes which channels it
+			 * carries, not their memory layout. Verified empirically against
+			 * devkitPro's own tex3ds: converting a solid (R=AA,G=BB,B=CC,A=DD)
+			 * image with `tex3ds -r -z none -f rgba8` emits `dd cc bb aa` per
+			 * texel. Writing R,G,B,A here put alpha in the sampled red channel
+			 * (a near-constant 128/255, hence a uniform red cast), swapped
+			 * green and blue, and fed the sampled alpha -- and therefore the
+			 * punch-through alpha test -- from the red channel.
+			 */
+			outTiled256[dstIndex * 4 + 0] = a;
+			outTiled256[dstIndex * 4 + 1] = b;
+			outTiled256[dstIndex * 4 + 2] = g;
+			outTiled256[dstIndex * 4 + 3] = r;
+		}
+	}
+}
+
+/*
+ * Finds an atlas cell already decoded for (texPage, clut, format) and still
+ * fresh (matching VRAM dirty-cell generations), or decodes into the
+ * least-recently-used atlas cell on a miss. Returns a flat cell index (see
+ * N3DS_CellIndexToAtlasCoord). Linear scan over N3DS_TOTAL_CELLS -- fine for
+ * a correctness-first pass at this count; the design doc explicitly leaves
+ * perf tuning for after on-device measurement. Note "cell" means two
+ * different things in this function and both are real: VRAM dirty-tracking
+ * cells (N3DS_VRAM_CELL_*, 256x256 regions of PSX VRAM) versus atlas cells
+ * (256x256 regions of a shared GPU texture) -- they are unrelated grids that
+ * happen to share a name and a size.
+ */
+internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
+{
+	const int pageCell = N3DS_VRAMCellIndex((texPage & 0xF) * 64, (texPage & 0x10) ? 256 : 0);
+	const int clutOriginX = (clut & 0x3F) * 16;
+	const int clutOriginY = clut >> 6;
+	const int clutCellA = N3DS_VRAMCellIndex(clutOriginX, clutOriginY);
+	/* An 8-bit CLUT is 256 texels wide and can straddle a 256-wide VRAM cell
+	 * boundary when its 16-aligned origin isn't itself cell-aligned (a
+	 * 4-bit CLUT is only 16 wide and can never cross one). Track the far
+	 * edge's cell too so a change there isn't missed. */
+	const int clutCellB = N3DS_VRAMCellIndex(clutOriginX + 255, clutOriginY);
+	int i, oldestSlot = 1;
+	u32 oldestFrame = 0xFFFFFFFFu;
+
+	for (i = 1; i < N3DS_TOTAL_CELLS; i++)
+	{
+		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
+
+		if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) &&
+		    (e->pageGen == s_vramCellGen[pageCell]) && (e->clutGenA == s_vramCellGen[clutCellA]) &&
+		    (e->clutGenB == s_vramCellGen[clutCellB]))
+		{
+			e->lastUsedFrame = s_frameCounter;
+			s_decodeCacheHits++;
+			return i;
+		}
+
+		if (e->lastUsedFrame < oldestFrame)
+		{
+			oldestFrame = e->lastUsedFrame;
+			oldestSlot = i;
+		}
+	}
+
+	s_decodeCacheMisses++;
+	if (s_decodeCache[oldestSlot].used)
+	{
+		s_decodeCacheEvictions++;
+	}
+
+	N3DS_DecodeAndTilePage(texPage, clut, format, s_decodeScratch);
+	{
+		int atlasIdx, cellX, cellY;
+
+		N3DS_CellIndexToAtlasCoord(oldestSlot, &atlasIdx, &cellX, &cellY);
+		N3DS_C3DUploadDecodedCell(atlasIdx, cellX, cellY, s_decodeScratch);
+	}
+
+	s_decodeCache[oldestSlot].used = 1;
+	s_decodeCache[oldestSlot].page = texPage;
+	s_decodeCache[oldestSlot].clut = clut;
+	s_decodeCache[oldestSlot].format = format;
+	s_decodeCache[oldestSlot].pageGen = s_vramCellGen[pageCell];
+	s_decodeCache[oldestSlot].clutGenA = s_vramCellGen[clutCellA];
+	s_decodeCache[oldestSlot].clutGenB = s_vramCellGen[clutCellB];
+	s_decodeCache[oldestSlot].lastUsedFrame = s_frameCounter;
+
+	return oldestSlot;
+}
+
+/*
+ * Binds atlas `atlasIndex` and draws the vertCount vertices already sitting
+ * in s_convertScratch. Appends (does not overwrite) into the shared
+ * per-frame vertex buffer and draws from wherever they actually landed --
+ * NOT from a hardcoded offset. That distinction is load-bearing: GPU
+ * command execution for a whole frame is deferred to a single
+ * GX_ProcessCommandList call at frame end (see n3ds_backend.h's header
+ * comment on N3DS_C3DAppendVertices), and DrawTriangles is called once per
+ * split -- up to thousands of times a frame -- so many runs get queued
+ * before any of them actually executes. Drawing from offset 0 every time
+ * (the bug this replaced, 2026-07-19) made every queued draw in the frame
+ * read whichever run's vertices were written last, since nothing stops a
+ * later CPU-side write from landing before an earlier draw's GPU read.
+ */
+internal void N3DS_FlushRun(int atlasIndex, int vertCount)
+{
+	int baseVertex;
+
+	if (vertCount <= 0)
+	{
+		return;
+	}
+
+	baseVertex = N3DS_C3DAppendVertices(s_convertScratch, vertCount);
+	if (baseVertex < 0)
+	{
+		/* Frame vertex buffer full (N3DS_MAX_FRAME_VERTICES, a headroom
+		 * ceiling, not a measured real number) -- drop this run rather than
+		 * draw from a wrong/stale offset. Silent geometry loss is a real
+		 * regression, but not a currently expected one; revisit with real
+		 * instrumentation if it's ever hit in practice. */
+		return;
+	}
+
+	N3DS_C3DBindAtlas(atlasIndex);
+	N3DS_C3DDrawTriangles(baseVertex, vertCount / 3);
+	s_drawCallCount++;
 }
 
 int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int fullscreen)
@@ -97,7 +474,39 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 
 int NativeRenderer_InitialisePSX(void)
 {
+	int i;
+
 	memset(vram, 0, sizeof(vram));
+
+	for (i = 0; i < (N3DS_VRAM_CELL_ROWS * N3DS_VRAM_CELL_COLS); i++)
+	{
+		s_vramCellGen[i] = 0;
+	}
+	for (i = 0; i < N3DS_TOTAL_CELLS; i++)
+	{
+		s_decodeCache[i].used = 0;
+		s_decodeCache[i].lastUsedFrame = 0;
+	}
+
+	/*
+	 * White cell: flat opaque texel (r=g=b=255, a=128 -- the "opaque" alpha
+	 * sentinel, see N3DS_DecodeAndTilePage) for untextured/Gouraud splits.
+	 * Uniform colour makes the 8x8 tile swizzle a no-op (every permutation of
+	 * identical values is identical), so this just fills linearly. Uploaded
+	 * once here into atlas 0's cell (0,0); that cell is never entered into
+	 * the LRU cache and never re-decoded. Byte order is A,B,G,R to match
+	 * N3DS_DecodeAndTilePage -- writing it R,G,B,A here would land alpha in
+	 * the sampled red channel and tint every untextured primitive.
+	 */
+	for (i = 0; i < (N3DS_DECODE_TEXTURE_DIM * N3DS_DECODE_TEXTURE_DIM); i++)
+	{
+		s_decodeScratch[i * 4 + 0] = 128;
+		s_decodeScratch[i * 4 + 1] = 255;
+		s_decodeScratch[i * 4 + 2] = 255;
+		s_decodeScratch[i * 4 + 3] = 255;
+	}
+	N3DS_C3DUploadDecodedCell(N3DS_WHITE_ATLAS, N3DS_WHITE_CELL_X, N3DS_WHITE_CELL_Y, s_decodeScratch);
+
 	return 1;
 }
 
@@ -119,10 +528,30 @@ void NativeRenderer_ResetDevice(void)
 
 void NativeRenderer_BeginScene(void)
 {
+	/*
+	 * Opens the citro3d frame bracket. Must happen here, not in SwapWindow:
+	 * real drawing happens via DrawAllSplits, which DrawOTag calls once near
+	 * the start of the frame (and DrawSync can call again mid-frame) -- long
+	 * before SwapWindow runs at frame end. Platform_BeginScene (the sole
+	 * caller) already guards re-entry within a frame, so this only opens the
+	 * bracket once regardless of how many times DrawAllSplits runs.
+	 */
+	if (!s_rendererInitialised)
+	{
+		return;
+	}
+
+	N3DS_C3DBeginFrame();
 }
 
 void NativeRenderer_EndScene(void)
 {
+	if (!s_rendererInitialised)
+	{
+		return;
+	}
+
+	N3DS_C3DEndFrame();
 }
 
 void NativeRenderer_UpdateSwapIntervalState(int swapInterval)
@@ -143,12 +572,6 @@ void NativeRenderer_SwapWindow(void)
 	 * a second vblank source or the 30fps gate would be paced twice.
 	 */
 	s_frameCounter++;
-
-	/* TEMPORARY -- see s_testTriangle's comment. Real path replaces this. */
-	N3DS_C3DBeginFrame();
-	N3DS_C3DUploadVertices(s_testTriangle, 3);
-	N3DS_C3DDrawTriangles(0, 1);
-	N3DS_C3DEndFrame();
 
 	if ((s_frameCounter & 31) == 0)
 	{
@@ -204,6 +627,39 @@ void NativeRenderer_SwapWindow(void)
 		         NativeAudio_XAStreamSectorsBuffered(), NATIVE_AUDIO_XA_RING_SECTORS, s_audio.xaStream.underrunEvents,
 		         s_audio.voicePcmArena.capacity / 1024, (int)sdata->mainGameState);
 		N3DS_DebugLog(line);
+
+		/*
+		 * Texture decode cache diagnostics -- added to check whether the cache
+		 * is thrashing (real, ongoing evictions of still-wanted textures, which
+		 * is expensive every single time) versus a one-time warm-up cost
+		 * (misses into never-yet-used slots, cheap after the first frame or
+		 * two). fps_now above is a frames-per-emulated-vblank ratio and can
+		 * look better than the real experience if per-frame cost is spiky --
+		 * this says directly whether that's what's happening here.
+		 */
+		{
+			const unsigned long missesWindow = (unsigned long)(s_decodeCacheMisses - s_lastStatCacheMisses);
+			const unsigned long evictionsWindow = (unsigned long)(s_decodeCacheEvictions - s_lastStatCacheEvictions);
+			const unsigned long drawsWindow = (unsigned long)(s_drawCallCount - s_lastStatDrawCallCount);
+			/* Report interval is always exactly 32 frames -- the (s_frameCounter & 31) gate above. */
+			const unsigned long drawsPerFrameAvgX10 = (drawsWindow * 10UL) / 32UL;
+			char cacheLine[128];
+
+			s_lastStatCacheMisses = s_decodeCacheMisses;
+			s_lastStatCacheEvictions = s_decodeCacheEvictions;
+			s_lastStatDrawCallCount = s_drawCallCount;
+
+			printf("cache  hits %-8lu miss %-6lu (+%-4lu/w) evict %-4lu (+%-4lu/w)\n", (unsigned long)s_decodeCacheHits,
+			       (unsigned long)s_decodeCacheMisses, missesWindow, (unsigned long)s_decodeCacheEvictions, evictionsWindow);
+			printf("draws  total %-8lu +%-6lu/w  ~%lu.%lu draws/frame        \n", (unsigned long)s_drawCallCount, drawsWindow,
+			       drawsPerFrameAvgX10 / 10UL, drawsPerFrameAvgX10 % 10UL);
+
+			snprintf(cacheLine, sizeof(cacheLine),
+			         "[CTR-3DS] cache hits=%lu misses=%lu missesWindow=%lu evictions=%lu evictionsWindow=%lu draws=%lu drawsWindow=%lu",
+			         (unsigned long)s_decodeCacheHits, (unsigned long)s_decodeCacheMisses, missesWindow,
+			         (unsigned long)s_decodeCacheEvictions, evictionsWindow, (unsigned long)s_drawCallCount, drawsWindow);
+			N3DS_DebugLog(cacheLine);
+		}
 	}
 
 	N3DS_GfxPresent();
@@ -248,6 +704,8 @@ void NativeRenderer_ClearVRAM(int x, int y, int w, int h, u8 r, u8 g, u8 b)
 		return;
 	}
 
+	N3DS_DirtyVRAMRect(x, y, w, h);
+
 	for (row = 0; row < h; row++)
 	{
 		u16 *dst = vram + x + ((y + row) * VRAM_WIDTH);
@@ -280,6 +738,8 @@ void NativeRenderer_CopyVRAM(u16 *src, int x, int y, int w, int h, int dstX, int
 
 	src += x + (y * stride);
 	dst = vram + dstX + (dstY * VRAM_WIDTH);
+
+	N3DS_DirtyVRAMRect(dstX, dstY, w, h);
 
 	for (row = 0; row < h; row++)
 	{
@@ -343,12 +803,12 @@ int NativeRenderer_RestoreVRAMState(const void *src, int srcSize)
 
 TextureID NativeRenderer_GetVRAMTexture(void)
 {
-	return 0;
+	return N3DS_TEXTURE_ID_VRAM;
 }
 
 TextureID NativeRenderer_GetWhiteTexture(void)
 {
-	return 0;
+	return N3DS_TEXTURE_ID_WHITE;
 }
 
 void NativeRenderer_SetBlendMode(BlendMode blendMode)
@@ -373,7 +833,8 @@ void NativeRenderer_SetupClipMode(const RECT16 *clipRect, const DISPENV *display
 
 void NativeRenderer_SetTexture(TextureID texture, TexFormat texFormat)
 {
-	(void)texture; (void)texFormat;
+	s_currentTextureId = texture;
+	s_currentTexFormat = texFormat;
 }
 
 void NativeRenderer_SetOverrideTextureSize(int width, int height)
@@ -398,12 +859,129 @@ void NativeRenderer_SetPSXDrawMaskSet(int maskSet)
 
 void NativeRenderer_UpdateVertexBuffer(const GrVertex *vertices, int count)
 {
-	(void)vertices; (void)count;
+	/*
+	 * Mirrors PC's own pattern (DrawAllSplits -> UpdateVertexBuffer once,
+	 * then DrawTriangles many times at different offsets into it): just
+	 * remember where the frame's vertices live. s_gpu.vertexBuffer
+	 * (native_gpu.c) is a persistent static array, not stack memory, so
+	 * holding this pointer across the DrawSplit loop that follows is safe.
+	 * The real GrVertex -> N3DS_Vertex conversion happens lazily in
+	 * DrawTriangles, which is where texFormat (from SetTexture) and each
+	 * triangle's own page/clut are actually known.
+	 */
+	s_pendingVertices = vertices;
+	s_pendingVertexCount = count;
 }
 
 void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 {
-	(void)startVertex; (void)triangles;
+	int i;
+	int currentAtlas = -1;
+	int vertsInRun = 0;
+	const int untextured = (s_currentTextureId == N3DS_TEXTURE_ID_WHITE);
+
+	if (!s_rendererInitialised || (s_pendingVertices == NULL) || (triangles <= 0))
+	{
+		return;
+	}
+
+	if ((s_currentTextureId != N3DS_TEXTURE_ID_VRAM) && (s_currentTextureId != N3DS_TEXTURE_ID_WHITE))
+	{
+		/* TF_32_BIT_RGBA override texture -- provably unreachable from any
+		 * real game/ code path (zero DR_PSYX_TEX call sites; the boot
+		 * splash uses NativeRenderer_PresentVRAMDisplay/PresentVRAMRect
+		 * instead, a separate presentation path entirely). Skip rather
+		 * than guess at an untested path -- see the file header. */
+		return;
+	}
+
+	if ((startVertex < 0) || ((startVertex + (triangles * 3)) > s_pendingVertexCount))
+	{
+		return;
+	}
+
+	/*
+	 * PC's AddSplit coalesces draw calls by blend/format/textureId/mask/
+	 * STP/clip/dfe but never by page or CLUT (native_gpu.c:895-901, a
+	 * literal FIXME) -- one PC draw call can legitimately span several
+	 * texture pages/palettes, relying on true per-vertex resolution in its
+	 * shader. citro3d can only bind one texture per draw call, so this walks
+	 * the split's triangles (each one's 3 vertices always share a single
+	 * page/clut -- see MakeTexcoordTriangle/Quad/Rect), resolves each to its
+	 * atlas cell, and flushes a new citro3d draw only when the ATLAS changes
+	 * -- not the cell -- since multiple cells of the same atlas share one
+	 * bind (see n3ds_backend.h's header comment on N3DS_C3DUploadDecodedCell
+	 * for why this exists: measured ~150-290 draws/frame before it did).
+	 * Vertex conversion happens inline per triangle (not deferred to a
+	 * separate per-run pass like the single-texture design this replaced)
+	 * because a run can now span multiple distinct cells, each needing its
+	 * own UV offset -- there is no single (page,clut) left to convert against
+	 * once triangles from different cells share a run. Triangles are never
+	 * reordered, only grouped by contiguous atlas -- draw order is preserved
+	 * exactly, which matters because this renderer has no depth test enabled
+	 * (matching PC) and relies on draw order alone for correct layering.
+	 */
+	for (i = 0; i < triangles; i++)
+	{
+		const GrVertex *triVerts = &s_pendingVertices[startVertex + (i * 3)];
+		int atlasIdx, cellX, cellY, v;
+
+		if (untextured)
+		{
+			atlasIdx = N3DS_WHITE_ATLAS;
+			cellX = N3DS_WHITE_CELL_X;
+			cellY = N3DS_WHITE_CELL_Y;
+		}
+		else
+		{
+			N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(triVerts[0].page, triVerts[0].clut, s_currentTexFormat), &atlasIdx,
+			                            &cellX, &cellY);
+		}
+
+		if ((atlasIdx != currentAtlas) || ((vertsInRun + 3) > N3DS_MAX_FRAME_VERTICES))
+		{
+			N3DS_FlushRun(currentAtlas, vertsInRun);
+			currentAtlas = atlasIdx;
+			vertsInRun = 0;
+		}
+
+		for (v = 0; v < 3; v++)
+		{
+			const GrVertex *src = &triVerts[v];
+			N3DS_Vertex *dst = &s_convertScratch[vertsInRun + v];
+			/* MakeTexcoordZero* (untextured) sets bright=1; MakeTexcoordQuad/
+			 * Triangle/Rect (textured) always set bright=2 -- see native_gpu.c.
+			 * PC's shader computes v_color.xyz = (color/255) * bright; baked
+			 * here CPU-side since bright isn't a GPU attribute on 3DS. */
+			const float brightScale = (src->bright != 0) ? (float)src->bright : 1.0f;
+
+			dst->x = (float)src->x;
+			dst->y = (float)src->y;
+
+			/* Offset into the cell's own region of the atlas, not the whole
+			 * atlas -- (cellX,cellY) select which 256x256 region, (u,v) or
+			 * the cell's centre (untextured) select where within it. */
+			if (untextured)
+			{
+				dst->u = ((float)cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM * 0.5f)) / (float)N3DS_ATLAS_DIM;
+				dst->v = ((float)cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM * 0.5f)) / (float)N3DS_ATLAS_DIM;
+			}
+			else
+			{
+				dst->u = ((float)cellX * N3DS_DECODE_TEXTURE_DIM + (float)src->u) / (float)N3DS_ATLAS_DIM;
+				dst->v = ((float)cellY * N3DS_DECODE_TEXTURE_DIM + (float)src->v) / (float)N3DS_ATLAS_DIM;
+			}
+
+			dst->r = N3DS_Clamp01(((float)src->r / 255.0f) * brightScale);
+			dst->g = N3DS_Clamp01(((float)src->g / 255.0f) * brightScale);
+			dst->b = N3DS_Clamp01(((float)src->b / 255.0f) * brightScale);
+			dst->a = 1.0f;
+		}
+
+		vertsInRun += 3;
+	}
+
+	N3DS_FlushRun(currentAtlas, vertsInRun);
 }
 
 void NativeRenderer_PushDebugLabel(const char *label)

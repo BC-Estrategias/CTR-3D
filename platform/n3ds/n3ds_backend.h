@@ -65,16 +65,92 @@ typedef struct
 int N3DS_C3DInit(void);
 void N3DS_C3DExit(void);
 
+/* Must bracket every N3DS_C3DAppendVertices/DrawTriangles call for a given
+ * display frame -- native_renderer_3ds.c calls these from
+ * NativeRenderer_BeginScene/EndScene (once per frame, per Platform_Begin/
+ * EndScene's own re-entrancy guard), NOT from SwapWindow: real drawing
+ * happens earlier, via DrawAllSplits (DrawOTag, and potentially again mid-
+ * frame via DrawSync), so the frame bracket has to open before that, not at
+ * present time. */
 void N3DS_C3DBeginFrame(void);
 void N3DS_C3DEndFrame(void);
 
-/* Mirrors the shared NativeRenderer contract's own pattern: one upload per
- * accumulation cycle, then many small draws at different offsets into it
- * with different bound state between them. count above the internal cap is
- * silently clamped -- the cap is a placeholder, not a measured real number;
- * see the design doc's open question on real per-frame vertex counts. */
-void N3DS_C3DUploadVertices(const N3DS_Vertex *vertices, int count);
+/*
+ * One real vertex buffer per FRAME, not per draw. C3D_DrawArrays only
+ * appends GPU commands to a command list; the GPU doesn't actually read any
+ * vertex data until that whole list is submitted at once, in C3D_FrameEnd
+ * (GX_ProcessCommandList) -- confirmed directly against citro3d's upstream
+ * renderqueue.c. DrawAllSplits/DrawSplit (native_gpu.c) call
+ * NativeRenderer_DrawTriangles once per split -- up to MAX_DRAW_SPLITS
+ * (4096) times a frame -- so a frame routinely queues many draws before any
+ * of them actually executes. N3DS_C3DAppendVertices therefore writes each
+ * caller's vertices into the NEXT free region of one persistent buffer and
+ * returns where they landed; the caller must draw from that returned offset,
+ * not 0. (A real bug from getting this wrong, found and fixed 2026-07-19:
+ * an earlier version always wrote to offset 0 and always drew from offset 0,
+ * on the mistaken assumption that C3D_FRAME_SYNCDRAW's frame-to-frame block
+ * also serialised draws within one frame -- it doesn't. Every draw ended up
+ * reading whichever run's vertices were written last, since GPU execution
+ * only happens after ALL of a frame's CPU-side writes are already done.)
+ * N3DS_C3DBeginFrame resets the write cursor to 0 every frame.
+ *
+ * N3DS_MAX_FRAME_VERTICES is a headroom ceiling, not a measured real number
+ * -- matches the PC renderer's own MAX_VERTEX_BUFFER_SIZE (65536) rather
+ * than guessing a 3DS-specific figure, since real per-frame vertex counts
+ * are still unmeasured on this port (see the design doc's own open question
+ * on this). Also used to size native_renderer_3ds.c's per-run conversion
+ * scratch, since a single run can never need more space than a whole frame.
+ */
+#define N3DS_MAX_FRAME_VERTICES 65536
+/* Returns the vertex offset this call's data was written at (pass to
+ * N3DS_C3DDrawTriangles), or -1 if the frame buffer is full -- caller must
+ * skip drawing in that case, not draw from a stale/wrong offset. */
+int N3DS_C3DAppendVertices(const N3DS_Vertex *vertices, int count);
 void N3DS_C3DDrawTriangles(int startVertex, int triangleCount);
+
+/* ---------------------------------------------------- decoded textures --- */
+/* CPU-decoded-texture cache backing store (design doc section 1), organised
+ * as a small number of shared texture atlases rather than one dedicated
+ * texture per decoded (page,clut,format) combo. Each atlas is a fixed
+ * GPU_RGBA8 texture, nearest-filtered, clamped, holding a grid of
+ * N3DS_DECODE_TEXTURE_DIM-sized cells; native_renderer_3ds.c owns cache-
+ * replacement policy (which (page,clut,format) is decoded into which
+ * (atlas,cell)) and calls UploadDecodedCell to overwrite one cell's content.
+ *
+ * Why atlases, not one texture per entry (2026-07-19, added after the first
+ * real-content Azahar run measured ~150-290 separate draw calls/frame): PC's
+ * AddSplit doesn't split by page/clut (native_gpu.c:895-901), so one PC
+ * scene commonly touches many (page,clut) combos in an interleaved triangle
+ * stream; citro3d can only bind one texture per draw, so without atlasing
+ * every combo change forces a new bind+draw. Multiple combos sharing one
+ * atlas need only ONE bind+draw for the whole run, addressed via UV offset
+ * into the right cell -- draw ORDER is unchanged either way (no reordering,
+ * no sorting), which matters because this renderer has no depth test enabled
+ * (same as PC) and relies entirely on draw order for correct layering.
+ *
+ * N3DS_ATLAS_DIM is 1024 because citro3d's own checkTexSize caps any single
+ * texture at 1024x1024 -- confirmed directly against citro3d's upstream
+ * texture.c, not assumed -- so this is the largest, and therefore
+ * highest-cells-per-bind, atlas actually obtainable.
+ *
+ * IMPORTANT: citro3d's C3D_TexLoadImage (which C3D_TexUpload wraps) is a raw
+ * memcpy over a WHOLE mip level -- verified directly against citro3d's
+ * upstream source -- with no sub-rect upload API at all, so a single cell's
+ * decoded content can't go through it. N3DS_C3DUploadDecodedCell instead
+ * writes directly into the atlas's own tiled backing memory, computing the
+ * cell's tile-block offset by hand (same PICA200 8x8 Z-order tiling as
+ * before -- see the comment on N3DS_DecodeAndTilePage in native_renderer_3ds.c
+ * for the verified tile-order derivation this extends). tiledRGBA8 (the
+ * per-call input) must already be tiled the same way a whole-texture upload
+ * would need to be. */
+#define N3DS_DECODE_TEXTURE_DIM    256
+#define N3DS_ATLAS_COUNT           2
+#define N3DS_ATLAS_DIM             1024
+#define N3DS_ATLAS_CELLS_PER_ROW   (N3DS_ATLAS_DIM / N3DS_DECODE_TEXTURE_DIM)
+#define N3DS_ATLAS_CELLS_PER_ATLAS (N3DS_ATLAS_CELLS_PER_ROW * N3DS_ATLAS_CELLS_PER_ROW)
+
+void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256RGBA8);
+void N3DS_C3DBindAtlas(int atlasIndex);
 
 /* ---------------------------------------------------------------- input --- */
 

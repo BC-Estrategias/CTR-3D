@@ -97,8 +97,6 @@ void N3DS_GfxPresent(void)
 
 /* ------------------------------------------------------------- render --- */
 
-#define N3DS_MAX_VERTICES 256 /* placeholder cap, unmeasured -- see docs/CITRO3D_RENDERER_DESIGN.md */
-
 #define N3DS_DISPLAY_TRANSFER_FLAGS                                                                         \
 	(GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |                        \
 	 GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) |          \
@@ -110,6 +108,8 @@ static int s_uLocProjection = -1;
 static C3D_RenderTarget *s_renderTarget = NULL;
 static C3D_Mtx s_projection;
 static void *s_vertexBufferMem = NULL;
+static int s_vertexCursor = 0;
+static C3D_Tex s_atlasTextures[N3DS_ATLAS_COUNT];
 
 int N3DS_C3DInit(void)
 {
@@ -154,7 +154,7 @@ int N3DS_C3DInit(void)
 	AttrInfo_AddLoader(attrInfo, 1, GPU_FLOAT, 2); /* v1 = texcoord (u, v) */
 	AttrInfo_AddLoader(attrInfo, 2, GPU_FLOAT, 4); /* v2 = color (r, g, b, a) */
 
-	s_vertexBufferMem = linearAlloc((size_t)N3DS_MAX_VERTICES * sizeof(N3DS_Vertex));
+	s_vertexBufferMem = linearAlloc((size_t)N3DS_MAX_FRAME_VERTICES * sizeof(N3DS_Vertex));
 	if (s_vertexBufferMem == NULL)
 	{
 		return 0;
@@ -165,22 +165,54 @@ int N3DS_C3DInit(void)
 	BufInfo_Add(bufInfo, s_vertexBufferMem, sizeof(N3DS_Vertex), 3, 0x210);
 
 	/*
-	 * Phase 2a: vertex color only, no texture bound yet -- see
-	 * docs/CITRO3D_RENDERER_DESIGN.md section 1 for the real CPU-decoded
-	 * texture path this will become.
+	 * Texture0 modulated by vertex color -- the CPU decode cache (design doc
+	 * section 1) resolves page/CLUT/palette on the CPU, so by the time a
+	 * texture reaches the GPU it is an ordinary RGBA8 image; the vertex color
+	 * multiply reproduces the PC shader's v_color * texel behaviour (bright
+	 * baked into vertex color CPU-side -- see native_renderer_3ds.c).
 	 */
 	env = C3D_GetTexEnv(0);
 	C3D_TexEnvInit(env);
-	C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, 0, 0);
-	C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+	C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+	C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+
+	/*
+	 * Punch-through sentinel (design doc section 2): the decode cache encodes
+	 * alpha as 0 = "PS1 pure-black-is-invisible" texel, 128 = opaque, 255 =
+	 * STP-on. Phase 2a is single-pass only (no STP 2-pass blending yet, that's
+	 * 2b), so one GEQUAL-1 test rejects exactly the punch-through case and
+	 * passes everything else -- exactly the design doc's "single-pass" mode.
+	 * Set once here rather than per-draw since 2a never needs a different test.
+	 */
+	C3D_AlphaTest(true, GPU_GEQUAL, 1);
 
 	C3D_CullFace(GPU_CULL_NONE);
+
+	{
+		int i;
+		for (i = 0; i < N3DS_ATLAS_COUNT; i++)
+		{
+			if (!C3D_TexInit(&s_atlasTextures[i], N3DS_ATLAS_DIM, N3DS_ATLAS_DIM, GPU_RGBA8))
+			{
+				return 0;
+			}
+			C3D_TexSetFilter(&s_atlasTextures[i], GPU_NEAREST, GPU_NEAREST);
+			C3D_TexSetWrap(&s_atlasTextures[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+		}
+	}
 
 	return 1;
 }
 
 void N3DS_C3DExit(void)
 {
+	int i;
+
+	for (i = 0; i < N3DS_ATLAS_COUNT; i++)
+	{
+		C3D_TexDelete(&s_atlasTextures[i]);
+	}
+
 	if (s_vertexBufferMem != NULL)
 	{
 		linearFree(s_vertexBufferMem);
@@ -203,6 +235,11 @@ void N3DS_C3DBeginFrame(void)
 	C3D_RenderTargetClear(s_renderTarget, C3D_CLEAR_ALL, 0x000000FF, 0);
 	C3D_FrameDrawOn(s_renderTarget);
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
+
+	/* Every draw this frame appends into the SAME persistent buffer at a
+	 * fresh offset (see the header comment on N3DS_C3DAppendVertices) --
+	 * reset the write cursor once per frame, not per draw. */
+	s_vertexCursor = 0;
 }
 
 void N3DS_C3DEndFrame(void)
@@ -210,30 +247,79 @@ void N3DS_C3DEndFrame(void)
 	C3D_FrameEnd(0);
 }
 
-void N3DS_C3DUploadVertices(const N3DS_Vertex *vertices, int count)
+int N3DS_C3DAppendVertices(const N3DS_Vertex *vertices, int count)
 {
-	if (count > N3DS_MAX_VERTICES)
+	int base;
+	N3DS_Vertex *dst;
+
+	if ((count <= 0) || ((s_vertexCursor + count) > N3DS_MAX_FRAME_VERTICES))
 	{
-		count = N3DS_MAX_VERTICES;
-	}
-	if (count <= 0)
-	{
-		return;
+		return -1;
 	}
 
-	/*
-	 * Whole-buffer overwrite from the same linear-memory address every call,
-	 * same de-facto pattern as the PC renderer's glBufferSubData (see design
-	 * doc section 6). Safe without extra sync because C3D_FRAME_SYNCDRAW
-	 * (N3DS_C3DBeginFrame) blocks until the GPU has finished the previous
-	 * frame's draws before this can run again.
-	 */
-	memcpy(s_vertexBufferMem, vertices, (size_t)count * sizeof(N3DS_Vertex));
+	base = s_vertexCursor;
+	dst = (N3DS_Vertex *)s_vertexBufferMem + base;
+	memcpy(dst, vertices, (size_t)count * sizeof(N3DS_Vertex));
+	s_vertexCursor += count;
+
+	return base;
 }
 
 void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
 {
 	C3D_DrawArrays(GPU_TRIANGLES, startVertex, triangleCount * 3);
+}
+
+/* 8x8 texels * 4 bytes/texel (RGBA8) -- one PICA200 tile, tiled contiguously. */
+#define N3DS_TILE_BYTES (64 * 4)
+
+void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256RGBA8)
+{
+	/*
+	 * Manual sub-rect write -- see the header comment for why C3D_TexUpload
+	 * can't be used here. PICA200 tiling addresses 8x8-texel tiles in simple
+	 * row-major order across a texture's FULL width (verified against
+	 * tex3ds's reference swizzle, see native_renderer_3ds.c). A cell is a
+	 * 32x32-tile square (256/8) positioned at tile offset (cellX*32, cellY*32)
+	 * within the atlas's 128x128-tile grid (1024/8); each of its 32 tile-rows
+	 * is 32 CONSECUTIVE tiles, which -- because tile-column is the
+	 * fastest-varying index in row-major order -- are contiguous in the
+	 * atlas's memory too, so one memcpy per tile-row is exact and correct,
+	 * not an approximation.
+	 */
+	const int atlasTilesPerRow = N3DS_ATLAS_DIM / 8;
+	const int cellTilesPerRow = N3DS_DECODE_TEXTURE_DIM / 8;
+	const int cellBaseTileRow = cellY * cellTilesPerRow;
+	const int cellBaseTileCol = cellX * cellTilesPerRow;
+	const u8 *src = (const u8 *)tiled256RGBA8;
+	u8 *atlasData;
+	int localTileRow;
+
+	if ((atlasIndex < 0) || (atlasIndex >= N3DS_ATLAS_COUNT))
+	{
+		return;
+	}
+
+	atlasData = (u8 *)s_atlasTextures[atlasIndex].data;
+
+	for (localTileRow = 0; localTileRow < cellTilesPerRow; localTileRow++)
+	{
+		const int atlasTileRow = cellBaseTileRow + localTileRow;
+		u8 *dstRow = atlasData + (size_t)((atlasTileRow * atlasTilesPerRow) + cellBaseTileCol) * N3DS_TILE_BYTES;
+		const u8 *srcRow = src + (size_t)localTileRow * cellTilesPerRow * N3DS_TILE_BYTES;
+
+		memcpy(dstRow, srcRow, (size_t)cellTilesPerRow * N3DS_TILE_BYTES);
+	}
+}
+
+void N3DS_C3DBindAtlas(int atlasIndex)
+{
+	if ((atlasIndex < 0) || (atlasIndex >= N3DS_ATLAS_COUNT))
+	{
+		return;
+	}
+
+	C3D_TexBind(0, &s_atlasTextures[atlasIndex]);
 }
 
 unsigned int N3DS_ReadButtons(void)
