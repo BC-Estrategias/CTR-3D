@@ -3531,6 +3531,267 @@ int NativeAudio_RenderFrames(s16 *out, int frameCount)
 	return framesRendered;
 }
 
+#if defined(CTR_INTERNAL)
+/*
+ * ===================================================== mixer golden test ===
+ *
+ * Regression harness for changing NativeAudio_MixFrame. The mixer is a pure
+ * function of SPU state, so this does not need the GAME to be deterministic --
+ * only the mixer's INPUT. That matters, because on PC the game is not frame
+ * -deterministic without the replay scheduler: Native_CatchUpDueVBlanks emits
+ * vblanks off the wall clock, so two runs diverge.
+ *
+ * Instead: capture one real SPU state to a file, then replay it through the
+ * mixer as often as you like. struct NativeAudioSnapshot carries the whole
+ * 512KB spuSampleMem alongside every voice, the reverb state and XA, and
+ * CopyStateToVoice deliberately restores each active voice with pcm=NULL and
+ * sampleDirty=1, so the decoded PCM is rebuilt from the captured sample RAM.
+ * The blob is therefore self-contained and bit-reproducible.
+ *
+ * Why a checksum and not ears: the per-voice-across-a-block restructure is
+ * supposed to produce IDENTICAL samples, and the mix accumulates in ints, so
+ * there is no rounding drift to excuse a difference. Bit-identical is the
+ * correct bar, and it catches things listening never would -- in particular
+ * NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock, which runs per sample when a
+ * voice stops and can free voice->pcm, making any reordering order-sensitive.
+ *
+ *   Capture:  ctr_native --audio-capture out.spustate [--audio-capture-vblank N]
+ *   Compare:  ctr_native --audio-golden out.spustate [--audio-golden-raw out.raw]
+ *
+ * Capture at a vblank where the mixer is busy -- check the reverb and voice
+ * counts are non-zero, or the test proves nothing. Reverb especially: an early
+ * measurement in this project recorded "reverb is never configured" because
+ * every sample was taken before the game reached content that enables it.
+ */
+#define NATIVE_AUDIO_GOLDEN_PATH_MAX    512
+#define NATIVE_AUDIO_GOLDEN_VBLANKS     600 /* 10 s of mixer work at 60Hz */
+
+global_variable char s_goldenCapturePath[NATIVE_AUDIO_GOLDEN_PATH_MAX];
+global_variable int s_goldenCaptureAtVblank = -1;
+global_variable int s_goldenCaptureVblanks;
+
+internal u32 NativeAudio_GoldenHash(u32 hash, const void *data, int bytes)
+{
+	const u8 *cursor = (const u8 *)data;
+
+	/* FNV-1a, 32-bit. Any order-sensitive change moves it. */
+	for (int i = 0; i < bytes; i++)
+	{
+		hash ^= (u32)cursor[i];
+		hash *= 16777619u;
+	}
+
+	return hash;
+}
+
+internal int NativeAudio_GoldenCaptureNow(const char *path)
+{
+	const int stateSize = NativeAudio_GetStateSize();
+	void *blob = malloc((size_t)stateSize);
+	FILE *file;
+	int liveVoices = 0;
+	int written;
+
+	if (blob == NULL)
+	{
+		return 0;
+	}
+
+	if (!NativeAudio_CaptureState(blob, stateSize))
+	{
+		free(blob);
+		return 0;
+	}
+
+	file = fopen(path, "wb");
+	if (file == NULL)
+	{
+		Platform_LogError("[CTR AudioGolden] cannot write %s\n", path);
+		free(blob);
+		return 0;
+	}
+
+	written = (int)fwrite(blob, 1, (size_t)stateSize, file);
+	fclose(file);
+	free(blob);
+
+	for (int i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
+	{
+		if (s_audio.voices[i].active && (s_audio.voices[i].adsrPhase != NATIVE_AUDIO_ADSR_OFF))
+		{
+			liveVoices++;
+		}
+	}
+
+	Platform_Log("[CTR AudioGolden] captured %d bytes to %s (liveVoices=%d reverbSamples=%d xaActive=%d)\n", written, path, liveVoices,
+	             s_audio.reverb.sizeSamples, (int)s_audio.xa.active);
+	if ((liveVoices == 0) && (s_audio.reverb.sizeSamples == 0))
+	{
+		Platform_LogWarn("[CTR AudioGolden] WARNING: no live voices and no reverb -- this state exercises almost nothing.\n");
+	}
+
+	return written == stateSize;
+}
+
+void NativeAudio_GoldenCaptureTick(void)
+{
+	if (s_goldenCaptureAtVblank < 0)
+	{
+		return;
+	}
+
+	s_goldenCaptureVblanks++;
+	if (s_goldenCaptureVblanks < s_goldenCaptureAtVblank)
+	{
+		return;
+	}
+
+	s_goldenCaptureAtVblank = -1;
+	NativeAudio_GoldenCaptureNow(s_goldenCapturePath);
+	Platform_LogFlush();
+	exit(0);
+}
+
+internal int NativeAudio_GoldenRun(const char *statePath, const char *rawPath)
+{
+	s16 block[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
+	const int stateSize = NativeAudio_GetStateSize();
+	void *blob = malloc((size_t)stateSize);
+	FILE *file;
+	FILE *rawFile = NULL;
+	u32 hash = 2166136261u;
+	long totalFrames = 0;
+	int read;
+
+	if (blob == NULL)
+	{
+		return 1;
+	}
+
+	file = fopen(statePath, "rb");
+	if (file == NULL)
+	{
+		Platform_LogError("[CTR AudioGolden] cannot read %s\n", statePath);
+		free(blob);
+		return 1;
+	}
+
+	read = (int)fread(blob, 1, (size_t)stateSize, file);
+	fclose(file);
+
+	if (read != stateSize)
+	{
+		Platform_LogError("[CTR AudioGolden] %s is %d bytes, expected %d (rebuild changed the snapshot layout?)\n", statePath, read, stateSize);
+		free(blob);
+		return 1;
+	}
+
+	if (!NativeAudio_RestoreState(blob, stateSize))
+	{
+		Platform_LogError("[CTR AudioGolden] RestoreState rejected %s\n", statePath);
+		free(blob);
+		return 1;
+	}
+	free(blob);
+
+	/*
+	 * Render on the deterministic clock, exactly as the 3DS does, so this
+	 * measures the same code path the port actually runs.
+	 */
+	NativeAudio_SetDeterministicRenderMode(1);
+
+	if (rawPath != NULL)
+	{
+		rawFile = fopen(rawPath, "wb");
+		if (rawFile == NULL)
+		{
+			Platform_LogWarn("[CTR AudioGolden] cannot write %s, continuing with checksum only\n", rawPath);
+		}
+	}
+
+	for (int vblank = 0; vblank < NATIVE_AUDIO_GOLDEN_VBLANKS; vblank++)
+	{
+		const int frames = NativeAudio_RenderFrames(block, NATIVE_AUDIO_VBLANK_FRAMES);
+		const int bytes = frames * NATIVE_AUDIO_CHANNELS * (int)sizeof(s16);
+
+		if (frames <= 0)
+		{
+			break;
+		}
+
+		hash = NativeAudio_GoldenHash(hash, block, bytes);
+		totalFrames += frames;
+
+		if (rawFile != NULL)
+		{
+			fwrite(block, 1, (size_t)bytes, rawFile);
+		}
+	}
+
+	if (rawFile != NULL)
+	{
+		fclose(rawFile);
+	}
+
+	Platform_Log("[CTR AudioGolden] state=%s frames=%ld checksum=%08x\n", statePath, totalFrames, hash);
+	Platform_LogFlush();
+	return 0;
+}
+
+int NativeAudio_GoldenConfigureFromArgs(int argc, char **argv)
+{
+	const char *capturePath = NULL;
+	const char *captureVblank = NULL;
+	const char *goldenPath = NULL;
+	const char *rawPath = NULL;
+
+	for (int i = 1; i < argc; i++)
+	{
+		if ((i + 1) >= argc)
+		{
+			break;
+		}
+
+		if (strcmp(argv[i], "--audio-capture") == 0)
+		{
+			capturePath = argv[i + 1];
+		}
+		else if (strcmp(argv[i], "--audio-capture-vblank") == 0)
+		{
+			captureVblank = argv[i + 1];
+		}
+		else if (strcmp(argv[i], "--audio-golden") == 0)
+		{
+			goldenPath = argv[i + 1];
+		}
+		else if (strcmp(argv[i], "--audio-golden-raw") == 0)
+		{
+			rawPath = argv[i + 1];
+		}
+	}
+
+	if (goldenPath != NULL)
+	{
+		/* Returns nonzero so main() exits without ever entering the game. */
+		NativeAudio_GoldenRun(goldenPath, rawPath);
+		return 1;
+	}
+
+	if (capturePath != NULL)
+	{
+		snprintf(s_goldenCapturePath, sizeof(s_goldenCapturePath), "%s", capturePath);
+		s_goldenCaptureAtVblank = (captureVblank != NULL) ? atoi(captureVblank) : 1800;
+		if (s_goldenCaptureAtVblank < 1)
+		{
+			s_goldenCaptureAtVblank = 1;
+		}
+		Platform_Log("[CTR AudioGolden] will capture SPU state to %s at vblank %d\n", s_goldenCapturePath, s_goldenCaptureAtVblank);
+	}
+
+	return 0;
+}
+#endif /* CTR_INTERNAL */
+
 #if defined(__3DS__)
 /*
  * Read by the 3DS stats block in native_renderer_3ds.c. Same translation unit
@@ -3605,6 +3866,11 @@ void NativeAudio_StepVBlank(void)
 	NativeAudio_XAStreamPump();
 
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_AUDIO_VBLANK);
+
+#if defined(CTR_INTERNAL)
+	/* Outside the perf scope: capturing writes ~530KB and then exits. */
+	NativeAudio_GoldenCaptureTick();
+#endif
 
 #ifdef CTR_INTERNAL
 	if (shouldReportStats)

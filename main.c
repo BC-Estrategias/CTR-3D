@@ -251,6 +251,15 @@ int main(int argc, char *argv[])
 		Platform_Shutdown();
 		return NativeConsole_Return(1);
 	}
+
+	// --audio-golden replays a captured SPU state through the mixer and exits
+	// without starting the game; --audio-capture just arms the capture.
+	if (NativeAudio_GoldenConfigureFromArgs(argc, argv) != 0)
+	{
+		Platform_LogFlush();
+		Platform_Shutdown();
+		return NativeConsole_Return(0);
+	}
 #endif
 
 	Platform_InitScratchpad();

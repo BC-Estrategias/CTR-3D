@@ -41,6 +41,16 @@ void NativeAudio_Shutdown(void);
 #ifdef CTR_INTERNAL
 void NativeAudio_GetOutputStats(int *underrunFrames, int *overflowFrames, int *queuedFrames);
 #endif
+#if defined(CTR_INTERNAL)
+/*
+ * Mixer golden-output regression harness -- see the block comment above the
+ * implementation in platform/native_audio.c. Returns nonzero when it has run a
+ * comparison and main() should exit without starting the game.
+ */
+int NativeAudio_GoldenConfigureFromArgs(int argc, char **argv);
+void NativeAudio_GoldenCaptureTick(void);
+#endif
+
 int NativeAudio_GetStateSize(void);
 int NativeAudio_CaptureState(void *dst, int dstSize);
 int NativeAudio_RestoreState(const void *src, int srcSize);
