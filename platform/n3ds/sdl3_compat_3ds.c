@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "n3ds_audio_thread.h"
 #include "n3ds_backend.h"
 #include "sdl3_compat_3ds.h"
 
@@ -464,12 +465,14 @@ bool SDL_ResumeAudioStreamDevice(SDL_AudioStream *stream)
 bool SDL_LockAudioStream(SDL_AudioStream *stream)
 {
 	(void)stream;
+	N3DS_AudioLock();
 	return true;
 }
 
 bool SDL_UnlockAudioStream(SDL_AudioStream *stream)
 {
 	(void)stream;
+	N3DS_AudioUnlock();
 	return true;
 }
 

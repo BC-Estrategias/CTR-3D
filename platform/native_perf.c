@@ -9,6 +9,8 @@
 
 #if !defined(__3DS__)
 #include <SDL3/SDL.h>
+#else
+#include "n3ds/n3ds_audio_thread.h"
 #endif
 
 #include <errno.h>
@@ -366,7 +368,7 @@ internal void NativePerf_InsertWorstFrame(const struct NativePerfWorstFrame *fra
  */
 internal void NativePerf_Report3DSWindow(void)
 {
-	char header[160];
+	char header[224];
 	char acc[192];
 	char out[224];
 	s32 taken[NATIVE_PERF_BUCKET_COUNT];
@@ -393,9 +395,9 @@ internal void NativePerf_Report3DSWindow(void)
 	 * project has recorded so far came from menu/attract content -- three of
 	 * its wrong conclusions came from exactly that gap.
 	 */
-	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s lvl=%d mode=%d load=%d", s_windowFrames, s_perfConsoleTotalUs,
+	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s lvl=%d mode=%d load=%d audioBacklog=%d audioDropped=%d", s_windowFrames, s_perfConsoleTotalUs,
 	         s_perfConsoleWorkUs, CTR_3DS_SKIP_SPU_MIX ? "SKIPPED" : "on", s_frameBeginInfo.levelID, s_frameBeginInfo.gameMode1,
-	         s_frameBeginInfo.loadingStage);
+	         s_frameBeginInfo.loadingStage, N3DS_AudioThreadGetBacklog(), N3DS_AudioThreadGetDropped());
 	N3DS_DebugLog(header);
 
 	memset(taken, 0, sizeof(taken));

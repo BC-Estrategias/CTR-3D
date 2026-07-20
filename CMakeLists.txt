@@ -104,6 +104,7 @@ endif()
 set(CTR_NATIVE_SOURCES main.c)
 if(NINTENDO_3DS)
     list(APPEND CTR_NATIVE_SOURCES platform/n3ds/n3ds_backend.c)
+    list(APPEND CTR_NATIVE_SOURCES platform/n3ds/n3ds_audio_thread.c)
 endif()
 
 add_executable(ctr_native ${CTR_NATIVE_SOURCES})
@@ -113,7 +114,7 @@ if(NINTENDO_3DS)
     # default short enums. Nothing enum-typed crosses n3ds_backend.h -- it
     # exposes only plain scalars -- so this file can match libctru's ABI while
     # the game TU keeps the 4-byte enums its struct layouts require.
-    set_source_files_properties(platform/n3ds/n3ds_backend.c
+    set_source_files_properties(platform/n3ds/n3ds_backend.c platform/n3ds/n3ds_audio_thread.c
         PROPERTIES COMPILE_OPTIONS "-fshort-enums")
 endif()
 target_include_directories(ctr_native PRIVATE ${CMAKE_SOURCE_DIR}/include)

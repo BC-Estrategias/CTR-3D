@@ -6,6 +6,8 @@
 
 #if !defined(__3DS__)
 #include <SDL3/SDL.h>
+#else
+#include "n3ds/n3ds_audio_thread.h"
 #endif
 #include <limits.h>
 #include <stdio.h>
@@ -3513,6 +3515,63 @@ internal int NativeAudio_RenderFramesNoLock(s16 *out, int frameCount)
 	return frameCount;
 }
 
+#if defined(__3DS__)
+/*
+ * External-linkage entry point for n3ds_audio_thread.c's worker thread. That
+ * file is its own translation unit (same isolation as n3ds_backend.c -- see
+ * n3ds_backend.h) and cannot call NativeAudio_RenderFramesNoLock directly:
+ * that function is `internal` (static, macros.h:74), scoped to this unity
+ * TU, and its s16 buffer type plus NATIVE_AUDIO_VBLANK_FRAMES/
+ * NATIVE_AUDIO_CHANNELS are game-side symbols n3ds_audio_thread.c cannot see
+ * without including headers that collide with libctru (n3ds_backend.h's
+ * documented three-way collision). This wrapper owns the scratch buffer
+ * itself so nothing PSX-typed needs to cross that boundary -- the rendered
+ * samples are discarded here, same as the StepVBlank fallback branch below
+ * (this design's discard-not-queue decision). Caller (the worker thread)
+ * holds s_audioRenderLock for the duration, which is the same lock
+ * NativeAudio_LockOutput/UnlockOutput take on this platform via the
+ * SDL_LockAudioStream/UnlockAudioStream shim -- so this still runs under
+ * the equivalent of the normal lock discipline even though it does not call
+ * those functions directly.
+ */
+void NativeAudio_RenderVBlankForAudioThread(void)
+{
+	s16 scratch[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
+
+	NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
+}
+#endif
+
+#if defined(__3DS__)
+/*
+ * External-linkage entry point for n3ds_audio_thread.c's worker thread, same
+ * cross-TU reasoning as NativeAudio_RenderVBlankForAudioThread above: that
+ * file is its own translation unit and cannot call NativeAudio_XAStreamPump
+ * directly, because that function is `internal` (static, macros.h:74),
+ * scoped to this unity TU. Unlike the render wrapper, no PSX-typed buffer
+ * needs to cross the boundary at all -- NativeAudio_XAStreamPump is already
+ * void->void, so this wrapper is a pure pass-through.
+ *
+ * Caller discipline (not enforced by the compiler -- see
+ * docs/AUDIO_THREADING_DESIGN.md, "Verification findings"): this must be
+ * called AFTER the worker thread has released s_audioRenderLock, never while
+ * still holding it. NativeAudio_XAStreamPump() internally takes
+ * NativeAudio_LockOutput()/UnlockOutput(), which resolve to the same
+ * s_audioRenderLock via the SDL_LockAudioStream/UnlockAudioStream shim.
+ * LightLock is non-recursive, so calling this from inside
+ * NativeAudio_RenderVBlankForAudioThread's own lock/unlock bracket (or any
+ * other span still holding that lock) would make the worker thread
+ * self-deadlock trying to re-lock a lock it already holds -- silent at
+ * compile time, visible only as a hang at runtime. The worker loop calls
+ * this as its own separate, sequential step after the render lock is
+ * released, not nested inside it.
+ */
+void NativeAudio_XAPumpForAudioThread(void)
+{
+	NativeAudio_XAStreamPump();
+}
+#endif
+
 int NativeAudio_RenderFrames(s16 *out, int frameCount)
 {
 	int framesRendered;
@@ -3819,10 +3878,17 @@ void NativeAudio_StepVBlank(void)
 	}
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_AUDIO_VBLANK);
-	NativeAudio_LockOutput();
 
 #if defined(__3DS__)
 	/*
+	 * On 3DS, StepVBlank does NOT take the big render lock at all -- the
+	 * audio-thread handshake below uses its own small counter lock
+	 * internally (N3DS_AudioThreadNotifyVBlank), and the shape-stats block
+	 * here is an explicitly unlocked, best-effort read, matching the
+	 * existing precedent for exactly this class of diagnostic
+	 * (NativeAudio_XAStreamSectorsBuffered: reads without a lock, a
+	 * best-effort periodic counter, not a correctness-sensitive read).
+	 *
 	 * Shape of the mixer's workload, sampled once per vblank rather than per
 	 * sample so it costs nothing measurable. NativeAudio_MixFrame runs the
 	 * 24-voice loop AND the reverb chain for every one of the 735 sample
@@ -3845,7 +3911,36 @@ void NativeAudio_StepVBlank(void)
 		s_audioShapeReverbSamples = s_audio.reverb.sizeSamples;
 		s_audioShapeXaActive = s_audio.xa.active;
 	}
-#endif
+
+	if (s_audio.output.deterministicRenderMode)
+	{
+		if (N3DS_AudioThreadIsRunning())
+		{
+			N3DS_AudioThreadNotifyVBlank(); /* O(1): small-lock bump + signal only */
+		}
+		else
+		{
+			/* Fallback: no worker thread secured (Old3DS, couldn't claim
+			 * core 1, or CTR_3DS_SKIP_SPU_MIX is on). Behaves like today's
+			 * synchronous path, minus queueing (discard decision). */
+			s16 scratch[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
+
+			NativeAudio_LockOutput(); /* real on this path too -- harmless,
+			                              nothing else contends for it when
+			                              there is no worker thread */
+			NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
+			NativeAudio_UnlockOutput();
+		}
+	}
+	/* No CTR_INTERNAL stats-reporting block on this path: with output
+	 * discarded on 3DS, underrun/overflow/queued counters are not
+	 * meaningful the way they are on PC. audioThreadBacklogVBlanks /
+	 * audioThreadDroppedVBlanks (N3DS_AudioThreadGetBacklog/GetDropped) are
+	 * the 3DS-relevant numbers instead. shouldReportStats therefore stays
+	 * false on this path, so the shared CTR_INTERNAL block below is a no-op
+	 * here without needing its own #if. */
+#else
+	NativeAudio_LockOutput();
 
 	if (s_audio.output.deterministicRenderMode)
 	{
@@ -3862,8 +3957,25 @@ void NativeAudio_StepVBlank(void)
 #endif
 
 	NativeAudio_UnlockOutput();
+#endif
 
+#if defined(__3DS__)
+	if (!(s_audio.output.deterministicRenderMode && N3DS_AudioThreadIsRunning()))
+	{
+		/* No worker thread handling this vblank (fallback path, or
+		 * deterministicRenderMode somehow false) -- pump XA decode
+		 * ourselves, exactly as before this change. When the worker IS
+		 * handling this vblank, it calls NativeAudio_XAPumpForAudioThread()
+		 * itself after releasing s_audioRenderLock (n3ds_audio_thread.c),
+		 * restoring the single-thread invariant between XA decode-pump and
+		 * XA position-advance (already inside MixFrame, worker-side) that
+		 * made this safe before lever 3 existed. See
+		 * docs/AUDIO_THREADING_DESIGN.md, "Verification findings". */
+		NativeAudio_XAStreamPump();
+	}
+#else
 	NativeAudio_XAStreamPump();
+#endif
 
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_AUDIO_VBLANK);
 
@@ -3972,6 +4084,14 @@ internal int NativeAudio_OpenDevice(void)
 
 void NativeAudio_Shutdown(void)
 {
+#if defined(__3DS__)
+	/* Single confirmed teardown chokepoint (HOME/power -> SDL_EVENT_QUIT ->
+	 * exit(0) -> atexit -> Platform_Shutdown -> here), and also reachable
+	 * via the early init-failure path before N3DS_AudioThreadInit ever ran
+	 * -- N3DS_AudioThreadShutdown is null-safe for that case. */
+	N3DS_AudioThreadShutdown();
+#endif
+
 	if (s_audio.output.stream != NULL)
 	{
 		SDL_DestroyAudioStream(s_audio.output.stream);
@@ -4013,6 +4133,21 @@ s32 NativeAudio_SpuInit(void)
 	// VBlank clock is the correct model here, and matches how the 3DS renderer
 	// is paced. Revisit when ndsp is wired up and a real callback exists.
 	NativeAudio_SetDeterministicRenderMode(1);
+
+	// 3DS audio subsystem finishing initialization: try to spin up the
+	// dedicated mixer thread (docs/AUDIO_THREADING_DESIGN.md). Safe to call
+	// every time this function runs, including the repeat calls
+	// NativeAudio_PlayXATrack/PlayXAFile make on every XA playback request --
+	// N3DS_AudioThreadInit no-ops if a worker is already running. Passing
+	// !CTR_3DS_SKIP_SPU_MIX rather than gating this call on it: that macro is
+	// only reliably normalized to 0/1 inside this translation unit (CMake
+	// only defines it explicitly when turned OFF; the default-ON case relies
+	// on this file's own #if !defined(CTR_3DS_SKIP_SPU_MIX) block above), so
+	// n3ds_audio_thread.c cannot safely re-derive it -- and gating the call
+	// itself away entirely would also skip the lock initialization
+	// N3DS_AudioLock/N3DS_AudioUnlock need for the ~30 existing call sites
+	// that keep running regardless of this flag.
+	N3DS_AudioThreadInit(!CTR_3DS_SKIP_SPU_MIX);
 #endif
 
 	return 1;
