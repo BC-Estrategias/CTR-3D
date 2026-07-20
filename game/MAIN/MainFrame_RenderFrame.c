@@ -13,12 +13,45 @@
 volatile int gCtrDebugSkipLevelGeometry = 0;
 #endif
 
+#ifdef CTR_NATIVE
+/*
+ * DIAGNOSTIC (2026-07-20, session 10): hardware hangs somewhere after
+ * LOAD_TenStages reaches stage 2 (confirmed via game/LOAD/LOAD_TenStages.c's
+ * own checkpoint logging -- that log stops cold right after "stage 2 ->
+ * called", and LOAD_OvrLOD (what stage 2 calls) is a two-field-write no-op on
+ * CTR_NATIVE, so it cannot itself be blocking). MainFrame_RenderFrame runs
+ * unconditionally every frame regardless of load state (see MainMain.c's
+ * case 3), so it is the next thing that runs after the loading-stage check
+ * completes for this frame -- tag each of its existing perf-scope boundaries
+ * with a checkpoint log, bounded to the first few calls, to localize a hang
+ * to one section instead of guessing which of ~1300 lines is responsible.
+ */
+static int s_mainFrameRenderCalls = 0;
+#define MAINFRAME_LOG_CHECKPOINT(name)                                                                            \
+	do                                                                                                             \
+	{                                                                                                              \
+		if (s_mainFrameRenderCalls <= 3)                                                                          \
+		{                                                                                                          \
+			Platform_Log("[CTR RENDER] MainFrame_RenderFrame call=%d checkpoint=%s\n", s_mainFrameRenderCalls,     \
+			             name);                                                                                   \
+		}                                                                                                         \
+	} while (0)
+#else
+#define MAINFRAME_LOG_CHECKPOINT(name) ((void)0)
+#endif
+
 void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamepads)
 {
 	struct Level *lev = gGT->level1;
 	struct mesh_info *ptr_mesh_info = 0;
 
+#ifdef CTR_NATIVE
+	s_mainFrameRenderCalls++;
+	MAINFRAME_LOG_CHECKPOINT("entry");
+#endif
+
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_SETUP);
+	MAINFRAME_LOG_CHECKPOINT("SETUP");
 	DrawUnpluggedMsg(gGT, gGamepads);
 	DrawFinalLap(gGT);
 
@@ -65,6 +98,7 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_SETUP);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
+	MAINFRAME_LOG_CHECKPOINT("EFFECTS_1_weather");
 	RenderAllWeather(gGT);
 	RenderAllConfetti(gGT);
 	// NOTE(aalhendi): ASM-verified NTSC-U 926 subrange 0x800364f8-0x80036538.
@@ -80,20 +114,24 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_HUD);
+	MAINFRAME_LOG_CHECKPOINT("HUD");
 	RenderAllHUD(gGT);
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_HUD);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
+	MAINFRAME_LOG_CHECKPOINT("EFFECTS_2_beakerrain");
 	RenderAllBeakerRain(gGT);
 
 	RenderAllBoxSceneSplitLines(gGT);
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_QUEUE_INSTANCES);
+	MAINFRAME_LOG_CHECKPOINT("QUEUE_INSTANCES");
 	RenderBucket_QueueAllInstances(gGT);
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_QUEUE_INSTANCES);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
+	MAINFRAME_LOG_CHECKPOINT("EFFECTS_3_particles");
 	RenderAllNormalParticles(gGT);
 
 	RenderDispEnv_World(gGT); // == RenderDispEnv_World ==
@@ -108,10 +146,12 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EXECUTE_INSTANCES);
+	MAINFRAME_LOG_CHECKPOINT("EXECUTE_INSTANCES");
 	RenderBucket_ExecuteAllInstances(gGT);
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EXECUTE_INSTANCES);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
+	MAINFRAME_LOG_CHECKPOINT("EFFECTS_4_tires");
 	RenderAllTires(gGT);
 
 	RenderAllShadows(gGT);
@@ -128,11 +168,13 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 #endif
 		{
 			MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_LEVEL_GEOMETRY);
+			MAINFRAME_LOG_CHECKPOINT("LEVEL_GEOMETRY");
 			RenderAllLevelGeometry(gGT, lev, ptr_mesh_info);
 			MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_LEVEL_GEOMETRY);
 		}
 
 		MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_POST_LEVEL);
+		MAINFRAME_LOG_CHECKPOINT("POST_LEVEL");
 		RenderDispEnv_World(gGT); // == RenderDispEnv_World ==
 
 		if (((gGT->hudFlags & HUD_FLAG_RACE_HUD) != 0) && (gGT->numPlyrCurrGame > 1))
@@ -192,19 +234,30 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	if ((gGT->gameMode1 & (ADVENTURE_ARENA | END_OF_RACE | MAIN_MENU)) != 0)
 	{
 		MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_REFRESHCARD);
+		MAINFRAME_LOG_CHECKPOINT("REFRESHCARD");
 		RefreshCard_Entry();
 		MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_REFRESHCARD);
 	}
 
+	MAINFRAME_LOG_CHECKPOINT("pre_clear_swapchain_lev_deref");
 	// clear swapchain
+	// DIAGNOSTIC (2026-07-20, session 10): lev is gGT->level1, only ever set in
+	// LOAD_TenStages case 7 -- unlike every other lev-derived pointer in this
+	// function (ptr_mesh_info, the level-geometry block), this dereferences
+	// lev directly with no "lev != 0" guard. If RENDER_FLAG_CLEAR_BACK_BUFFER
+	// is ever set while a level is still loading (lev == NULL), this is an
+	// unguarded null deref -- a plausible hardware-only hang/crash if the
+	// timing that lets it happen never occurs on Azahar's much faster load.
 	if (((gGT->renderFlags & RENDER_FLAG_CLEAR_BACK_BUFFER) != 0) && ((lev->clearColor[0].enable != 0) || (lev->clearColor[1].enable != 0)))
 	{
 		MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_CLEAR_SCREEN);
+		MAINFRAME_LOG_CHECKPOINT("CLEAR_SCREEN");
 		CAM_ClearScreen(gGT);
 		MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_CLEAR_SCREEN);
 	}
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_UI);
+	MAINFRAME_LOG_CHECKPOINT("UI");
 	if ((gGT->renderFlags & RENDER_FLAG_CHECKERED_FLAG) != 0)
 	{
 		RaceFlag_DrawSelf();
@@ -214,6 +267,7 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_UI);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_RENDER_VSYNC);
+	MAINFRAME_LOG_CHECKPOINT("RENDER_VSYNC");
 	RenderVSYNC(gGT);
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_RENDER_VSYNC);
 
@@ -221,7 +275,9 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 	RenderFMV();
 #endif
 
+	MAINFRAME_LOG_CHECKPOINT("pre_RenderSubmit");
 	RenderSubmit(gGT);
+	MAINFRAME_LOG_CHECKPOINT("exit_post_RenderSubmit");
 }
 
 void DrawUnpluggedMsg(struct GameTracker *gGT, struct GamepadSystem *gGamepads)

@@ -35,6 +35,26 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
 	int ovrRegion1;
 	int ovrRegion3;
 
+#ifdef CTR_NATIVE
+	// DIAGNOSTIC (2026-07-20, session 10): log only on a stage CHANGE or a
+	// load_inProgress transition, so this stays cheap even though the caller
+	// (MainMain.c) invokes this once per rendered frame throughout a load --
+	// a per-call log here would flood sdmc:/ctr3ds.log. Answers "did we ever
+	// advance past stage 0, and did load_inProgress ever get stuck."
+	{
+		static int s_lastLoggedStage = -100;
+		static int s_lastLoggedLoadInProgress = -1;
+
+		if ((loadingStage != s_lastLoggedStage) || ((int)sdata->load_inProgress != s_lastLoggedLoadInProgress))
+		{
+			Platform_Log("[CTR LOAD] TenStages: stage %d -> called with loadInProgress=%d boolFirstBoot=%d\n", loadingStage,
+			             (int)sdata->load_inProgress, (int)sdata->boolFirstBoot);
+			s_lastLoggedStage = loadingStage;
+			s_lastLoggedLoadInProgress = (int)sdata->load_inProgress;
+		}
+	}
+#endif
+
 	// if game is loading
 	if (sdata->load_inProgress != 0)
 	{
@@ -74,10 +94,44 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
 			// the point retail normally reaches while loading the ND crate.
 			// Present every wait tick so both host swapchain images are
 			// overwritten with copyright instead of briefly revealing SCEA.
-			while (((sdata->songPool[0].flags & 3) == 1) && (sdata->songPool[0].timeSpentPlaying < LOAD_NATIVE_NDBOX_INTRO_SONG_SYNC_TIME))
+			//
+			// DIAGNOSTIC (2026-07-20, session 10): this loop is a plausible hang
+			// suspect on real hardware -- it is the only #ifdef CTR_NATIVE
+			// addition here, it fires exactly once (boolFirstBoot is cleared
+			// just above), and it has no timeout: if songPool[0].timeSpentPlaying
+			// never reaches the threshold, this never returns and the whole
+			// per-frame loop stops dead, which matches "hangs at the first
+			// triangle" (nothing downstream of this call, including the OT walk,
+			// ever runs). Logged via Platform_Log, NOT the renderer's own
+			// periodic console block, because that block requires reaching
+			// NativeRenderer_SwapWindow -- which this loop may or may not ever
+			// reach depending on what Platform_PresentVRAMDisplay does -- so it
+			// must not be trusted to report on this loop's own state.
 			{
-				VSync(0);
-				Platform_PresentVRAMDisplay();
+				u32 spinIterations = 0;
+
+				Platform_Log("[CTR LOAD] first-boot wait: enter, flags=%d timeSpentPlaying=%d target=%d\n",
+				             (int)sdata->songPool[0].flags, sdata->songPool[0].timeSpentPlaying,
+				             (int)LOAD_NATIVE_NDBOX_INTRO_SONG_SYNC_TIME);
+
+				while (((sdata->songPool[0].flags & 3) == 1) &&
+				       (sdata->songPool[0].timeSpentPlaying < LOAD_NATIVE_NDBOX_INTRO_SONG_SYNC_TIME))
+				{
+					VSync(0);
+					Platform_PresentVRAMDisplay();
+
+					spinIterations++;
+					if ((spinIterations <= 5) || ((spinIterations % 30) == 0))
+					{
+						Platform_Log("[CTR LOAD] first-boot wait: iter=%lu flags=%d timeSpentPlaying=%d\n",
+						             (unsigned long)spinIterations, (int)sdata->songPool[0].flags,
+						             sdata->songPool[0].timeSpentPlaying);
+					}
+				}
+
+				Platform_Log("[CTR LOAD] first-boot wait: EXIT after %lu iters, flags=%d timeSpentPlaying=%d\n",
+				             (unsigned long)spinIterations, (int)sdata->songPool[0].flags,
+				             sdata->songPool[0].timeSpentPlaying);
 			}
 #endif
 

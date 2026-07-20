@@ -1172,8 +1172,45 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 		GTECapture_BeginOTWalk();
 #endif
 
+		/*
+		 * DIAGNOSTIC (2026-07-20, session 10): this loop's only exits are the
+		 * terminator tag (isendprim) and the invalid-link check below -- both
+		 * assume the OT is a simple forward chain. Neither catches a genuine
+		 * CYCLE: a chain of otherwise-legitimate, individually-registered
+		 * pointers that loops back on itself instead of ever reaching the
+		 * terminator. Every node in such a cycle passes NativeGpu_IsValidOTLink
+		 * (it really is a registered pointer), so that check can never trip,
+		 * and the walk spins forever with no log output -- a silent hang.
+		 * Real OTs here are at most a few thousand entries (RenderSubmit uses
+		 * ptrOT[0x3ff]; MainFrame.c sizes the swapchain OT at
+		 * numPlyrCurrGame<<10 | 6, i.e. ~1030-4102 for 1-4 players), so a
+		 * 65536-iteration cap is far above any legitimate walk and costs
+		 * nothing to check (a few cycles per node) -- but it turns an
+		 * unrecoverable freeze into a diagnosable one.
+		 */
+		u32 otWalkIterations = 0;
+
 		while (true)
 		{
+			otWalkIterations++;
+			if (otWalkIterations > 65536)
+			{
+				char packetRegion[64];
+				char startRegion[64];
+
+				NativeGpu_FormatPointerRegion(packetRegion, sizeof(packetRegion), (uintptr_t)basePacket);
+				NativeGpu_FormatPointerRegion(startRegion, sizeof(startRegion), (uintptr_t)p);
+				NATIVE_GPU_ERROR(
+				    "OT WALK DID NOT TERMINATE after %lu iterations -- likely a cycle. start=%p startRegion=%s "
+				    "current=%p currentRegion=%s addr=%06x len=%d code=%02x words=%08x %08x %08x %08x\n",
+				    (unsigned long)otWalkIterations, (void *)p, startRegion, (void *)basePacket, packetRegion, getaddr(basePacket), getlen(basePacket),
+				    getcode(basePacket), NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 0), NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 1),
+				    NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 2), NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 3));
+				Platform_Log("[CTR GPU] OT WALK CYCLE after %lu iters, current=%p addr=%06x len=%d code=%02x\n", (unsigned long)otWalkIterations,
+				             (void *)basePacket, getaddr(basePacket), getlen(basePacket), getcode(basePacket));
+				break;
+			}
+
 			const int tagLength = getlen(basePacket);
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
