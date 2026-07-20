@@ -194,8 +194,18 @@ bool SDL_HideCursor(void)
  * PSX pad bits (see NativeInput_DefaultMappings). Routing through the existing
  * mapping avoids duplicating the pad-bus logic.
  *
- * Face buttons follow CTR's PSX layout: Cross accelerates, Square brakes,
- * Circle fires, Triangle looks back.
+ * Face buttons map by PHYSICAL POSITION, not by letter. The 3DS diamond sits
+ * where the PlayStation diamond does, so bottom->Cross, left->Square,
+ * top->Triangle, right->Circle:
+ *
+ *        X                      /\                 X -> Triangle
+ *      Y   A                  []    O              Y -> Square
+ *        B                      ><                 A -> Circle
+ *                                                  B -> Cross
+ *
+ * Matching them by letter instead (3DS A -> Cross because both are "A"-ish)
+ * puts accelerate on the right-hand button rather than the bottom one, which
+ * is wrong under the thumb for anyone who has played the original.
  */
 
 static bool s_keyState[SDL_SCANCODE_COUNT];
@@ -209,10 +219,10 @@ static void N3DS_PumpInput(void)
 {
 	const unsigned int held = N3DS_ReadButtons();
 
-	N3DS_SetKey(SDL_SCANCODE_C, (held & N3DS_BTN_A) != 0); /* cross    */
-	N3DS_SetKey(SDL_SCANCODE_X, (held & N3DS_BTN_B) != 0); /* square   */
-	N3DS_SetKey(SDL_SCANCODE_V, (held & N3DS_BTN_X) != 0); /* circle   */
-	N3DS_SetKey(SDL_SCANCODE_Z, (held & N3DS_BTN_Y) != 0); /* triangle */
+	N3DS_SetKey(SDL_SCANCODE_C, (held & N3DS_BTN_B) != 0); /* B (bottom) -> cross    : accelerate */
+	N3DS_SetKey(SDL_SCANCODE_X, (held & N3DS_BTN_Y) != 0); /* Y (left)   -> square   : brake     */
+	N3DS_SetKey(SDL_SCANCODE_V, (held & N3DS_BTN_A) != 0); /* A (right)  -> circle   : fire      */
+	N3DS_SetKey(SDL_SCANCODE_Z, (held & N3DS_BTN_X) != 0); /* X (top)    -> triangle : look back */
 
 	N3DS_SetKey(SDL_SCANCODE_LSHIFT, (held & N3DS_BTN_L) != 0); /* L1 */
 	N3DS_SetKey(SDL_SCANCODE_RSHIFT, (held & N3DS_BTN_R) != 0); /* R1 */
