@@ -145,6 +145,19 @@ global_variable u32 s_windowFrames;
 global_variable f64 s_windowTotalMs;
 global_variable f64 s_windowWorkMs;
 global_variable f64 s_windowBucketMs[NATIVE_PERF_BUCKET_COUNT];
+
+/*
+ * Last reported window, mirrored for the bottom-screen console in
+ * native_renderer_3ds.c. On real hardware the top screen may be blank and the
+ * SD card lives behind the backplate, so the console is often the only
+ * readable output -- these let a photo of it carry the attribution, not just
+ * the frame rate.
+ */
+#define NATIVE_PERF_3DS_CONSOLE_BUCKETS 2
+global_variable int s_perfConsoleTotalUs;
+global_variable int s_perfConsoleWorkUs;
+global_variable const char *s_perfConsoleName[NATIVE_PERF_3DS_CONSOLE_BUCKETS];
+global_variable int s_perfConsoleUs[NATIVE_PERF_3DS_CONSOLE_BUCKETS];
 #endif
 
 internal f64 NativePerf_CounterToMs(u64 counterDelta)
@@ -353,7 +366,7 @@ internal void NativePerf_InsertWorstFrame(const struct NativePerfWorstFrame *fra
  */
 internal void NativePerf_Report3DSWindow(void)
 {
-	char header[96];
+	char header[160];
 	char acc[192];
 	char out[224];
 	s32 taken[NATIVE_PERF_BUCKET_COUNT];
@@ -371,8 +384,18 @@ internal void NativePerf_Report3DSWindow(void)
 	// spuMix is stamped into every window on purpose: these numbers mean
 	// something very different with the voice mixer skipped, and a perf figure
 	// recorded without that context has already misled this project once.
-	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s", s_windowFrames, (int)(s_windowTotalMs * toAvgUs),
-	         (int)(s_windowWorkMs * toAvgUs), CTR_3DS_SKIP_SPU_MIX ? "SKIPPED" : "on");
+	s_perfConsoleTotalUs = (int)(s_windowTotalMs * toAvgUs);
+	s_perfConsoleWorkUs = (int)(s_windowWorkMs * toAvgUs);
+
+	/*
+	 * lvl/mode identify WHAT was on screen for this window. Without them a log
+	 * cannot tell a menu from a race, and every performance number this
+	 * project has recorded so far came from menu/attract content -- three of
+	 * its wrong conclusions came from exactly that gap.
+	 */
+	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s lvl=%d mode=%d load=%d", s_windowFrames, s_perfConsoleTotalUs,
+	         s_perfConsoleWorkUs, CTR_3DS_SKIP_SPU_MIX ? "SKIPPED" : "on", s_frameBeginInfo.levelID, s_frameBeginInfo.gameMode1,
+	         s_frameBeginInfo.loadingStage);
 	N3DS_DebugLog(header);
 
 	memset(taken, 0, sizeof(taken));
@@ -399,6 +422,11 @@ internal void NativePerf_Report3DSWindow(void)
 		}
 
 		taken[best] = 1;
+		if (rank < NATIVE_PERF_3DS_CONSOLE_BUCKETS)
+		{
+			s_perfConsoleName[rank] = NativePerf_BucketName((enum NativePerfBucket)best);
+			s_perfConsoleUs[rank] = (int)(bestMs * toAvgUs);
+		}
 		written = snprintf(acc + offset, sizeof(acc) - (size_t)offset, " %s=%d", NativePerf_BucketName((enum NativePerfBucket)best),
 		                   (int)(bestMs * toAvgUs));
 		if ((written > 0) && ((size_t)(offset + written) < sizeof(acc)))

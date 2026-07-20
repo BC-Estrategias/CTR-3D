@@ -3875,8 +3875,23 @@ void NativeAudio_StepVBlank(void)
 #ifdef CTR_INTERNAL
 	if (shouldReportStats)
 	{
+#if defined(__3DS__)
+		/*
+		 * To the log, never stdout: on 3DS stdout IS the bottom-screen console
+		 * that the stats block draws with absolute cursor positioning, and an
+		 * unpositioned line here scrolls the whole thing out from under it.
+		 */
+		{
+			char line[128];
+
+			snprintf(line, sizeof(line), "[CTR-3DS] audio out underrun=%d overflow=%d queued=%d cbMax=%d", underrunFrames, overflowFrames, queuedFrames,
+			         s_audio.output.callbackMaxRequestFrames);
+			N3DS_DebugLog(line);
+		}
+#else
 		printf("[CTR Native] Audio output stats: underrunFrames=%d overflowFrames=%d queuedFrames=%d callbackMaxRequestFrames=%d\n", underrunFrames,
 		       overflowFrames, queuedFrames, s_audio.output.callbackMaxRequestFrames);
+#endif
 	}
 #endif
 }

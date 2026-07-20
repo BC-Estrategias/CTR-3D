@@ -641,7 +641,19 @@ void NativeRenderer_SwapWindow(void)
 		s_lastStatFrames = frames;
 		s_lastStatVblanks = vblanks;
 
-		printf("\x1b[16;1H---- 3DS port stats ----------------\n");
+		/*
+		 * Row 1, not row 16: the block started halfway down when the console
+		 * shared the TOP screen with game output. citro3d owns the top screen
+		 * now, so the whole bottom console is ours -- and starting at 16 left
+		 * too few rows, so the block overflowed, scrolled, and then redrew
+		 * over its own scrolled remains. Unreadable on hardware, which is
+		 * where this is the only output there is.
+		 */
+		// \x1b[2J (clear) then home. Redrawing in place left fragments of the
+		// previous, longer values behind wherever a new line was shorter,
+		// which reads as garbled overlapping text -- useless in a photo, and a
+		// photo of this screen is the whole readout on real hardware.
+		printf("\x1b[2J\x1b[1;1H---- 3DS port stats ----------------\n");
 		printf("frames %-8lu vblanks %-8lu\n", frames, vblanks);
 		printf("fps    %lu.%lu now / %lu.%lu avg (target 30)   \n",
 		       nowX10 / 10UL, nowX10 % 10UL, avgX10 / 10UL, avgX10 % 10UL);
@@ -736,6 +748,22 @@ void NativeRenderer_SwapWindow(void)
 				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] audio voicesX10=%lu vblanks=%lu reverbSamples=%d xaActive=%d",
 				         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive);
 				N3DS_DebugLog(cacheLine);
+			}
+
+			/*
+			 * Profiler attribution on screen, not only in sdmc:/ctr3ds.log. On
+			 * real hardware the SD card is behind the backplate and the top
+			 * screen may still be blank, so this console is often the only
+			 * output that can be read at all -- a photo of it should answer
+			 * "where did the frame go", not just "how fast was it".
+			 */
+			printf("perf   frame %lu.%lums  work %lu.%lums        \n", (unsigned long)s_perfConsoleTotalUs / 1000UL,
+			       ((unsigned long)s_perfConsoleTotalUs % 1000UL) / 100UL, (unsigned long)s_perfConsoleWorkUs / 1000UL,
+			       ((unsigned long)s_perfConsoleWorkUs % 1000UL) / 100UL);
+			for (int i = 0; i < NATIVE_PERF_3DS_CONSOLE_BUCKETS; i++)
+			{
+				printf(" %-24s %lu.%lums   \n", (s_perfConsoleName[i] != NULL) ? s_perfConsoleName[i] : "-",
+				       (unsigned long)s_perfConsoleUs[i] / 1000UL, ((unsigned long)s_perfConsoleUs[i] % 1000UL) / 100UL);
 			}
 		}
 	}
