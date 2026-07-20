@@ -1123,8 +1123,21 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 		for (x = 0; x < displayW; x += maxChunk)
 		{
 			const int chunkW = ((displayW - x) > maxChunk) ? maxChunk : (displayW - x);
-			const float u1 = (float)chunkW / (float)maxChunk;
-			const float v1 = (float)chunkH / (float)maxChunk;
+			/*
+			 * Pre-scaled by (1024/maxChunk), not left as a plain [0,1]
+			 * fraction like the old float u1/v1 were: ctr.v.pica now applies
+			 * a single, unconditional *1/1024 to every vertex's texcoord
+			 * (design doc "Lever 2"/docs/VERTEX_FORMAT_DESIGN.md) because one
+			 * vertex shader is shared by every draw call in this renderer,
+			 * not just DrawTriangles' atlas-cell path. This quad samples a
+			 * dedicated, non-atlas s_vramDisplayTex directly in [0,1]
+			 * (N3DS_C3DBindVramDisplayTex -- no atlas-cell offset involved),
+			 * so what has to reach the shader is the corner's normalized UV
+			 * pre-multiplied back up by 1024. Exact, not approximated:
+			 * maxChunk (N3DS_VRAM_DISPLAY_TEX_DIM, 256) divides 1024 evenly.
+			 */
+			const s16 u1 = (s16)(chunkW * (1024 / maxChunk));
+			const s16 v1 = (s16)(chunkH * (1024 / maxChunk));
 			/* Which pool texture this chunk uploads to and draws from. Must
 			 * be distinct per chunk within this call -- see the header
 			 * comment on N3DS_C3DUploadVramDisplayChunk for why reusing one
@@ -1154,35 +1167,39 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 			 * one elsewhere in this codebase to check against). If this
 			 * looks wrong on the next capture, revert this V swap and look
 			 * upstream of this function instead. */
-			verts[0].x = (float)x;
-			verts[0].y = (float)y;
-			verts[0].u = 0.0f;
+			verts[0].x = (s16)x;
+			verts[0].y = (s16)y;
+			verts[0].u = 0;
 			verts[0].v = v1;
 
-			verts[1].x = (float)x;
-			verts[1].y = (float)(y + chunkH);
-			verts[1].u = 0.0f;
-			verts[1].v = 0.0f;
+			verts[1].x = (s16)x;
+			verts[1].y = (s16)(y + chunkH);
+			verts[1].u = 0;
+			verts[1].v = 0;
 
-			verts[2].x = (float)(x + chunkW);
-			verts[2].y = (float)(y + chunkH);
+			verts[2].x = (s16)(x + chunkW);
+			verts[2].y = (s16)(y + chunkH);
 			verts[2].u = u1;
-			verts[2].v = 0.0f;
+			verts[2].v = 0;
 
 			verts[3] = verts[0];
 			verts[4] = verts[2];
 
-			verts[5].x = (float)(x + chunkW);
-			verts[5].y = (float)y;
+			verts[5].x = (s16)(x + chunkW);
+			verts[5].y = (s16)y;
 			verts[5].u = u1;
 			verts[5].v = v1;
 
 			for (i = 0; i < 6; i++)
 			{
-				verts[i].r = 1.0f;
-				verts[i].g = 1.0f;
-				verts[i].b = 1.0f;
-				verts[i].a = 1.0f;
+				/* Full-scale white -- ctr.v.pica's colorScale turns raw 255
+				 * back into 1.0, same as every other vertex's r/g/b now (see
+				 * the main conversion loop above). Alpha is no longer a
+				 * struct field: the shader supplies a constant 1.0 for it
+				 * instead (design doc finding 3). */
+				verts[i].r = 255;
+				verts[i].g = 255;
+				verts[i].b = 255;
 			}
 
 			N3DS_C3DBindVramDisplayTex(slot);
@@ -1497,38 +1514,39 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			 * all the headroom above it, which is what made textured surfaces
 			 * render darker than PC. See N3DS_C3DSetColorDoubling. */
 
-			dst->x = (float)src->x;
-			dst->y = (float)src->y;
+			dst->x = (s16)src->x;
+			dst->y = (s16)src->y;
 
 			/* Offset into the cell's own region of the atlas, not the whole
 			 * atlas -- (cellX,cellY) select which 256x256 region, (u,v) or
-			 * the cell's centre (untextured) select where within it. */
+			 * the cell's centre (untextured) select where within it. Stored
+			 * as the exact integer atlas-texel numerator, range [0,1023] --
+			 * comfortably inside s16 -- with the old /N3DS_ATLAS_DIM divide
+			 * moved into the shader (ctr.v.pica's texcoordScale, design doc
+			 * finding 2, Option A) instead of done here. Do NOT divide here
+			 * too -- that would double-scale every UV. */
 			if (untextured)
 			{
-				dst->u = ((float)cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM * 0.5f)) / (float)N3DS_ATLAS_DIM;
-				dst->v = ((float)cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM * 0.5f)) / (float)N3DS_ATLAS_DIM;
+				dst->u = (s16)(cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2));
+				dst->v = (s16)(cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2));
 			}
 			else
 			{
-				dst->u = ((float)cellX * N3DS_DECODE_TEXTURE_DIM + (float)src->u) / (float)N3DS_ATLAS_DIM;
-				dst->v = ((float)cellY * N3DS_DECODE_TEXTURE_DIM + (float)src->v) / (float)N3DS_ATLAS_DIM;
+				dst->u = (s16)(cellX * N3DS_DECODE_TEXTURE_DIM + (int)src->u);
+				dst->v = (s16)(cellY * N3DS_DECODE_TEXTURE_DIM + (int)src->v);
 			}
 
-			/*
-			 * Multiply by the reciprocal rather than divide. GCC cannot make
-			 * this substitution itself without -ffast-math, because 1/255 is
-			 * not exactly representable in binary float -- but a VFP divide on
-			 * ARM11 is ~14-19 cycles and does not pipeline, and this ran three
-			 * times per vertex, nine times per triangle, ~2040 triangles a
-			 * frame, inside the top profiler bucket. The rounding difference is
-			 * at most one ULP on a value that ends up in an 8-bit channel.
-			 * (The UV divides above are by 1024, a power of two and therefore
-			 * exact, so the compiler already folds those to a multiply.)
-			 */
-			dst->r = (float)src->r * (1.0f / 255.0f);
-			dst->g = (float)src->g * (1.0f / 255.0f);
-			dst->b = (float)src->b * (1.0f / 255.0f);
-			dst->a = 1.0f;
+			/* Raw u8 copy, no scale -- the *1/255 reciprocal-multiply that
+			 * used to live here (and the hot-path reasoning for why it was a
+			 * multiply, not a divide) moved into the shader's colorScale
+			 * constant instead (design doc finding 3). Alpha is no longer a
+			 * struct field: color is fetched at count=3 (RGB only) now, and
+			 * the shader writes a constant 1.0 for alpha -- dst->a was
+			 * already a hardcoded 1.0f here, never read from src->a, so
+			 * dropping the field loses no real value. */
+			dst->r = src->r;
+			dst->g = src->g;
+			dst->b = src->b;
 		}
 
 		vertsInRun += 3;

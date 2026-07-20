@@ -44,18 +44,55 @@ void N3DS_GfxPresent(void);
  * new operations, phase by phase, rather than being designed complete
  * up front. */
 
+/* <stdint.h>, not <3ds.h> or macros.h, for s16/u8 below -- this header is
+ * included directly and EARLY from the unity build (main.c, before
+ * <platform.h>/macros.h are reached, so their s16/u8 don't exist yet in that
+ * TU at this point), as well as from n3ds_backend.c (which sees libctru's own
+ * s16/u8 via <3ds.h>, included before this header there). Typedef'ing them
+ * here too, rather than assuming either side already has, is what keeps this
+ * header genuinely "safe to include from the unity build" per the file
+ * comment above -- not just for the old all-float struct, which never needed
+ * a sized type at all. Not a collision risk: GCC accepts a typedef name being
+ * redeclared with an identical underlying type (confirmed against this exact
+ * toolchain/-std=gnu99), and libctru's 3ds/types.h and macros.h both spell
+ * s16/u8 as int16_t/uint8_t too -- verified by reading both, not assumed. */
+#include <stdint.h>
+typedef int16_t s16;
+typedef uint8_t u8;
+
 /* Plain-scalar mirror of the vertex layout the 3DS GPU consumes. Narrower
  * than the shared GrVertex (include/platform/native_renderer_types.h):
  * page/clut never reach the GPU here -- texture resolution happens on the
  * CPU side of native_renderer_3ds.c before a draw call (design doc section
- * 1). All-float for now, matching every local citro3d example's attribute
- * format; see design doc section 6 for the packed-format follow-up this
- * deliberately defers. */
+ * 1). Packed to 12 bytes -- GPU_SHORT position/texcoord + GPU_UNSIGNED_BYTE
+ * color, down from the original 32-byte all-float layout (docs/
+ * VERTEX_FORMAT_DESIGN.md, "Lever 2") -- because PICA200 vertex fetch does
+ * NOT normalize integer attribute formats: a GPU_SHORT of 6000 arrives in
+ * the shader as 6000.0f, not 6000.0f/32767.0f. Verified against Azahar's own
+ * vertex-loader source and a disassembly of citro3d's AttrInfo_AddLoader
+ * (design doc finding 4), not assumed. The shader (ctr.v.pica) rescales
+ * texcoord/color back to their old numeric range itself instead.
+ *
+ * Field order (position, texcoord, color) must NOT change: it matches the
+ * GPU attribute-register permutation (0x210, set in N3DS_C3DInit below) and
+ * is what lands every attribute on its own element-size boundary with zero
+ * inter-attribute padding (design doc finding 5) -- reordering would force a
+ * gap the struct doesn't provide, which PICA200 hardware can react to by
+ * freezing rather than just drawing wrong.
+ *
+ * The trailing pad byte is not slop: without it the stride is 11 (odd), so
+ * odd-indexed vertices' SHORT-typed fields land at odd byte offsets -- an
+ * unaligned access real hardware may not tolerate. This risk is specifically
+ * NOT visible by testing in Azahar (its vertex loader reads via an x86
+ * reinterpret_cast that silently tolerates misalignment ARM hardware might
+ * not), so don't drop this byte just because it "looks unused" on an
+ * emulator screenshot -- see design doc finding 5 for the full reasoning. */
 typedef struct
 {
-	float x, y;
-	float u, v;
-	float r, g, b, a;
+	s16 x, y;
+	s16 u, v;
+	u8 r, g, b;
+	u8 _pad;
 } N3DS_Vertex;
 
 /* One-time setup: citro3d itself, the top-screen render target, the

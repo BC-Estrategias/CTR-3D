@@ -168,9 +168,9 @@ int N3DS_C3DInit(void)
 
 	attrInfo = C3D_GetAttrInfo();
 	AttrInfo_Init(attrInfo);
-	AttrInfo_AddLoader(attrInfo, 0, GPU_FLOAT, 2); /* v0 = position (x, y) */
-	AttrInfo_AddLoader(attrInfo, 1, GPU_FLOAT, 2); /* v1 = texcoord (u, v) */
-	AttrInfo_AddLoader(attrInfo, 2, GPU_FLOAT, 4); /* v2 = color (r, g, b, a) */
+	AttrInfo_AddLoader(attrInfo, 0, GPU_SHORT, 2);         /* v0 = position (x, y) */
+	AttrInfo_AddLoader(attrInfo, 1, GPU_SHORT, 2);         /* v1 = texcoord (u, v) */
+	AttrInfo_AddLoader(attrInfo, 2, GPU_UNSIGNED_BYTE, 3); /* v2 = color (r, g, b) -- alpha is a shader constant now, not fetched */
 
 	s_vertexBufferMem = linearAlloc((size_t)N3DS_MAX_FRAME_VERTICES * sizeof(N3DS_Vertex));
 	if (s_vertexBufferMem == NULL)

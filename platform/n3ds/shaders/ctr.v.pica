@@ -2,10 +2,14 @@
 ;
 ; Positions arrive already projected to PSX screen-pixel space -- the GTE does
 ; that on the CPU, same as the PC renderer's GTE_VERTEX_SHADER
-; (platform/native_renderer.c). This shader's job is only the screen-pixel ->
+; (platform/native_renderer.c). This shader's job is the screen-pixel ->
 ; clip-space remap (the "projection" uniform is an orthographic matrix, not a
-; camera), plus passthrough of texcoord and color. No page/clut reaches the
-; GPU at all -- texture resolution happens on the CPU before binding (see
+; camera), plus rescaling texcoord/color from their packed integer vertex
+; format back to the float range the old all-float vertex passed directly
+; (docs/VERTEX_FORMAT_DESIGN.md, "Lever 2" -- PICA200 vertex fetch does not
+; normalize GPU_SHORT/GPU_UNSIGNED_BYTE, so the raw integers must be scaled
+; here, not on the CPU). No page/clut reaches the GPU at all -- texture
+; resolution happens on the CPU before binding (see
 ; docs/CITRO3D_RENDERER_DESIGN.md, sections 1 and 6). No blending, no stereo
 ; eye offset yet -- both staged for later phases in the same doc.
 
@@ -16,6 +20,10 @@
 .constf constants(0.0, 1.0, -1.0, 0.0)
 .alias  zeros constants.xxxx
 .alias  ones  constants.yyyy
+
+.constf vertexScale(0.0009765625, 0.0039215686, 0.0, 0.0) ; 1/1024, 1/255
+.alias  texcoordScale vertexScale.xxxx
+.alias  colorScale    vertexScale.yyyy
 
 ; Outputs
 .out outpos position
@@ -38,8 +46,22 @@
 	dp4 outpos.z, projection[2], r0
 	dp4 outpos.w, projection[3], r0
 
-	mov outtc0.xy, intc.xy
-	mov outclr, inclr
+	; intc/inclr now carry raw unnormalized integers (GPU_SHORT / GPU_UNSIGNED_BYTE
+	; fetch, see n3ds_backend.c) -- rescale here instead of on the CPU (design doc
+	; finding 2/3). inclr only has 3 real fetched components (RGB, count=3 in
+	; AttrInfo_AddLoader): do NOT read inclr.w, it is not a real value. Alpha is
+	; a constant 1.0 instead.
+	;
+	; Constant operand goes FIRST (src1), input register SECOND (src2) --
+	; verified empirically against picasso, not assumed: `mul outtc0.xy,
+	; intc.xy, texcoordScale` (constant as src2) fails to assemble at all
+	; ("invalid source2 register"), regardless of aliasing or destination
+	; masking. PICA200's src2 operand cannot address the constant/uniform
+	; bank, only src1 can -- swapping operand order is the fix, not a
+	; workaround.
+	mul outtc0.xy, texcoordScale, intc.xy
+	mul outclr.xyz, colorScale, inclr.xyz
+	mov outclr.w, ones
 
 	end
 .end
