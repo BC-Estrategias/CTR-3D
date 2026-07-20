@@ -368,8 +368,11 @@ internal void NativePerf_Report3DSWindow(void)
 
 	toAvgUs = 1000.0 / (f64)s_windowFrames;
 
-	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d", s_windowFrames, (int)(s_windowTotalMs * toAvgUs),
-	         (int)(s_windowWorkMs * toAvgUs));
+	// spuMix is stamped into every window on purpose: these numbers mean
+	// something very different with the voice mixer skipped, and a perf figure
+	// recorded without that context has already misled this project once.
+	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s", s_windowFrames, (int)(s_windowTotalMs * toAvgUs),
+	         (int)(s_windowWorkMs * toAvgUs), CTR_3DS_SKIP_SPU_MIX ? "SKIPPED" : "on");
 	N3DS_DebugLog(header);
 
 	memset(taken, 0, sizeof(taken));

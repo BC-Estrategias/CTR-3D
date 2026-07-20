@@ -12,6 +12,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * INTERIM, 3DS ONLY, AND TEMPORARY -- delete this once ndsp is wired up.
+ *
+ * The 3DS build has no audio output yet: the SPU emulation mixes as normal but
+ * "only the final handoff to hardware is dropped" (platform/n3ds/
+ * sdl3_compat_3ds.c). So every sample the voice mixer produces is computed and
+ * then thrown away -- and that mixer measured 48-81% of total frame time,
+ * because it runs a 24-voice loop per OUTPUT SAMPLE FRAME (735 per vblank, and
+ * the vblank catch-up loop runs up to 8 of those per rendered frame).
+ *
+ * Skipping the generation of samples nobody can hear takes the frame from
+ * 154-411ms to 35-49ms in Azahar. Voice lifecycle is deliberately left intact
+ * -- see the block this gates in NativeAudio_MixFrame for why that is not
+ * optional.
+ *
+ * Flip it off to measure mixer optimisations on 3DS:
+ *   cmake -DCTR_3DS_SKIP_SPU_MIX=OFF ...
+ * PC is untouched either way; this is never defined off-3DS.
+ */
+#if defined(__3DS__)
+#if !defined(CTR_3DS_SKIP_SPU_MIX)
+#define CTR_3DS_SKIP_SPU_MIX 1
+#endif
+#else
+#undef CTR_3DS_SKIP_SPU_MIX
+#define CTR_3DS_SKIP_SPU_MIX 0
+#endif
+
 #define NATIVE_AUDIO_SAMPLE_RATE            44100
 #define NATIVE_AUDIO_CHANNELS               2
 #define NATIVE_AUDIO_SPU_VOICE_COUNT        24
@@ -3387,6 +3415,24 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 				}
 			}
 
+#if CTR_3DS_SKIP_SPU_MIX
+			/*
+			 * Sample GENERATION only. Everything below this block -- ADSR
+			 * advance, position advance, loop wrap, stop detection -- still
+			 * runs, so voices start, finish and report as finished exactly as
+			 * before. That matters: the game polls voice state to sequence
+			 * itself, and a voice that never finishes hangs it (measured --
+			 * skipping the whole loop stalls boot at mainGameState=0).
+			 *
+			 * InterpolateVoiceSample is also the part that actually touches
+			 * memory, reading each voice's PCM at a scattered address, so
+			 * dropping it removes the cache misses and keeps the cheap
+			 * arithmetic that carries the semantics.
+			 */
+			(void)sample;
+			(void)left;
+			(void)right;
+#else
 			sample = NativeAudio_InterpolateVoiceSample(voice);
 			sample = NativeAudio_ApplyAdsrEnvelope(sample, voice->adsrLevel);
 			left = NativeAudio_ApplyVolume(sample, voice->attr.volume.left, s_audio.masterVolumeLeft);
@@ -3397,6 +3443,7 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 				NativeAudio_MixSample(&reverbSendLeft, &reverbSendRight, NativeAudio_ApplyMasterVolume(sample, voice->attr.volume.left),
 				                      NativeAudio_ApplyMasterVolume(sample, voice->attr.volume.right));
 			}
+#endif
 			NativeAudio_AdsrAdvance(voice);
 			if (!voice->active || voice->adsrPhase == NATIVE_AUDIO_ADSR_OFF)
 			{
@@ -3418,9 +3465,24 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 		}
 	}
 
+#if CTR_3DS_SKIP_SPU_MIX
+	/*
+	 * With voice generation skipped, reverbSend is always zero -- this would
+	 * be computing the echo of silence. Measured: with only the voice loop
+	 * gated, the reverb chain alone still cost ~115ms/frame once the game
+	 * reached content that configures it (reverbSamples 0 -> 4000). Reverb
+	 * holds no game-visible state, so unlike voice lifecycle there is nothing
+	 * to preserve here.
+	 */
+	(void)reverbSendLeft;
+	(void)reverbSendRight;
+	(void)reverbWetLeft;
+	(void)reverbWetRight;
+#else
 	NativeAudio_ReverbProcessNoLock(reverbSendLeft, reverbSendRight, &reverbWetLeft, &reverbWetRight);
 	NativeAudio_MixSample(&mixLeft, &mixRight, NativeAudio_ApplyMasterVolume(reverbWetLeft, s_audio.masterVolumeLeft),
 	                      NativeAudio_ApplyMasterVolume(reverbWetRight, s_audio.masterVolumeRight));
+#endif
 
 	*outLeft = (s16)NativeAudio_Clamp16(mixLeft);
 	*outRight = (s16)NativeAudio_Clamp16(mixRight);
