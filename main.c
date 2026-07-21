@@ -33,6 +33,7 @@
 #include "platform/native_assets.h"
 #include "platform/native_log.h"
 #include "platform/native_memory.h"
+#include "platform/native_offscreen_capture.h"
 #include "platform/native_perf.h"
 #include "platform/native_replay_scheduler.h"
 #include "platform/native_savestate.h"
@@ -64,6 +65,7 @@
 #include "platform/native_cd.c"
 #include "platform/native_gpu_links.c"
 #include "platform/native_gte_capture.c"
+#include "platform/native_offscreen_capture.c"
 #include "platform/native_gpu.c"
 #include "platform/native_gte_core.c"
 #if !defined(__3DS__)
@@ -265,6 +267,10 @@ int main(int argc, char *argv[])
 	// of the PC-vs-3DS same-scene VRAM diff; format matches the 3DS
 	// vramdump.bin).
 	NativeRenderer_VramCaptureConfigureFromArgs(argc, argv);
+
+	// --offscreen-capture arms the dfe=0 split inventory + golden stream
+	// (docs/OFFSCREEN_RENDER_VRAM_DESIGN.md Phase 0/1).
+	NativeOffscreenCapture_ConfigureFromArgs(argc, argv);
 #endif
 
 	Platform_InitScratchpad();

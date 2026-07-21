@@ -352,11 +352,14 @@ void N3DS_EarlyInit(void);
 int N3DS_NetloadStreamActive(void);
 
 /* Registers the emulated PSX VRAM buffer so the SELECT+R debug capture in
- * N3DS_ReadButtons can write it to sdmc:/vramdump.bin. Called once from the
- * renderer TU (which owns vram[]) since the backend TU can't see that global.
- * bytes is sizeof(vram). CTR_INTERNAL-only diagnostic (texture-corruption
- * investigation, 2026-07-20); no-op otherwise. */
-void N3DS_DebugSetVRAMForDump(const void *vram, unsigned int bytes);
+ * N3DS_ReadButtons can write it to sdmc:/vramdump_<frame>.bin. Called once
+ * from the renderer TU (which owns vram[]) since the backend TU can't see
+ * that global. bytes is sizeof(vram). frameCounter points at the renderer's
+ * frame counter (plain unsigned int, so no ABI hazard) and stamps every
+ * capture filename -- fixed names cost a race capture once (2026-07-21).
+ * CTR_INTERNAL-only diagnostic (texture-corruption investigation,
+ * 2026-07-20); no-op otherwise. */
+void N3DS_DebugSetVRAMForDump(const void *vram, unsigned int bytes, const unsigned int *frameCounter);
 
 /* ---------------------------------------------------------------- memory --- */
 /* Bytes currently handed out by malloc, and free space in the linear heap.

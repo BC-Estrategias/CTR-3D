@@ -135,17 +135,31 @@ void N3DS_DebugLog(const char *msg)
  */
 static const void *s_dumpVramPtr = NULL;
 static unsigned int s_dumpVramBytes = 0;
+static const unsigned int *s_dumpFrameCounterPtr = NULL;
 
-void N3DS_DebugSetVRAMForDump(const void *vram, unsigned int bytes)
+void N3DS_DebugSetVRAMForDump(const void *vram, unsigned int bytes, const unsigned int *frameCounter)
 {
 	s_dumpVramPtr = vram;
 	s_dumpVramBytes = bytes;
+	s_dumpFrameCounterPtr = frameCounter;
 }
+
+#ifdef CTR_INTERNAL
+/* Frame number stamped into every capture filename. Fixed names already cost
+ * one race capture (overwritten by a later menu capture, 2026-07-21); the
+ * shared stamp also groups the vramdump/atlas/cachemeta files of one capture
+ * instant into a self-identifying set. */
+static unsigned int N3DS_DebugCaptureFrame(void)
+{
+	return (s_dumpFrameCounterPtr != NULL) ? *s_dumpFrameCounterPtr : 0u;
+}
+#endif
 
 #ifdef CTR_INTERNAL
 static void N3DS_DebugWriteVRAMDump(void)
 {
 	FILE *f;
+	char path[64];
 	char msg[96];
 
 	if ((s_dumpVramPtr == NULL) || (s_dumpVramBytes == 0))
@@ -154,17 +168,19 @@ static void N3DS_DebugWriteVRAMDump(void)
 		return;
 	}
 
-	f = fopen("sdmc:/vramdump.bin", "wb");
+	snprintf(path, sizeof(path), "sdmc:/vramdump_%u.bin", N3DS_DebugCaptureFrame());
+	f = fopen(path, "wb");
 	if (f == NULL)
 	{
-		N3DS_DebugLog("[CTR-3DS] VRAM dump FAILED: fopen sdmc:/vramdump.bin");
+		snprintf(msg, sizeof(msg), "[CTR-3DS] VRAM dump FAILED: fopen %s", path);
+		N3DS_DebugLog(msg);
 		return;
 	}
 
 	fwrite(s_dumpVramPtr, 1, s_dumpVramBytes, f);
 	fclose(f);
 
-	snprintf(msg, sizeof(msg), "[CTR-3DS] VRAM dumped to sdmc:/vramdump.bin (%u bytes)", s_dumpVramBytes);
+	snprintf(msg, sizeof(msg), "[CTR-3DS] VRAM dumped to %s (%u bytes)", path, s_dumpVramBytes);
 	N3DS_DebugLog(msg);
 }
 #endif
@@ -642,7 +658,7 @@ static void N3DS_DebugWriteAtlasDump(void)
 			continue;
 		}
 
-		snprintf(path, sizeof(path), "sdmc:/atlas_%d.bin", i);
+		snprintf(path, sizeof(path), "sdmc:/atlas_%u_%d.bin", N3DS_DebugCaptureFrame(), i);
 		f = fopen(path, "wb");
 		if (f == NULL)
 		{

@@ -967,6 +967,18 @@ void DrawSplit(const GPUDrawSplit *split)
 	NativeRenderer_SetupClipMode(&split->drawenv.clip, &split->dispenv, drawOnScreen);
 	NativeRenderer_SetOffscreenState(&split->drawenv.clip, &split->dispenv, !drawOnScreen);
 
+#if defined(CTR_INTERNAL) && !defined(__3DS__)
+	if (!drawOnScreen)
+	{
+		// After SetOffscreenState so the capture's session (OnBegin) already
+		// exists when its first split records.
+		NativeOffscreenCapture_OnSplit(&s_gpu.vertexBuffer[split->startVertex], split->numVerts, (int)split->blendMode, (int)split->texFormat,
+		                               split->textureId != NativeRenderer_GetWhiteTexture(), split->psxTexturedSemiTrans ? 1 : 0,
+		                               split->psxTextureOutputSTP ? 1 : 0, split->psxDrawMaskSet, split->drawPrimMode, split->drawenv.dtd,
+		                               &split->drawenv.clip);
+	}
+#endif
+
 	if (split->psxTexturedSemiTrans)
 	{
 		// NOTE(aalhendi): CTR native renderer divergence from upstream PsyCross.

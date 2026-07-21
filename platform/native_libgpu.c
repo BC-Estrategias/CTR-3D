@@ -25,6 +25,9 @@ void (*drawsync_callback)(void) = NULL;
 
 int ClearImage(RECT16 *rect, uint8_t r, uint8_t g, uint8_t b)
 {
+#if defined(CTR_INTERNAL) && !defined(__3DS__)
+	NativeVramTrace_Op("CLEAR", rect->x, rect->y, rect->w, rect->h, -1, -1);
+#endif
 	NativeRenderer_ClearVRAM(rect->x, rect->y, rect->w, rect->h, r, g, b);
 	NativeRenderer_Clear(rect->x, rect->y, rect->w, rect->h, r, g, b);
 	return 0;
@@ -56,6 +59,9 @@ int DrawSync(int mode)
 
 int LoadImage(RECT16 *rect, void *p)
 {
+#if defined(CTR_INTERNAL) && !defined(__3DS__)
+	NativeVramTrace_Op("LOAD", rect->x, rect->y, rect->w, rect->h, -1, -1);
+#endif
 	NativeRenderer_CopyVRAM((unsigned short *)p, 0, 0, rect->w, rect->h, rect->x, rect->y);
 	return 0;
 }
@@ -70,12 +76,18 @@ int LoadImage2(RECT16 *rect, void *p)
 
 int MoveImage(RECT16 *rect, int x, int y)
 {
+#if defined(CTR_INTERNAL) && !defined(__3DS__)
+	NativeVramTrace_Op("MOVE", x, y, rect->w, rect->h, rect->x, rect->y);
+#endif
 	NativeRenderer_CopyVRAM(NULL, rect->x, rect->y, rect->w, rect->h, x, y);
 	return 0;
 }
 
 int StoreImage(RECT16 *rect, uint32_t *p)
 {
+#if defined(CTR_INTERNAL) && !defined(__3DS__)
+	NativeVramTrace_Op("STORE", rect->x, rect->y, rect->w, rect->h, -1, -1);
+#endif
 	NativeRenderer_ReadVRAM((unsigned short *)p, rect->x, rect->y, rect->w, rect->h);
 	return 0;
 }

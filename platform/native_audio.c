@@ -4156,6 +4156,9 @@ void NativeAudio_StepVBlank(void)
 		void NativeRenderer_VramCaptureTick(void);
 
 		NativeRenderer_VramCaptureTick();
+		/* Offscreen-split capture shares this vblank timebase so its
+		 * inventory lines correlate with --vram-capture-vblank numbers. */
+		NativeOffscreenCapture_Tick();
 	}
 #endif
 #endif

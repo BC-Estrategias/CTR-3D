@@ -1097,9 +1097,9 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 	N3DS_DebugLog("[CTR-3DS] renderer init ok, citro3d ready");
 
 	/* Hand the backend TU the VRAM buffer so its SELECT+R debug capture can
-	 * write it to SD (see N3DS_DebugSetVRAMForDump). vram[] is a stable global,
-	 * so registering its address once is safe. */
-	N3DS_DebugSetVRAMForDump(vram, (unsigned int)sizeof(vram));
+	 * write it to SD (see N3DS_DebugSetVRAMForDump). vram[] and s_frameCounter
+	 * are stable globals, so registering their addresses once is safe. */
+	N3DS_DebugSetVRAMForDump(vram, (unsigned int)sizeof(vram), &s_frameCounter);
 
 	return 1;
 }
@@ -2220,12 +2220,19 @@ internal void N3DS_MetaWriteU32(FILE *f, u32 v)
 void NativeRenderer3DS_DebugDumpCacheMeta(void)
 {
 	FILE *f;
+	char path[64];
+	char msg[96];
 	int i;
 
-	f = fopen("sdmc:/cachemeta.bin", "wb");
+	/* Same frame stamp as the vramdump/atlas files written alongside this
+	 * (n3ds_backend.c N3DS_DebugCaptureAll), so one capture instant forms a
+	 * self-identifying file set and captures never overwrite each other. */
+	snprintf(path, sizeof(path), "sdmc:/cachemeta_%u.bin", (unsigned)s_frameCounter);
+	f = fopen(path, "wb");
 	if (f == NULL)
 	{
-		N3DS_DebugLog("[CTR-3DS] cachemeta dump FAILED: fopen sdmc:/cachemeta.bin");
+		snprintf(msg, sizeof(msg), "[CTR-3DS] cachemeta dump FAILED: fopen %s", path);
+		N3DS_DebugLog(msg);
 		return;
 	}
 
@@ -2280,6 +2287,7 @@ void NativeRenderer3DS_DebugDumpCacheMeta(void)
 	}
 
 	fclose(f);
-	N3DS_DebugLog("[CTR-3DS] cachemeta dumped to sdmc:/cachemeta.bin");
+	snprintf(msg, sizeof(msg), "[CTR-3DS] cachemeta dumped to %s", path);
+	N3DS_DebugLog(msg);
 }
 #endif

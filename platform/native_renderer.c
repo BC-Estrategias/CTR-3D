@@ -1437,6 +1437,11 @@ void NativeRenderer_ReadFramebufferDataToVRAM(void)
 		// NOTE(aalhendi): Keep the CPU-side VRAM mirror packed like PS1 VRAM.
 		// Host texture bindings are invalid after this direct GL texture read.
 		NativeRenderer_CopyRGBAFramebufferToVRAM(pixels, x, y, w, h, 1, 0);
+#ifdef CTR_INTERNAL
+		// Rendered-frame content entering the mirror: the PC-only writer the
+		// 3DS lacks entirely (its renderer never reads the PICA target back).
+		NativeVramTrace_Op("FBREAD", x, y, w, h, -1, -1);
+#endif
 		s_lastBoundTexture = (TextureID)-1;
 
 		free(pixels);
@@ -1539,6 +1544,11 @@ void NativeRenderer_SetOffscreenState(const RECT16 *offscreenRect, const DISPENV
 		if (s_previousOffscreenState)
 		{
 			NativeRenderer_FlushOffscreenToVRAM();
+#ifdef CTR_INTERNAL
+			// Rect changed while offscreen: the flush above ended the prior
+			// accumulation (s_previousOffscreen still holds its rect here).
+			NativeOffscreenCapture_OnFlush(&s_previousOffscreen);
+#endif
 		}
 
 		s_previousOffscreenState = 1;
@@ -1559,6 +1569,12 @@ void NativeRenderer_SetOffscreenState(const RECT16 *offscreenRect, const DISPENV
 		// clear it out
 		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
+
+#ifdef CTR_INTERNAL
+		// New accumulation begins; the mirror still holds pre-session bytes
+		// (this FBO flushes back only at disable/rect-change).
+		NativeOffscreenCapture_OnBegin(offscreenRect);
+#endif
 	}
 	else
 	{
@@ -1571,6 +1587,9 @@ void NativeRenderer_SetOffscreenState(const RECT16 *offscreenRect, const DISPENV
 
 		NativeRenderer_FlushOffscreenToVRAM();
 		NativeRenderer_SetViewPort(s_presentViewport.x, s_presentViewport.y, s_presentViewport.w, s_presentViewport.h);
+#ifdef CTR_INTERNAL
+		NativeOffscreenCapture_OnFlush(&s_previousOffscreen);
+#endif
 	}
 }
 
@@ -1716,8 +1735,12 @@ int NativeRenderer_CaptureVRAMState(void *dst, int dstSize)
  * is whether the two platforms even agree on what's IN VRAM). Mirrors the
  * --audio-capture flag pattern exactly.
  */
+#define VRAM_CAPTURE_MAX_VBLANKS 8
+
 global_variable char s_vramCapturePath[260];
-global_variable int s_vramCaptureAtVblank = -1;
+global_variable int s_vramCaptureVblankList[VRAM_CAPTURE_MAX_VBLANKS];
+global_variable int s_vramCaptureVblankCount = 0;
+global_variable int s_vramCaptureVblankIndex = 0;
 global_variable int s_vramCaptureVblanks = 0;
 
 int NativeRenderer_VramCaptureConfigureFromArgs(int argc, char **argv)
@@ -1743,12 +1766,48 @@ int NativeRenderer_VramCaptureConfigureFromArgs(int argc, char **argv)
 	}
 
 	snprintf(s_vramCapturePath, sizeof(s_vramCapturePath), "%s", path);
-	s_vramCaptureAtVblank = (vblank != NULL) ? atoi(vblank) : 1800;
-	if (s_vramCaptureAtVblank < 1)
+
+	// Comma-separated ascending vblank list ("3000,3060"): several dumps from
+	// ONE run. Cross-run capture pairs lean on boot determinism; a same-run
+	// pair does not, which is what the static-cell subtraction method wants.
+	if (vblank == NULL)
 	{
-		s_vramCaptureAtVblank = 1;
+		s_vramCaptureVblankList[s_vramCaptureVblankCount++] = 1800;
 	}
-	Platform_Log("[CTR VramCapture] will dump VRAM to %s at vblank %d\n", s_vramCapturePath, s_vramCaptureAtVblank);
+	else
+	{
+		const char *cursor = vblank;
+
+		while ((s_vramCaptureVblankCount < VRAM_CAPTURE_MAX_VBLANKS) && (*cursor != '\0'))
+		{
+			int value = atoi(cursor);
+
+			if (value < 1)
+			{
+				value = 1;
+			}
+			if ((s_vramCaptureVblankCount > 0) && (value <= s_vramCaptureVblankList[s_vramCaptureVblankCount - 1]))
+			{
+				Platform_LogWarn("[CTR VramCapture] vblank list must ascend, ignoring %d\n", value);
+			}
+			else
+			{
+				s_vramCaptureVblankList[s_vramCaptureVblankCount++] = value;
+			}
+
+			cursor = strchr(cursor, ',');
+			if (cursor == NULL)
+			{
+				break;
+			}
+			cursor++;
+		}
+	}
+
+	for (int i = 0; i < s_vramCaptureVblankCount; i++)
+	{
+		Platform_Log("[CTR VramCapture] will dump VRAM to %s at vblank %d\n", s_vramCapturePath, s_vramCaptureVblankList[i]);
+	}
 	return 0;
 }
 
@@ -1756,40 +1815,56 @@ void NativeRenderer_VramCaptureTick(void)
 {
 	void *blob;
 	FILE *f;
+	char path[300];
 	const int size = (int)sizeof(vram);
 
-	if (s_vramCaptureAtVblank < 0)
+	if (s_vramCaptureVblankIndex >= s_vramCaptureVblankCount)
 	{
 		return;
 	}
 
 	s_vramCaptureVblanks++;
-	if (s_vramCaptureVblanks < s_vramCaptureAtVblank)
+	if (s_vramCaptureVblanks < s_vramCaptureVblankList[s_vramCaptureVblankIndex])
 	{
 		return;
 	}
 
-	s_vramCaptureAtVblank = -1;
+	// One target vblank: exact requested path (existing tooling). Several:
+	// suffix each with its vblank so the set self-identifies.
+	if (s_vramCaptureVblankCount == 1)
+	{
+		snprintf(path, sizeof(path), "%s", s_vramCapturePath);
+	}
+	else
+	{
+		snprintf(path, sizeof(path), "%s.%d", s_vramCapturePath, s_vramCaptureVblankList[s_vramCaptureVblankIndex]);
+	}
+	s_vramCaptureVblankIndex++;
+
 	blob = malloc((size_t)size);
 	if (blob == NULL)
 	{
 		return;
 	}
 	NativeRenderer_CaptureVRAMState(blob, size);
-	f = fopen(s_vramCapturePath, "wb");
+	f = fopen(path, "wb");
 	if (f != NULL)
 	{
 		fwrite(blob, 1, (size_t)size, f);
 		fclose(f);
-		Platform_Log("[CTR VramCapture] dumped %d bytes to %s\n", size, s_vramCapturePath);
+		Platform_Log("[CTR VramCapture] dumped %d bytes to %s\n", size, path);
 	}
 	else
 	{
-		Platform_LogWarn("[CTR VramCapture] FAILED to open %s\n", s_vramCapturePath);
+		Platform_LogWarn("[CTR VramCapture] FAILED to open %s\n", path);
 	}
 	free(blob);
-	Platform_LogFlush();
-	exit(0);
+
+	if (s_vramCaptureVblankIndex >= s_vramCaptureVblankCount)
+	{
+		Platform_LogFlush();
+		exit(0);
+	}
 }
 #endif /* CTR_INTERNAL */
 
