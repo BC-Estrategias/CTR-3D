@@ -834,6 +834,24 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_texturelessMode ^= 1;
 					N3DS_DebugLog(g_dbg_texturelessMode ? "[CTR-3DS] textureless mode: 1" : "[CTR-3DS] textureless mode: 0");
 				}
+				else if (strncmp(word, "atlasview", 9) == 0)
+				{
+					extern int g_dbg_atlasView;
+					char msg[48];
+
+					/* 'atlasview N' selects atlas N directly; bare
+					 * 'atlasview' cycles off -> 0 -> 1 -> ... -> off. */
+					if (word[9] == ' ')
+					{
+						g_dbg_atlasView = atoi(&word[10]) + 1;
+					}
+					else
+					{
+						g_dbg_atlasView = (g_dbg_atlasView + 1) % (N3DS_ATLAS_COUNT + 1);
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] atlas view: %d", g_dbg_atlasView - 1);
+					N3DS_DebugLog(g_dbg_atlasView ? msg : "[CTR-3DS] atlas view: off");
+				}
 				else
 				{
 					N3DS_DebugCaptureAll();

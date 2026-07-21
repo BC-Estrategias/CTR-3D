@@ -187,6 +187,12 @@ global_variable int s_forcedTexValid = 0;
  */
 int g_dbg_disableSubPage = 0;
 
+/* Diagnostic (2026-07-21 session 16): 0 = off; k = draw atlas k-1 full-screen
+ * instead of the game (see NativeRenderer_EndScene). Cycled by dumpreq
+ * 'atlasview'. Compares the GPU's live view of atlas memory against the
+ * capture set's CPU-side atlas dumps. */
+int g_dbg_atlasView = 0;
+
 /* ABLATION A (2026-07-21, session 14): boot-splash present submits clear +
  * display transfer but no draw calls. Used to prove the real-hardware boot
  * hang lived in the draw path, not clear/transfer -- which led to the
@@ -1347,6 +1353,58 @@ void NativeRenderer_EndScene(void)
 		return;
 	}
 
+#ifdef CTR_INTERNAL
+	/*
+	 * Atlas inspector (session 16, dumpreq 'atlasview'): draw atlas
+	 * (g_dbg_atlasView - 1) full-screen INSTEAD of the game (DrawTriangles
+	 * suppresses normal emission while active). The screen then shows what
+	 * the GPU actually samples from that atlas; the capture set's
+	 * atlas_<frame>_<i>.bin shows what the CPU wrote. Any visible
+	 * difference = the GPU/emulator texture view is stale relative to
+	 * memory -- the one link every CPU-side dump is structurally blind to,
+	 * and the only remaining suspect after VRAM content, decode content,
+	 * keys, UVs and grouping all byte-verified clean while the screen
+	 * quilts. (The GSPGPU_FlushDataCache comment in n3ds_backend.c records
+	 * a previous fight with exactly this staleness class.)
+	 */
+	if (g_dbg_atlasView > 0)
+	{
+		N3DS_Vertex quad[6];
+		const int atlasIndex = g_dbg_atlasView - 1;
+		int baseVertex;
+		int i;
+
+		/* Screen-space rect: the 240px-tall square at the screen's left
+		 * (mapped through the same projection every draw uses -- x right,
+		 * y down, 400x240). Numerators span the full atlas [0,2048). */
+		const s16 x0 = 0, y0 = 0, x1 = 240, y1 = 240;
+		const s16 u0 = 1, v0 = 1, u1 = 2047, v1 = 2047;
+
+		quad[0].x = x0; quad[0].y = y0; quad[0].u = u0; quad[0].v = v0;
+		quad[1].x = x1; quad[1].y = y0; quad[1].u = u1; quad[1].v = v0;
+		quad[2].x = x0; quad[2].y = y1; quad[2].u = u0; quad[2].v = v1;
+		quad[3].x = x1; quad[3].y = y0; quad[3].u = u1; quad[3].v = v0;
+		quad[4].x = x1; quad[4].y = y1; quad[4].u = u1; quad[4].v = v1;
+		quad[5].x = x0; quad[5].y = y1; quad[5].u = u0; quad[5].v = v1;
+		for (i = 0; i < 6; i++)
+		{
+			quad[i].r = 255;
+			quad[i].g = 255;
+			quad[i].b = 255;
+			quad[i]._pad = 0;
+		}
+
+		/* Modulate off (bright=1 pipeline) so texels show unscaled. */
+		N3DS_C3DSetColorDoubling(0);
+		baseVertex = N3DS_C3DAppendVertices(quad, 6);
+		if (baseVertex >= 0)
+		{
+			N3DS_C3DBindAtlas(atlasIndex);
+			N3DS_C3DDrawTriangles(baseVertex, 2);
+		}
+	}
+#endif
+
 	s_endSceneCount++;
 	// C3D_FrameEnd: the whole frame's queued GPU commands actually execute
 	// here, so this is where any GPU-side stall or submit cost shows up.
@@ -2084,6 +2142,16 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		return;
 	}
 
+#ifdef CTR_INTERNAL
+	if (g_dbg_atlasView > 0)
+	{
+		/* Atlas inspector active: suppress the game's draws so the screen
+		 * shows ONLY the atlas (EndScene draws it). Decode/caching still
+		 * runs untouched -- the point is to view its output memory. */
+		return;
+	}
+#endif
+
 	if ((s_currentTextureId != N3DS_TEXTURE_ID_VRAM) && (s_currentTextureId != N3DS_TEXTURE_ID_WHITE))
 	{
 		/* TF_32_BIT_RGBA override texture -- provably unreachable from any
@@ -2246,25 +2314,33 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			 * fine, addressing was not.
 			 */
 			/*
-			 * V-flip note (session 16): PresentVRAMRect's empirical quad-V
-			 * swap suggested PICA might sample atlas T bottom-up; DISPROVED
-			 * for this path without a build -- the reserved white cell
-			 * (atlas 0 rows 0-255, confirmed at memory top in raw atlas
-			 * dumps) renders every untextured primitive correctly when
-			 * sampled UNFLIPPED, so T=0 reads memory row 0 here. Whatever
-			 * that present-path swap compensates is local to its own quad
-			 * construction. Do not "fix" this path with a global V flip:
-			 * it would move untextured sampling onto cell (0,3)'s content.
+			 * V FLIP -- proven by direct observation (session 16 atlas
+			 * inspector, dumpreq 'atlasview'): the GPU's live view of an
+			 * atlas is the CPU-side memory VERTICALLY MIRRORED (white cell
+			 * at memory top renders at screen bottom; cell rows in exact
+			 * reverse order). PICA T=0 reads our tiler's LAST row: the
+			 * tex3ds parity probe used `tex3ds -r` (raw, unflipped), so it
+			 * validated Morton/tile math while silently inheriting the
+			 * wrong orientation, and PresentVRAMRect's empirical quad-V
+			 * swap (2026-07-20) was this same fact discovered locally.
+			 * Sample-side fix: numerator 2048-(2a+1) = 2047-2a targets
+			 * memory row a from the bottom-up T axis. Applies to the white
+			 * cell too -- the earlier "white renders fine unflipped"
+			 * counterargument fails because unflipped sampling read cell
+			 * (0,3)'s lightish content, which multiplies vertex colors
+			 * plausibly enough to pass eyeballing; the inspector picture
+			 * is the ground truth. U is NOT flipped (horizontal order
+			 * matches between the views).
 			 */
 			if (untextured)
 			{
 				dst->u = (s16)(((cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) + 1);
-				dst->v = (s16)(((cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) + 1);
+				dst->v = (s16)(2047 - ((cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1));
 			}
 			else
 			{
 				dst->u = (s16)(((pixelBaseU + ((int)src->u - originU)) << 1) + 1);
-				dst->v = (s16)(((pixelBaseV + ((int)src->v - originV)) << 1) + 1);
+				dst->v = (s16)(2047 - ((pixelBaseV + ((int)src->v - originV)) << 1));
 			}
 
 			/* Raw u8 copy, no scale -- the *1/255 reciprocal-multiply that
