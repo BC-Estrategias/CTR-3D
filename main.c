@@ -260,6 +260,11 @@ int main(int argc, char *argv[])
 		Platform_Shutdown();
 		return NativeConsole_Return(0);
 	}
+
+	// --vram-capture arms a raw VRAM-mirror dump at a target vblank (PC side
+	// of the PC-vs-3DS same-scene VRAM diff; format matches the 3DS
+	// vramdump.bin).
+	NativeRenderer_VramCaptureConfigureFromArgs(argc, argv);
 #endif
 
 	Platform_InitScratchpad();

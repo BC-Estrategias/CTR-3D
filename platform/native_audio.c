@@ -4149,6 +4149,15 @@ void NativeAudio_StepVBlank(void)
 #if defined(CTR_INTERNAL)
 	/* Outside the perf scope: capturing writes ~530KB and then exits. */
 	NativeAudio_GoldenCaptureTick();
+#if !defined(__3DS__)
+	{
+		/* Defined later in this unity TU (native_renderer.c, PC-only file);
+		 * same vblank cadence as the audio capture above. */
+		void NativeRenderer_VramCaptureTick(void);
+
+		NativeRenderer_VramCaptureTick();
+	}
+#endif
 #endif
 
 #ifdef CTR_INTERNAL

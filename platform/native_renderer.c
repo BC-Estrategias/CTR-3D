@@ -1705,6 +1705,94 @@ int NativeRenderer_CaptureVRAMState(void *dst, int dstSize)
 	return 1;
 }
 
+#ifdef CTR_INTERNAL
+/*
+ * --vram-capture <file> [--vram-capture-vblank N]: dump the CPU-side PSX VRAM
+ * mirror (post framebuffer-readback pull, via CaptureVRAMState) to a raw
+ * 1024x512xu16-LE file at vblank N, then exit. Same file format as the 3DS
+ * SELECT+R/dumpreq vramdump.bin, so tools/texdump/* work on both -- built for
+ * the PC-vs-3DS same-scene VRAM diff (session 15b: wrong-texture mapping is
+ * established at load time and reshuffles per reload, so the first question
+ * is whether the two platforms even agree on what's IN VRAM). Mirrors the
+ * --audio-capture flag pattern exactly.
+ */
+global_variable char s_vramCapturePath[260];
+global_variable int s_vramCaptureAtVblank = -1;
+global_variable int s_vramCaptureVblanks = 0;
+
+int NativeRenderer_VramCaptureConfigureFromArgs(int argc, char **argv)
+{
+	const char *path = NULL;
+	const char *vblank = NULL;
+
+	for (int i = 1; (i + 1) < argc; i++)
+	{
+		if (strcmp(argv[i], "--vram-capture") == 0)
+		{
+			path = argv[i + 1];
+		}
+		else if (strcmp(argv[i], "--vram-capture-vblank") == 0)
+		{
+			vblank = argv[i + 1];
+		}
+	}
+
+	if (path == NULL)
+	{
+		return 0;
+	}
+
+	snprintf(s_vramCapturePath, sizeof(s_vramCapturePath), "%s", path);
+	s_vramCaptureAtVblank = (vblank != NULL) ? atoi(vblank) : 1800;
+	if (s_vramCaptureAtVblank < 1)
+	{
+		s_vramCaptureAtVblank = 1;
+	}
+	Platform_Log("[CTR VramCapture] will dump VRAM to %s at vblank %d\n", s_vramCapturePath, s_vramCaptureAtVblank);
+	return 0;
+}
+
+void NativeRenderer_VramCaptureTick(void)
+{
+	void *blob;
+	FILE *f;
+	const int size = (int)sizeof(vram);
+
+	if (s_vramCaptureAtVblank < 0)
+	{
+		return;
+	}
+
+	s_vramCaptureVblanks++;
+	if (s_vramCaptureVblanks < s_vramCaptureAtVblank)
+	{
+		return;
+	}
+
+	s_vramCaptureAtVblank = -1;
+	blob = malloc((size_t)size);
+	if (blob == NULL)
+	{
+		return;
+	}
+	NativeRenderer_CaptureVRAMState(blob, size);
+	f = fopen(s_vramCapturePath, "wb");
+	if (f != NULL)
+	{
+		fwrite(blob, 1, (size_t)size, f);
+		fclose(f);
+		Platform_Log("[CTR VramCapture] dumped %d bytes to %s\n", size, s_vramCapturePath);
+	}
+	else
+	{
+		Platform_LogWarn("[CTR VramCapture] FAILED to open %s\n", s_vramCapturePath);
+	}
+	free(blob);
+	Platform_LogFlush();
+	exit(0);
+}
+#endif /* CTR_INTERNAL */
+
 int NativeRenderer_RestoreVRAMState(const void *src, int srcSize)
 {
 	local_persist const RECT16 zeroRect = {0, 0, 0, 0};
