@@ -263,13 +263,15 @@ int main(int argc, char *argv[])
 		return NativeConsole_Return(0);
 	}
 
+#if !defined(__3DS__)
 	// --vram-capture arms a raw VRAM-mirror dump at a target vblank (PC side
 	// of the PC-vs-3DS same-scene VRAM diff; format matches the 3DS
-	// vramdump.bin).
+	// vramdump.bin). PC-only: the 3DS captures via SELECT+R / dumpreq.txt.
 	NativeRenderer_VramCaptureConfigureFromArgs(argc, argv);
+#endif
 
 	// --offscreen-capture arms the dfe=0 split inventory + golden stream
-	// (docs/OFFSCREEN_RENDER_VRAM_DESIGN.md Phase 0/1).
+	// (docs/OFFSCREEN_RENDER_VRAM_DESIGN.md Phase 0/1). No-op stub on 3DS.
 	NativeOffscreenCapture_ConfigureFromArgs(argc, argv);
 #endif
 

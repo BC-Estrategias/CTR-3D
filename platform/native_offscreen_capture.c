@@ -128,10 +128,65 @@ void NativeVramTrace_Op(const char *op, int x, int y, int w, int h, int srcX, in
 	}
 }
 
+/* --tri-dump state (see header): one frame of per-triangle records. */
+global_variable FILE *s_triDumpFile = NULL;
+global_variable u32 s_triDumpVblank = 0;
+global_variable int s_triDumpArmed = 0;
+global_variable int s_triDumpCount = 0;
+
+internal void TriDump_PutS16(u8 *dst, int v)
+{
+	dst[0] = (u8)(v & 0xFF);
+	dst[1] = (u8)((v >> 8) & 0xFF);
+}
+
+void NativeOffscreenCapture_OnAnySplit(const GrVertex *verts, int numVerts, int texFormat, int textured)
+{
+	/* A 4-vblank window, not equality: the game renders at 30fps, so any
+	 * single vblank can be the non-render half of the pair and see zero
+	 * splits (the first run of this dumped 0 triangles exactly that way). */
+	if (!s_triDumpArmed || (s_triDumpFile == NULL) || (s_ofscapVblank < s_triDumpVblank) || (s_ofscapVblank >= s_triDumpVblank + 4))
+	{
+		return;
+	}
+
+	for (int i = 0; (i + 2) < numVerts; i += 3)
+	{
+		const GrVertex *t = &verts[i];
+		u8 rec[36];
+
+		TriDump_PutS16(&rec[0], (u16)t[0].page);
+		TriDump_PutS16(&rec[2], (u16)t[0].clut);
+		rec[4] = textured ? (u8)texFormat : 255;
+		rec[5] = (u8)(textured ? 1 : 0);
+		for (int v = 0; v < 3; v++)
+		{
+			rec[6 + v] = t[v].u;
+			rec[9 + v] = t[v].v;
+		}
+		for (int v = 0; v < 3; v++)
+		{
+			TriDump_PutS16(&rec[12 + v * 2], t[v].x);
+			TriDump_PutS16(&rec[18 + v * 2], t[v].y);
+		}
+		TriDump_PutS16(&rec[24], -1);
+		TriDump_PutS16(&rec[26], -1);
+		TriDump_PutS16(&rec[28], -1);
+		TriDump_PutS16(&rec[30], -1);
+		TriDump_PutS16(&rec[32], -1);
+		rec[34] = 0;
+		rec[35] = 0;
+		fwrite(rec, sizeof(rec), 1, s_triDumpFile);
+		s_triDumpCount++;
+	}
+}
+
 int NativeOffscreenCapture_ConfigureFromArgs(int argc, char **argv)
 {
 	const char *path = NULL;
 	const char *maxSessions = NULL;
+	const char *triPath = NULL;
+	const char *triVblank = NULL;
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -139,6 +194,33 @@ int NativeOffscreenCapture_ConfigureFromArgs(int argc, char **argv)
 		{
 			s_vtraceEnabled = 1;
 			Platform_Log("[VTRACE] tracing VRAM mirror writes\n");
+		}
+	}
+
+	for (int i = 1; (i + 1) < argc; i++)
+	{
+		if (strcmp(argv[i], "--tri-dump") == 0)
+		{
+			triPath = argv[i + 1];
+		}
+		else if (strcmp(argv[i], "--tri-dump-vblank") == 0)
+		{
+			triVblank = argv[i + 1];
+		}
+	}
+
+	if (triPath != NULL)
+	{
+		s_triDumpFile = fopen(triPath, "wb");
+		if (s_triDumpFile != NULL)
+		{
+			s_triDumpVblank = (u32)((triVblank != NULL) ? atoi(triVblank) : 4000);
+			s_triDumpArmed = 1;
+			Platform_Log("[TRIDUMP] will dump triangles of vblank %u to %s\n", s_triDumpVblank, triPath);
+		}
+		else
+		{
+			Platform_LogWarn("[TRIDUMP] FAILED to open %s\n", triPath);
 		}
 	}
 
@@ -188,6 +270,14 @@ int NativeOffscreenCapture_ConfigureFromArgs(int argc, char **argv)
 
 void NativeOffscreenCapture_Tick(void)
 {
+	if (s_triDumpArmed && (s_ofscapVblank >= (s_triDumpVblank + 4)) && (s_triDumpFile != NULL))
+	{
+		fclose(s_triDumpFile);
+		s_triDumpFile = NULL;
+		s_triDumpArmed = 0;
+		Platform_Log("[TRIDUMP] dumped %d triangles\n", s_triDumpCount);
+	}
+
 	if (s_ofscapFile == NULL)
 	{
 		/* The vblank counter doubles as --vram-trace's timebase. */
@@ -446,6 +536,14 @@ void NativeVramTrace_Op(const char *op, int x, int y, int w, int h, int srcX, in
 	(void)h;
 	(void)srcX;
 	(void)srcY;
+}
+
+void NativeOffscreenCapture_OnAnySplit(const GrVertex *verts, int numVerts, int texFormat, int textured)
+{
+	(void)verts;
+	(void)numVerts;
+	(void)texFormat;
+	(void)textured;
 }
 
 int NativeOffscreenCapture_ConfigureFromArgs(int argc, char **argv)

@@ -22,12 +22,13 @@
 .alias  ones  constants.yyyy
 
 ; texcoordScale is 1/2048, NOT 1/N3DS_ATLAS_DIM: vertex UVs arrive as
-; HALF-texel numerators (2*texel - 1, see DrawTriangles) so the sampled
-; coordinate is texel - 0.5 -- the PC parity target's own half-texel-center
-; correction (native_renderer.c: v_texcoord += a_extra.xy*0.5 with tcx/tcy
-; always -1, then floor at sample time). Without it every fragment whose
-; interpolated UV fraction lands below .5 resolves one texel off (~half of
-; all textured pixels -- the pervasive per-pixel "static", session 15).
+; texel-CENTER numerators (2*texel + 1, see DrawTriangles) so the sampled
+; coordinate is texel + 0.5 -- dead centre of the intended texel, where
+; nearest-neighbour needs no boundary tie-break. (Session 16 correction: the
+; previous 2*texel - 1 form cited PC's tcx=tcy=-1 vertices, but that PC code
+; is commented out; sampling at texel - 0.5 put 1:1-mapped fragments -- font
+; glyphs, sprites -- exactly ON texel boundaries, and at sub-page tile edges
+; the tie-break crossed into the neighbouring 64x64 cache cell.)
 .constf vertexScale(0.00048828125, 0.0039215686, 0.0, 0.0) ; 1/2048, 1/255
 .alias  texcoordScale vertexScale.xxxx
 .alias  colorScale    vertexScale.yyyy

@@ -744,15 +744,22 @@ extern int g_dbg_texturelessMode;
  * header). void(void), so no ABI hazard across the enum-width boundary. */
 void NativeRenderer3DS_DebugDumpCacheMeta(void);
 
+void NativeRenderer3DS_DebugArmTriangleDump(void);
+
 /* Runs the full SELECT+R capture set: emulated VRAM, every atlas's raw
  * storage, and both decode-cache tiers' metadata, all describing the same
- * instant. One entry point so the button gesture and the host-side file
- * trigger below can never drift apart in what they capture. */
+ * instant, plus arms a per-triangle dump of the NEXT frame (page/clut/UV/
+ * position/atlas-resolution per triangle -- the addressing-side complement
+ * to the content-side dumps; session 16 proved content byte-correct while
+ * the screen quilts, so the divergence must be visible here). One entry
+ * point so the button gesture and the host-side file trigger below can
+ * never drift apart in what they capture. */
 static void N3DS_DebugCaptureAll(void)
 {
 	N3DS_DebugWriteVRAMDump();
 	N3DS_DebugWriteAtlasDump();
 	NativeRenderer3DS_DebugDumpCacheMeta();
+	NativeRenderer3DS_DebugArmTriangleDump();
 }
 #endif
 
@@ -776,12 +783,17 @@ unsigned int N3DS_ReadButtons(void)
 		N3DS_DebugCaptureAll();
 	}
 
-	/* Host-scriptable capture trigger (2026-07-21): Azahar's SD card is a
-	 * plain host folder, so an autonomous session can request the SELECT+R
-	 * capture by creating sdmc:/dumpreq.txt -- no window focus or key
-	 * injection involved. Polled every 64 frames so the SD probe cost stays
-	 * negligible on real hardware; the request file is deleted before dumping
-	 * so one request fires exactly once. */
+	/* Host-scriptable trigger (2026-07-21): Azahar's SD card is a plain host
+	 * folder, so an autonomous session can drive diagnostics by creating
+	 * sdmc:/dumpreq.txt -- no window focus or key injection involved. The
+	 * file's first word selects the action (session 16: the A/B toggles need
+	 * to be reachable without a gamepad):
+	 *   capture (or anything else) -- the full SELECT+R capture set
+	 *   subpage     -- toggle g_dbg_disableSubPage (route all to full-page tier)
+	 *   single      -- toggle g_dbg_forceSingleTexture
+	 *   textureless -- toggle g_dbg_texturelessMode
+	 * Polled every 64 frames so the SD probe cost stays negligible on real
+	 * hardware; the request file is deleted first so one request fires once. */
 	{
 		static unsigned int s_dumpPollCountdown = 64;
 
@@ -792,9 +804,40 @@ unsigned int N3DS_ReadButtons(void)
 			s_dumpPollCountdown = 64;
 			if (req != NULL)
 			{
+				extern int g_dbg_disableSubPage;
+				extern int g_dbg_forceSingleTexture;
+				char word[16];
+				size_t got = fread(word, 1, sizeof(word) - 1, req);
+
+				word[got] = '\0';
 				fclose(req);
 				remove("sdmc:/dumpreq.txt");
-				N3DS_DebugCaptureAll();
+
+				if (strncmp(word, "subpage", 7) == 0)
+				{
+					void NativeRenderer3DS_DebugInvalidateCaches(void);
+
+					g_dbg_disableSubPage ^= 1;
+					/* Both tiers share physical cells while the diagnostic
+					 * bound is widened -- drop all cached decodes so neither
+					 * regime serves the other's overwrites. */
+					NativeRenderer3DS_DebugInvalidateCaches();
+					N3DS_DebugLog(g_dbg_disableSubPage ? "[CTR-3DS] sub-page tier: DISABLED (full-page only)" : "[CTR-3DS] sub-page tier: enabled");
+				}
+				else if (strncmp(word, "single", 6) == 0)
+				{
+					g_dbg_forceSingleTexture ^= 1;
+					N3DS_DebugLog(g_dbg_forceSingleTexture ? "[CTR-3DS] force single texture: ON" : "[CTR-3DS] force single texture: off");
+				}
+				else if (strncmp(word, "textureless", 11) == 0)
+				{
+					g_dbg_texturelessMode ^= 1;
+					N3DS_DebugLog(g_dbg_texturelessMode ? "[CTR-3DS] textureless mode: 1" : "[CTR-3DS] textureless mode: 0");
+				}
+				else
+				{
+					N3DS_DebugCaptureAll();
+				}
 			}
 		}
 	}

@@ -977,6 +977,10 @@ void DrawSplit(const GPUDrawSplit *split)
 		                               split->psxTextureOutputSTP ? 1 : 0, split->psxDrawMaskSet, split->drawPrimMode, split->drawenv.dtd,
 		                               &split->drawenv.clip);
 	}
+	// Every split, any dfe: the --tri-dump addressing records (no-op unless
+	// armed for this vblank).
+	NativeOffscreenCapture_OnAnySplit(&s_gpu.vertexBuffer[split->startVertex], split->numVerts, (int)split->texFormat,
+	                                  split->textureId != NativeRenderer_GetWhiteTexture());
 #endif
 
 	if (split->psxTexturedSemiTrans)

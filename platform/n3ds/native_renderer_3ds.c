@@ -57,6 +57,70 @@ int g_cfg_bilinearFiltering = 0;
 
 global_variable int s_rendererInitialised = 0;
 global_variable u32 s_frameCounter = 0;
+/* Shadow of s_frameCounter as a plain unsigned int -- the type the
+ * n3ds_backend.h dump-registration boundary expects (see SwapWindow). */
+global_variable unsigned int s_frameCounterForDump = 0;
+
+#ifdef CTR_INTERNAL
+/* Per-triangle addressing dump (session 16): one frame of (page, clut, fmt,
+ * UVs, positions, resolved atlas cell) records, armed alongside the capture
+ * set. Content dumps proved every sampled cell byte-correct while the screen
+ * quilts; this captures the ADDRESSING side so it can be diffed against the
+ * same records from PC (--tri-dump) at a matched scene. Record layout (LE,
+ * 36 bytes, mirrored in native_offscreen_capture.c and
+ * tools/texdump/tridump_diff.py):
+ *   u16 page, clut; u8 fmt, textured; u8 u0,u1,u2, v0,v1,v2;
+ *   s16 x0,x1,x2, y0,y1,y2;
+ *   s16 atlasIdx, pixelBaseU, pixelBaseV, originU, originV; u16 pad
+ */
+global_variable int s_triDumpArm = 0;
+global_variable FILE *s_triDumpFile = NULL;
+
+void NativeRenderer3DS_DebugArmTriangleDump(void)
+{
+	s_triDumpArm = 1;
+}
+
+internal void N3DS_TriDumpPutS16(u8 *dst, int v)
+{
+	dst[0] = (u8)(v & 0xFF);
+	dst[1] = (u8)((v >> 8) & 0xFF);
+}
+
+internal void N3DS_TriDumpRecord(const GrVertex *t, int textured, int fmt, int atlasIdx, int pixelBaseU, int pixelBaseV, int originU, int originV)
+{
+	u8 rec[36];
+	int i;
+
+	if (s_triDumpFile == NULL)
+	{
+		return;
+	}
+
+	N3DS_TriDumpPutS16(&rec[0], (u16)t[0].page);
+	N3DS_TriDumpPutS16(&rec[2], (u16)t[0].clut);
+	rec[4] = (u8)fmt;
+	rec[5] = (u8)textured;
+	for (i = 0; i < 3; i++)
+	{
+		rec[6 + i] = t[i].u;
+		rec[9 + i] = t[i].v;
+	}
+	for (i = 0; i < 3; i++)
+	{
+		N3DS_TriDumpPutS16(&rec[12 + i * 2], t[i].x);
+		N3DS_TriDumpPutS16(&rec[18 + i * 2], t[i].y);
+	}
+	N3DS_TriDumpPutS16(&rec[24], atlasIdx);
+	N3DS_TriDumpPutS16(&rec[26], pixelBaseU);
+	N3DS_TriDumpPutS16(&rec[28], pixelBaseV);
+	N3DS_TriDumpPutS16(&rec[30], originU);
+	N3DS_TriDumpPutS16(&rec[32], originV);
+	rec[34] = 0;
+	rec[35] = 0;
+	fwrite(rec, sizeof(rec), 1, s_triDumpFile);
+}
+#endif
 global_variable unsigned long s_lastStatFrames = 0;
 global_variable unsigned long s_lastStatVblanks = 0;
 
@@ -252,7 +316,17 @@ typedef struct
 #define N3DS_SUBPAGE_DIM                64
 #define N3DS_SUBPAGE_PHYSICAL_BASE      (1 + N3DS_FULLPAGE_RESERVED_CELLS)
 
-global_variable N3DS_DecodeCacheEntry s_decodeCache[1 + N3DS_FULLPAGE_RESERVED_CELLS];
+/* Sized for every physical cell, not just the full-page partition: with
+ * g_dbg_disableSubPage the full-page tier scans the idle sub-tier cells too
+ * (N3DS_FullPageCellBound below), so the s14/s16 A/B isn't confounded by
+ * eviction thrash -- 96 cells hold less than one busy scene's working set,
+ * which is exactly what invalidated the first run of that experiment. */
+global_variable N3DS_DecodeCacheEntry s_decodeCache[N3DS_TOTAL_CELLS];
+
+internal int N3DS_FullPageCellBound(void)
+{
+	return g_dbg_disableSubPage ? N3DS_TOTAL_CELLS : (1 + N3DS_FULLPAGE_RESERVED_CELLS);
+}
 
 /* Flat cell index -> which atlas texture, and which cell within its grid. */
 internal void N3DS_CellIndexToAtlasCoord(int cellIndex, int *outAtlas, int *outCellX, int *outCellY)
@@ -671,7 +745,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 		}
 	}
 
-	for (i = 1; i < (1 + N3DS_FULLPAGE_RESERVED_CELLS); i++)
+	for (i = 1; i < N3DS_FullPageCellBound(); i++)
 	{
 		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
 
@@ -733,7 +807,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 	 */
 	oldestSlot = -1;
 	oldestFrame = 0xFFFFFFFFu;
-	for (i = 1; i < (1 + N3DS_FULLPAGE_RESERVED_CELLS); i++)
+	for (i = 1; i < N3DS_FullPageCellBound(); i++)
 	{
 		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
 
@@ -1097,9 +1171,10 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 	N3DS_DebugLog("[CTR-3DS] renderer init ok, citro3d ready");
 
 	/* Hand the backend TU the VRAM buffer so its SELECT+R debug capture can
-	 * write it to SD (see N3DS_DebugSetVRAMForDump). vram[] and s_frameCounter
-	 * are stable globals, so registering their addresses once is safe. */
-	N3DS_DebugSetVRAMForDump(vram, (unsigned int)sizeof(vram), &s_frameCounter);
+	 * write it to SD (see N3DS_DebugSetVRAMForDump). vram[] and the frame
+	 * counter shadow are stable globals, so registering their addresses once
+	 * is safe. */
+	N3DS_DebugSetVRAMForDump(vram, (unsigned int)sizeof(vram), &s_frameCounterForDump);
 
 	return 1;
 }
@@ -1177,6 +1252,26 @@ void NativeRenderer_BeginScene(void)
 	}
 
 	s_beginSceneCount++;
+
+#ifdef CTR_INTERNAL
+	/* Armed by the capture set (N3DS_DebugCaptureAll): dump the coming
+	 * frame's triangles. Opened here (frame start), closed next BeginScene. */
+	if (s_triDumpFile != NULL)
+	{
+		fclose(s_triDumpFile);
+		s_triDumpFile = NULL;
+		N3DS_DebugLog("[CTR-3DS] triangle dump closed");
+	}
+	if (s_triDumpArm)
+	{
+		char triPath[64];
+
+		s_triDumpArm = 0;
+		snprintf(triPath, sizeof(triPath), "sdmc:/tridump_%u.bin", (unsigned)s_frameCounter);
+		s_triDumpFile = fopen(triPath, "wb");
+		N3DS_DebugLog(s_triDumpFile ? "[CTR-3DS] triangle dump armed for this frame" : "[CTR-3DS] triangle dump fopen FAILED");
+	}
+#endif
 
 	/* Working-set estimate is per frame, so latch its peak and restart the
 	 * count at the frame boundary. BeginScene is guarded against re-entry by
@@ -1284,6 +1379,11 @@ void NativeRenderer_SwapWindow(void)
 	 * a second vblank source or the 30fps gate would be paced twice.
 	 */
 	s_frameCounter++;
+	/* Plain-unsigned shadow for the backend's capture-filename stamp: u32 is
+	 * unsigned long on this ABI, and the n3ds_backend.h boundary carries only
+	 * plain scalar types (no u32), so hand it a real unsigned int instead of
+	 * an aliased pointer. */
+	s_frameCounterForDump = (unsigned int)s_frameCounter;
 
 	if ((s_frameCounter & 31) == 0)
 	{
@@ -2092,6 +2192,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			vertsInRun = 0;
 		}
 
+#ifdef CTR_INTERNAL
+		N3DS_TriDumpRecord(triVerts, !untextured, untextured ? 255 : (int)s_currentTexFormat, atlasIdx, pixelBaseU, pixelBaseV, originU, originV);
+#endif
+
 		for (v = 0; v < 3; v++)
 		{
 			const GrVertex *src = &triVerts[v];
@@ -2121,29 +2225,46 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			 * finding 2, Option A) instead of done here. Do NOT divide here
 			 * too -- that would double-scale every UV. */
 			/*
-			 * HALF-texel numerators: 2*texel - 1, scaled by 1/2048 in the
-			 * shader, so the GPU samples at (texel - 0.5) -- reproducing the
-			 * PC parity target's half-texel-center correction exactly
-			 * (native_renderer.c: every textured primitive carries
-			 * tcx=tcy=-1, applied as v_texcoord += a_extra.xy*0.5, then the
-			 * PSX samplers floor the interpolated result). Session 15: the
-			 * capture-verified atlas was byte-perfect while the screen showed
-			 * pervasive per-pixel noise -- because without this bias every
-			 * fragment whose interpolated UV fraction fell below .5 floored
-			 * to the neighbouring texel (~half of all textured pixels; on
-			 * 4bpp palette art a neighbour texel is an arbitrary colour), and
-			 * far-edge UVs (u=64/256 at a tile boundary) floored into the
-			 * NEIGHBOURING atlas cell -- a different texture entirely.
+			 * Texel-CENTER numerators: 2*texel + 1, scaled by 1/2048 in the
+			 * shader, so the GPU samples at (texel + 0.5) -- the dead centre
+			 * of the intended texel, where nearest-neighbour needs no
+			 * boundary tie-break at all.
+			 *
+			 * CORRECTED RECORD (session 16). The previous 2*texel - 1 form
+			 * ("half-texel", e7ffe8d) cited PC vertices carrying tcx=tcy=-1;
+			 * that claim was wrong -- PC's tcx/tcy block is COMMENTED OUT
+			 * (native_gpu.c, g_cfg_bilinearFiltering), so PC simply floors
+			 * the centre-interpolated UV nudged by a small positive fudge
+			 * (c_UVFudge). Sampling at (texel - 0.5) put every 1:1-mapped
+			 * fragment (font glyphs, sprites, UI quads -- integer UV deltas
+			 * matching integer pixel deltas) EXACTLY ON a texel boundary,
+			 * where the pick is ambiguous, and at a sub-page tile's left/top
+			 * edge the losing side is the NEIGHBOURING 64x64 cache cell -- a
+			 * different texture entirely. Fresh-boot Azahar capture that led
+			 * here: VRAM byte-identical to PC, every fresh cache cell
+			 * byte-correct, screen still quilted garbage -- content was
+			 * fine, addressing was not.
+			 */
+			/*
+			 * V-flip note (session 16): PresentVRAMRect's empirical quad-V
+			 * swap suggested PICA might sample atlas T bottom-up; DISPROVED
+			 * for this path without a build -- the reserved white cell
+			 * (atlas 0 rows 0-255, confirmed at memory top in raw atlas
+			 * dumps) renders every untextured primitive correctly when
+			 * sampled UNFLIPPED, so T=0 reads memory row 0 here. Whatever
+			 * that present-path swap compensates is local to its own quad
+			 * construction. Do not "fix" this path with a global V flip:
+			 * it would move untextured sampling onto cell (0,3)'s content.
 			 */
 			if (untextured)
 			{
-				dst->u = (s16)(((cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) - 1);
-				dst->v = (s16)(((cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) - 1);
+				dst->u = (s16)(((cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) + 1);
+				dst->v = (s16)(((cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) + 1);
 			}
 			else
 			{
-				dst->u = (s16)(((pixelBaseU + ((int)src->u - originU)) << 1) - 1);
-				dst->v = (s16)(((pixelBaseV + ((int)src->v - originV)) << 1) - 1);
+				dst->u = (s16)(((pixelBaseU + ((int)src->u - originU)) << 1) + 1);
+				dst->v = (s16)(((pixelBaseV + ((int)src->v - originV)) << 1) + 1);
 			}
 
 			/* Raw u8 copy, no scale -- the *1/255 reciprocal-multiply that
@@ -2217,6 +2338,26 @@ internal void N3DS_MetaWriteU32(FILE *f, u32 v)
  *       used, page, clut, format, tileX, tileY, pageGen, clutGenA, clutGenB,
  *       lastUsedFrame
  */
+/* Backend-callable (dumpreq 'subpage' toggle): drop every cached decode in
+ * both tiers. Required on each toggle -- the tiers share physical atlas
+ * cells under N3DS_FullPageCellBound's diagnostic reach, so entries recorded
+ * by one routing regime can describe cells the other regime has since
+ * rewritten. */
+void NativeRenderer3DS_DebugInvalidateCaches(void)
+{
+	int i;
+
+	for (i = 0; i < N3DS_TOTAL_CELLS; i++)
+	{
+		s_decodeCache[i].used = 0;
+	}
+	for (i = 0; i < N3DS_SUBPAGE_TOTAL_CELLS; i++)
+	{
+		s_subPageCache[i].used = 0;
+	}
+	N3DS_DebugLog("[CTR-3DS] decode caches invalidated (tier toggle)");
+}
+
 void NativeRenderer3DS_DebugDumpCacheMeta(void)
 {
 	FILE *f;
