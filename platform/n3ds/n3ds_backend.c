@@ -230,9 +230,15 @@ int N3DS_C3DInit(void)
 		char msg[128];
 
 		/* Atlases are the single largest linear-memory consumer here
-		 * (N3DS_ATLAS_DIM^2 * 4 bytes each). Log the budget before and after
-		 * so cache capacity can be sized from the real ceiling instead of
-		 * guessed -- 8 atlases was tried and failed outright. */
+		 * (N3DS_ATLAS_DIM^2 * 2 bytes each, GPU_RGBA5551). Log the budget
+		 * before and after so cache capacity can be sized from the real
+		 * ceiling instead of guessed -- see N3DS_ATLAS_COUNT's own comment
+		 * in n3ds_backend.h for the current count and why; a stale version
+		 * of this comment used to claim a specific count "failed outright",
+		 * which was true only for the twice-as-large RGBA8 format this no
+		 * longer uses. If allocation ever fails now, the log line below
+		 * states exactly which atlas index and how much free KiB remained --
+		 * trust that over any comment. */
 		snprintf(msg, sizeof(msg), "[CTR-3DS] linear free before atlases: %lu KiB (want %d x %d KiB)",
 		         (unsigned long)(linearSpaceFree() / 1024), N3DS_ATLAS_COUNT,
 		         (N3DS_ATLAS_DIM * N3DS_ATLAS_DIM * 2) / 1024);
@@ -394,25 +400,33 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
  */
 #define N3DS_TILE_BYTES (64 * 2)
 
-void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256)
+/*
+ * Manual sub-rect write -- see the header comment for why C3D_TexUpload
+ * can't be used here. PICA200 tiling addresses 8x8-texel tiles in simple
+ * row-major order across a texture's FULL width (verified against
+ * tex3ds's reference swizzle, see native_renderer_3ds.c). A tile block is a
+ * tilesWide x tilesHigh square positioned at tile offset (baseTileCol,
+ * baseTileRow) within the atlas's 128x128-tile grid (1024/8); each of its
+ * tile-rows is tilesWide CONSECUTIVE tiles, which -- because tile-column is
+ * the fastest-varying index in row-major order -- are contiguous in the
+ * atlas's memory too, so one memcpy per tile-row is exact and correct, not
+ * an approximation.
+ *
+ * Shared by the whole-cell (32x32-tile) and sub-cell (8x8-tile) upload
+ * wrappers below (docs/SUBPAGE_DECODE_CACHE_DESIGN.md) -- both are the same
+ * blit, just a different tile-block size and origin. tilesWide/tilesHigh
+ * must be used for ALL FOUR of the base-tile calc (the caller's job here,
+ * via baseTileCol/baseTileRow), the loop bound, the srcRow stride, and the
+ * memcpy width -- getting only the loop bound right and leaving srcRow/
+ * memcpy at a stale hardcoded stride was caught in review before this
+ * shipped (correct only for a 32-wide caller, silently wrong for an 8-wide
+ * one).
+ */
+static void N3DS_C3DUploadTileBlock(int atlasIndex, int baseTileCol, int baseTileRow, int tilesWide, int tilesHigh,
+                                     const void *tiled)
 {
-	/*
-	 * Manual sub-rect write -- see the header comment for why C3D_TexUpload
-	 * can't be used here. PICA200 tiling addresses 8x8-texel tiles in simple
-	 * row-major order across a texture's FULL width (verified against
-	 * tex3ds's reference swizzle, see native_renderer_3ds.c). A cell is a
-	 * 32x32-tile square (256/8) positioned at tile offset (cellX*32, cellY*32)
-	 * within the atlas's 128x128-tile grid (1024/8); each of its 32 tile-rows
-	 * is 32 CONSECUTIVE tiles, which -- because tile-column is the
-	 * fastest-varying index in row-major order -- are contiguous in the
-	 * atlas's memory too, so one memcpy per tile-row is exact and correct,
-	 * not an approximation.
-	 */
 	const int atlasTilesPerRow = N3DS_ATLAS_DIM / 8;
-	const int cellTilesPerRow = N3DS_DECODE_TEXTURE_DIM / 8;
-	const int cellBaseTileRow = cellY * cellTilesPerRow;
-	const int cellBaseTileCol = cellX * cellTilesPerRow;
-	const u8 *src = (const u8 *)tiled256;
+	const u8 *src = (const u8 *)tiled;
 	u8 *atlasData;
 	int localTileRow;
 
@@ -423,14 +437,24 @@ void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void 
 
 	atlasData = (u8 *)s_atlasTextures[atlasIndex].data;
 
-	for (localTileRow = 0; localTileRow < cellTilesPerRow; localTileRow++)
+	for (localTileRow = 0; localTileRow < tilesHigh; localTileRow++)
 	{
-		const int atlasTileRow = cellBaseTileRow + localTileRow;
-		u8 *dstRow = atlasData + (size_t)((atlasTileRow * atlasTilesPerRow) + cellBaseTileCol) * N3DS_TILE_BYTES;
-		const u8 *srcRow = src + (size_t)localTileRow * cellTilesPerRow * N3DS_TILE_BYTES;
+		const int atlasTileRow = baseTileRow + localTileRow;
+		u8 *dstRow = atlasData + (size_t)((atlasTileRow * atlasTilesPerRow) + baseTileCol) * N3DS_TILE_BYTES;
+		const u8 *srcRow = src + (size_t)localTileRow * tilesWide * N3DS_TILE_BYTES;
 
-		memcpy(dstRow, srcRow, (size_t)cellTilesPerRow * N3DS_TILE_BYTES);
+		memcpy(dstRow, srcRow, (size_t)tilesWide * N3DS_TILE_BYTES);
 	}
+}
+
+void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256)
+{
+	N3DS_C3DUploadTileBlock(atlasIndex, cellX * 32, cellY * 32, 32, 32, tiled256); /* unchanged behavior */
+}
+
+void N3DS_C3DUploadDecodedSubCell(int atlasIndex, int physCellX, int physCellY, int subX, int subY, const void *tiled64)
+{
+	N3DS_C3DUploadTileBlock(atlasIndex, (physCellX * 32) + (subX * 8), (physCellY * 32) + (subY * 8), 8, 8, tiled64);
 }
 
 void N3DS_C3DSetColorDoubling(int enable)

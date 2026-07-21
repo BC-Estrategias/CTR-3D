@@ -180,14 +180,44 @@ typedef struct
  * header comment on N3DS_C3DUploadDecodedCell in n3ds_backend.h for why).
  * Flat index 0 is reserved for a permanent flat opaque-white texel
  * (untextured/Gouraud primitives -- N3DS_WHITE_ATLAS/CELL_X/CELL_Y below),
- * never entered into the LRU cache; indices 1..N3DS_TOTAL_CELLS-1 are real.
+ * never entered into the LRU cache; indices 1..N3DS_TOTAL_CELLS-1 are real,
+ * split between two tiers as of the sub-page cache below.
  */
 #define N3DS_TOTAL_CELLS (N3DS_ATLAS_COUNT * N3DS_ATLAS_CELLS_PER_ATLAS)
 #define N3DS_WHITE_ATLAS  0
 #define N3DS_WHITE_CELL_X 0
 #define N3DS_WHITE_CELL_Y 0
 
-global_variable N3DS_DecodeCacheEntry s_decodeCache[N3DS_TOTAL_CELLS];
+/*
+ * Sub-page decode cache (docs/SUBPAGE_DECODE_CACHE_DESIGN.md): a static split
+ * of the same N3DS_TOTAL_CELLS physical atlas cells, not a separate memory
+ * budget. Cell 0 stays the reserved white cell; cells 1..N3DS_FULLPAGE_RESERVED_CELLS
+ * back the whole-page tier below (unchanged logic, just a smaller array); the
+ * remaining physical cells back a new sub-page tier, each physical cell
+ * further subdivided into a 4x4 grid of 64x64 sub-cells.
+ *
+ * 96 is a corrected first-pass number, not yet a fully measured one -- the
+ * design doc's original guess of 32 was shipped, boot-tested, and measured
+ * WRONG the same day: a menu background scene (hills/road/tunnel/sky) alone
+ * peaked at 25/32 full-page cells with evictInUse=11846, i.e. severe
+ * mid-frame-eviction-hazard pressure -- the exact mechanism session 9/10 tied
+ * directly to visible corruption. Meanwhile the sub-page tier peaked at only
+ * ~86/1520 slots across the same content, so it had enormous unused headroom
+ * to give back. Growing this further necessarily shrinks the sub-page tier
+ * (both draw from the same fixed 127-cell pool, see the design doc's
+ * capacity-tension note) -- 96/31 leaves the sub-page tier 31*16=496 slots,
+ * still ~6x its observed peak. Race content (the scenario the design doc
+ * predicted would stress this tier hardest) has not yet been measured against
+ * either number.
+ */
+#define N3DS_FULLPAGE_RESERVED_CELLS    96
+#define N3DS_SUBPAGE_PHYSICAL_CELLS     (N3DS_TOTAL_CELLS - 1 - N3DS_FULLPAGE_RESERVED_CELLS)
+#define N3DS_SUBPAGE_CELLS_PER_PHYSICAL 16
+#define N3DS_SUBPAGE_TOTAL_CELLS        (N3DS_SUBPAGE_PHYSICAL_CELLS * N3DS_SUBPAGE_CELLS_PER_PHYSICAL)
+#define N3DS_SUBPAGE_DIM                64
+#define N3DS_SUBPAGE_PHYSICAL_BASE      (1 + N3DS_FULLPAGE_RESERVED_CELLS)
+
+global_variable N3DS_DecodeCacheEntry s_decodeCache[1 + N3DS_FULLPAGE_RESERVED_CELLS];
 
 /* Flat cell index -> which atlas texture, and which cell within its grid. */
 internal void N3DS_CellIndexToAtlasCoord(int cellIndex, int *outAtlas, int *outCellX, int *outCellY)
@@ -197,6 +227,48 @@ internal void N3DS_CellIndexToAtlasCoord(int cellIndex, int *outAtlas, int *outC
 	*outAtlas = cellIndex / N3DS_ATLAS_CELLS_PER_ATLAS;
 	*outCellX = within % N3DS_ATLAS_CELLS_PER_ROW;
 	*outCellY = within / N3DS_ATLAS_CELLS_PER_ROW;
+}
+
+/*
+ * Sub-page cache entry -- same shape as N3DS_DecodeCacheEntry plus tileX/tileY,
+ * the key's sub-page component (which 64x64 tile of the page, 0-3 each).
+ * pageGen is the generation of the ONE VRAM dirty-cell exactly covering this
+ * tile (a 64-aligned sub-tile's absolute VRAM origin is always exactly one
+ * N3DS_VRAM_CELL_DIM cell -- see the design doc's "useful coincidence" note);
+ * clutGenA/B are the identical two-cell check the full-page tier uses (same
+ * pre-existing straddle gap, inherited verbatim, not fixed here).
+ */
+typedef struct
+{
+	int used;
+	s16 page;
+	s16 clut;
+	TexFormat format;
+	u8 tileX, tileY;
+	u32 pageGen;
+	u32 clutGenA, clutGenB;
+	u32 lastUsedFrame;
+} N3DS_SubPageCacheEntry;
+
+global_variable N3DS_SubPageCacheEntry s_subPageCache[N3DS_SUBPAGE_TOTAL_CELLS];
+/* Mirrors s_lastCellHit. -1 = no memo yet -- unlike the full-page array, index
+ * 0 is a real, valid sub-page slot here (no reserved white cell at 0), so 0
+ * can't double as the "no memo" sentinel the way it implicitly does not for
+ * s_lastCellHit either (that one guards with `> 0`, this one with `>= 0`). */
+global_variable int s_lastSubPageCellHit = -1;
+
+/* Sub-page counterpart to N3DS_CellIndexToAtlasCoord -- reuses it unchanged,
+ * offset into the physical-cell range the sub-page tier owns, then further
+ * resolves which of the 16 sub-cells within that physical cell. */
+internal void N3DS_SubCellIndexToAtlasCoord(int subIndex, int *outAtlas, int *outPhysCellX, int *outPhysCellY,
+                                             int *outSubX, int *outSubY)
+{
+	const int physCellIndex = N3DS_SUBPAGE_PHYSICAL_BASE + (subIndex / N3DS_SUBPAGE_CELLS_PER_PHYSICAL);
+	const int within = subIndex % N3DS_SUBPAGE_CELLS_PER_PHYSICAL;
+
+	N3DS_CellIndexToAtlasCoord(physCellIndex, outAtlas, outPhysCellX, outPhysCellY);
+	*outSubX = within % 4;
+	*outSubY = within / 4;
 }
 
 /*
@@ -223,8 +295,10 @@ global_variable u32 s_lastStatCacheEvictions = 0;
  * IDENTICAL in that pair, and they have opposite fixes:
  *
  *   - CAPACITY: no entry for this (page,clut,format) at all. The working set
- *     genuinely exceeds N3DS_TOTAL_CELLS. Fix = more/smaller cells, or decode
- *     a level's set once at load into persistent atlases.
+ *     genuinely exceeds this tier's cell budget (N3DS_TOTAL_CELLS at the time
+ *     this was measured; now 1+N3DS_FULLPAGE_RESERVED_CELLS for this counter
+ *     specifically, after the sub-page split below). Fix = more/smaller
+ *     cells, or decode a level's set once at load into persistent atlases.
  *   - STALE: an entry for exactly this (page,clut,format) IS resident, but a
  *     VRAM cell generation moved under it, so it re-decodes. Fix = dirty VRAM
  *     at finer granularity than 256x256, or stop the mutator. Decoding once at
@@ -242,10 +316,12 @@ global_variable u32 s_lastStatCapacityMisses = 0;
 
 /*
  * Distinct atlas cells touched in one frame -- an estimate of the live working
- * set, to compare against N3DS_TOTAL_CELLS (63 usable). Counted by noticing an
- * entry whose lastUsedFrame was not already this frame, so it SATURATES at the
- * cache size when capacity binds: reading 63 means "at least 63", not "exactly
- * 63". Read it together with the capacity/stale split, not alone.
+ * set, to compare against this tier's own cell budget (N3DS_FULLPAGE_RESERVED_CELLS
+ * after the sub-page split below; was N3DS_TOTAL_CELLS before). Counted by
+ * noticing an entry whose lastUsedFrame was not already this frame, so it
+ * SATURATES at the cache size when capacity binds: reading the budget means
+ * "at least that many", not "exactly that many". Read it together with the
+ * capacity/stale split, not alone.
  */
 global_variable u32 s_frameTouchedCells = 0;
 global_variable u32 s_frameTouchedPeak = 0;
@@ -275,6 +351,34 @@ global_variable int s_lastCellHit = 0;
  */
 global_variable u32 s_evictHazards = 0;
 
+/*
+ * Sub-page tier diagnostics -- field-for-field mirror of the full-page
+ * counters above; see those comments for what each one means. lastStat*
+ * variants exist only to compute the same windowed (+N/w) deltas the
+ * stats block already prints for the full-page tier.
+ */
+global_variable u32 s_subPageCacheHits = 0;
+global_variable u32 s_subPageCacheMisses = 0;
+global_variable u32 s_subPageCacheEvictions = 0;
+global_variable u32 s_subPageLastStatCacheMisses = 0;
+global_variable u32 s_subPageLastStatCacheEvictions = 0;
+global_variable u32 s_subPageCacheStaleMisses = 0;
+global_variable u32 s_subPageCacheCapacityMisses = 0;
+global_variable u32 s_subPageLastStatStaleMisses = 0;
+global_variable u32 s_subPageLastStatCapacityMisses = 0;
+global_variable u32 s_subPageFrameTouchedCells = 0;
+global_variable u32 s_subPageFrameTouchedPeak = 0;
+global_variable u32 s_subPageEvictHazards = 0;
+
+/*
+ * Per-triangle routing outcome (N3DS_ResolveTriangleTexture) -- the single
+ * most important new number: whether the straddling/large-surface fallback
+ * to the full-page tier dominates real content or is genuinely the minority
+ * case this design assumes (design doc "Instrumentation").
+ */
+global_variable u32 s_trianglesRoutedSubPage = 0;
+global_variable u32 s_trianglesRoutedFullPage = 0;
+
 /* One increment per actual C3D_DrawArrays call (N3DS_FlushRun, called from
  * DrawTriangles) -- checks the design doc's own predicted "more, smaller
  * draw calls than PC" risk directly; measured ~150-290/frame before the
@@ -292,6 +396,10 @@ global_variable u32 s_lastStatDrawCallCount = 0;
 /* Scratch for one decoded+tiled page; reused every decode, never persisted.
  * One u16 per texel (GPU_RGBA5551) -- see N3DS_TILE_BYTES in n3ds_backend.c. */
 global_variable u16 s_decodeScratch[N3DS_DECODE_TEXTURE_DIM * N3DS_DECODE_TEXTURE_DIM];
+
+/* Scratch for one decoded+tiled 64x64 sub-cell; mirrors s_decodeScratch's
+ * role, sized for N3DS_SUBPAGE_DIM instead of N3DS_DECODE_TEXTURE_DIM. */
+global_variable u16 s_subpageDecodeScratch[N3DS_SUBPAGE_DIM * N3DS_SUBPAGE_DIM];
 
 /* Scratch for one converted atlas-run. Bounded by N3DS_MAX_RUN_VERTICES,
  * NOT the whole-frame budget: a run is flushed whenever the atlas changes
@@ -344,34 +452,40 @@ global_variable u32 s_droppedRuns = 0;
  * only consumes the 0-vs-nonzero distinction (single alpha test, see
  * n3ds_backend.c); the 128/255 split is decoded now so 2b's STP 2-pass
  * doesn't need to touch this function at all.
+ *
+ * Generalized 2026-07-20 for the sub-page decode cache (docs/
+ * SUBPAGE_DECODE_CACHE_DESIGN.md): originU/originV/width/height say what
+ * page-relative rectangle to decode (the page's own absolute VRAM origin is
+ * still added internally, below); destStrideTiles says how wide the
+ * DESTINATION buffer is, in tiles -- a property of which scratch buffer the
+ * caller is writing into, and NOT derivable from width. They only happen to
+ * agree for the sub-page tier (both always 64px/8 tiles); the full-page
+ * tier's width is format-clamped (256/128/64) while its destination
+ * (s_decodeScratch) is always 256px/32 tiles, so deriving stride from width
+ * would silently desync from the unchanged uploader on every 8bpp/16bpp page
+ * (caught in review before this shipped -- see the design doc's "What
+ * changed from v1" section). Pass destStrideTiles explicitly, always.
  */
-internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u16 *outTiled256)
+internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, int originU, int originV, int width,
+                                      int height, int destStrideTiles, u16 *outTiled)
 {
 	const int pageOriginX = (texPage & 0xF) * 64;
 	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
 	const int clutOriginX = (clut & 0x3F) * 16;
 	const int clutOriginY = clut >> 6;
-	/*
-	 * Decode only the columns this format can actually address. u/v reach the
-	 * full 0-255 at 4bpp, but a texture page is 64 VRAM words wide, so 8bpp
-	 * can only address u=0..127 and 16bpp only u=0..63 -- the game authors
-	 * texcoords format-aware and never samples beyond that. Decoding a fixed
-	 * 256 columns regardless was doing 2x the necessary work for 8bpp and 4x
-	 * for 16bpp, on the hottest path in the renderer (a cache miss decodes
-	 * 65,536 texels, and real track content was missing ~77 times a frame).
-	 * Columns past this bound keep whatever a previous decode left in them
-	 * and are never sampled.
-	 */
-	const int decodeWidth = (format == TF_4_BIT) ? 256 : ((format == TF_8_BIT) ? 128 : 64);
 	int v;
 
-	for (v = 0; v < N3DS_DECODE_TEXTURE_DIM; v++)
+	for (v = 0; v < height; v++)
 	{
-		const int wordRow = pageOriginY + v;
+		const int wordRow = pageOriginY + originV + v;
 		int u;
 
-		for (u = 0; u < decodeWidth; u++)
+		for (u = 0; u < width; u++)
 		{
+			/* Page-relative source column -- VRAM addressing uses this, but
+			 * the Morton swizzle and destination tile indexing below stay on
+			 * the local, 0-based u/v (unchanged math either way). */
+			const int pageU = originU + u;
 			u16 color16;
 			int morton, tileIndex, dstIndex;
 
@@ -379,9 +493,9 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u1
 			{
 			case TF_4_BIT:
 			{
-				const int wordCol = pageOriginX + (u >> 2);
+				const int wordCol = pageOriginX + (pageU >> 2);
 				const u16 word = vram[wordRow * VRAM_WIDTH + wordCol];
-				const int nibble = (word >> ((u & 3) * 4)) & 0xF;
+				const int nibble = (word >> ((pageU & 3) * 4)) & 0xF;
 				/* Wrap within the CLUT's own VRAM row. PC's VRAM sampler
 				 * inherits GL_REPEAT and wraps S independently of T, so it
 				 * can never walk into the next scanline; a flat array index
@@ -393,9 +507,9 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u1
 			}
 			case TF_8_BIT:
 			{
-				const int wordCol = pageOriginX + (u >> 1);
+				const int wordCol = pageOriginX + (pageU >> 1);
 				const u16 word = vram[wordRow * VRAM_WIDTH + wordCol];
-				const int index = (word >> ((u & 1) * 8)) & 0xFF;
+				const int index = (word >> ((pageU & 1) * 8)) & 0xFF;
 				/* 256 entries from a 16-aligned origin reaches column 1263 of
 				 * a 1024-wide row, i.e. 239 texels into the NEXT scanline.
 				 * Wrap instead, matching PC's GL_REPEAT S-wrap (see the 4-bit
@@ -406,12 +520,12 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u1
 			case TF_16_BIT:
 			case TF_32_BIT_RGBA: /* unreachable -- DrawTriangles never calls this path for it, see file header */
 			default:
-				color16 = vram[wordRow * VRAM_WIDTH + pageOriginX + u];
+				color16 = vram[wordRow * VRAM_WIDTH + pageOriginX + pageU];
 				break;
 			}
 
 			morton = (u & 1) | ((v & 1) << 1) | ((u & 2) << 1) | ((v & 2) << 2) | ((u & 4) << 2) | ((v & 4) << 3);
-			tileIndex = ((v >> 3) * (N3DS_DECODE_TEXTURE_DIM / 8) + (u >> 3)) * 64;
+			tileIndex = ((v >> 3) * destStrideTiles + (u >> 3)) * 64;
 			dstIndex = tileIndex + morton;
 
 			/*
@@ -437,10 +551,10 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u1
 			 * which is not built and which can recover the STP bit straight
 			 * from VRAM (bit 15, still right there) when it is.
 			 */
-			outTiled256[dstIndex] = (u16)(((color16 & 0x001Fu) << 11) |        /* R */
-			                              (((color16 >> 5) & 0x1Fu) << 6) |     /* G */
-			                              (((color16 >> 10) & 0x1Fu) << 1) |    /* B */
-			                              ((color16 != 0) ? 1u : 0u));          /* punch-through */
+			outTiled[dstIndex] = (u16)(((color16 & 0x001Fu) << 11) |       /* R */
+			                          (((color16 >> 5) & 0x1Fu) << 6) |   /* G */
+			                          (((color16 >> 10) & 0x1Fu) << 1) |  /* B */
+			                          ((color16 != 0) ? 1u : 0u));        /* punch-through */
 		}
 	}
 }
@@ -449,8 +563,10 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, u1
  * Finds an atlas cell already decoded for (texPage, clut, format) and still
  * fresh (matching VRAM dirty-cell generations), or decodes into the
  * least-recently-used atlas cell on a miss. Returns a flat cell index (see
- * N3DS_CellIndexToAtlasCoord). Linear scan over N3DS_TOTAL_CELLS -- fine for
- * a correctness-first pass at this count; the design doc explicitly leaves
+ * N3DS_CellIndexToAtlasCoord). Linear scan over 1+N3DS_FULLPAGE_RESERVED_CELLS
+ * (this tier's whole-page cell budget, since docs/SUBPAGE_DECODE_CACHE_DESIGN.md's
+ * two-tier split -- was N3DS_TOTAL_CELLS before) -- fine for a
+ * correctness-first pass at this count; the design doc explicitly leaves
  * perf tuning for after on-device measurement. Note "cell" means two
  * different things in this function and both are real: VRAM dirty-tracking
  * cells (N3DS_VRAM_CELL_*, 256x256 regions of PSX VRAM) versus atlas cells
@@ -498,7 +614,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 		}
 	}
 
-	for (i = 1; i < N3DS_TOTAL_CELLS; i++)
+	for (i = 1; i < (1 + N3DS_FULLPAGE_RESERVED_CELLS); i++)
 	{
 		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
 
@@ -560,7 +676,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 	 */
 	oldestSlot = -1;
 	oldestFrame = 0xFFFFFFFFu;
-	for (i = 1; i < N3DS_TOTAL_CELLS; i++)
+	for (i = 1; i < (1 + N3DS_FULLPAGE_RESERVED_CELLS); i++)
 	{
 		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
 
@@ -599,7 +715,26 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 	}
 	s_lastCellHit = oldestSlot;
 
-	N3DS_DecodeAndTilePage(texPage, clut, format, s_decodeScratch);
+	{
+		/*
+		 * Decode only the columns this format can actually address. u/v reach the
+		 * full 0-255 at 4bpp, but a texture page is 64 VRAM words wide, so 8bpp
+		 * can only address u=0..127 and 16bpp only u=0..63 -- the game authors
+		 * texcoords format-aware and never samples beyond that. Decoding a fixed
+		 * 256 columns regardless was doing 2x the necessary work for 8bpp and 4x
+		 * for 16bpp, on the hottest path in the renderer (a cache miss decodes
+		 * 65,536 texels, and real track content was missing ~77 times a frame).
+		 * Columns past this bound keep whatever a previous decode left in them
+		 * and are never sampled. destStrideTiles below is N3DS_DECODE_TEXTURE_DIM/8,
+		 * s_decodeScratch's own width in tiles -- NOT decodeWidth/8, which
+		 * would desync from N3DS_C3DUploadDecodedCell's fixed stride whenever
+		 * decodeWidth < 256 (see N3DS_DecodeAndTilePage's header comment).
+		 */
+		const int decodeWidth = (format == TF_4_BIT) ? 256 : ((format == TF_8_BIT) ? 128 : 64);
+
+		N3DS_DecodeAndTilePage(texPage, clut, format, 0, 0, decodeWidth, N3DS_DECODE_TEXTURE_DIM,
+		                        N3DS_DECODE_TEXTURE_DIM / 8, s_decodeScratch);
+	}
 	{
 		int atlasIdx, cellX, cellY;
 
@@ -615,6 +750,162 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 	s_decodeCache[oldestSlot].clutGenA = s_vramCellGen[clutCellA];
 	s_decodeCache[oldestSlot].clutGenB = s_vramCellGen[clutCellB];
 	s_decodeCache[oldestSlot].lastUsedFrame = s_frameCounter;
+
+	return oldestSlot;
+}
+
+/*
+ * Sub-page counterpart to N3DS_FindOrDecodeTexture above -- same memo/scan/
+ * stale-vs-capacity/hazard-aware-LRU logic, additionally keyed on which 64x64
+ * tile of the page (tileX,tileY), operating over s_subPageCache/
+ * N3DS_SUBPAGE_TOTAL_CELLS instead of s_decodeCache/(1+N3DS_FULLPAGE_RESERVED_CELLS).
+ * Every bound below is 0-based, NOT 1-based like the full-page tier: index 0
+ * is a real, valid sub-page slot here (no reserved white cell at 0 in this
+ * array -- see s_lastSubPageCellHit's own comment). Copy-pasting the
+ * full-page tier's 1-based bounds here would be silently wrong: the memo
+ * guard `> 0` must be `>= 0`, both scan loops start at `i = 0` not `i = 1`,
+ * and the hazard-fallback victim is slot 0, not 1.
+ */
+internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat format, int tileX, int tileY)
+{
+	const int pageOriginX = (texPage & 0xF) * 64;
+	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
+	/* The one VRAM dirty-cell exactly covering this 64x64 tile -- both
+	 * pageOriginX/Y and tileX*64/tileY*64 are multiples of N3DS_VRAM_CELL_DIM,
+	 * so this is exact, not an approximation (see the struct's own comment). */
+	const int pageCell = N3DS_VRAMCellIndex(pageOriginX + (tileX * 64), pageOriginY + (tileY * 64));
+	const int clutOriginX = (clut & 0x3F) * 16;
+	const int clutOriginY = clut >> 6;
+	const int clutCellA = N3DS_VRAMCellIndex(clutOriginX, clutOriginY);
+	const int clutCellB = N3DS_VRAMCellIndex(clutOriginX + 255, clutOriginY);
+	const u32 pageGen = s_vramCellGen[pageCell];
+	const u32 clutGenA = s_vramCellGen[clutCellA];
+	const u32 clutGenB = s_vramCellGen[clutCellB];
+	int i, oldestSlot;
+	u32 oldestFrame;
+	int sawStaleKeyMatch = 0;
+
+	/* Fast path: the cell that answered the previous lookup. See s_lastSubPageCellHit. */
+	if (s_lastSubPageCellHit >= 0)
+	{
+		N3DS_SubPageCacheEntry *e = &s_subPageCache[s_lastSubPageCellHit];
+
+		if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) && (e->tileX == tileX) &&
+		    (e->tileY == tileY) && (e->pageGen == pageGen) && (e->clutGenA == clutGenA) && (e->clutGenB == clutGenB))
+		{
+			if (e->lastUsedFrame != s_frameCounter)
+			{
+				s_subPageFrameTouchedCells++;
+			}
+			e->lastUsedFrame = s_frameCounter;
+			s_subPageCacheHits++;
+			return s_lastSubPageCellHit;
+		}
+	}
+
+	for (i = 0; i < N3DS_SUBPAGE_TOTAL_CELLS; i++)
+	{
+		N3DS_SubPageCacheEntry *e = &s_subPageCache[i];
+
+		if (!e->used || (e->page != texPage) || (e->clut != clut) || (e->format != format) || (e->tileX != tileX) ||
+		    (e->tileY != tileY))
+		{
+			continue;
+		}
+
+		if ((e->pageGen == pageGen) && (e->clutGenA == clutGenA) && (e->clutGenB == clutGenB))
+		{
+			if (e->lastUsedFrame != s_frameCounter)
+			{
+				s_subPageFrameTouchedCells++;
+			}
+			e->lastUsedFrame = s_frameCounter;
+			s_subPageCacheHits++;
+			s_lastSubPageCellHit = i;
+			return i;
+		}
+
+		sawStaleKeyMatch = 1;
+	}
+
+	s_subPageCacheMisses++;
+	if (sawStaleKeyMatch)
+	{
+		s_subPageCacheStaleMisses++;
+	}
+	else
+	{
+		s_subPageCacheCapacityMisses++;
+	}
+
+	/* Victim search -- see N3DS_FindOrDecodeTexture's own comment above for
+	 * the full reasoning (mid-frame eviction hazard; frame-0 all-zero-
+	 * lastUsedFrame guard). Identical here except the hazard-fallback victim
+	 * is slot 0, not 1 -- see this function's own header comment. */
+	oldestSlot = -1;
+	oldestFrame = 0xFFFFFFFFu;
+	for (i = 0; i < N3DS_SUBPAGE_TOTAL_CELLS; i++)
+	{
+		N3DS_SubPageCacheEntry *e = &s_subPageCache[i];
+
+		if (e->used && (e->lastUsedFrame == s_frameCounter))
+		{
+			continue;
+		}
+
+		if (e->lastUsedFrame < oldestFrame)
+		{
+			oldestFrame = e->lastUsedFrame;
+			oldestSlot = i;
+		}
+	}
+
+	if (oldestSlot < 0)
+	{
+		s_subPageEvictHazards++;
+		oldestSlot = 0;
+	}
+
+	if (s_subPageCache[oldestSlot].used)
+	{
+		s_subPageCacheEvictions++;
+	}
+	if (s_subPageCache[oldestSlot].lastUsedFrame != s_frameCounter)
+	{
+		s_subPageFrameTouchedCells++;
+	}
+	s_lastSubPageCellHit = oldestSlot;
+
+	/*
+	 * originU/originV are PAGE-RELATIVE (0-based within the page), matching
+	 * the convention N3DS_ResolveTriangleTexture's outOriginU/V use below --
+	 * N3DS_DecodeAndTilePage adds the page's own absolute VRAM origin
+	 * internally, so do NOT add pageOriginX/Y here too (that double-counts
+	 * the page origin and reads off the bottom of VRAM for any bottom-half
+	 * page -- caught in review before this shipped, see the design doc's
+	 * "What changed from v1" section). width=height=64 always exactly fills
+	 * s_subpageDecodeScratch, unlike the full-page tier's format-clamped
+	 * decodeWidth<256 cases, which leave stale columns from a prior decode.
+	 */
+	N3DS_DecodeAndTilePage(texPage, clut, format, tileX * 64, tileY * 64, N3DS_SUBPAGE_DIM, N3DS_SUBPAGE_DIM,
+	                        N3DS_SUBPAGE_DIM / 8, s_subpageDecodeScratch);
+	{
+		int atlasIdx, physCellX, physCellY, subX, subY;
+
+		N3DS_SubCellIndexToAtlasCoord(oldestSlot, &atlasIdx, &physCellX, &physCellY, &subX, &subY);
+		N3DS_C3DUploadDecodedSubCell(atlasIdx, physCellX, physCellY, subX, subY, s_subpageDecodeScratch);
+	}
+
+	s_subPageCache[oldestSlot].used = 1;
+	s_subPageCache[oldestSlot].page = texPage;
+	s_subPageCache[oldestSlot].clut = clut;
+	s_subPageCache[oldestSlot].format = format;
+	s_subPageCache[oldestSlot].tileX = (u8)tileX;
+	s_subPageCache[oldestSlot].tileY = (u8)tileY;
+	s_subPageCache[oldestSlot].pageGen = s_vramCellGen[pageCell];
+	s_subPageCache[oldestSlot].clutGenA = s_vramCellGen[clutCellA];
+	s_subPageCache[oldestSlot].clutGenB = s_vramCellGen[clutCellB];
+	s_subPageCache[oldestSlot].lastUsedFrame = s_frameCounter;
 
 	return oldestSlot;
 }
@@ -659,6 +950,70 @@ internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 	s_drawCallCount++;
 }
 
+/* This codebase has no 3-way min/max anywhere -- native_libgte.c's
+ * fst_min/fst_max are 2-argument and, being defined in a different
+ * translation unit's file scope, not usable from here regardless. Trivial
+ * enough not to warrant sharing; kept local to where N3DS_ResolveTriangleTexture
+ * needs them. */
+internal inline int MIN3(int a, int b, int c)
+{
+	return (a < b) ? ((a < c) ? a : c) : ((b < c) ? b : c);
+}
+
+internal inline int MAX3(int a, int b, int c)
+{
+	return (a > b) ? ((a > c) ? a : c) : ((b > c) ? b : c);
+}
+
+/*
+ * Routes one triangle to the sub-page tier (common case: its UV bounding box
+ * fits one 64x64 grid-aligned tile) or the full-page tier (fallback: it
+ * straddles a tile boundary or is simply larger than 64x64 -- e.g. a large
+ * floor/wall/sky surface). GrVertex.u/.v are raw u8 (0-255) with no alignment
+ * guarantee, so this bbox-vs-tile test must run per triangle, not once per
+ * (page,clut): two triangles sharing a texture can still have different UV
+ * footprints (docs/SUBPAGE_DECODE_CACHE_DESIGN.md). Both branches resolve to
+ * the same output shape (pixelBase/origin), so the caller's UV assignment is
+ * one formula for both tiers -- see NativeRenderer_DrawTriangles.
+ */
+internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1, const GrVertex *v2, s16 texPage,
+                                          s16 clut, TexFormat format, int *outAtlasIdx, int *outPixelBaseU,
+                                          int *outPixelBaseV, int *outOriginU, int *outOriginV)
+{
+	const int minU = MIN3(v0->u, v1->u, v2->u), maxU = MAX3(v0->u, v1->u, v2->u);
+	const int minV = MIN3(v0->v, v1->v, v2->v), maxV = MAX3(v0->v, v1->v, v2->v);
+	const int tileX0 = minU / N3DS_SUBPAGE_DIM, tileX1 = maxU / N3DS_SUBPAGE_DIM;
+	const int tileY0 = minV / N3DS_SUBPAGE_DIM, tileY1 = maxV / N3DS_SUBPAGE_DIM;
+
+	if ((tileX0 == tileX1) && (tileY0 == tileY1))
+	{
+		int atlasIdx, physCellX, physCellY, subX, subY;
+
+		N3DS_SubCellIndexToAtlasCoord(N3DS_FindOrDecodeSubPageTexture(texPage, clut, format, tileX0, tileY0), &atlasIdx,
+		                               &physCellX, &physCellY, &subX, &subY);
+		*outAtlasIdx = atlasIdx;
+		*outPixelBaseU = (physCellX * N3DS_DECODE_TEXTURE_DIM) + (subX * N3DS_SUBPAGE_DIM);
+		*outPixelBaseV = (physCellY * N3DS_DECODE_TEXTURE_DIM) + (subY * N3DS_SUBPAGE_DIM);
+		*outOriginU = tileX0 * N3DS_SUBPAGE_DIM;
+		*outOriginV = tileY0 * N3DS_SUBPAGE_DIM;
+		s_trianglesRoutedSubPage++;
+		return 1;
+	}
+
+	{
+		int atlasIdx, cellX, cellY;
+
+		N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(texPage, clut, format), &atlasIdx, &cellX, &cellY);
+		*outAtlasIdx = atlasIdx;
+		*outPixelBaseU = cellX * N3DS_DECODE_TEXTURE_DIM;
+		*outPixelBaseV = cellY * N3DS_DECODE_TEXTURE_DIM;
+		*outOriginU = 0;
+		*outOriginV = 0;
+		s_trianglesRoutedFullPage++;
+		return 0;
+	}
+}
+
 int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int fullscreen)
 {
 	(void)fullscreen;
@@ -696,10 +1051,15 @@ int NativeRenderer_InitialisePSX(void)
 	{
 		s_vramCellGen[i] = 0;
 	}
-	for (i = 0; i < N3DS_TOTAL_CELLS; i++)
+	for (i = 0; i < (1 + N3DS_FULLPAGE_RESERVED_CELLS); i++)
 	{
 		s_decodeCache[i].used = 0;
 		s_decodeCache[i].lastUsedFrame = 0;
+	}
+	for (i = 0; i < N3DS_SUBPAGE_TOTAL_CELLS; i++)
+	{
+		s_subPageCache[i].used = 0;
+		s_subPageCache[i].lastUsedFrame = 0;
 	}
 
 	/*
@@ -763,6 +1123,13 @@ void NativeRenderer_BeginScene(void)
 		s_frameTouchedPeak = s_frameTouchedCells;
 	}
 	s_frameTouchedCells = 0;
+
+	/* Sub-page tier counterpart -- same latch-and-reset, see above. */
+	if (s_subPageFrameTouchedCells > s_subPageFrameTouchedPeak)
+	{
+		s_subPageFrameTouchedPeak = s_subPageFrameTouchedCells;
+	}
+	s_subPageFrameTouchedCells = 0;
 
 	/*
 	 * Fit the game's own display area to the panel, cropped to the PSX's
@@ -938,11 +1305,13 @@ void NativeRenderer_SwapWindow(void)
 			 * stale = the texture was resident but its VRAM moved. These have
 			 * opposite fixes, so never read the miss count without this split.
 			 * set = distinct cells touched in the worst frame (saturates at
-			 * N3DS_TOTAL_CELLS-1); dirty = generation bumps since boot. */
+			 * N3DS_FULLPAGE_RESERVED_CELLS, the whole-page tier's own budget
+			 * since the two-tier split -- was N3DS_TOTAL_CELLS-1 before);
+			 * dirty = generation bumps since boot. */
 			printf("miss   cap %-6lu (+%-4lu/w) stale %-6lu (+%-4lu/w)\n", (unsigned long)s_decodeCacheCapacityMisses,
 			       capacityWindow, (unsigned long)s_decodeCacheStaleMisses, staleWindow);
 			printf("set    peak %-4lu /%-4d cells   vramDirty %-8lu\n", (unsigned long)s_frameTouchedPeak,
-			       (int)(N3DS_TOTAL_CELLS - 1), (unsigned long)s_vramDirtyBumps);
+			       (int)N3DS_FULLPAGE_RESERVED_CELLS, (unsigned long)s_vramDirtyBumps);
 			/* Nonzero = a cell was overwritten while a queued draw still
 			 * referenced it, i.e. visible texture corruption. */
 			printf("hazard evictInUse %-8lu\n", (unsigned long)s_evictHazards);
@@ -958,12 +1327,65 @@ void NativeRenderer_SwapWindow(void)
 			snprintf(cacheLine, sizeof(cacheLine),
 			         "[CTR-3DS] miss capacity=%lu capacityWindow=%lu stale=%lu staleWindow=%lu setPeak=%lu/%d vramDirty=%lu",
 			         (unsigned long)s_decodeCacheCapacityMisses, capacityWindow, (unsigned long)s_decodeCacheStaleMisses,
-			         staleWindow, (unsigned long)s_frameTouchedPeak, (int)(N3DS_TOTAL_CELLS - 1),
+			         staleWindow, (unsigned long)s_frameTouchedPeak, (int)N3DS_FULLPAGE_RESERVED_CELLS,
 			         (unsigned long)s_vramDirtyBumps);
 			N3DS_DebugLog(cacheLine);
 
 			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] hazard evictInUse=%lu", (unsigned long)s_evictHazards);
 			N3DS_DebugLog(cacheLine);
+
+			/*
+			 * Sub-page tier diagnostics -- mirrors the full-page block just
+			 * above, field-for-field (docs/SUBPAGE_DECODE_CACHE_DESIGN.md
+			 * "Instrumentation"). Full per-tier breakdown goes to the log
+			 * only; the console gets one compact routing-summary line below
+			 * instead of a full duplicate block -- this console has already
+			 * hit its practical width/line limit once before (see the
+			 * audio-stats line's own history).
+			 */
+			{
+				const unsigned long subMissesWindow = (unsigned long)(s_subPageCacheMisses - s_subPageLastStatCacheMisses);
+				const unsigned long subEvictionsWindow =
+				    (unsigned long)(s_subPageCacheEvictions - s_subPageLastStatCacheEvictions);
+				const unsigned long subStaleWindow =
+				    (unsigned long)(s_subPageCacheStaleMisses - s_subPageLastStatStaleMisses);
+				const unsigned long subCapacityWindow =
+				    (unsigned long)(s_subPageCacheCapacityMisses - s_subPageLastStatCapacityMisses);
+
+				s_subPageLastStatCacheMisses = s_subPageCacheMisses;
+				s_subPageLastStatCacheEvictions = s_subPageCacheEvictions;
+				s_subPageLastStatStaleMisses = s_subPageCacheStaleMisses;
+				s_subPageLastStatCapacityMisses = s_subPageCacheCapacityMisses;
+
+				snprintf(cacheLine, sizeof(cacheLine),
+				         "[CTR-3DS] subpage cache hits=%lu misses=%lu missesWindow=%lu evictions=%lu evictionsWindow=%lu",
+				         (unsigned long)s_subPageCacheHits, (unsigned long)s_subPageCacheMisses, subMissesWindow,
+				         (unsigned long)s_subPageCacheEvictions, subEvictionsWindow);
+				N3DS_DebugLog(cacheLine);
+
+				snprintf(cacheLine, sizeof(cacheLine),
+				         "[CTR-3DS] subpage miss capacity=%lu capacityWindow=%lu stale=%lu staleWindow=%lu setPeak=%lu/%d",
+				         (unsigned long)s_subPageCacheCapacityMisses, subCapacityWindow,
+				         (unsigned long)s_subPageCacheStaleMisses, subStaleWindow, (unsigned long)s_subPageFrameTouchedPeak,
+				         (int)N3DS_SUBPAGE_TOTAL_CELLS);
+				N3DS_DebugLog(cacheLine);
+
+				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] subpage hazard evictInUse=%lu",
+				         (unsigned long)s_subPageEvictHazards);
+				N3DS_DebugLog(cacheLine);
+
+				/* s_trianglesRoutedSubPage/FullPage: the single most important
+				 * new number (design doc) -- whether the straddling/large-
+				 * surface fallback to the full-page tier dominates real
+				 * content or stays the minority case this design assumes. */
+				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] routing subPage=%lu fullPage=%lu",
+				         (unsigned long)s_trianglesRoutedSubPage, (unsigned long)s_trianglesRoutedFullPage);
+				N3DS_DebugLog(cacheLine);
+
+				printf("route  sub %-8lu full %-8lu  subMiss %-5lu subEvict %-5lu\n",
+				       (unsigned long)s_trianglesRoutedSubPage, (unsigned long)s_trianglesRoutedFullPage,
+				       (unsigned long)s_subPageCacheMisses, (unsigned long)s_subPageCacheEvictions);
+			}
 
 			/*
 			 * Vertex budget occupancy. dropped != 0 means whole draws were
@@ -1480,7 +1902,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	for (i = 0; i < triangles; i++)
 	{
 		const GrVertex *triVerts = &s_pendingVertices[startVertex + (i * 3)];
-		int atlasIdx, cellX, cellY, v;
+		int atlasIdx, cellX = 0, cellY = 0, pixelBaseU = 0, pixelBaseV = 0, originU = 0, originV = 0, v;
 
 		if (untextured)
 		{
@@ -1490,8 +1912,15 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		}
 		else
 		{
-			N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(triVerts[0].page, triVerts[0].clut, s_currentTexFormat), &atlasIdx,
-			                            &cellX, &cellY);
+			/* Routes this triangle independently to the sub-page tier
+			 * (common case) or the full-page tier (fallback for a UV
+			 * footprint that doesn't fit one 64x64 tile) -- must run per
+			 * triangle, not once per (page,clut): two triangles sharing a
+			 * texture can still have different UV footprints (e.g. a small
+			 * decal vs. a large floor triangle both sampling the same page).
+			 * See N3DS_ResolveTriangleTexture / docs/SUBPAGE_DECODE_CACHE_DESIGN.md. */
+			N3DS_ResolveTriangleTexture(&triVerts[0], &triVerts[1], &triVerts[2], triVerts[0].page, triVerts[0].clut,
+			                             s_currentTexFormat, &atlasIdx, &pixelBaseU, &pixelBaseV, &originU, &originV);
 		}
 
 		if ((atlasIdx != currentAtlas) || ((vertsInRun + 3) > N3DS_MAX_RUN_VERTICES))
@@ -1517,9 +1946,13 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			dst->x = (s16)src->x;
 			dst->y = (s16)src->y;
 
-			/* Offset into the cell's own region of the atlas, not the whole
-			 * atlas -- (cellX,cellY) select which 256x256 region, (u,v) or
-			 * the cell's centre (untextured) select where within it. Stored
+			/* Offset into the resolved region of the atlas, not the whole
+			 * atlas. Untextured uses the fixed white cell's centre
+			 * (cellX,cellY); textured uses pixelBaseU/V -- a whole 256x256
+			 * full-page cell or a 64x64 sub-page sub-cell, whichever
+			 * N3DS_ResolveTriangleTexture resolved -- plus the triangle's own
+			 * (u,v) re-based against originU/V (0 on the full-page path, so
+			 * this reduces to exactly the old cellX*256+src->u there). Stored
 			 * as the exact integer atlas-texel numerator, range [0,1023] --
 			 * comfortably inside s16 -- with the old /N3DS_ATLAS_DIM divide
 			 * moved into the shader (ctr.v.pica's texcoordScale, design doc
@@ -1532,8 +1965,8 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			}
 			else
 			{
-				dst->u = (s16)(cellX * N3DS_DECODE_TEXTURE_DIM + (int)src->u);
-				dst->v = (s16)(cellY * N3DS_DECODE_TEXTURE_DIM + (int)src->v);
+				dst->u = (s16)(pixelBaseU + ((int)src->u - originU));
+				dst->v = (s16)(pixelBaseV + ((int)src->v - originV));
 			}
 
 			/* Raw u8 copy, no scale -- the *1/255 reciprocal-multiply that

@@ -228,27 +228,57 @@ int N3DS_C3DFrameVertexHighWater(void);
  */
 #define N3DS_DECODE_TEXTURE_DIM    256
 /*
- * 8 atlases at 2MB each (GPU_RGBA5551) = 16MB -- exactly what 4 RGBA8 atlases
- * cost before, so this is 2x the cells for the same memory. See N3DS_TILE_BYTES
- * in n3ds_backend.c for why RGBA8 was buying nothing.
+ * 12 atlases at 2MB each (GPU_RGBA5551) = 24MB (2026-07-20, up from 8 = 16MB).
+ * The boot log's own "linear free before atlases" line measured ~30169 KiB
+ * (~29.5MB) free right before this allocation runs -- 8 atlases only ever used
+ * 16MB of that, leaving ~14MB sitting unused. That headroom was never revisited
+ * after the RGBA8->RGBA5551 switch that halved atlas cost; the "8 atlases
+ * (32MB) does NOT allocate" note two paragraphs below is about the OLD, twice
+ * -as-large RGBA8 format and stopped being the real ceiling once atlases got
+ * cheaper. 12 leaves ~5.5MB of margin below the observed free figure, not the
+ * whole thing -- if a future bump ever fails, N3DS_C3DBackend_InitialisePSX
+ * logs exactly which atlas index failed and the free KiB at that point (see
+ * its call to C3D_TexInit below), so this is safe to retune from real
+ * boot-log numbers, not by guessing further.
+ *
+ * Why more atlases now, specifically (as opposed to more cells per atlas,
+ * which N3DS_ATLAS_DIM's own comment says is already at citro3d's ceiling):
+ * real race driving (2026-07-20, sub-page decode cache session) measured the
+ * sub-page tier's capacity misses (954) dwarfing its stale misses (62) --
+ * i.e. the cache is overwhelmingly serving genuinely-new content, not
+ * re-decoding content that went stale. A whole race's total distinct texture
+ * footprint, accumulated over the full route, exceeds any single moment's
+ * working set (peak concurrent usage stayed well under budget) -- so old,
+ * still-visible-from-some-angles cells get reclaimed for new track ahead
+ * before they're actually done being needed, which reads as a texture
+ * visibly changing as you approach new geometry. See
+ * docs/SUBPAGE_DECODE_CACHE_DESIGN.md and the ctr-pc-poc-workspace memory for
+ * the full diagnosis.
  *
  * The old note here said "8 atlases (32MB) does NOT allocate": true, and still
- * true, but that was 8 RGBA8 atlases. The real constraint is the ~28MB linear
- * ceiling logged at init, not the atlas count -- keep reading that log line
- * rather than trusting either number.
+ * true, but that was 8 RGBA8 atlases. The real constraint is the linear
+ * ceiling logged at init, not any specific atlas count -- keep reading that
+ * log line rather than trusting a fixed number here.
  *
  * Why cells and not something cleverer: playing the menu measured a SATURATED
  * 63/63 working set with ~45 capacity misses per frame and 2052 evictions of
  * cells that a queued draw still pointed at. Cell count was the binding
  * constraint on both the corruption and the decode cost.
  */
-#define N3DS_ATLAS_COUNT           8
+#define N3DS_ATLAS_COUNT           12
 #define N3DS_ATLAS_DIM             1024
 #define N3DS_ATLAS_CELLS_PER_ROW   (N3DS_ATLAS_DIM / N3DS_DECODE_TEXTURE_DIM)
 #define N3DS_ATLAS_CELLS_PER_ATLAS (N3DS_ATLAS_CELLS_PER_ROW * N3DS_ATLAS_CELLS_PER_ROW)
 
 /* tiled256 buffer is RGBA5551 (2 bytes/texel), not RGBA8 -- see N3DS_TILE_BYTES. */
 void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256);
+/* Sub-page counterpart (docs/SUBPAGE_DECODE_CACHE_DESIGN.md) -- writes an
+ * 8x8-tile (64x64 texel) sub-cell at physical cell (physCellX,physCellY)'s
+ * (subX,subY) quadrant-of-16, instead of a whole 32x32-tile cell. tiled64 is
+ * RGBA5551, same tiling convention as tiled256 above, just a quarter the
+ * cell's linear dimension. Both wrap the shared N3DS_C3DUploadTileBlock in
+ * n3ds_backend.c. */
+void N3DS_C3DUploadDecodedSubCell(int atlasIndex, int physCellX, int physCellY, int subX, int subY, const void *tiled64);
 void N3DS_C3DBindAtlas(int atlasIndex);
 /* Enables PC's x2 "bright" multiplier on RGB, applied after the texture
  * modulate the way PC's fragment shader does it. Must not be folded into the
