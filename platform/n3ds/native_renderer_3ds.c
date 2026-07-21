@@ -165,8 +165,27 @@ global_variable TexFormat s_currentTexFormat = TF_16_BIT;
  */
 global_variable int s_currentBlendMode = 0; /* BM_NONE */
 global_variable int s_semiTransPass = 0;
-/* Blend mode the pending vertex run was opened under -- part of the
- * run-break condition in DrawTriangles alongside the atlas index. */
+/*
+ * Pending-run state, FRAME scope, not per-DrawTriangles-call (cross-split
+ * run persistence, session 17 -- docs/DRAW_CALL_BATCH_SURVEY.md). The
+ * survey's finding: draw count ~= split count because every DrawTriangles
+ * call ended with an unconditional flush, while the whole frame's texture
+ * working set lives in ~3 atlases -- so consecutive splits usually bind
+ * the SAME atlas and their runs can merge. A run now stays open across
+ * calls and flushes only on: atlas change, blend-mode change, the
+ * textured/untextured color-doubling flip, run-buffer budget, any
+ * non-atlas draw (PresentVRAMRect/Display, atlas inspector), and EndScene. Those are
+ * ALL the states that vary between 3DS draws today -- clip/stencil/mask
+ * are stubs here (they'd each join the flush set when implemented).
+ * Submission order never changes: merging is only ever "don't flush yet",
+ * never reorder -- this renderer has no depth test and layers purely by
+ * draw order.
+ */
+global_variable int s_runAtlas = -1;
+global_variable int s_runVertCount = 0;
+/* -1 = unknown, forces the first call of each frame to assert TEV scale. */
+global_variable int s_runUntextured = -1;
+/* Blend mode the pending run was opened under. */
 global_variable int s_runBlendMode = 0;
 
 /*
@@ -1245,6 +1264,17 @@ internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 	s_frameAtlasMask |= (1u << (atlasIndex & 31));
 }
 
+/* Flushes the frame-scope pending run (see the s_runAtlas block). Must be
+ * called before ANY draw that isn't an atlas run (PresentVRAM*, the atlas
+ * inspector) and at EndScene -- a pending run left unflushed across a
+ * foreign bind would still draw correctly (N3DS_FlushRun re-binds), but
+ * AFTER the foreign draw, breaking paint order. */
+internal void N3DS_FlushPendingRun(void)
+{
+	N3DS_FlushRun(s_runAtlas, s_runVertCount);
+	s_runVertCount = 0;
+}
+
 /* This codebase has no 3-way min/max anywhere -- native_libgte.c's
  * fst_min/fst_max are 2-argument and, being defined in a different
  * translation unit's file scope, not usable from here regardless. Trivial
@@ -1529,6 +1559,14 @@ void NativeRenderer_BeginScene(void)
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);
 	N3DS_C3DBeginFrame();
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);
+
+	/* Fresh frame, fresh vertex-buffer cursor: no run can carry across
+	 * (EndScene flushed it). Reset the frame-scope run state and force the
+	 * first DrawTriangles to re-assert the TEV scale -- the atlas inspector
+	 * and PresentVRAMRect may have left it at 0-doubling. */
+	s_runAtlas = -1;
+	s_runVertCount = 0;
+	s_runUntextured = -1;
 }
 
 void NativeRenderer_EndScene(void)
@@ -1537,6 +1575,10 @@ void NativeRenderer_EndScene(void)
 	{
 		return;
 	}
+
+	/* Last flush point of the frame: whatever run the final splits left
+	 * open has to be recorded before C3D_FrameEnd submits the frame. */
+	N3DS_FlushPendingRun();
 
 #ifdef CTR_INTERNAL
 	/*
@@ -1992,6 +2034,13 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 		return;
 	}
 
+	/* Foreign (non-atlas) draw: the pending atlas run must be recorded
+	 * first, both for paint order and because the TEV change below would
+	 * otherwise apply to it. The TEV latch is invalidated so the next
+	 * DrawTriangles re-asserts its own scale. */
+	N3DS_FlushPendingRun();
+	s_runUntextured = -1;
+
 	N3DS_C3DSetColorDoubling(0);
 
 	for (y = 0; y < displayH; y += maxChunk)
@@ -2337,8 +2386,6 @@ void NativeRenderer_UpdateVertexBuffer(const GrVertex *vertices, int count)
 void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 {
 	int i;
-	int currentAtlas = -1;
-	int vertsInRun = 0;
 	const int untextured = (s_currentTextureId == N3DS_TEXTURE_ID_WHITE);
 
 	s_drawTrianglesCalls++;
@@ -2387,18 +2434,30 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
 
 	/*
-	 * Assert this split's blend state before any of its runs are recorded
-	 * (deduped backend-side; recorded into the deferred command list at the
-	 * next draw). Also latched into the run-break below: a run must never
-	 * be flushed under a different blend mode than it was opened with,
-	 * because the C3D state applies to the whole draw. Constant across one
-	 * DrawTriangles call today (DrawSplit sets it per split), so the break
-	 * can only fire once cross-split run persistence lands
-	 * (docs/DRAW_CALL_BATCH_SURVEY.md) -- it is the run-break dimension
-	 * batching has to preserve, in place now so that work can't miss it.
+	 * Cross-split flush points (the batching lever): a pending run from an
+	 * earlier split keeps accumulating unless THIS split needs different
+	 * GPU state. citro3d records a state change at the next draw, so state
+	 * must only ever change while no run is pending -- flush first, then
+	 * assert. Both branches are change-gated here (SetColorDoubling has no
+	 * dedup of its own -- it dirties the TEV unconditionally), so the
+	 * common case (consecutive same-state splits) costs two compares and
+	 * no flush: that is where the draws/frame reduction comes from.
 	 */
-	N3DS_C3DSetBlendMode(s_currentBlendMode);
-	s_runBlendMode = s_currentBlendMode;
+	if (untextured != s_runUntextured)
+	{
+		N3DS_FlushPendingRun();
+		/* bright is 2 for every textured primitive and 1 for every
+		 * untextured one, without exception (native_gpu.c), so the split's
+		 * texture sentinel determines it for the whole call. */
+		N3DS_C3DSetColorDoubling(untextured ? 0 : 1);
+		s_runUntextured = untextured;
+	}
+	if (s_currentBlendMode != s_runBlendMode)
+	{
+		N3DS_FlushPendingRun();
+		N3DS_C3DSetBlendMode(s_currentBlendMode);
+		s_runBlendMode = s_currentBlendMode;
+	}
 
 	/*
 	 * PC's AddSplit coalesces draw calls by blend/format/textureId/mask/
@@ -2421,11 +2480,6 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	 * exactly, which matters because this renderer has no depth test enabled
 	 * (matching PC) and relies on draw order alone for correct layering.
 	 */
-	/* bright is 2 for every textured primitive and 1 for every untextured
-	 * one, without exception (native_gpu.c), so the split's texture sentinel
-	 * determines it for the whole call -- no need to inspect each vertex. */
-	N3DS_C3DSetColorDoubling(untextured ? 0 : 1);
-
 	for (i = 0; i < triangles; i++)
 	{
 		const GrVertex *triVerts = &s_pendingVertices[startVertex + (i * 3)];
@@ -2477,20 +2531,19 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		}
 		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
 
-		if ((atlasIdx != currentAtlas) || (s_runBlendMode != s_currentBlendMode) || ((vertsInRun + 3) > N3DS_MAX_RUN_VERTICES))
+		if ((atlasIdx != s_runAtlas) || ((s_runVertCount + 3) > N3DS_MAX_RUN_VERTICES))
 		{
 			/* Attribute the flush: only a MID-RUN atlas change is the
-			 * potentially-reducible kind (vertsInRun > 0 excludes the first
-			 * triangle's currentAtlas==-1 bootstrap, which flushes nothing). */
-			if ((atlasIdx != currentAtlas) && (vertsInRun > 0))
+			 * potentially-reducible kind (s_runVertCount > 0 excludes the
+			 * frame's first triangle, which flushes nothing). Blend/TEV
+			 * changes were already handled (pending run flushed) at call
+			 * entry, so an atlas change is the only break left here. */
+			if ((atlasIdx != s_runAtlas) && (s_runVertCount > 0))
 			{
 				s_atlasSwitchFlushes++;
 			}
-			N3DS_FlushRun(currentAtlas, vertsInRun);
-			N3DS_C3DSetBlendMode(s_currentBlendMode);
-			s_runBlendMode = s_currentBlendMode;
-			currentAtlas = atlasIdx;
-			vertsInRun = 0;
+			N3DS_FlushPendingRun();
+			s_runAtlas = atlasIdx;
 		}
 
 #ifdef CTR_INTERNAL
@@ -2501,7 +2554,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		for (v = 0; v < 3; v++)
 		{
 			const GrVertex *src = &triVerts[v];
-			N3DS_Vertex *dst = &s_convertScratch[vertsInRun + v];
+			N3DS_Vertex *dst = &s_convertScratch[s_runVertCount + v];
 			/* Vertex colour is the raw PSX colour only. The "bright" x2
 			 * multiplier (MakeTexcoordQuad/Triangle/Rect set bright=2 for
 			 * every textured primitive, MakeTexcoordZero* set 1 for every
@@ -2591,10 +2644,12 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		}
 		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
 
-		vertsInRun += 3;
+		s_runVertCount += 3;
 	}
 
-	N3DS_FlushRun(currentAtlas, vertsInRun);
+	/* No flush here -- the run stays open for the next split (the whole
+	 * point of frame-scope run state). EndScene and the state guards above
+	 * are the flush points. */
 
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
 }
