@@ -50,7 +50,15 @@
  * runs and a shutdown-only summary would produce nothing at all.
  */
 #define NATIVE_PERF_3DS_REPORT_FRAMES 64
-#define NATIVE_PERF_3DS_TOP_BUCKETS   6
+/* 12, up from 6 (session 17): the report ranks ALL buckets together, and the
+ * top of that ranking is chronically saturated by the ~6 nested aggregates
+ * that wrap every frame (render_frame > render_submit > draw_otag >
+ * draw_all_splits > renderer_draw_triangles, plus mainframe_render_vsync) --
+ * at 6, leaf buckets like the new draw_triangles_* sub-slices could never
+ * print at all (verified in Azahar: race windows showed the parent at ~21ms
+ * and not one sub-bucket line). 12 = four full 3-per-line rows; the extra
+ * visibility costs two more SD-card log lines per 64-frame window. */
+#define NATIVE_PERF_3DS_TOP_BUCKETS   12
 #endif
 
 struct NativePerfBucketInfo
@@ -113,6 +121,13 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
     {"n3ds_c3d_frame_end_ms", 1},
     {"n3ds_gfx_present_ms", 1},
     {"audio_voice_start_ms", 1},
+    /* dominantCandidate 0: these nest inside renderer_draw_triangles_ms,
+     * which is already a candidate -- letting a sub-slice win "dominant"
+     * would double-report the same time. */
+    {"draw_triangles_resolve_ms", 0},
+    {"draw_triangles_convert_ms", 0},
+    {"draw_triangles_append_ms", 0},
+    {"draw_triangles_flush_ms", 0},
 };
 
 global_variable FILE *s_csvFile;

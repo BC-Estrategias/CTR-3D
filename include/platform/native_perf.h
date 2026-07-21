@@ -59,6 +59,20 @@ enum NativePerfBucket
 	 * s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_AUDIO_VOICE_START,
+	/*
+	 * Sub-phases of RENDERER_DRAW_TRIANGLES (3DS renderer): per-triangle
+	 * atlas-cell resolution (decode-cache lookup/decode), per-triangle
+	 * GrVertex->N3DS_Vertex conversion, and N3DS_FlushRun's two halves --
+	 * the CPU copy into the shared frame vertex buffer (append) vs. the
+	 * atlas bind + draw enqueue (flush). They nest inside the parent
+	 * bucket, so their sum <= renderer_draw_triangles_ms; the remainder is
+	 * loop/scope overhead. Appended, never inserted: s_bucketInfo is
+	 * indexed by this enum.
+	 */
+	NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE,
+	NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT,
+	NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND,
+	NATIVE_PERF_BUCKET_DRAW_TRIANGLES_FLUSH,
 	NATIVE_PERF_BUCKET_COUNT
 };
 

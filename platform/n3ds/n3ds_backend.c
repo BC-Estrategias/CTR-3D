@@ -232,6 +232,56 @@ void N3DS_GfxPresent(void)
 	gfxScreenSwapBuffers(GFX_BOTTOM, false);
 }
 
+/*
+ * Copies the top screen's last completed gfx framebuffer into dstRGB as
+ * row-major RGB triplets, nearest-resampled from the 400x240 panel to
+ * dstW x dstH (docs/PAUSE_FREEZE_FRAME_DESIGN.md). The source costs nothing
+ * to produce: citro3d's C3D_FrameEnd already display-transfers every frame
+ * into the linear-heap gfx framebuffers (GSP_BGR8_OES via gfxInitDefault;
+ * the transfer's OUT_FORMAT is RGB8, which is what fills that byte layout),
+ * so this is a plain CPU read of memory the present path maintains anyway --
+ * no GX call, no GPU sync.
+ *
+ * gfxGetFramebuffer returns the BACK buffer (the one drawn into next), whose
+ * content is the frame presented one swap before the current front -- so the
+ * copy can be one presentation old. Acceptable by design for the freeze-
+ * frame use: the consumer is a paused/transitioning scene.
+ *
+ * Rotation: the 3DS top framebuffer is stored rotated -- fbW(=240) is the
+ * panel's SHORT axis and consecutive bytes walk UP a screen column, so the
+ * pixel at screen (sx, sy), y-down, lives at ((sx * 240) + (239 - sy)) * 3,
+ * bytes B,G,R.
+ */
+int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH)
+{
+	u16 fbW = 0, fbH = 0;
+	u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fbW, &fbH);
+	int x, y;
+
+	if ((fb == NULL) || (dstRGB == NULL) || (dstW <= 0) || (dstH <= 0))
+	{
+		return 0;
+	}
+
+	for (y = 0; y < dstH; y++)
+	{
+		const int sy = (y * 240) / dstH;
+		unsigned char *dstRow = dstRGB + ((size_t)y * (size_t)dstW * 3);
+
+		for (x = 0; x < dstW; x++)
+		{
+			const int sx = (x * 400) / dstW;
+			const u8 *p = fb + (((sx * 240) + (239 - sy)) * 3);
+
+			dstRow[(x * 3) + 0] = p[2]; /* R */
+			dstRow[(x * 3) + 1] = p[1]; /* G */
+			dstRow[(x * 3) + 2] = p[0]; /* B */
+		}
+	}
+
+	return 1;
+}
+
 /* ------------------------------------------------------------- render --- */
 
 #define N3DS_DISPLAY_TRANSFER_FLAGS                                                                         \
@@ -342,6 +392,17 @@ int N3DS_C3DInit(void)
 	 * Set once here rather than per-draw since 2a never needs a different test.
 	 */
 	C3D_AlphaTest(true, GPU_GEQUAL, 1);
+
+	/*
+	 * Fixed blend color shared by BM_AVERAGE (reads the alpha, 0.5) and
+	 * BM_ADD_QUATER_SOURCE (reads the RGB, 0.25) -- the same dual-use
+	 * constant PC sets with glBlendColor(0.25, 0.25, 0.25, 0.5).
+	 * GPUREG_BLEND_COLOR is R in bits 0-7 through A in bits 24-31.
+	 * Set once: no mode ever needs a different constant, so
+	 * N3DS_C3DSetBlendMode only ever touches equation/factors.
+	 */
+	C3D_BlendingColor(0x80404040u);
+	N3DS_C3DSetBlendMode(0);
 
 	C3D_CullFace(GPU_CULL_NONE);
 
@@ -715,6 +776,71 @@ void N3DS_C3DBindAtlas(int atlasIndex)
 	}
 
 	C3D_TexBind(0, &s_atlasTextures[atlasIndex]);
+}
+
+/*
+ * PS1 semi-transparency (the four ABR modes) via PICA's fixed-function blend
+ * unit -- the same equation/factor mapping PC uses in GL
+ * (NativeRenderer_SetBlendMode, native_renderer.c), including its constant-
+ * color trick: one blend color of RGB=0.25 / A=0.5 (set once in N3DS_C3DInit)
+ * serves both AVERAGE (constant ALPHA carries the 1/2) and ADD_QUARTER
+ * (constant COLOR carries the 1/4).
+ *
+ * BM_NONE is blending "enabled" with ONE/ZERO rather than a switch to
+ * GPU logic-op mode: numerically identical to opaque, and it keeps the
+ * fragment pipeline in one mode instead of toggling GPUREG_COLOR_OPERATION
+ * per split.
+ *
+ * Deduped against the last-applied mode: C3D state persists across frames,
+ * so a redundant call would only dirty state for nothing. citro3d records a
+ * state change into the command list at the NEXT draw, and the whole frame
+ * is one deferred command list, so calling this between draws mid-frame
+ * takes effect exactly at the following draw -- same ordering contract as
+ * every other state setter here.
+ *
+ * Alpha channel stays ONE/ZERO in every mode (PC does the same via
+ * glBlendFuncSeparate): the framebuffer alpha carries nothing this renderer
+ * reads, and blending it with the RGB factors could only corrupt it.
+ */
+void N3DS_C3DSetBlendMode(int blendMode)
+{
+	static int lastMode = -1;
+
+	if (blendMode == lastMode)
+	{
+		return;
+	}
+	lastMode = blendMode;
+
+	switch (blendMode)
+	{
+	default:
+	case 0:
+	{ /* BM_NONE: opaque */
+		C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+		break;
+	}
+	case 1:
+	{ /* BM_AVERAGE: 0.5*dst + 0.5*src, via constant alpha = 0.5 */
+		C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_CONSTANT_ALPHA, GPU_ONE_MINUS_CONSTANT_ALPHA, GPU_ONE, GPU_ZERO);
+		break;
+	}
+	case 2:
+	{ /* BM_ADD: dst + src */
+		C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ONE, GPU_ONE, GPU_ZERO);
+		break;
+	}
+	case 3:
+	{ /* BM_SUBTRACT: dst - src (reverse-subtract, same as PC's GL_FUNC_REVERSE_SUBTRACT) */
+		C3D_AlphaBlend(GPU_BLEND_REVERSE_SUBTRACT, GPU_BLEND_ADD, GPU_ONE, GPU_ONE, GPU_ONE, GPU_ZERO);
+		break;
+	}
+	case 4:
+	{ /* BM_ADD_QUATER_SOURCE: dst + 0.25*src, via constant color = 0.25 */
+		C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_CONSTANT_COLOR, GPU_ONE, GPU_ONE, GPU_ZERO);
+		break;
+	}
+	}
 }
 
 void N3DS_C3DUploadVramDisplayChunk(int slotIndex, const void *tiled256)

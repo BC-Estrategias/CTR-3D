@@ -147,6 +147,27 @@ internal u16 NativeRenderer3DS_PackBGR555(u8 r, u8 g, u8 b)
 
 global_variable TextureID s_currentTextureId = N3DS_TEXTURE_ID_VRAM;
 global_variable TexFormat s_currentTexFormat = TF_16_BIT;
+/*
+ * Latched draw state from DrawSplit (native_gpu.c), consumed by
+ * DrawTriangles. s_currentBlendMode is the split's PS1 ABR mode as a
+ * BlendMode value; s_semiTransPass is PC's two-pass shader STP split
+ * (0 = normal, 1 = opaque-texels-only pass, 2 = STP-texels-only pass).
+ *
+ * WHOLE-PRIM first cut (session 17): this renderer blends every texel of a
+ * semi-transparent prim -- the decode cache's RGBA5551 alpha is 1-bit
+ * punch-through only, so the per-texel STP bit that passes 1/2 discriminate
+ * on does not exist GPU-side yet (see N3DS_TILE_BYTES in n3ds_backend.c:
+ * recovering it needs a format decision, RGBA4444 3-level alpha vs RGBA8).
+ * So: pass 1 draws NOTHING here (its texels are instead covered by pass 2),
+ * and pass 2 blends the whole prim. Right for the common all-STP content
+ * (exhaust smoke, waterfalls, HUD backdrops); slightly wrong for prims
+ * mixing opaque and STP texels, which render fully blended.
+ */
+global_variable int s_currentBlendMode = 0; /* BM_NONE */
+global_variable int s_semiTransPass = 0;
+/* Blend mode the pending vertex run was opened under -- part of the
+ * run-break condition in DrawTriangles alongside the atlas index. */
+global_variable int s_runBlendMode = 0;
 
 /*
  * Debug-only, mirrors PC's g_dbg_texturelessMode (native_renderer.c:79,
@@ -264,6 +285,138 @@ internal void N3DS_DirtyVRAMRect(int x, int y, int w, int h)
 			s_vramCellGen[N3DS_VRAMCellIndex(cx * N3DS_VRAM_CELL_DIM, cy * N3DS_VRAM_CELL_DIM)]++;
 			s_vramDirtyBumps++;
 		}
+	}
+}
+
+/*
+ * Lazy framebuffer-region mirror refresh -- docs/PAUSE_FREEZE_FRAME_DESIGN.md.
+ *
+ * PC refreshes the mirror's framebuffer region from the rendered frame every
+ * Platform_EndScene (StoreFrameBuffer -> readback -> pack, the FBREAD writer).
+ * Doing that per frame here would cost a multi-ms readback+pack every frame,
+ * so this is pull-based instead: StoreFrameBuffer (called unconditionally
+ * every EndScene) only records the display rect and arms a stale flag, and
+ * the consumers that actually READ the region -- the decode cache resolving
+ * a page inside it, StoreImage's ReadVRAM, MoveImage's VRAM-source copy --
+ * trigger one refresh before their read. Frames where nothing samples the
+ * framebuffer region (nearly all of them) pay two integer stores.
+ *
+ * The refresh source is the last presented top-screen frame (see
+ * N3DS_CopyDisplayedTopFrame), nearest-resampled to the armed rect and packed
+ * to PSX 1555 with bit15 clear -- PC packs the GL backbuffer's alpha (the
+ * PS1 mask bit) there, but the pause/wipe consumers draw the result as plain
+ * opaque textures, so the mask bit carries nothing for this path.
+ *
+ * Pause loops re-sample the region every frame while re-arming it every
+ * frame, so the refreshed content feeds back through the renderer (as it
+ * does on PS1, where the region IS the framebuffer). Two properties keep
+ * that loop stable: atlas sampling and this resample are both NEAREST (a
+ * pure pixel re-selection, no progressive bilinear smear), and the pause
+ * menu is redrawn on top each frame exactly as on PS1. Verify on hardware;
+ * if column drift ever shows up in a long pause, the follow-up is
+ * freeze-until-rect-changes, not bilinear.
+ */
+global_variable int s_fbStoreX, s_fbStoreY, s_fbStoreW, s_fbStoreH;
+global_variable int s_fbMirrorStale = 0;
+/* Refresh count, surfaced via a rate-limited log line (below): expected 0
+ * during normal play, small during pauses/wipes. A large steady number means
+ * some race content samples the display region every frame and this path
+ * needs revisiting. */
+global_variable u32 s_fbMirrorRefreshes = 0;
+
+#define N3DS_FB_COPY_MAX_W 640
+#define N3DS_FB_COPY_MAX_H 256
+global_variable u8 s_fbCopyScratch[N3DS_FB_COPY_MAX_W * N3DS_FB_COPY_MAX_H * 3];
+
+internal int N3DS_FBStoreOverlaps(int x, int y, int w, int h)
+{
+	return s_fbMirrorStale && (x < (s_fbStoreX + s_fbStoreW)) && ((x + w) > s_fbStoreX) && (y < (s_fbStoreY + s_fbStoreH)) &&
+	       ((y + h) > s_fbStoreY);
+}
+
+internal void N3DS_RefreshFramebufferMirror(void)
+{
+	int x = s_fbStoreX, y = s_fbStoreY, w = s_fbStoreW, h = s_fbStoreH;
+	int row, col;
+
+	/* Cleared even if the copy fails below: StoreFrameBuffer re-arms every
+	 * EndScene, so a failed attempt retries next frame instead of looping
+	 * on every consumer this frame. */
+	s_fbMirrorStale = 0;
+
+	if (w > N3DS_FB_COPY_MAX_W) { w = N3DS_FB_COPY_MAX_W; }
+	if (h > N3DS_FB_COPY_MAX_H) { h = N3DS_FB_COPY_MAX_H; }
+	if (w > (VRAM_WIDTH - x)) { w = VRAM_WIDTH - x; }
+	if (h > (VRAM_HEIGHT - y)) { h = VRAM_HEIGHT - y; }
+	if ((x < 0) || (y < 0) || (w <= 0) || (h <= 0))
+	{
+		return;
+	}
+
+	if (!N3DS_CopyDisplayedTopFrame(s_fbCopyScratch, w, h))
+	{
+		return;
+	}
+
+	/*
+	 * Change-detecting write: only cells whose content actually moved get
+	 * their generation bumped. This is load-bearing, not an optimization
+	 * nicety (measured in Azahar, session 17): menu/idle content samples the
+	 * display region EVERY frame (the same screen-feedback blur PC's
+	 * per-frame FBREAD exists to serve), so this refresh runs per frame
+	 * there -- a blanket N3DS_DirtyVRAMRect(x,y,w,h) then re-decoded ~32
+	 * cells' worth of cache every frame and cost several fps. A static
+	 * screen converges after one refresh (zero bumps, zero re-decodes);
+	 * FMV-style content keeps changing and pays the honest re-decode cost.
+	 */
+	{
+		u32 changedMask[N3DS_VRAM_CELL_ROWS];
+		int cellRow, cellCol;
+
+		memset(changedMask, 0, sizeof(changedMask));
+
+		for (row = 0; row < h; row++)
+		{
+			const u8 *srcRow = s_fbCopyScratch + ((size_t)row * (size_t)w * 3);
+			u16 *dstRow = vram + ((size_t)(y + row) * VRAM_WIDTH) + x;
+			u32 *rowMask = &changedMask[(y + row) / N3DS_VRAM_CELL_DIM];
+
+			for (col = 0; col < w; col++)
+			{
+				const u8 *p = srcRow + (col * 3);
+				const u16 packed = (u16)((p[0] >> 3) | ((p[1] >> 3) << 5) | ((p[2] >> 3) << 10));
+
+				if (dstRow[col] != packed)
+				{
+					dstRow[col] = packed;
+					*rowMask |= (1u << ((u32)(x + col) / N3DS_VRAM_CELL_DIM));
+				}
+			}
+		}
+
+		for (cellRow = 0; cellRow < N3DS_VRAM_CELL_ROWS; cellRow++)
+		{
+			for (cellCol = 0; cellCol < N3DS_VRAM_CELL_COLS; cellCol++)
+			{
+				if (changedMask[cellRow] & (1u << (u32)cellCol))
+				{
+					s_vramCellGen[(cellRow * N3DS_VRAM_CELL_COLS) + cellCol]++;
+					s_vramDirtyBumps++;
+				}
+			}
+		}
+	}
+
+	s_fbMirrorRefreshes++;
+
+	/* First refresh and every 32nd after: enough to prove the path fired
+	 * (and which rect) without an SD-card flush per pause frame. */
+	if ((s_fbMirrorRefreshes & 31u) == 1u)
+	{
+		char msg[96];
+
+		snprintf(msg, sizeof(msg), "[CTR-3DS] fb-mirror refresh #%lu rect=%d,%d %dx%d", (unsigned long)s_fbMirrorRefreshes, x, y, w, h);
+		N3DS_DebugLog(msg);
 	}
 }
 
@@ -1070,7 +1223,9 @@ internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 		return;
 	}
 
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND);
 	baseVertex = N3DS_C3DAppendVertices(s_convertScratch, vertCount);
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND);
 	if (baseVertex < 0)
 	{
 		/* Frame vertex budget exhausted -- drop this run rather than draw
@@ -1082,8 +1237,10 @@ internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 		return;
 	}
 
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_FLUSH);
 	N3DS_C3DBindAtlas(atlasIndex);
 	N3DS_C3DDrawTriangles(baseVertex, vertCount / 3);
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_FLUSH);
 	s_drawCallCount++;
 	s_frameAtlasMask |= (1u << (atlasIndex & 31));
 }
@@ -1120,6 +1277,34 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 {
 	const int minU = MIN3(v0->u, v1->u, v2->u), maxU = MAX3(v0->u, v1->u, v2->u);
 	const int minV = MIN3(v0->v, v1->v, v2->v), maxV = MAX3(v0->v, v1->v, v2->v);
+
+	/* Freeze-frame consumer trigger: this triangle is about to be decoded
+	 * from VRAM the armed display rect covers (pause background, screen-copy
+	 * wipes) -- refresh the mirror region first so the decode reads the last
+	 * presented frame, not boot-era content. The test uses the triangle's
+	 * actual sampled footprint (UV bbox mapped to VRAM halfwords), NOT the
+	 * whole 256-tall page: CTR's display buffers sit at y=0..216 and
+	 * y=296..512 with ordinary textures living in the y-gap between them, so
+	 * any page anchored at y=0 overlaps the display rect even when every
+	 * texel it actually samples lies below it -- the whole-page form of this
+	 * test fired on essentially every frame of menu and race content
+	 * (measured in Azahar, session 17). Costs a few integer ops per textured
+	 * triangle when it doesn't fire. */
+	if (s_fbMirrorStale)
+	{
+		const int pageX = (texPage & 0xF) * 64;
+		const int pageY = (texPage & 0x10) ? 256 : 0;
+		/* Texel -> VRAM halfword column: 4 texels/halfword at 4-bit, 2 at
+		 * 8-bit, 1:1 at 16-bit. */
+		const int shift = (format == TF_16_BIT) ? 0 : ((format == TF_8_BIT) ? 1 : 2);
+		const int wordX0 = pageX + (minU >> shift);
+		const int wordX1 = pageX + (maxU >> shift);
+
+		if (N3DS_FBStoreOverlaps(wordX0, pageY + minV, (wordX1 - wordX0) + 1, (maxV - minV) + 1))
+		{
+			N3DS_RefreshFramebufferMirror();
+		}
+	}
 	const int tileX0 = minU / N3DS_SUBPAGE_DIM, tileX1 = maxU / N3DS_SUBPAGE_DIM;
 	const int tileY0 = minV / N3DS_SUBPAGE_DIM, tileY1 = maxV / N3DS_SUBPAGE_DIM;
 
@@ -1730,7 +1915,13 @@ void NativeRenderer_SwapWindow(void)
 
 void NativeRenderer_StoreFrameBuffer(int x, int y, int w, int h)
 {
-	(void)x; (void)y; (void)w; (void)h;
+	/* Record-and-arm only; the actual refresh is pull-based -- see
+	 * N3DS_RefreshFramebufferMirror. */
+	s_fbStoreX = x;
+	s_fbStoreY = y;
+	s_fbStoreW = w;
+	s_fbStoreH = h;
+	s_fbMirrorStale = (w > 0) && (h > 0);
 }
 
 /* Scratch for one tiled VRAM-display chunk; reused every call, never
@@ -1979,7 +2170,13 @@ void NativeRenderer_CopyVRAM(u16 *src, int x, int y, int w, int h, int dstX, int
 
 	if (src == NULL)
 	{
-		/* MoveImage: VRAM-to-VRAM. No host framebuffer exists to reconcile yet. */
+		/* MoveImage: VRAM-to-VRAM. If the source overlaps the armed display
+		 * rect, pull the last presented frame into the mirror first --
+		 * screen-copy effects MoveImage the display area. */
+		if (N3DS_FBStoreOverlaps(x, y, w, h))
+		{
+			N3DS_RefreshFramebufferMirror();
+		}
 		src = vram;
 		stride = VRAM_WIDTH;
 	}
@@ -1999,8 +2196,17 @@ void NativeRenderer_CopyVRAM(u16 *src, int x, int y, int w, int h, int dstX, int
 
 void NativeRenderer_ReadVRAM(u16 *dst, int x, int y, int dstW, int dstH)
 {
-	u16 *src = vram + x + (VRAM_WIDTH * y);
+	u16 *src;
 	int row;
+
+	/* StoreImage reading the display area (screenshot-style effects): same
+	 * freeze-frame pull as the decode-path trigger. */
+	if (N3DS_FBStoreOverlaps(x, y, dstW, dstH))
+	{
+		N3DS_RefreshFramebufferMirror();
+	}
+
+	src = vram + x + (VRAM_WIDTH * y);
 
 	for (row = 0; row < dstH; row++)
 	{
@@ -2061,7 +2267,7 @@ TextureID NativeRenderer_GetWhiteTexture(void)
 
 void NativeRenderer_SetBlendMode(BlendMode blendMode)
 {
-	(void)blendMode;
+	s_currentBlendMode = (int)blendMode;
 }
 
 void NativeRenderer_SetStencilMode(int drawPrim)
@@ -2098,7 +2304,7 @@ void NativeRenderer_SetOverrideTextureSize(int width, int height)
 
 void NativeRenderer_SetPSXTextureSemiTransPass(int pass)
 {
-	(void)pass;
+	s_semiTransPass = pass;
 }
 
 void NativeRenderer_SetPSXTextureOutputSTP(int enabled)
@@ -2167,9 +2373,32 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		return;
 	}
 
+	if (s_semiTransPass == 1)
+	{
+		/* PC's opaque-texels-only STP pass. Whole-prim first cut: this
+		 * pass draws nothing -- its texels are covered (blended) by pass 2
+		 * instead. Drawing it opaque AND drawing pass 2 blended on top
+		 * would double-draw the prim. See the s_semiTransPass comment. */
+		return;
+	}
+
 	// Opened only after every early return above, so the scope is always
 	// balanced without an end on each bail-out path.
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
+
+	/*
+	 * Assert this split's blend state before any of its runs are recorded
+	 * (deduped backend-side; recorded into the deferred command list at the
+	 * next draw). Also latched into the run-break below: a run must never
+	 * be flushed under a different blend mode than it was opened with,
+	 * because the C3D state applies to the whole draw. Constant across one
+	 * DrawTriangles call today (DrawSplit sets it per split), so the break
+	 * can only fire once cross-split run persistence lands
+	 * (docs/DRAW_CALL_BATCH_SURVEY.md) -- it is the run-break dimension
+	 * batching has to preserve, in place now so that work can't miss it.
+	 */
+	N3DS_C3DSetBlendMode(s_currentBlendMode);
+	s_runBlendMode = s_currentBlendMode;
 
 	/*
 	 * PC's AddSplit coalesces draw calls by blend/format/textureId/mask/
@@ -2202,6 +2431,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		const GrVertex *triVerts = &s_pendingVertices[startVertex + (i * 3)];
 		int atlasIdx, cellX = 0, cellY = 0, pixelBaseU = 0, pixelBaseV = 0, originU = 0, originV = 0, v;
 
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
 		if (untextured)
 		{
 			atlasIdx = N3DS_WHITE_ATLAS;
@@ -2245,8 +2475,9 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 				                             s_currentTexFormat, &atlasIdx, &pixelBaseU, &pixelBaseV, &originU, &originV);
 			}
 		}
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
 
-		if ((atlasIdx != currentAtlas) || ((vertsInRun + 3) > N3DS_MAX_RUN_VERTICES))
+		if ((atlasIdx != currentAtlas) || (s_runBlendMode != s_currentBlendMode) || ((vertsInRun + 3) > N3DS_MAX_RUN_VERTICES))
 		{
 			/* Attribute the flush: only a MID-RUN atlas change is the
 			 * potentially-reducible kind (vertsInRun > 0 excludes the first
@@ -2256,6 +2487,8 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 				s_atlasSwitchFlushes++;
 			}
 			N3DS_FlushRun(currentAtlas, vertsInRun);
+			N3DS_C3DSetBlendMode(s_currentBlendMode);
+			s_runBlendMode = s_currentBlendMode;
 			currentAtlas = atlasIdx;
 			vertsInRun = 0;
 		}
@@ -2264,6 +2497,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		N3DS_TriDumpRecord(triVerts, !untextured, untextured ? 255 : (int)s_currentTexFormat, atlasIdx, pixelBaseU, pixelBaseV, originU, originV);
 #endif
 
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
 		for (v = 0; v < 3; v++)
 		{
 			const GrVertex *src = &triVerts[v];
@@ -2355,6 +2589,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			dst->g = src->g;
 			dst->b = src->b;
 		}
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
 
 		vertsInRun += 3;
 	}

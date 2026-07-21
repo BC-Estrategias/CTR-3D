@@ -285,6 +285,12 @@ void N3DS_C3DBindAtlas(int atlasIndex);
  * vertex colour instead -- see the implementation comment for why that loses
  * headroom and darkens everything textured. */
 void N3DS_C3DSetColorDoubling(int enable);
+/* PS1 semi-transparency: blendMode is the shared BlendMode enum's numeric
+ * value (BM_NONE=0, BM_AVERAGE=1, BM_ADD=2, BM_SUBTRACT=3,
+ * BM_ADD_QUATER_SOURCE=4 -- native_renderer_types.h), passed as a plain int
+ * across this boundary like every other enum here. Deduped internally;
+ * takes effect at the next recorded draw. */
+void N3DS_C3DSetBlendMode(int blendMode);
 
 /* ------------------------------------------------------ VRAM display --- */
 /* Dedicated (not atlas-shared) textures backing NativeRenderer_PresentVRAMRect/
@@ -312,6 +318,12 @@ void N3DS_C3DSetColorDoubling(int enable);
 #define N3DS_VRAM_DISPLAY_TEX_COUNT 4
 void N3DS_C3DUploadVramDisplayChunk(int slotIndex, const void *tiled256);
 void N3DS_C3DBindVramDisplayTex(int slotIndex);
+
+/* Copies the top screen's last completed frame (the gfx framebuffer the
+ * present path fills every frame) into dstRGB as row-major RGB triplets,
+ * nearest-resampled 400x240 -> dstW x dstH. May be one presentation old.
+ * Returns 0 if no framebuffer. docs/PAUSE_FREEZE_FRAME_DESIGN.md. */
+int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH);
 
 /* ---------------------------------------------------------------- input --- */
 
