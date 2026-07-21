@@ -244,6 +244,13 @@ void *LOAD_VramFile(void *bigfilePtr, int subfileIndex, void *ptrDestination, u3
 	{
 		loadedFile = LOAD_ReadFile_ex(bigfilePtr, LT_VRAM, subfileIndex, ptrDestination, sizePtr, NULL);
 
+#ifdef CTR_NATIVE
+		// DIAGNOSTIC (2026-07-21, session 14): synchronous-load breadcrumbs for
+		// the real-hardware first-boot stall; each candidate wait in this rare
+		// (-1) path gets its own line. See LOAD_TenStages.c.
+		Platform_Log("[CTR LOAD] VramFile: read done, loading images\n");
+#endif
+
 		lqs.ptrBigfileCdPos_UNUSED = bigfilePtr;
 		lqs.flags = 0;
 		lqs.type_UNUSED = LT_VRAM;
@@ -254,7 +261,13 @@ void *LOAD_VramFile(void *bigfilePtr, int subfileIndex, void *ptrDestination, u3
 
 		LOAD_VramFileCallback(&lqs);
 
+#ifdef CTR_NATIVE
+		Platform_Log("[CTR LOAD] VramFile: images loaded, VSync(2)\n");
+#endif
 		VSync(2);
+#ifdef CTR_NATIVE
+		Platform_Log("[CTR LOAD] VramFile: VSync(2) done\n");
+#endif
 		sdata->frameFinishedVRAM = 0;
 
 		if (ptrDestination == NULL)

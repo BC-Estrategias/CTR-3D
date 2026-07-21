@@ -60,6 +60,14 @@
 	; bank, only src1 can -- swapping operand order is the fix, not a
 	; workaround.
 	mul outtc0.xy, texcoordScale, intc.xy
+	; Real PICA200 only emits a vertex once EVERY component of EVERY declared
+	; output register has been written; a partially-written output stalls the
+	; shader unit forever, which wedges the whole command list -- the 2026-07-21
+	; real-hardware boot hang (first draw-bearing frame never completed, next
+	; C3D_FrameBegin(SYNCDRAW) waited forever). Emulators do not enforce this,
+	; which is why Azahar rendered fine all along. outclr below already gets
+	; the same full-write treatment (.xyz + .w); outtc0 was the one gap.
+	mov outtc0.zw, zeros
 	mul outclr.xyz, colorScale, inclr.xyz
 	mov outclr.w, ones
 

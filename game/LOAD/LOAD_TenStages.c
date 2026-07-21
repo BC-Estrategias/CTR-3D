@@ -84,9 +84,22 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
 
 			sdata->boolFirstBoot = 0;
 
+#ifdef CTR_NATIVE
+			// DIAGNOSTIC (2026-07-21, session 14): hardware hung between the
+			// stage-0 checkpoint above and the first-boot wait's "enter" line
+			// below -- i.e. somewhere in VramFile/VRAMDisplay. Bracket each so
+			// the last line on the console names the stall.
+			Platform_Log("[CTR LOAD] first-boot: VramFile(copyright TIM) begin\n");
+#endif
 			// Load Intro TIM for Copyright Page from VRAM file
 			LOAD_VramFile(bigfile, LOAD_FIRST_BOOT_COPYRIGHT_TIM_BIGFILE_INDEX, NULL, &vramSize, -1);
+#ifdef CTR_NATIVE
+			Platform_Log("[CTR LOAD] first-boot: VramFile done, VRAMDisplay begin\n");
+#endif
 			MainInit_VRAMDisplay();
+#ifdef CTR_NATIVE
+			Platform_Log("[CTR LOAD] first-boot: VRAMDisplay done\n");
+#endif
 
 #ifdef CTR_NATIVE
 			// NOTE(aalhendi): SCEA is already held by XA playback in MainMain. The copyright

@@ -94,6 +94,41 @@ global_variable TexFormat s_currentTexFormat = TF_16_BIT;
  */
 int g_dbg_texturelessMode = 0;
 
+/*
+ * Diagnostic (2026-07-20): force EVERY textured triangle to sample ONE fixed
+ * texture, captured fresh each frame from the first textured triangle (so it is
+ * always a currently-loaded, valid texture) and routed through the simple
+ * full-page path. If the whole world then shows that single texture cleanly and
+ * stably, the base path -- decode, atlas write, GPU sample, cache coherency --
+ * is proven sound and the corruption lives entirely in the dynamic
+ * per-triangle cache/eviction/sub-page machinery. If it's still garbled, the
+ * base path itself is broken. s_forcedTexValid is reset once per frame in
+ * NativeRenderer_SwapWindow. Toggle off to restore normal rendering.
+ */
+int g_dbg_forceSingleTexture = 0;
+global_variable s16 s_forcedPage = 0;
+global_variable s16 s_forcedClut = 0;
+global_variable TexFormat s_forcedFormat = TF_4_BIT;
+global_variable int s_forcedTexValid = 0;
+
+/*
+ * Diagnostic (2026-07-20): route EVERY textured triangle through the full-page
+ * tier, bypassing the sub-page tier entirely. The forced-single-texture test
+ * proved the base decode/atlas/sample/coherency path renders one texture
+ * cleanly across all geometry -- but it only ever exercised the full-page path,
+ * while normal rendering sends ~92% of triangles through sub-page. This isolates
+ * whether the sub-page routing/sub-cell-remap machinery is the corruption source.
+ * Paired with a raised N3DS_FULLPAGE_RESERVED_CELLS so the now-100%-full-page
+ * traffic doesn't evict and confound the result.
+ */
+int g_dbg_disableSubPage = 0;
+
+/* ABLATION A (2026-07-21, session 14): boot-splash present submits clear +
+ * display transfer but no draw calls. Used to prove the real-hardware boot
+ * hang lived in the draw path, not clear/transfer -- which led to the
+ * partial-output-write fix in shaders/ctr.v.pica (outtc0.zw). Keep at 0. */
+int g_dbg_skipSplashDraws = 0;
+
 global_variable const GrVertex *s_pendingVertices = NULL;
 global_variable int s_pendingVertexCount = 0;
 
@@ -493,7 +528,7 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, in
 			{
 			case TF_4_BIT:
 			{
-				const int wordCol = pageOriginX + (pageU >> 2);
+				const int wordCol = (pageOriginX + (pageU >> 2)) & (VRAM_WIDTH - 1);
 				const u16 word = vram[wordRow * VRAM_WIDTH + wordCol];
 				const int nibble = (word >> ((pageU & 3) * 4)) & 0xF;
 				/* Wrap within the CLUT's own VRAM row. PC's VRAM sampler
@@ -507,7 +542,7 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, in
 			}
 			case TF_8_BIT:
 			{
-				const int wordCol = pageOriginX + (pageU >> 1);
+				const int wordCol = (pageOriginX + (pageU >> 1)) & (VRAM_WIDTH - 1);
 				const u16 word = vram[wordRow * VRAM_WIDTH + wordCol];
 				const int index = (word >> ((pageU & 1) * 8)) & 0xFF;
 				/* 256 entries from a 16-aligned origin reaches column 1263 of
@@ -520,7 +555,7 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, in
 			case TF_16_BIT:
 			case TF_32_BIT_RGBA: /* unreachable -- DrawTriangles never calls this path for it, see file header */
 			default:
-				color16 = vram[wordRow * VRAM_WIDTH + pageOriginX + pageU];
+				color16 = vram[wordRow * VRAM_WIDTH + ((pageOriginX + pageU) & (VRAM_WIDTH - 1))];
 				break;
 			}
 
@@ -717,20 +752,20 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 
 	{
 		/*
-		 * Decode only the columns this format can actually address. u/v reach the
-		 * full 0-255 at 4bpp, but a texture page is 64 VRAM words wide, so 8bpp
-		 * can only address u=0..127 and 16bpp only u=0..63 -- the game authors
-		 * texcoords format-aware and never samples beyond that. Decoding a fixed
-		 * 256 columns regardless was doing 2x the necessary work for 8bpp and 4x
-		 * for 16bpp, on the hottest path in the renderer (a cache miss decodes
-		 * 65,536 texels, and real track content was missing ~77 times a frame).
-		 * Columns past this bound keep whatever a previous decode left in them
-		 * and are never sampled. destStrideTiles below is N3DS_DECODE_TEXTURE_DIM/8,
-		 * s_decodeScratch's own width in tiles -- NOT decodeWidth/8, which
-		 * would desync from N3DS_C3DUploadDecodedCell's fixed stride whenever
-		 * decodeWidth < 256 (see N3DS_DecodeAndTilePage's header comment).
+		 * A PSX texture page is 256 TEXELS wide in EVERY colour mode -- the
+		 * mode only changes how many VRAM words those 256 texels occupy (64 at
+		 * 4bpp, 128 at 8bpp, 256 at 16bpp), i.e. how many tpage columns the
+		 * texture spans, NOT how far U can reach. U/V are always 0-255. A prior
+		 * version decoded only 128 columns for 8bpp / 64 for 16bpp on the theory
+		 * that "the game never samples beyond that" -- that was wrong (it
+		 * confused word-width with texel-width), and it left the right half (or
+		 * three-quarters) of every wide 8/16bpp texture stale, which is exactly
+		 * the large-surface corruption. Decode the full 256 always; the wider
+		 * VRAM reads are wrap-guarded in N3DS_DecodeAndTilePage (matching PC's
+		 * GL_REPEAT). destStrideTiles stays N3DS_DECODE_TEXTURE_DIM/8, the
+		 * destination scratch's own width in tiles.
 		 */
-		const int decodeWidth = (format == TF_4_BIT) ? 256 : ((format == TF_8_BIT) ? 128 : 64);
+		const int decodeWidth = N3DS_DECODE_TEXTURE_DIM;
 
 		N3DS_DecodeAndTilePage(texPage, clut, format, 0, 0, decodeWidth, N3DS_DECODE_TEXTURE_DIM,
 		                        N3DS_DECODE_TEXTURE_DIM / 8, s_decodeScratch);
@@ -985,7 +1020,7 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 	const int tileX0 = minU / N3DS_SUBPAGE_DIM, tileX1 = maxU / N3DS_SUBPAGE_DIM;
 	const int tileY0 = minV / N3DS_SUBPAGE_DIM, tileY1 = maxV / N3DS_SUBPAGE_DIM;
 
-	if ((tileX0 == tileX1) && (tileY0 == tileY1))
+	if (!g_dbg_disableSubPage && (tileX0 == tileX1) && (tileY0 == tileY1))
 	{
 		int atlasIdx, physCellX, physCellY, subX, subY;
 
@@ -1037,6 +1072,11 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 	printf("\nPhase 2a: citro3d is live on the top\nscreen (see file header for scope).\n\n");
 
 	N3DS_DebugLog("[CTR-3DS] renderer init ok, citro3d ready");
+
+	/* Hand the backend TU the VRAM buffer so its SELECT+R debug capture can
+	 * write it to SD (see N3DS_DebugSetVRAMForDump). vram[] is a stable global,
+	 * so registering its address once is safe. */
+	N3DS_DebugSetVRAMForDump(vram, (unsigned int)sizeof(vram));
 
 	return 1;
 }
@@ -1196,6 +1236,10 @@ void NativeRenderer_SwapWindow(void)
 	{
 		return;
 	}
+
+	/* Re-capture the forced diagnostic texture next frame (see
+	 * g_dbg_forceSingleTexture) so it always tracks a currently-loaded one. */
+	s_forcedTexValid = 0;
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_SWAP_WINDOW);
 
@@ -1529,6 +1573,18 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 	const int maxChunk = N3DS_VRAM_DISPLAY_TEX_DIM;
 	int y;
 	int chunkSlot = 0;
+	/* DIAGNOSTIC (2026-07-21, session 14): bounded entry/exit trace pairing
+	 * with the FrameBegin/FrameEnd traces in n3ds_backend.c -- together they
+	 * bracket every stage of the boot-splash present that real hardware
+	 * freezes inside. */
+	static int s_presentTraceBudget = 16;
+	const int trace = (s_presentTraceBudget > 0);
+
+	if (trace)
+	{
+		s_presentTraceBudget--;
+		N3DS_DebugLog("[CTR-3DS] PresentVRAMRect: enter");
+	}
 
 	if ((displayW <= 0) || (displayH <= 0))
 	{
@@ -1624,6 +1680,19 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 				verts[i].b = 255;
 			}
 
+			/* ABLATION A (2026-07-21, session 14, hardware GPU-wedge hunt):
+			 * submit the splash frames with clear+transfer but ZERO draws.
+			 * Real hardware never completes the first submitted command list
+			 * (FrameBegin #2 waits forever); this splits {clear/transfer}
+			 * from {draw state}. If boot proceeds past the splash with this
+			 * on, the wedge is in the draw path -- and the first real menu
+			 * frame (DrawTriangles, not skipped here) then tests the shader
+			 * itself. REVERT after the test. */
+			if (g_dbg_skipSplashDraws)
+			{
+				continue;
+			}
+
 			N3DS_C3DBindVramDisplayTex(slot);
 			baseVertex = N3DS_C3DAppendVertices(verts, 6);
 			if (baseVertex >= 0)
@@ -1631,6 +1700,12 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 				N3DS_C3DDrawTriangles(baseVertex, 2);
 			}
 		}
+	}
+
+	if (trace)
+	{
+		N3DS_DebugLog(g_dbg_skipSplashDraws ? "[CTR-3DS] PresentVRAMRect: done (draws SKIPPED, ablation A)"
+		                                    : "[CTR-3DS] PresentVRAMRect: done (draws queued)");
 	}
 }
 
@@ -1919,8 +1994,33 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			 * texture can still have different UV footprints (e.g. a small
 			 * decal vs. a large floor triangle both sampling the same page).
 			 * See N3DS_ResolveTriangleTexture / docs/SUBPAGE_DECODE_CACHE_DESIGN.md. */
-			N3DS_ResolveTriangleTexture(&triVerts[0], &triVerts[1], &triVerts[2], triVerts[0].page, triVerts[0].clut,
-			                             s_currentTexFormat, &atlasIdx, &pixelBaseU, &pixelBaseV, &originU, &originV);
+			if (g_dbg_forceSingleTexture)
+			{
+				/* Diagnostic: pin every textured triangle to one fixed texture
+				 * (first textured triangle of the frame), full-page path, real
+				 * UVs. See g_dbg_forceSingleTexture's declaration. */
+				int fCellX = 0, fCellY = 0;
+
+				if (!s_forcedTexValid)
+				{
+					s_forcedPage = triVerts[0].page;
+					s_forcedClut = triVerts[0].clut;
+					s_forcedFormat = s_currentTexFormat;
+					s_forcedTexValid = 1;
+				}
+
+				N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(s_forcedPage, s_forcedClut, s_forcedFormat), &atlasIdx,
+				                            &fCellX, &fCellY);
+				pixelBaseU = fCellX * N3DS_DECODE_TEXTURE_DIM;
+				pixelBaseV = fCellY * N3DS_DECODE_TEXTURE_DIM;
+				originU = 0;
+				originV = 0;
+			}
+			else
+			{
+				N3DS_ResolveTriangleTexture(&triVerts[0], &triVerts[1], &triVerts[2], triVerts[0].page, triVerts[0].clut,
+				                             s_currentTexFormat, &atlasIdx, &pixelBaseU, &pixelBaseV, &originU, &originV);
+			}
 		}
 
 		if ((atlasIdx != currentAtlas) || ((vertsInRun + 3) > N3DS_MAX_RUN_VERTICES))

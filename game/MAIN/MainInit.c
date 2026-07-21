@@ -727,12 +727,30 @@ void MainInit_VRAMDisplay()
 
 			move.tag |= 0xffffff;
 
+#ifdef CTR_NATIVE
+			// DIAGNOSTIC (2026-07-21, session 14): real hardware survives this
+			// function's FIRST invocation (SCEA) and hangs in its SECOND
+			// (copyright, "VRAMDisplay begin" logged, "moves done" never) --
+			// name the exact move iteration and which of DrawOTag/DrawSync
+			// stalls.
+			Platform_Log("[CTR LOAD] VRAMDisplay: move i=%d j=%d DrawOTag\n", i, j);
+#endif
 			DrawOTag(&move);
+#ifdef CTR_NATIVE
+			Platform_Log("[CTR LOAD] VRAMDisplay: move i=%d j=%d DrawSync\n", i, j);
+#endif
 			DrawSync(0);
+#ifdef CTR_NATIVE
+			Platform_Log("[CTR LOAD] VRAMDisplay: move i=%d j=%d done\n", i, j);
+#endif
 		}
 	}
 
 #ifdef CTR_NATIVE
+	// DIAGNOSTIC (2026-07-21, session 14): separates the DR_MOVE/DrawSync page
+	// moves above from the boot-splash present path -- the two halves of this
+	// function are different real-hardware stall suspects.
+	Platform_Log("[CTR LOAD] VRAMDisplay: moves done, presenting\n");
 	Platform_PresentVRAMDisplay();
 #endif
 }

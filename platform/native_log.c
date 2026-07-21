@@ -23,6 +23,18 @@ internal void Platform_LogWrite(FILE *consoleStream, const char *text)
 
 	fputs(text, stream);
 
+#ifdef __3DS__
+	// When netloaded, stderr is the live stream back to the sending PC
+	// (n3ds_backend.c). stdout-bound lines would otherwise exist only on the
+	// bottom-screen console, which the stats block periodically clears -- and
+	// the LOAD/hang checkpoints in game/ go through Platform_Log, not
+	// N3DS_DebugLog, so they must be mirrored here to reach the host.
+	if ((stream != stderr) && N3DS_NetloadStreamActive())
+	{
+		fputs(text, stderr);
+	}
+#endif
+
 	if (s_logStream != NULL)
 	{
 		fputs(text, s_logStream);

@@ -345,6 +345,19 @@ void N3DS_DebugLog(const char *msg);
  * exist until the renderer initialises. */
 void N3DS_EarlyInit(void);
 
+/* Nonzero when the app was netloaded via 3dslink and the stderr stream back to
+ * the sending PC is connected (run 3dslink with -s to receive it). Platform_Log
+ * mirrors into that stream so hardware hang diagnostics arrive live over Wi-Fi
+ * instead of needing an SD pull. */
+int N3DS_NetloadStreamActive(void);
+
+/* Registers the emulated PSX VRAM buffer so the SELECT+R debug capture in
+ * N3DS_ReadButtons can write it to sdmc:/vramdump.bin. Called once from the
+ * renderer TU (which owns vram[]) since the backend TU can't see that global.
+ * bytes is sizeof(vram). CTR_INTERNAL-only diagnostic (texture-corruption
+ * investigation, 2026-07-20); no-op otherwise. */
+void N3DS_DebugSetVRAMForDump(const void *vram, unsigned int bytes);
+
 /* ---------------------------------------------------------------- memory --- */
 /* Bytes currently handed out by malloc, and free space in the linear heap.
  * Reported on screen so runaway allocation is visible as it happens. */

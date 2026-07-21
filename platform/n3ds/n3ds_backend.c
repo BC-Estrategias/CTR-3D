@@ -6,7 +6,9 @@
 #include <3ds.h>
 #include <citro3d.h>
 #include <malloc.h>
+#include <netinet/in.h> /* full struct in_addr for __3dslink_host (3dslink.h only forward-declares it) */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "n3ds_backend.h"
@@ -24,11 +26,80 @@
 
 static FILE *s_logFile = NULL;
 
+/*
+ * 3dslink netload stderr streaming (2026-07-21). When the app was sent over
+ * Wi-Fi with 3dslink, HBL records the sender's IP in __3dslink_host; connect
+ * a TCP stream back to it (3dslink must be run with -s to listen) and point
+ * stderr at it. Every N3DS_DebugLog / Platform_Log line is then mirrored to
+ * the PC live, which is the difference between "the exact last line before a
+ * hardware freeze, on the host terminal" and pulling the SD card out from
+ * behind the backplate. stdout is deliberately NOT redirected -- it is the
+ * bottom-screen console. SD-card / Azahar launches have s_addr == 0 and skip
+ * all of this.
+ */
+#define N3DS_SOC_ALIGN       0x1000
+#define N3DS_SOC_BUFFER_SIZE 0x100000
+
+static u32 *s_socBuffer = NULL;
+static int s_netloadStreamActive = 0;
+
+int N3DS_NetloadStreamActive(void)
+{
+	return s_netloadStreamActive;
+}
+
+static void N3DS_NetloadStreamExit(void)
+{
+	if (s_socBuffer != NULL)
+	{
+		socExit();
+	}
+}
+
+static void N3DS_NetloadStreamInit(void)
+{
+	if (__3dslink_host.s_addr == 0)
+	{
+		return;
+	}
+
+	s_socBuffer = (u32 *)memalign(N3DS_SOC_ALIGN, N3DS_SOC_BUFFER_SIZE);
+	if (s_socBuffer == NULL)
+	{
+		return;
+	}
+
+	if (R_FAILED(socInit(s_socBuffer, N3DS_SOC_BUFFER_SIZE)))
+	{
+		free(s_socBuffer);
+		s_socBuffer = NULL;
+		return;
+	}
+
+	atexit(N3DS_NetloadStreamExit);
+
+	/* stderr only: stdout must stay the bottom-screen console. If the host
+	 * isn't listening (3dslink without -s) this fails fast and boot proceeds
+	 * with the socket service up but no stream -- harmless. */
+	if (link3dsConnectToHost(false, true) < 0)
+	{
+		return;
+	}
+
+	s_netloadStreamActive = 1;
+}
+
 void N3DS_EarlyInit(void)
 {
 	consoleDebugInit(debugDevice_SVC);
 
 	s_logFile = fopen(N3DS_LOG_PATH, "w");
+
+	N3DS_NetloadStreamInit();
+	if (s_netloadStreamActive)
+	{
+		N3DS_DebugLog("[CTR-3DS] netload stderr stream connected");
+	}
 }
 
 void N3DS_DebugLog(const char *msg)
@@ -40,6 +111,12 @@ void N3DS_DebugLog(const char *msg)
 
 	svcOutputDebugString(msg, (int)strlen(msg));
 
+	if (s_netloadStreamActive)
+	{
+		fputs(msg, stderr);
+		fputc('\n', stderr);
+	}
+
 	if (s_logFile != NULL)
 	{
 		fputs(msg, s_logFile);
@@ -47,6 +124,50 @@ void N3DS_DebugLog(const char *msg)
 		fflush(s_logFile);
 	}
 }
+
+/*
+ * SELECT+R VRAM capture (CTR_INTERNAL, texture-corruption diagnostic,
+ * 2026-07-20). The renderer TU owns vram[] but can't do the SELECT+R button
+ * check (libctru's hid* live only in this TU); this TU can't see vram[]. So
+ * the renderer registers the buffer pointer once and the button check +
+ * fwrite happen here, in N3DS_ReadButtons, where hidScanInput() has already
+ * run this frame.
+ */
+static const void *s_dumpVramPtr = NULL;
+static unsigned int s_dumpVramBytes = 0;
+
+void N3DS_DebugSetVRAMForDump(const void *vram, unsigned int bytes)
+{
+	s_dumpVramPtr = vram;
+	s_dumpVramBytes = bytes;
+}
+
+#ifdef CTR_INTERNAL
+static void N3DS_DebugWriteVRAMDump(void)
+{
+	FILE *f;
+	char msg[96];
+
+	if ((s_dumpVramPtr == NULL) || (s_dumpVramBytes == 0))
+	{
+		N3DS_DebugLog("[CTR-3DS] VRAM dump skipped: buffer not registered");
+		return;
+	}
+
+	f = fopen("sdmc:/vramdump.bin", "wb");
+	if (f == NULL)
+	{
+		N3DS_DebugLog("[CTR-3DS] VRAM dump FAILED: fopen sdmc:/vramdump.bin");
+		return;
+	}
+
+	fwrite(s_dumpVramPtr, 1, s_dumpVramBytes, f);
+	fclose(f);
+
+	snprintf(msg, sizeof(msg), "[CTR-3DS] VRAM dumped to sdmc:/vramdump.bin (%u bytes)", s_dumpVramBytes);
+	N3DS_DebugLog(msg);
+}
+#endif
 
 unsigned long long N3DS_GetTickCount(void)
 {
@@ -309,9 +430,30 @@ void N3DS_C3DExit(void)
 	C3D_Fini();
 }
 
+/*
+ * DIAGNOSTIC (2026-07-21, session 14): real hardware freezes inside the
+ * first boot-splash present with no further output. The two blocking
+ * candidates are C3D_FrameBegin's SYNCDRAW wait (previous command list never
+ * completed) and C3D_FrameEnd's queue handoff. Trace the first few frame
+ * brackets so the stream names the exact call that never returns; bounded so
+ * steady-state runs don't flood sdmc:/ctr3ds.log.
+ */
+static int s_frameTraceBudget = 48;
+
+static void N3DS_FrameTrace(const char *msg)
+{
+	if (s_frameTraceBudget > 0)
+	{
+		s_frameTraceBudget--;
+		N3DS_DebugLog(msg);
+	}
+}
+
 void N3DS_C3DBeginFrame(void)
 {
+	N3DS_FrameTrace("[CTR-3DS] FrameBegin: enter (SYNCDRAW wait)");
 	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+	N3DS_FrameTrace("[CTR-3DS] FrameBegin: returned");
 	C3D_RenderTargetClear(s_renderTarget, C3D_CLEAR_ALL, 0x000000FF, 0);
 	C3D_FrameDrawOn(s_renderTarget);
 
@@ -343,7 +485,9 @@ void N3DS_C3DBeginFrame(void)
 
 void N3DS_C3DEndFrame(void)
 {
+	N3DS_FrameTrace("[CTR-3DS] FrameEnd: enter (submit)");
 	C3D_FrameEnd(0);
+	N3DS_FrameTrace("[CTR-3DS] FrameEnd: returned");
 }
 
 int N3DS_C3DAppendVertices(const N3DS_Vertex *vertices, int count)
@@ -445,6 +589,25 @@ static void N3DS_C3DUploadTileBlock(int atlasIndex, int baseTileCol, int baseTil
 
 		memcpy(dstRow, srcRow, (size_t)tilesWide * N3DS_TILE_BYTES);
 	}
+
+	/*
+	 * Flush the just-written region to physical RAM. Without this the GPU (and,
+	 * critically, Azahar's/Citra's host-side texture cache) never learns the
+	 * atlas cell changed: after a cell is evicted and re-decoded for a new
+	 * texture, the emulator keeps serving the cell's PREVIOUS occupant, which is
+	 * exactly the "recognizable textures showing up in the wrong places on the
+	 * track" corruption. This is the missing counterpart to a C3D_TexUpload that
+	 * the raw-memcpy upload path above never had. Flush the bounding range of
+	 * the rows written (over-flushing the inter-row gaps is harmless -- the data
+	 * there is already correct, and a slightly larger invalidation just re-reads
+	 * a little more of the atlas). GSPGPU_FlushDataCache rounds to cache lines
+	 * internally, so an unaligned start/size is fine. */
+	{
+		u8 *flushStart = atlasData + (size_t)((baseTileRow * atlasTilesPerRow) + baseTileCol) * N3DS_TILE_BYTES;
+		size_t flushBytes = (size_t)(((tilesHigh - 1) * atlasTilesPerRow) + tilesWide) * N3DS_TILE_BYTES;
+
+		GSPGPU_FlushDataCache(flushStart, (u32)flushBytes);
+	}
 }
 
 void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256)
@@ -456,6 +619,45 @@ void N3DS_C3DUploadDecodedSubCell(int atlasIndex, int physCellX, int physCellY, 
 {
 	N3DS_C3DUploadTileBlock(atlasIndex, (physCellX * 32) + (subX * 8), (physCellY * 32) + (subY * 8), 8, 8, tiled64);
 }
+
+#ifdef CTR_INTERNAL
+/* Dumps every atlas texture's raw (8x8-Morton-tiled RGBA5551) linear storage to
+ * sdmc:/atlas_<i>.bin for the texture-corruption investigation (2026-07-20).
+ * Un-swizzled + rendered on the host. Triggered by SELECT+R alongside the VRAM
+ * dump so both capture the same frame. s_atlasTextures[].data is CPU-written by
+ * the decode (N3DS_C3DUploadTileBlock), so it is CPU-readable here. */
+static void N3DS_DebugWriteAtlasDump(void)
+{
+	const size_t bytes = (size_t)N3DS_ATLAS_DIM * (size_t)N3DS_ATLAS_DIM * 2;
+	char path[64];
+	char msg[96];
+	int i, written = 0;
+
+	for (i = 0; i < N3DS_ATLAS_COUNT; i++)
+	{
+		FILE *f;
+
+		if (s_atlasTextures[i].data == NULL)
+		{
+			continue;
+		}
+
+		snprintf(path, sizeof(path), "sdmc:/atlas_%d.bin", i);
+		f = fopen(path, "wb");
+		if (f == NULL)
+		{
+			continue;
+		}
+
+		fwrite(s_atlasTextures[i].data, 1, bytes, f);
+		fclose(f);
+		written++;
+	}
+
+	snprintf(msg, sizeof(msg), "[CTR-3DS] dumped %d/%d atlas textures (%u bytes each)", written, N3DS_ATLAS_COUNT, (unsigned)bytes);
+	N3DS_DebugLog(msg);
+}
+#endif
 
 void N3DS_C3DSetColorDoubling(int enable)
 {
@@ -532,6 +734,18 @@ unsigned int N3DS_ReadButtons(void)
 	held = hidKeysHeld();
 
 #ifdef CTR_INTERNAL
+	/* SELECT+R (R down-edge while SELECT held): dump emulated PSX VRAM to
+	 * sdmc:/vramdump.bin for the texture-corruption investigation. L+R is
+	 * powersliding (core CTR mechanic) so it can't be used; SELECT is not a
+	 * driving button. Checked here because hidScanInput() already ran above --
+	 * a second scan elsewhere would consume the R down-edge. Runs before the
+	 * textureless toggle so the two never fire on the same frame. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_R))
+	{
+		N3DS_DebugWriteVRAMDump();
+		N3DS_DebugWriteAtlasDump();
+	}
+
 	/* SELECT, not ZL: ZL already changes camera angle in CTR's own controls
 	 * (2026-07-20). SELECT still also feeds N3DS_BTN_SELECT below for the
 	 * game as normal; requested this pairing anyway. Mirrors PC's F2
