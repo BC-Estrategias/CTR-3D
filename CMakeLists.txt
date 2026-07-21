@@ -181,6 +181,18 @@ if(CTR_NATIVE_AUDIO_ARENA_LOG)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_AUDIO_ARENA_LOG=1)
 endif()
 
+# Per-window voice-start decode counters + [PERF-VOICE] report line + the
+# worst-frame/key-on correlation (docs/VOICE_START_DECODE_DESIGN.md step 1).
+# The 64-frame [PERF] averages smear a one-frame key-on decode spike into
+# nothing, which is how the sound-start hitches hid; this is the
+# instrumentation that has to confirm the cause before optimizing further.
+option(CTR_NATIVE_AUDIO_DECODE_PROFILE
+    "Per-window voice-start decode counters"
+    OFF)
+if(CTR_NATIVE_AUDIO_DECODE_PROFILE)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_AUDIO_DECODE_PROFILE=1)
+endif()
+
 # Reset that arena on the LOAD_RESTART fast path (Time Trial "Retry"), which
 # reloads no audio banks and so never hits the only unconditional reset.
 option(CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART

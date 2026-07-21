@@ -42,6 +42,36 @@
 #define CTR_3DS_SKIP_SPU_MIX 0
 #endif
 
+/*
+ * Below this the idle-arena reclaim leaves decoded voice PCM alone, so a
+ * re-triggered sound between-sounds re-keys for free instead of paying a
+ * full re-decode (docs/VOICE_START_DECODE_DESIGN.md step 4). With the
+ * exact-size reservations of step 2 a normal SFX working set sits well under
+ * this, so the unbounded-growth defence the reclaim was added for only has
+ * to fire in genuinely pathological sessions; the bank-reload path
+ * (NativeAudio_ResetVoicePcmArena) still drops everything unconditionally.
+ */
+#define NATIVE_AUDIO_VOICE_ARENA_RECLAIM_KEEP (256 * 1024)
+
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+/*
+ * Voice-start decode counters (docs/VOICE_START_DECODE_DESIGN.md step 1).
+ * Window-scoped ones reset when the [PERF-VOICE] line is emitted; frameKeyOns
+ * is consumed by native_perf.c once per frame for the worst-frame/key-on
+ * correlation test. Same unity TU, so `internal` linkage crosses the files.
+ */
+global_variable struct
+{
+	int windowKeyOns;
+	int windowDecodeCalls;
+	int windowDecodedSamples;
+	int windowScannedBlocks;
+	int windowArenaGrows;
+	int arenaPeakKiB;
+	int frameKeyOns;
+} s_voiceProf;
+#endif
+
 #define NATIVE_AUDIO_SAMPLE_RATE            44100
 #define NATIVE_AUDIO_CHANNELS               2
 #define NATIVE_AUDIO_SPU_VOICE_COUNT        24
@@ -1494,6 +1524,14 @@ internal int NativeAudio_VoiceArenaEnsureCapacityNoLock(int capacity)
 	arena->memory = newMemory;
 	arena->capacity = newCapacity;
 
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+	s_voiceProf.windowArenaGrows++;
+	if ((arena->capacity >> 10) > s_voiceProf.arenaPeakKiB)
+	{
+		s_voiceProf.arenaPeakKiB = arena->capacity >> 10;
+	}
+#endif
+
 #if CTR_NATIVE_AUDIO_ARENA_LOG
 	// Growth is by doubling, so this fires rarely (about once per size class) and
 	// will not perturb the timing it is measuring.
@@ -1587,10 +1625,20 @@ internal int NativeAudio_DecodeAdpcmNibble(u8 soundParameter, int nibble, int *o
 	return sample;
 }
 
-internal int NativeAudio_DecodeSpuSample(u32 addr, u32 loopAddr, struct NativeAudioPcmBuffer *pcm, int *loopStart, int *loopEnd, b32 *loopEnabled)
+/*
+ * Metadata-only walk of an SPU sample: same 16-byte block iteration, loop-flag
+ * logic and stop condition as NativeAudio_DecodeSpuSample below, but reads
+ * only each block's flags byte and counts XA_SAMPLES_PER_SOUND_UNIT per block
+ * -- no nibble math, no PCM writes, roughly 1/28th the work
+ * (docs/VOICE_START_DECODE_DESIGN.md step 2). Gives UpdateVoiceSample the
+ * exact sample count to reserve (killing the old worst-case multi-MB arena
+ * reservation) and owns the loop metadata so the decode below is a pure fill.
+ * The two walks MUST agree on sample positions; any edit to one's loop/stop
+ * logic must land in both.
+ */
+internal int NativeAudio_ScanSpuSampleExtent(u32 addr, u32 loopAddr, int *sampleCount, int *loopStart, int *loopEnd, b32 *loopEnabled)
 {
-	int old = 0;
-	int older = 0;
+	int count = 0;
 	int block;
 	int loopStartSample = 0;
 	int loopEndSample = 0;
@@ -1605,20 +1653,64 @@ internal int NativeAudio_DecodeSpuSample(u32 addr, u32 loopAddr, struct NativeAu
 
 	for (block = (int)addr; block + 16 <= NATIVE_AUDIO_SPU_MEMSIZE; block += 16)
 	{
-		u8 soundParameter = s_audio.spu.memory[block];
 		u8 flags = s_audio.spu.memory[block + 1];
-		int i;
 
 		if ((loopAddr > addr) && (loopAddr == (u32)block))
 		{
-			loopStartSample = pcm->count;
+			loopStartSample = count;
 			hasLoopStart = 1;
 		}
 		else if ((flags & ADPCM_LOOP_START) != 0)
 		{
-			loopStartSample = pcm->count;
+			loopStartSample = count;
 			hasLoopStart = 1;
 		}
+
+		count += XA_SAMPLES_PER_SOUND_UNIT;
+
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+		s_voiceProf.windowScannedBlocks++;
+#endif
+
+		if ((flags & ADPCM_LOOP_END) != 0)
+		{
+			loopEndSample = count;
+			hasLoopEnd = 1;
+			hasRepeat = (flags & ADPCM_REPEAT) != 0;
+			break;
+		}
+	}
+
+	*sampleCount = count;
+	*loopStart = hasLoopStart ? loopStartSample : 0;
+	*loopEnd = hasLoopEnd ? loopEndSample : count;
+	*loopEnabled = (hasLoopEnd && hasRepeat && (*loopEnd > *loopStart));
+	return count > 0;
+}
+
+/*
+ * Pure PCM fill: loop metadata comes from NativeAudio_ScanSpuSampleExtent
+ * (which runs first and sized the buffer exactly), so this only decodes
+ * nibbles and stops at the same ADPCM_LOOP_END the scan stopped at. The
+ * PcmPush bounds check stays as the backstop against the two walks ever
+ * disagreeing.
+ */
+internal int NativeAudio_DecodeSpuSample(u32 addr, struct NativeAudioPcmBuffer *pcm)
+{
+	int old = 0;
+	int older = 0;
+	int block;
+
+	if (addr >= NATIVE_AUDIO_SPU_MEMSIZE)
+	{
+		return 0;
+	}
+
+	for (block = (int)addr; block + 16 <= NATIVE_AUDIO_SPU_MEMSIZE; block += 16)
+	{
+		u8 soundParameter = s_audio.spu.memory[block];
+		u8 flags = s_audio.spu.memory[block + 1];
+		int i;
 
 		for (i = 0; i < 14; i++)
 		{
@@ -1635,16 +1727,10 @@ internal int NativeAudio_DecodeSpuSample(u32 addr, u32 loopAddr, struct NativeAu
 
 		if ((flags & ADPCM_LOOP_END) != 0)
 		{
-			loopEndSample = pcm->count;
-			hasLoopEnd = 1;
-			hasRepeat = (flags & ADPCM_REPEAT) != 0;
 			break;
 		}
 	}
 
-	*loopStart = hasLoopStart ? loopStartSample : 0;
-	*loopEnd = hasLoopEnd ? loopEndSample : pcm->count;
-	*loopEnabled = (hasLoopEnd && hasRepeat && (*loopEnd > *loopStart));
 	return pcm->count > 0;
 }
 
@@ -1697,11 +1783,25 @@ void NativeAudio_ResetVoicePcmArena(void)
 	NativeAudio_UnlockOutput();
 }
 
+/* Defined after NativeAudio_UpdateVoiceSample below (it documents the step-3
+ * build split it exists for); declared here for the reclaim guard's use. */
+internal int NativeAudio_VoiceHasSample(const struct NativeAudioVoice *voice);
+
 internal void NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock(void)
 {
 	int i;
 
-	if (s_audio.voicePcmArena.used == 0)
+	/*
+	 * Was `used == 0`: the arena reset fired the instant nothing was
+	 * sounding -- i.e. precisely the gap BETWEEN sounds -- so every sound
+	 * paid a full re-decode on its next key-on (docs/
+	 * VOICE_START_DECODE_DESIGN.md step 4). Below the high-water mark the
+	 * decoded PCM now survives idle gaps and a re-triggered sound re-keys
+	 * for free; the reset still runs (only ever with no voice live, the
+	 * guard loop below is untouched) once a genuinely large session pushes
+	 * past the mark.
+	 */
+	if (s_audio.voicePcmArena.used <= NATIVE_AUDIO_VOICE_ARENA_RECLAIM_KEEP)
 	{
 		return;
 	}
@@ -1710,7 +1810,7 @@ internal void NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock(void)
 	{
 		struct NativeAudioVoice *voice = &s_audio.voices[i];
 
-		if (voice->active && voice->pcm != NULL && voice->sampleCount > 0 && voice->adsrPhase != NATIVE_AUDIO_ADSR_OFF)
+		if (voice->active && NativeAudio_VoiceHasSample(voice) && voice->sampleCount > 0 && voice->adsrPhase != NATIVE_AUDIO_ADSR_OFF)
 		{
 			return;
 		}
@@ -1719,43 +1819,43 @@ internal void NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock(void)
 	NativeAudio_ResetVoicePcmArenaNoLock(0);
 }
 
-internal int NativeAudio_PrepareVoicePcmBuffer(u32 addr, struct NativeAudioPcmBuffer *pcm, int *markerOut)
+/*
+ * Reserves exactly sampleCount samples -- the count comes from
+ * NativeAudio_ScanSpuSampleExtent, so this no longer books the worst case
+ * from addr to the end of SPU RAM (up to ~1.8 MB per key-on, the multi-MB
+ * malloc+memcpy spike docs/VOICE_START_DECODE_DESIGN.md step 2 removes; the
+ * 128 MiB arena peak in BUGREPORT_audio_arena_growth.md was this mechanism).
+ */
+internal int NativeAudio_PrepareVoicePcmBuffer(int sampleCount, struct NativeAudioPcmBuffer *pcm, int *markerOut)
 {
-	int maxSamples;
-	int maxBytes;
+	int bytes;
 	int marker;
 
-	if (addr >= NATIVE_AUDIO_SPU_MEMSIZE)
+	if ((sampleCount <= 0) || (sampleCount > (INT_MAX / (int)sizeof(s16))))
 	{
 		return 0;
 	}
 
-	maxSamples = ((NATIVE_AUDIO_SPU_MEMSIZE - (int)addr) / 16) * XA_SAMPLES_PER_SOUND_UNIT;
-	if ((maxSamples <= 0) || (maxSamples > (INT_MAX / (int)sizeof(s16))))
-	{
-		return 0;
-	}
-
-	maxBytes = maxSamples * (int)sizeof(s16);
+	bytes = sampleCount * (int)sizeof(s16);
 	marker = NativeAudio_AlignUpInt(s_audio.voicePcmArena.used, NATIVE_AUDIO_ARENA_ALIGN);
-	if ((marker < 0) || (maxBytes > INT_MAX - marker))
+	if ((marker < 0) || (bytes > INT_MAX - marker))
 	{
 		return 0;
 	}
 
-	if (!NativeAudio_VoiceArenaEnsureCapacityNoLock(marker + maxBytes))
+	if (!NativeAudio_VoiceArenaEnsureCapacityNoLock(marker + bytes))
 	{
 		return 0;
 	}
 
-	pcm->samples = (s16 *)NativeAudio_ArenaPush(&s_audio.voicePcmArena, maxBytes, NATIVE_AUDIO_ARENA_ALIGN, markerOut);
+	pcm->samples = (s16 *)NativeAudio_ArenaPush(&s_audio.voicePcmArena, bytes, NATIVE_AUDIO_ARENA_ALIGN, markerOut);
 	if (pcm->samples == NULL)
 	{
 		return 0;
 	}
 
 	pcm->count = 0;
-	pcm->capacity = maxSamples;
+	pcm->capacity = sampleCount;
 	return 1;
 }
 
@@ -1774,16 +1874,51 @@ internal void NativeAudio_WrapVoiceLoop(struct NativeAudioVoice *voice)
 internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 {
 	struct NativeAudioPcmBuffer pcm;
+	int scanCount;
 	int loopStart;
 	int loopEnd;
 	b32 loopEnabled;
 	int arenaMarker = 0;
 
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+	s_voiceProf.windowDecodeCalls++;
+#endif
+
+	/* Metadata first: exact extent + loop points, ~1/28th of a decode. */
+	if (!NativeAudio_ScanSpuSampleExtent(voice->attr.addr, voice->attr.loop_addr, &scanCount, &loopStart, &loopEnd, &loopEnabled))
+	{
+		NativeAudio_FreeVoicePcm(voice);
+		voice->active = 0;
+		voice->sampleDirty = 0;
+		return 0;
+	}
+
+#if CTR_3DS_SKIP_SPU_MIX
+	/*
+	 * Metadata-only fast path (docs/VOICE_START_DECODE_DESIGN.md step 3):
+	 * in the muted build nothing ever reads the decoded PCM --
+	 * NativeAudio_InterpolateVoiceSample is the only consumer and it lives
+	 * inside the #else of the mix gate -- so don't decode it and don't touch
+	 * the arena at all. The lifecycle fields the game actually observes
+	 * (sampleCount + loop points) come from the scan, so voices start, loop
+	 * and finish identically; NativeAudio_VoiceHasSample is the
+	 * pcm-replacing predicate. This block evaporates when ndsp lands.
+	 */
+	(void)pcm;
+	(void)arenaMarker;
+	NativeAudio_FreeVoicePcm(voice);
+	voice->sampleCount = scanCount;
+	voice->loopStart = loopStart;
+	voice->loopEnd = loopEnd;
+	voice->loopEnabled = loopEnabled;
+	voice->sampleDirty = 0;
+	return 1;
+#else
 	memset(&pcm, 0, sizeof(pcm));
-	if (!NativeAudio_PrepareVoicePcmBuffer(voice->attr.addr, &pcm, &arenaMarker))
+	if (!NativeAudio_PrepareVoicePcmBuffer(scanCount, &pcm, &arenaMarker))
 	{
 		NativeAudio_ResetVoicePcmArenaNoLock(1);
-		if (!NativeAudio_PrepareVoicePcmBuffer(voice->attr.addr, &pcm, &arenaMarker))
+		if (!NativeAudio_PrepareVoicePcmBuffer(scanCount, &pcm, &arenaMarker))
 		{
 			NativeAudio_FreeVoicePcm(voice);
 			voice->active = 0;
@@ -1792,7 +1927,7 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 		}
 	}
 
-	if (!NativeAudio_DecodeSpuSample(voice->attr.addr, voice->attr.loop_addr, &pcm, &loopStart, &loopEnd, &loopEnabled))
+	if (!NativeAudio_DecodeSpuSample(voice->attr.addr, &pcm))
 	{
 		NativeAudio_ArenaRewind(&s_audio.voicePcmArena, arenaMarker);
 		NativeAudio_FreeVoicePcm(voice);
@@ -1801,7 +1936,14 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 		return 0;
 	}
 
+	/* Exact reservation makes this a no-op when the scan and the decode
+	 * agree (they walk identical block logic); kept as the backstop. */
 	NativeAudio_ArenaRewind(&s_audio.voicePcmArena, arenaMarker + pcm.count * (int)sizeof(s16));
+
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+	s_voiceProf.windowDecodedSamples += pcm.count;
+#endif
+
 	NativeAudio_FreeVoicePcm(voice);
 	voice->pcm = pcm.samples;
 	voice->sampleCount = pcm.count;
@@ -1810,6 +1952,23 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 	voice->loopEnabled = loopEnabled;
 	voice->sampleDirty = 0;
 	return 1;
+#endif
+}
+
+/*
+ * "Has a decoded sample" predicate for every site that used to test
+ * voice->pcm != NULL. Under CTR_3DS_SKIP_SPU_MIX pcm legitimately stays NULL
+ * (step 3 above never decodes), so voice liveness rides on sampleCount --
+ * which NativeAudio_FreeVoicePcm zeroes alongside pcm on every teardown
+ * path, keeping the two builds' predicates equivalent state-for-state.
+ */
+internal int NativeAudio_VoiceHasSample(const struct NativeAudioVoice *voice)
+{
+#if CTR_3DS_SKIP_SPU_MIX
+	return voice->sampleCount > 0;
+#else
+	return voice->pcm != NULL;
+#endif
 }
 
 // NOTE(aalhendi): Assumes the caller already holds NativeAudio_LockOutput(),
@@ -3381,12 +3540,20 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 			int left;
 			int right;
 
-			if (voice->active && ((voice->pcm == NULL) || voice->sampleDirty) && !NativeAudio_UpdateVoiceSample(voice))
+			if (voice->active && (!NativeAudio_VoiceHasSample(voice) || voice->sampleDirty))
 			{
-				voiceStopped = 1;
+				/* Same predicate as before, restructured from the old
+				 * short-circuit chain so the decode/scan sits alone inside
+				 * the voice-start perf bucket. */
+				NativePerf_BeginScope(NATIVE_PERF_BUCKET_AUDIO_VOICE_START);
+				if (!NativeAudio_UpdateVoiceSample(voice))
+				{
+					voiceStopped = 1;
+				}
+				NativePerf_EndScope(NATIVE_PERF_BUCKET_AUDIO_VOICE_START);
 			}
 
-			if (!voice->active || voice->pcm == NULL || voice->sampleCount <= 0 || voice->adsrPhase == NATIVE_AUDIO_ADSR_OFF)
+			if (!voice->active || !NativeAudio_VoiceHasSample(voice) || voice->sampleCount <= 0 || voice->adsrPhase == NATIVE_AUDIO_ADSR_OFF)
 			{
 				continue;
 			}
@@ -4321,14 +4488,20 @@ void NativeAudio_SpuSetKey(s32 on_off, u32 voice_bit)
 		voice = &s_audio.voices[i];
 		if (on_off && !s_audio.muted)
 		{
-			if ((voice->pcm == NULL) || voice->sampleDirty)
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+			s_voiceProf.windowKeyOns++;
+			s_voiceProf.frameKeyOns++;
+#endif
+			if (!NativeAudio_VoiceHasSample(voice) || voice->sampleDirty)
 			{
+				NativePerf_BeginScope(NATIVE_PERF_BUCKET_AUDIO_VOICE_START);
 				NativeAudio_UpdateVoiceSample(voice);
+				NativePerf_EndScope(NATIVE_PERF_BUCKET_AUDIO_VOICE_START);
 			}
 
 			voice->positionFp = 0;
 			voice->looped = 0;
-			voice->active = voice->pcm != NULL;
+			voice->active = NativeAudio_VoiceHasSample(voice);
 			if (voice->active)
 			{
 				NativeAudio_AdsrKeyOn(voice);
@@ -4756,3 +4929,36 @@ int NativeAudio_GetXAMaxSampleAtOffset(int xaCurrOffset)
 
 	return max;
 }
+
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+/*
+ * Voice-start profile plumbing for native_perf.c (same unity TU; perf
+ * forward-declares both). Consume returns-and-resets the per-frame key-on
+ * count -- called once per frame by the perf frame close for the
+ * worst-frame/key-on correlation. Format emits the whole [PERF-VOICE]
+ * payload and resets the window counters, so the report and the reset can
+ * never drift apart. Integers only: devkitARM newlib does not link float
+ * formatting unless asked, and a silently-blank %f costs a build-and-run
+ * cycle to notice.
+ */
+internal int NativeAudio_DebugConsumeFrameKeyOns(void)
+{
+	int n = s_voiceProf.frameKeyOns;
+
+	s_voiceProf.frameKeyOns = 0;
+	return n;
+}
+
+internal void NativeAudio_DebugFormatVoiceProfWindow(char *buf, int bufSize, int maxFrameUs, int maxFrameKeyOns)
+{
+	snprintf(buf, (size_t)bufSize,
+	         "[PERF-VOICE] keyOns=%d decodeCalls=%d decodedSamples=%d scannedBlocks=%d arenaGrows=%d arenaPeakKiB=%d maxFrameUs=%d maxFrameKeyOns=%d",
+	         s_voiceProf.windowKeyOns, s_voiceProf.windowDecodeCalls, s_voiceProf.windowDecodedSamples, s_voiceProf.windowScannedBlocks,
+	         s_voiceProf.windowArenaGrows, s_voiceProf.arenaPeakKiB, maxFrameUs, maxFrameKeyOns);
+	s_voiceProf.windowKeyOns = 0;
+	s_voiceProf.windowDecodeCalls = 0;
+	s_voiceProf.windowDecodedSamples = 0;
+	s_voiceProf.windowScannedBlocks = 0;
+	s_voiceProf.windowArenaGrows = 0;
+}
+#endif

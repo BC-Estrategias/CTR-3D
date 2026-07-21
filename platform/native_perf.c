@@ -112,6 +112,7 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
     {"audio_vblank_ms", 1},
     {"n3ds_c3d_frame_end_ms", 1},
     {"n3ds_gfx_present_ms", 1},
+    {"audio_voice_start_ms", 1},
 };
 
 global_variable FILE *s_csvFile;
@@ -147,6 +148,21 @@ global_variable u32 s_windowFrames;
 global_variable f64 s_windowTotalMs;
 global_variable f64 s_windowWorkMs;
 global_variable f64 s_windowBucketMs[NATIVE_PERF_BUCKET_COUNT];
+
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+/*
+ * Worst single frame in the window plus the key-on count ON THAT FRAME --
+ * the voice-start correlation test (docs/VOICE_START_DECODE_DESIGN.md).
+ * The window's 64-frame averages smear a one-frame decode spike into
+ * nothing, which is exactly how it went unnoticed; the hypothesis is
+ * confirmed iff worst frames consistently coincide with keyOns > 0 in race
+ * content. Defined in native_audio.c later in this same unity TU.
+ */
+internal int NativeAudio_DebugConsumeFrameKeyOns(void);
+internal void NativeAudio_DebugFormatVoiceProfWindow(char *buf, int bufSize, int maxFrameUs, int maxFrameKeyOns);
+global_variable f64 s_windowMaxTotalMs;
+global_variable int s_windowMaxFrameKeyOns;
+#endif
 
 /*
  * Last reported window, mirrored for the bottom-screen console in
@@ -455,6 +471,16 @@ internal void NativePerf_Report3DSWindow(void)
 		N3DS_DebugLog(out);
 	}
 
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+	/* Separate line, deliberately not appended to `header` -- its 224-byte
+	 * buffer is already nearly full. Counters live in native_audio.c and are
+	 * window-reset inside the format call. */
+	NativeAudio_DebugFormatVoiceProfWindow(out, (int)sizeof(out), (int)(s_windowMaxTotalMs * 1000.0), s_windowMaxFrameKeyOns);
+	N3DS_DebugLog(out);
+	s_windowMaxTotalMs = 0.0;
+	s_windowMaxFrameKeyOns = 0;
+#endif
+
 	s_windowFrames = 0;
 	s_windowTotalMs = 0.0;
 	s_windowWorkMs = 0.0;
@@ -728,6 +754,21 @@ void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 	{
 		s_windowBucketMs[bucket] += s_frameBucketMs[bucket];
 	}
+
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+	{
+		/* Consumed (and so reset) EVERY frame, not just on a new max --
+		 * otherwise key-ons accumulate across frames and the correlation
+		 * reads spuriously high. */
+		int frameKeyOns = NativeAudio_DebugConsumeFrameKeyOns();
+
+		if (totalMs > s_windowMaxTotalMs)
+		{
+			s_windowMaxTotalMs = totalMs;
+			s_windowMaxFrameKeyOns = frameKeyOns;
+		}
+	}
+#endif
 
 	if (s_windowFrames >= NATIVE_PERF_3DS_REPORT_FRAMES)
 	{
