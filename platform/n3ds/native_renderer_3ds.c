@@ -476,10 +476,12 @@ global_variable u32 s_droppedRuns = 0;
  * fragment shader's v_page_clut derivation (native_renderer.c:613-616)
  * reduces to the same formula. CLUT origin is ((clut & 0x3F) * 16,
  * clut >> 6), same as the GET_CLUT_X/GET_CLUT_Y macros (native_gpu.c:43-44).
- * u/v (0-255) are native-texel coordinates within the page, already
- * format-aware as authored by the game (4bpp uses the full 0-255 range,
- * 8bpp only 0-127, 16bpp only 0-63) -- decoding a fixed 256x256 regardless
- * of format just leaves the unaddressed columns unused, never sampled.
+ * u/v (0-255) are native-texel coordinates within the page. A page is 256
+ * TEXELS wide in every colour mode -- 8bpp spans two tpage columns of VRAM
+ * words, 16bpp four. (An earlier revision claimed 8bpp could only address
+ * u=0..127, conflating VRAM-word width with texel width, and under-decoded
+ * every wide 8/16bpp texture -- fixed session 13; see the decodeWidth
+ * comment at the full-page call site.)
  *
  * Alpha is the same 3-level encoding NativeRenderer_InitRG8LUT's channel
  * expansion feeds the PC shader (native_renderer.c:828-843): 0 = PS1
@@ -1611,11 +1613,14 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 			 * dedicated, non-atlas s_vramDisplayTex directly in [0,1]
 			 * (N3DS_C3DBindVramDisplayTex -- no atlas-cell offset involved),
 			 * so what has to reach the shader is the corner's normalized UV
-			 * pre-multiplied back up by 1024. Exact, not approximated:
-			 * maxChunk (N3DS_VRAM_DISPLAY_TEX_DIM, 256) divides 1024 evenly.
+			 * pre-multiplied back up by the shader's texcoord denominator --
+			 * 2048 since the half-texel numerator change (the atlas path
+			 * carries 2*texel-1; this edge-normalized [0,1] quad just doubles
+			 * its numerators to keep the same normalized value, no bias).
+			 * Exact, not approximated: maxChunk (256) divides 2048 evenly.
 			 */
-			const s16 u1 = (s16)(chunkW * (1024 / maxChunk));
-			const s16 v1 = (s16)(chunkH * (1024 / maxChunk));
+			const s16 u1 = (s16)(chunkW * (2048 / maxChunk));
+			const s16 v1 = (s16)(chunkH * (2048 / maxChunk));
 			/* Which pool texture this chunk uploads to and draws from. Must
 			 * be distinct per chunk within this call -- see the header
 			 * comment on N3DS_C3DUploadVramDisplayChunk for why reusing one
@@ -2058,15 +2063,30 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			 * moved into the shader (ctr.v.pica's texcoordScale, design doc
 			 * finding 2, Option A) instead of done here. Do NOT divide here
 			 * too -- that would double-scale every UV. */
+			/*
+			 * HALF-texel numerators: 2*texel - 1, scaled by 1/2048 in the
+			 * shader, so the GPU samples at (texel - 0.5) -- reproducing the
+			 * PC parity target's half-texel-center correction exactly
+			 * (native_renderer.c: every textured primitive carries
+			 * tcx=tcy=-1, applied as v_texcoord += a_extra.xy*0.5, then the
+			 * PSX samplers floor the interpolated result). Session 15: the
+			 * capture-verified atlas was byte-perfect while the screen showed
+			 * pervasive per-pixel noise -- because without this bias every
+			 * fragment whose interpolated UV fraction fell below .5 floored
+			 * to the neighbouring texel (~half of all textured pixels; on
+			 * 4bpp palette art a neighbour texel is an arbitrary colour), and
+			 * far-edge UVs (u=64/256 at a tile boundary) floored into the
+			 * NEIGHBOURING atlas cell -- a different texture entirely.
+			 */
 			if (untextured)
 			{
-				dst->u = (s16)(cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2));
-				dst->v = (s16)(cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2));
+				dst->u = (s16)(((cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) - 1);
+				dst->v = (s16)(((cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) - 1);
 			}
 			else
 			{
-				dst->u = (s16)(pixelBaseU + ((int)src->u - originU));
-				dst->v = (s16)(pixelBaseV + ((int)src->v - originV));
+				dst->u = (s16)(((pixelBaseU + ((int)src->u - originU)) << 1) - 1);
+				dst->v = (s16)(((pixelBaseV + ((int)src->v - originV)) << 1) - 1);
 			}
 
 			/* Raw u8 copy, no scale -- the *1/255 reciprocal-multiply that
@@ -2098,3 +2118,111 @@ void NativeRenderer_PushDebugLabel(const char *label)
 void NativeRenderer_PopDebugLabel(void)
 {
 }
+
+#ifdef CTR_INTERNAL
+/*
+ * Little-endian u32 field writer for the cachemeta dump below. ARM11 and the
+ * x86 host are both little-endian, but serializing field-by-field through an
+ * explicit byte view keeps the on-disk format independent of struct padding
+ * and enum width -- TexFormat is 4 bytes in this TU and 1 byte in the backend
+ * TU (-fshort-enums), so a raw struct fwrite is exactly the ABI trap the
+ * unity-build notes warn about. Never let it near a file format.
+ */
+internal void N3DS_MetaWriteU32(FILE *f, u32 v)
+{
+	u8 b[4];
+
+	b[0] = (u8)(v & 0xFFu);
+	b[1] = (u8)((v >> 8) & 0xFFu);
+	b[2] = (u8)((v >> 16) & 0xFFu);
+	b[3] = (u8)((v >> 24) & 0xFFu);
+	fwrite(b, 1, 4, f);
+}
+
+/*
+ * Dumps both decode-cache tiers' metadata + the VRAM dirty-cell generation
+ * grid to sdmc:/cachemeta.bin, for the offline cell-by-cell verification loop
+ * (tools/texdump/cache_verify.py). Captured alongside the VRAM + atlas dumps
+ * so all three describe the same instant: every `used` entry's atlas bytes
+ * were uploaded synchronously before the entry was stamped, so entry+atlas
+ * are consistent per-cell at any capture point.
+ *
+ * Format (all fields little-endian u32; page/clut widened via u16 so tpage
+ * attribute bits above the page index survive unsigned):
+ *   magic 'CTCM', version, frameCounter,
+ *   FULLPAGE_RESERVED_CELLS, SUBPAGE_TOTAL_CELLS, SUBPAGE_PHYSICAL_BASE,
+ *   ATLAS_COUNT, ATLAS_DIM, DECODE_TEXTURE_DIM, SUBPAGE_DIM,
+ *   VRAM_CELL_DIM, VRAM_CELL_COLS, VRAM_CELL_ROWS, vramDirtyBumps,
+ *   vramCellGen[COLS*ROWS],
+ *   fullpage entries [0 .. FULLPAGE_RESERVED_CELLS]:
+ *       used, page, clut, format, pageGen, clutGenA, clutGenB, lastUsedFrame
+ *   subpage entries [0 .. SUBPAGE_TOTAL_CELLS):
+ *       used, page, clut, format, tileX, tileY, pageGen, clutGenA, clutGenB,
+ *       lastUsedFrame
+ */
+void NativeRenderer3DS_DebugDumpCacheMeta(void)
+{
+	FILE *f;
+	int i;
+
+	f = fopen("sdmc:/cachemeta.bin", "wb");
+	if (f == NULL)
+	{
+		N3DS_DebugLog("[CTR-3DS] cachemeta dump FAILED: fopen sdmc:/cachemeta.bin");
+		return;
+	}
+
+	N3DS_MetaWriteU32(f, 0x4D435443u); /* 'CTCM' little-endian */
+	N3DS_MetaWriteU32(f, 1u);
+	N3DS_MetaWriteU32(f, s_frameCounter);
+	N3DS_MetaWriteU32(f, (u32)N3DS_FULLPAGE_RESERVED_CELLS);
+	N3DS_MetaWriteU32(f, (u32)N3DS_SUBPAGE_TOTAL_CELLS);
+	N3DS_MetaWriteU32(f, (u32)N3DS_SUBPAGE_PHYSICAL_BASE);
+	N3DS_MetaWriteU32(f, (u32)N3DS_ATLAS_COUNT);
+	N3DS_MetaWriteU32(f, (u32)N3DS_ATLAS_DIM);
+	N3DS_MetaWriteU32(f, (u32)N3DS_DECODE_TEXTURE_DIM);
+	N3DS_MetaWriteU32(f, (u32)N3DS_SUBPAGE_DIM);
+	N3DS_MetaWriteU32(f, (u32)N3DS_VRAM_CELL_DIM);
+	N3DS_MetaWriteU32(f, (u32)N3DS_VRAM_CELL_COLS);
+	N3DS_MetaWriteU32(f, (u32)N3DS_VRAM_CELL_ROWS);
+	N3DS_MetaWriteU32(f, s_vramDirtyBumps);
+
+	for (i = 0; i < (N3DS_VRAM_CELL_ROWS * N3DS_VRAM_CELL_COLS); i++)
+	{
+		N3DS_MetaWriteU32(f, s_vramCellGen[i]);
+	}
+
+	for (i = 0; i < (1 + N3DS_FULLPAGE_RESERVED_CELLS); i++)
+	{
+		const N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
+
+		N3DS_MetaWriteU32(f, (u32)e->used);
+		N3DS_MetaWriteU32(f, (u32)(u16)e->page);
+		N3DS_MetaWriteU32(f, (u32)(u16)e->clut);
+		N3DS_MetaWriteU32(f, (u32)e->format);
+		N3DS_MetaWriteU32(f, e->pageGen);
+		N3DS_MetaWriteU32(f, e->clutGenA);
+		N3DS_MetaWriteU32(f, e->clutGenB);
+		N3DS_MetaWriteU32(f, e->lastUsedFrame);
+	}
+
+	for (i = 0; i < N3DS_SUBPAGE_TOTAL_CELLS; i++)
+	{
+		const N3DS_SubPageCacheEntry *e = &s_subPageCache[i];
+
+		N3DS_MetaWriteU32(f, (u32)e->used);
+		N3DS_MetaWriteU32(f, (u32)(u16)e->page);
+		N3DS_MetaWriteU32(f, (u32)(u16)e->clut);
+		N3DS_MetaWriteU32(f, (u32)e->format);
+		N3DS_MetaWriteU32(f, (u32)e->tileX);
+		N3DS_MetaWriteU32(f, (u32)e->tileY);
+		N3DS_MetaWriteU32(f, e->pageGen);
+		N3DS_MetaWriteU32(f, e->clutGenA);
+		N3DS_MetaWriteU32(f, e->clutGenB);
+		N3DS_MetaWriteU32(f, e->lastUsedFrame);
+	}
+
+	fclose(f);
+	N3DS_DebugLog("[CTR-3DS] cachemeta dumped to sdmc:/cachemeta.bin");
+}
+#endif

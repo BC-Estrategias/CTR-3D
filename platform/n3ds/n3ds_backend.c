@@ -723,6 +723,21 @@ void N3DS_C3DBindVramDisplayTex(int slotIndex)
 
 #ifdef CTR_INTERNAL
 extern int g_dbg_texturelessMode;
+/* Defined in the unity TU (native_renderer_3ds.c) -- the cache arrays live
+ * there and this TU can't see them (deliberate TU split, see the file
+ * header). void(void), so no ABI hazard across the enum-width boundary. */
+void NativeRenderer3DS_DebugDumpCacheMeta(void);
+
+/* Runs the full SELECT+R capture set: emulated VRAM, every atlas's raw
+ * storage, and both decode-cache tiers' metadata, all describing the same
+ * instant. One entry point so the button gesture and the host-side file
+ * trigger below can never drift apart in what they capture. */
+static void N3DS_DebugCaptureAll(void)
+{
+	N3DS_DebugWriteVRAMDump();
+	N3DS_DebugWriteAtlasDump();
+	NativeRenderer3DS_DebugDumpCacheMeta();
+}
 #endif
 
 unsigned int N3DS_ReadButtons(void)
@@ -742,8 +757,30 @@ unsigned int N3DS_ReadButtons(void)
 	 * textureless toggle so the two never fire on the same frame. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_R))
 	{
-		N3DS_DebugWriteVRAMDump();
-		N3DS_DebugWriteAtlasDump();
+		N3DS_DebugCaptureAll();
+	}
+
+	/* Host-scriptable capture trigger (2026-07-21): Azahar's SD card is a
+	 * plain host folder, so an autonomous session can request the SELECT+R
+	 * capture by creating sdmc:/dumpreq.txt -- no window focus or key
+	 * injection involved. Polled every 64 frames so the SD probe cost stays
+	 * negligible on real hardware; the request file is deleted before dumping
+	 * so one request fires exactly once. */
+	{
+		static unsigned int s_dumpPollCountdown = 64;
+
+		if (--s_dumpPollCountdown == 0)
+		{
+			FILE *req = fopen("sdmc:/dumpreq.txt", "rb");
+
+			s_dumpPollCountdown = 64;
+			if (req != NULL)
+			{
+				fclose(req);
+				remove("sdmc:/dumpreq.txt");
+				N3DS_DebugCaptureAll();
+			}
+		}
 	}
 
 	/* SELECT, not ZL: ZL already changes camera angle in CTR's own controls

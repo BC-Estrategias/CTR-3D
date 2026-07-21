@@ -21,7 +21,14 @@
 .alias  zeros constants.xxxx
 .alias  ones  constants.yyyy
 
-.constf vertexScale(0.0009765625, 0.0039215686, 0.0, 0.0) ; 1/1024, 1/255
+; texcoordScale is 1/2048, NOT 1/N3DS_ATLAS_DIM: vertex UVs arrive as
+; HALF-texel numerators (2*texel - 1, see DrawTriangles) so the sampled
+; coordinate is texel - 0.5 -- the PC parity target's own half-texel-center
+; correction (native_renderer.c: v_texcoord += a_extra.xy*0.5 with tcx/tcy
+; always -1, then floor at sample time). Without it every fragment whose
+; interpolated UV fraction lands below .5 resolves one texel off (~half of
+; all textured pixels -- the pervasive per-pixel "static", session 15).
+.constf vertexScale(0.00048828125, 0.0039215686, 0.0, 0.0) ; 1/2048, 1/255
 .alias  texcoordScale vertexScale.xxxx
 .alias  colorScale    vertexScale.yyyy
 
