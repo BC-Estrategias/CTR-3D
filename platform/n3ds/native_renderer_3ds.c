@@ -419,6 +419,26 @@ global_variable u32 s_trianglesRoutedFullPage = 0;
  * draw calls than PC" risk directly; measured ~150-290/frame before the
  * atlas rework above, which is what motivated it. */
 global_variable u32 s_drawCallCount = 0;
+
+/*
+ * Draw-call structure counters (session 15 perf survey). Session 14's first
+ * real-hardware race put the frame-end GPU wait (platform_end_frame_ms,
+ * 231-257ms of a ~350ms frame) on top with ~383 draws/frame, and real-PICA
+ * per-draw overhead far exceeds Azahar's -- so draws/frame is the one
+ * Azahar-measurable number that transfers. These split it into its
+ * mechanisms: s_atlasSwitchFlushes counts run flushes forced by an ATLAS
+ * CHANGE between consecutive triangles mid-split (the potentially reducible
+ * kind -- cell-to-atlas allocation affinity could shrink them; submission
+ * order itself must never change, layering depends on it);
+ * s_distinctAtlasTotal accumulates each frame's popcount of distinct atlases
+ * actually bound (the switching floor for the frame's content as allocated).
+ */
+global_variable u32 s_atlasSwitchFlushes = 0;
+global_variable u32 s_frameAtlasMask = 0;
+global_variable u32 s_distinctAtlasTotal = 0;
+global_variable u32 s_frameDistinctAtlasPeak = 0;
+global_variable u32 s_lastStatAtlasSwitchFlushes = 0;
+global_variable u32 s_lastStatDistinctAtlasTotal = 0;
 /* Reached only through DrawAllSplits, so uvb==0 means the OT walk never ran at
  * all, rather than DrawTriangles running and bailing. See the stats block. */
 global_variable u32 s_updateVertexBufferCalls = 0;
@@ -985,6 +1005,7 @@ internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 	N3DS_C3DBindAtlas(atlasIndex);
 	N3DS_C3DDrawTriangles(baseVertex, vertCount / 3);
 	s_drawCallCount++;
+	s_frameAtlasMask |= (1u << (atlasIndex & 31));
 }
 
 /* This codebase has no 3-way min/max anywhere -- native_libgte.c's
@@ -1172,6 +1193,18 @@ void NativeRenderer_BeginScene(void)
 		s_subPageFrameTouchedPeak = s_subPageFrameTouchedCells;
 	}
 	s_subPageFrameTouchedCells = 0;
+
+	/* Distinct-atlas-per-frame latch (see the counter block's header). */
+	{
+		u32 distinct = (u32)__builtin_popcount(s_frameAtlasMask);
+
+		s_distinctAtlasTotal += distinct;
+		if (distinct > s_frameDistinctAtlasPeak)
+		{
+			s_frameDistinctAtlasPeak = distinct;
+		}
+		s_frameAtlasMask = 0;
+	}
 
 	/*
 	 * Fit the game's own display area to the panel, cropped to the PSX's
@@ -1379,6 +1412,23 @@ void NativeRenderer_SwapWindow(void)
 
 			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] hazard evictInUse=%lu", (unsigned long)s_evictHazards);
 			N3DS_DebugLog(cacheLine);
+
+			/* Draw-call structure: window deltas (32-frame window, so /32 for
+			 * per-frame; x10 for one decimal without floats). See the counter
+			 * block's header for what each mechanism means. */
+			{
+				const unsigned long switchWindow = (unsigned long)(s_atlasSwitchFlushes - s_lastStatAtlasSwitchFlushes);
+				const unsigned long distinctWindow = (unsigned long)(s_distinctAtlasTotal - s_lastStatDistinctAtlasTotal);
+
+				s_lastStatAtlasSwitchFlushes = s_atlasSwitchFlushes;
+				s_lastStatDistinctAtlasTotal = s_distinctAtlasTotal;
+
+				snprintf(cacheLine, sizeof(cacheLine),
+				         "[CTR-3DS] batch atlasSwitchX10=%lu/frame distinctAtlasX10=%lu/frame distinctPeak=%lu dtriCallsTotal=%lu",
+				         (switchWindow * 10UL) / 32UL, (distinctWindow * 10UL) / 32UL,
+				         (unsigned long)s_frameDistinctAtlasPeak, (unsigned long)s_drawTrianglesCalls);
+				N3DS_DebugLog(cacheLine);
+			}
 
 			/*
 			 * Sub-page tier diagnostics -- mirrors the full-page block just
@@ -2030,6 +2080,13 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 
 		if ((atlasIdx != currentAtlas) || ((vertsInRun + 3) > N3DS_MAX_RUN_VERTICES))
 		{
+			/* Attribute the flush: only a MID-RUN atlas change is the
+			 * potentially-reducible kind (vertsInRun > 0 excludes the first
+			 * triangle's currentAtlas==-1 bootstrap, which flushes nothing). */
+			if ((atlasIdx != currentAtlas) && (vertsInRun > 0))
+			{
+				s_atlasSwitchFlushes++;
+			}
 			N3DS_FlushRun(currentAtlas, vertsInRun);
 			currentAtlas = atlasIdx;
 			vertsInRun = 0;
