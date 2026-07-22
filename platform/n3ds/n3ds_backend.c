@@ -94,6 +94,13 @@ void N3DS_EarlyInit(void)
 	consoleDebugInit(debugDevice_SVC);
 
 	s_logFile = fopen(N3DS_LOG_PATH, "w");
+	if (s_logFile != NULL)
+	{
+		/* 16KB stdio buffer: at the stats block's ~2-3KB/s the default ~1KB
+		 * buffer would auto-flush (an SD stall) mid-window anyway, defeating
+		 * the timed flush in N3DS_DebugLog. */
+		setvbuf(s_logFile, NULL, _IOFBF, 16384);
+	}
 
 	N3DS_NetloadStreamInit();
 	if (s_netloadStreamActive)
@@ -101,6 +108,13 @@ void N3DS_EarlyInit(void)
 		N3DS_DebugLog("[CTR-3DS] netload stderr stream connected");
 	}
 }
+
+/* Last SD-log flush, in system ticks. Per-LINE fflush stalled gameplay
+ * visibly on hardware: each flush pays FAT + card latency (tens of ms), and
+ * the stats window emits ~15 lines back-to-back, so every window froze the
+ * frame for a beat (owner-reported, session 18 -- invisible in Azahar, whose
+ * sdmc is a host folder with free flushes). */
+static u64 s_logLastFlushTick = 0;
 
 void N3DS_DebugLog(const char *msg)
 {
@@ -121,7 +135,19 @@ void N3DS_DebugLog(const char *msg)
 	{
 		fputs(msg, s_logFile);
 		fputc('\n', s_logFile);
-		fflush(s_logFile);
+		/* Flush at most every ~2s. The SD file is the post-hoc trail and
+		 * tolerates a bounded tail loss on a hard crash -- the live trails
+		 * (netload stderr stream, svcOutputDebugString) still carry every
+		 * line the instant it happens. */
+		{
+			const u64 now = svcGetSystemTick();
+
+			if ((now - s_logLastFlushTick) > (SYSCLOCK_ARM11 * 2ull))
+			{
+				fflush(s_logFile);
+				s_logLastFlushTick = now;
+			}
+		}
 	}
 }
 
