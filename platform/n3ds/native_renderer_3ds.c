@@ -153,15 +153,16 @@ global_variable TexFormat s_currentTexFormat = TF_16_BIT;
  * BlendMode value; s_semiTransPass is PC's two-pass shader STP split
  * (0 = normal, 1 = opaque-texels-only pass, 2 = STP-texels-only pass).
  *
- * WHOLE-PRIM first cut (session 17): this renderer blends every texel of a
- * semi-transparent prim -- the decode cache's RGBA5551 alpha is 1-bit
- * punch-through only, so the per-texel STP bit that passes 1/2 discriminate
- * on does not exist GPU-side yet (see N3DS_TILE_BYTES in n3ds_backend.c:
- * recovering it needs a format decision, RGBA4444 3-level alpha vs RGBA8).
- * So: pass 1 draws NOTHING here (its texels are instead covered by pass 2),
- * and pass 2 blends the whole prim. Right for the common all-STP content
- * (exhaust smoke, waterfalls, HUD backdrops); slightly wrong for prims
- * mixing opaque and STP texels, which render fully blended.
+ * PER-TEXEL STP (session 18, replacing session 17's whole-prim first cut):
+ * PC discriminates the passes per-texel in its shader; the PICA has no
+ * fragment shader, so the pass split is baked into the decode cache
+ * instead -- s_semiTransPass selects which N3DS_TexView a triangle's
+ * texture resolves through (0->OPAQUE, 1->PASS1, 2->PASS2; see the
+ * N3DS_TexView comment for the predicates). Pass 1 arrives with BM_NONE
+ * (opaque draw of non-STP texels), pass 2 with the split's ABR mode
+ * (blend of STP texels); the alpha test is the same GEQUAL-1 in every
+ * pass. Fixes mixed-texel elements (wooden track arrows, tires,
+ * character-select portraits) rendering wholly translucent.
  */
 global_variable int s_currentBlendMode = 0; /* BM_NONE */
 global_variable int s_semiTransPass = 0;
@@ -326,6 +327,15 @@ internal void N3DS_DirtyVRAMRect(int x, int y, int w, int h)
  * PS1 mask bit) there, but the pause/wipe consumers draw the result as plain
  * opaque textures, so the mask bit carries nothing for this path.
  *
+ * TWO armed slots, not one (session 17 hardware finding): CTR double-buffers
+ * the display, so EndScene's arm alternates between the two buffers' rects
+ * (y=0 / y=296) -- and the pause BG samples the buffer armed the frame
+ * BEFORE the most recent arm. A single most-recent rect therefore misses
+ * every pause-era read (measured: a real hardware pause produced ZERO
+ * refreshes and an amber stale-mirror background). Arms update the slot
+ * with a matching rect anchor, or evict the older slot for a new rect;
+ * consumers overlap-test both slots and refresh each stale one they touch.
+ *
  * Pause loops re-sample the region every frame while re-arming it every
  * frame, so the refreshed content feeds back through the renderer (as it
  * does on PS1, where the region IS the framebuffer). Two properties keep
@@ -335,7 +345,18 @@ internal void N3DS_DirtyVRAMRect(int x, int y, int w, int h)
  * if column drift ever shows up in a long pause, the follow-up is
  * freeze-until-rect-changes, not bilinear.
  */
-global_variable int s_fbStoreX, s_fbStoreY, s_fbStoreW, s_fbStoreH;
+typedef struct
+{
+	int x, y, w, h;
+	int stale;
+} N3DS_FBStoreSlot;
+
+global_variable N3DS_FBStoreSlot s_fbStore[2];
+/* Which slot the most recent arm landed in; a new, third distinct rect
+ * evicts the OTHER (older) slot. */
+global_variable int s_fbStoreLastArmed = 0;
+/* Any-slot gate so the per-triangle decode path pays one load when nothing
+ * is armed. Kept in sync by arm/refresh/discard below. */
 global_variable int s_fbMirrorStale = 0;
 /* Refresh count, surfaced via a rate-limited log line (below): expected 0
  * during normal play, small during pauses/wipes. A large steady number means
@@ -347,21 +368,16 @@ global_variable u32 s_fbMirrorRefreshes = 0;
 #define N3DS_FB_COPY_MAX_H 256
 global_variable u8 s_fbCopyScratch[N3DS_FB_COPY_MAX_W * N3DS_FB_COPY_MAX_H * 3];
 
-internal int N3DS_FBStoreOverlaps(int x, int y, int w, int h)
+internal void N3DS_RefreshFramebufferMirrorSlot(N3DS_FBStoreSlot *slot)
 {
-	return s_fbMirrorStale && (x < (s_fbStoreX + s_fbStoreW)) && ((x + w) > s_fbStoreX) && (y < (s_fbStoreY + s_fbStoreH)) &&
-	       ((y + h) > s_fbStoreY);
-}
-
-internal void N3DS_RefreshFramebufferMirror(void)
-{
-	int x = s_fbStoreX, y = s_fbStoreY, w = s_fbStoreW, h = s_fbStoreH;
+	int x = slot->x, y = slot->y, w = slot->w, h = slot->h;
 	int row, col;
 
 	/* Cleared even if the copy fails below: StoreFrameBuffer re-arms every
 	 * EndScene, so a failed attempt retries next frame instead of looping
 	 * on every consumer this frame. */
-	s_fbMirrorStale = 0;
+	slot->stale = 0;
+	s_fbMirrorStale = s_fbStore[0].stale || s_fbStore[1].stale;
 
 	if (w > N3DS_FB_COPY_MAX_W) { w = N3DS_FB_COPY_MAX_W; }
 	if (h > N3DS_FB_COPY_MAX_H) { h = N3DS_FB_COPY_MAX_H; }
@@ -439,12 +455,59 @@ internal void N3DS_RefreshFramebufferMirror(void)
 	}
 }
 
+/* Overlap-test the read rect against BOTH armed slots and refresh each stale
+ * slot it touches (see the two-slot rationale in the block comment above).
+ * All three freeze-frame consumers funnel through here. */
+internal void N3DS_FBRefreshIfOverlaps(int x, int y, int w, int h)
+{
+	int i;
+
+	for (i = 0; i < 2; i++)
+	{
+		N3DS_FBStoreSlot *slot = &s_fbStore[i];
+
+		if (slot->stale && (x < (slot->x + slot->w)) && ((x + w) > slot->x) && (y < (slot->y + slot->h)) && ((y + h) > slot->y))
+		{
+			N3DS_RefreshFramebufferMirrorSlot(slot);
+		}
+	}
+}
+
+/*
+ * Which per-texel visibility predicate a decoded cell was built with -- the
+ * per-texel STP mechanism (session 18). RGBA5551 has ONE alpha bit, but PS1
+ * semi-transparent textured prims need THREE distinct texel-visibility views
+ * (PC discriminates them in its shader, discardForSemiTransPass -- the
+ * predicates below are that function's, verbatim):
+ *
+ *   OPAQUE: ABE=0 draws. Every non-zero texel visible; 0x0000 punch-through.
+ *   PASS1:  semi-trans pass 1 (drawn with blending OFF). Only non-STP texels
+ *           visible -- the opaque body of mixed-texel elements (wooden track
+ *           arrows, tires, character portraits).
+ *   PASS2:  semi-trans pass 2 (blended). Only STP-bit texels visible
+ *           (0x8000 semi-transparent black included, exactly as PS1).
+ *
+ * PASS1|PASS2 partition OPAQUE, so one prim drawn twice composes the full
+ * PS1 result. The view is part of the cache key: a texture drawn only one
+ * way materializes one cell (the overwhelmingly common case); mixed usage
+ * lazily materializes what its draws actually request. Chosen over RGBA4444
+ * (a global 5->4-bit color loss to fix a small element set) and RGBA8
+ * (doubles atlas memory, doesn't fit) -- session 17 status note.
+ */
+typedef enum
+{
+	N3DS_TEXVIEW_OPAQUE = 0,
+	N3DS_TEXVIEW_PASS1  = 1,
+	N3DS_TEXVIEW_PASS2  = 2,
+} N3DS_TexView;
+
 typedef struct
 {
 	int used;         /* 0 = empty cell, never decoded into */
 	s16 page;
 	s16 clut;
 	TexFormat format;
+	u8 view;           /* N3DS_TexView the cell was decoded under (cache key) */
 	u32 pageGen;
 	u32 clutGenA;
 	u32 clutGenB;      /* == clutGenA when the CLUT doesn't straddle two VRAM cells */
@@ -531,6 +594,7 @@ typedef struct
 	s16 page;
 	s16 clut;
 	TexFormat format;
+	u8 view;          /* N3DS_TexView, same key role as the full-page tier */
 	u8 tileX, tileY;
 	u32 pageGen;
 	u32 clutGenA, clutGenB;
@@ -543,6 +607,74 @@ global_variable N3DS_SubPageCacheEntry s_subPageCache[N3DS_SUBPAGE_TOTAL_CELLS];
  * can't double as the "no memo" sentinel the way it implicitly does not for
  * s_lastCellHit either (that one guards with `> 0`, this one with `>= 0`). */
 global_variable int s_lastSubPageCellHit = -1;
+
+/*
+ * Hash index over each tier's entry array (session 18). Hardware measured
+ * resolve at ~36us/triangle -- ~85% of DrawTriangles and ~half the frame --
+ * and nearly all of it is the linear key scans below: the one-entry memo
+ * only catches same-texture runs, and race content alternates textures and
+ * sub-page tiles constantly. Each table maps key-hash -> the cell LAST KNOWN
+ * to hold that key. A probe re-verifies the FULL key + freshness before
+ * trusting the bucket, so a stale bucket (evicted cell, colliding key) is
+ * never wrong, only slow: it falls through to the linear scan, which repairs
+ * the bucket on any fresh find or new decode. The entry arrays stay the only
+ * ground truth; the index needs no invalidation anywhere -- eviction,
+ * VRAM dirtying, and NativeRenderer3DS_DebugInvalidateCaches all leave
+ * buckets pointing at entries the probe's own checks reject.
+ *
+ * Sizes: load factor <= ~0.5 against each tier's live-entry bound
+ * (97 full-page entries / 256 buckets, 1520 sub-page / 4096). s16 buckets,
+ * -1 = never written (only meaningful for the sub-page table, where cell 0
+ * is a real slot; the full-page probe also rejects cand 0 = white cell).
+ */
+#define N3DS_FULLPAGE_HASH_SIZE 256
+#define N3DS_SUBPAGE_HASH_SIZE  4096
+
+/*
+ * Atlas allocation affinity (session 18). Race content keeps all 12 atlases
+ * live with ~190 mid-run atlas-switch flushes/frame (s17 hardware) -- every
+ * switch is a draw-call boundary, and PICA per-draw overhead is the
+ * frame-end wait's main feeder. When a miss must pick a victim cell, prefer
+ * one in the atlas the CURRENT pending run is bound to: the just-decoded
+ * texture then extends the open run instead of breaking it (an immediately
+ * saved switch), and over frames co-drawn content migrates into shared
+ * atlases. The preference only fires when the same-atlas victim hasn't been
+ * used for at least this many frames -- affinity must never evict the live
+ * working set (that is thrash, which costs far more than a switch saves).
+ */
+#define N3DS_ATLAS_AFFINITY_MIN_AGE 2
+/* Placements the preference actually redirected (vs the global-LRU pick),
+ * per tier -- proves the mechanism fires without a hardware A/B. */
+global_variable u32 s_fullPageAffinityPlacements = 0;
+global_variable u32 s_subPageAffinityPlacements = 0;
+global_variable s16 s_fullPageHashIdx[N3DS_FULLPAGE_HASH_SIZE];
+global_variable s16 s_subPageHashIdx[N3DS_SUBPAGE_HASH_SIZE];
+/* Probe outcomes, windowed in the stats block: probe hits should carry the
+ * overwhelming share of lookups once warm; scan fallbacks that FIND a fresh
+ * entry (s_*HashRepairs) mean bucket collisions/recycling, and their rate
+ * bounds how much scan cost the index failed to remove. */
+global_variable u32 s_fullPageHashHits = 0;
+global_variable u32 s_fullPageHashRepairs = 0;
+global_variable u32 s_subPageHashHits = 0;
+global_variable u32 s_subPageHashRepairs = 0;
+global_variable u32 s_lastStatFullPageHashHits = 0;
+global_variable u32 s_lastStatSubPageHashHits = 0;
+
+internal u32 N3DS_TexKeyHash(s16 page, s16 clut, TexFormat format, N3DS_TexView view, int tileX, int tileY)
+{
+	/* Knuth/Murmur-style odd-constant multiplies. format/view/tile occupy
+	 * distinct low nibbles BEFORE the final multiply so the multiply+shift
+	 * spreads them across the whole word -- a tile bit parked above the
+	 * bucket mask would otherwise make vertical neighbour tiles of one page
+	 * permanent collision partners. */
+	u32 h = ((u32)(u16)page) * 0x9E3779B1u;
+
+	h ^= ((u32)(u16)clut) * 0x85EBCA77u;
+	h ^= ((u32)format) ^ ((u32)view << 4) ^ ((u32)tileX << 8) ^ ((u32)tileY << 12);
+	h *= 0x9E3779B1u;
+	h ^= h >> 16;
+	return h;
+}
 
 /* Sub-page counterpart to N3DS_CellIndexToAtlasCoord -- reuses it unchanged,
  * offset into the physical-cell range the sub-page tier owns, then further
@@ -755,12 +887,11 @@ global_variable u32 s_droppedRuns = 0;
  * every wide 8/16bpp texture -- fixed session 13; see the decodeWidth
  * comment at the full-page call site.)
  *
- * Alpha is the same 3-level encoding NativeRenderer_InitRG8LUT's channel
- * expansion feeds the PC shader (native_renderer.c:828-843): 0 = PS1
- * punch-through (raw value 0x0000), 128 = opaque, 255 = STP-on. Phase 2a
- * only consumes the 0-vs-nonzero distinction (single alpha test, see
- * n3ds_backend.c); the 128/255 split is decoded now so 2b's STP 2-pass
- * doesn't need to touch this function at all.
+ * Alpha is ONE bit (RGBA5551), so the caller picks WHICH texels get it via
+ * `view` (N3DS_TexView): the per-texel STP information PC keeps as a 3-level
+ * alpha and discriminates in-shader is here baked into per-view decoded
+ * cells instead, one predicate per view (see the N3DS_TexView comment). The
+ * single C3D_AlphaTest(GPU_GEQUAL, 1) then serves every pass unchanged.
  *
  * Generalized 2026-07-20 for the sub-page decode cache (docs/
  * SUBPAGE_DECODE_CACHE_DESIGN.md): originU/originV/width/height say what
@@ -775,13 +906,24 @@ global_variable u32 s_droppedRuns = 0;
  * (caught in review before this shipped -- see the design doc's "What
  * changed from v1" section). Pass destStrideTiles explicitly, always.
  */
-internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, int originU, int originV, int width,
-                                      int height, int destStrideTiles, u16 *outTiled)
+internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, N3DS_TexView view, int originU,
+                                      int originV, int width, int height, int destStrideTiles, u16 *outTiled)
 {
 	const int pageOriginX = (texPage & 0xF) * 64;
 	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
 	const int clutOriginX = (clut & 0x3F) * 16;
 	const int clutOriginY = clut >> 6;
+	/* Per-view texel visibility, hoisted to two masks so the hot loop pays
+	 * the same two ALU ops for every view (65k texels per full-page decode
+	 * at 268 MHz -- a per-texel switch is real money here):
+	 *   visible = ((c & visMask) != 0) && ((c & killMask) == 0)
+	 * OPAQUE: any non-zero texel        (vis 0xFFFF, kill 0x0000)
+	 * PASS1:  non-zero AND bit15 clear  (vis 0x7FFF, kill 0x8000 -- bit15
+	 *         clear makes the 0x7FFF test equivalent to c != 0)
+	 * PASS2:  bit15 set                 (vis 0x8000, kill 0x0000; 0x8000
+	 *         "semi-transparent black" is visible, exactly as on PS1/PC). */
+	const u16 visMask = (view == N3DS_TEXVIEW_PASS2) ? 0x8000u : ((view == N3DS_TEXVIEW_PASS1) ? 0x7FFFu : 0xFFFFu);
+	const u16 killMask = (view == N3DS_TEXVIEW_PASS1) ? 0x8000u : 0x0000u;
 	int v;
 
 	for (v = 0; v < height; v++)
@@ -853,17 +995,15 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, in
 			 * emits `01 f8` per texel, i.e. 0xF801 little-endian = R=31, G=0,
 			 * B=0, A=1. That pins R to the top 5 bits and alpha to bit 0.
 			 *
-			 * Alpha is now one bit: 0 for the PS1 "pure black is invisible"
-			 * punch-through case, 1 otherwise. That is exactly what the single
-			 * C3D_AlphaTest(GPU_GEQUAL, 1) consumes. The old three-level
-			 * 0/128/255 encoding existed for phase 2b's STP two-pass blend,
-			 * which is not built and which can recover the STP bit straight
-			 * from VRAM (bit 15, still right there) when it is.
+			 * Alpha is one bit, set per the caller's view predicate (visMask/
+			 * killMask above) -- punch-through for OPAQUE cells, the per-texel
+			 * STP split for PASS1/PASS2 cells. The single
+			 * C3D_AlphaTest(GPU_GEQUAL, 1) consumes all three unchanged.
 			 */
 			outTiled[dstIndex] = (u16)(((color16 & 0x001Fu) << 11) |       /* R */
 			                          (((color16 >> 5) & 0x1Fu) << 6) |   /* G */
 			                          (((color16 >> 10) & 0x1Fu) << 1) |  /* B */
-			                          ((color16 != 0) ? 1u : 0u));        /* punch-through */
+			                          ((((color16 & visMask) != 0) && ((color16 & killMask) == 0)) ? 1u : 0u));
 		}
 	}
 }
@@ -882,7 +1022,7 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, in
  * (256x256 regions of a shared GPU texture) -- they are unrelated grids that
  * happen to share a name and a size.
  */
-internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
+internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N3DS_TexView view)
 {
 	const int pageCell = N3DS_VRAMCellIndex((texPage & 0xF) * 64, (texPage & 0x10) ? 256 : 0);
 	const int clutOriginX = (clut & 0x3F) * 16;
@@ -900,18 +1040,25 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 	const u32 clutGenB = s_vramCellGen[clutCellB];
 	int i, oldestSlot;
 	u32 oldestFrame;
+	u32 hashBucket;
 	/* Set when a cell holds exactly this (page,clut,format) but its source VRAM
 	 * generation has moved -- i.e. the texture IS resident and we are re-decoding
-	 * it anyway. Separates the two miss causes; see s_decodeCacheStaleMisses. */
+	 * it anyway. Separates the two miss causes; see s_decodeCacheStaleMisses.
+	 * The slot itself is remembered too: a stale twin is the natural victim
+	 * (it holds a dead copy of exactly this texture), and reusing it in place
+	 * both skips the whole victim walk and stops animated textures from
+	 * churning a fresh slot per re-decode while their old cell decays into
+	 * LRU garbage (~19 stale re-decodes/frame in race content, s17 hardware). */
 	int sawStaleKeyMatch = 0;
+	int staleMatchSlot = -1;
 
 	/* Fast path: the cell that answered the previous lookup. See s_lastCellHit. */
 	if (s_lastCellHit > 0)
 	{
 		N3DS_DecodeCacheEntry *e = &s_decodeCache[s_lastCellHit];
 
-		if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) && (e->pageGen == pageGen) &&
-		    (e->clutGenA == clutGenA) && (e->clutGenB == clutGenB))
+		if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) && (e->view == (u8)view) &&
+		    (e->pageGen == pageGen) && (e->clutGenA == clutGenA) && (e->clutGenB == clutGenB))
 		{
 			if (e->lastUsedFrame != s_frameCounter)
 			{
@@ -923,6 +1070,33 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 		}
 	}
 
+	/* Hash probe -- O(1) for everything the memo doesn't catch. Verified
+	 * against the full key + generations, so a wrong bucket only costs the
+	 * scan fallback below (see the hash-index comment). */
+	hashBucket = N3DS_TexKeyHash(texPage, clut, format, view, 0, 0) & (N3DS_FULLPAGE_HASH_SIZE - 1);
+	{
+		const int cand = s_fullPageHashIdx[hashBucket];
+
+		if ((cand > 0) && (cand < N3DS_FullPageCellBound()))
+		{
+			N3DS_DecodeCacheEntry *e = &s_decodeCache[cand];
+
+			if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) && (e->view == (u8)view) &&
+			    (e->pageGen == pageGen) && (e->clutGenA == clutGenA) && (e->clutGenB == clutGenB))
+			{
+				if (e->lastUsedFrame != s_frameCounter)
+				{
+					s_frameTouchedCells++;
+				}
+				e->lastUsedFrame = s_frameCounter;
+				s_decodeCacheHits++;
+				s_fullPageHashHits++;
+				s_lastCellHit = cand;
+				return cand;
+			}
+		}
+	}
+
 	for (i = 1; i < N3DS_FullPageCellBound(); i++)
 	{
 		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
@@ -931,7 +1105,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 		 * to share this loop has moved below: it is only needed on a miss, and
 		 * misses are rare (measured 0-25 per 32-frame window against ~65,000
 		 * lookups), so it was pure overhead on every hit. */
-		if (!e->used || (e->page != texPage) || (e->clut != clut) || (e->format != format))
+		if (!e->used || (e->page != texPage) || (e->clut != clut) || (e->format != format) || (e->view != (u8)view))
 		{
 			continue;
 		}
@@ -945,10 +1119,14 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 			e->lastUsedFrame = s_frameCounter;
 			s_decodeCacheHits++;
 			s_lastCellHit = i;
+			/* Reached only when the probe missed: repair the bucket. */
+			s_fullPageHashIdx[hashBucket] = (s16)i;
+			s_fullPageHashRepairs++;
 			return i;
 		}
 
 		sawStaleKeyMatch = 1;
+		staleMatchSlot = i;
 	}
 
 	s_decodeCacheMisses++;
@@ -983,21 +1161,50 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 	 * hazard branch below on every miss that frame -- exactly the same-slot
 	 * re-eviction bug this rewrite was meant to fix, reintroduced for frame 0.
 	 */
+	/* Stale twin not referenced by any queued draw this frame: re-decode
+	 * into it directly (see staleMatchSlot's comment). The same-frame guard
+	 * is the mid-frame eviction hazard rule from the victim walk below. */
+	if ((staleMatchSlot >= 0) && (s_decodeCache[staleMatchSlot].lastUsedFrame != s_frameCounter))
+	{
+		oldestSlot = staleMatchSlot;
+		goto decodeIntoSlot;
+	}
+
 	oldestSlot = -1;
 	oldestFrame = 0xFFFFFFFFu;
-	for (i = 1; i < N3DS_FullPageCellBound(); i++)
 	{
-		N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
+		int preferredSlot = -1;
+		u32 preferredFrame = 0xFFFFFFFFu;
+		const int preferredAtlas = s_runAtlas; /* -1 when no run is open */
 
-		if (e->used && (e->lastUsedFrame == s_frameCounter))
+		for (i = 1; i < N3DS_FullPageCellBound(); i++)
 		{
-			continue;
+			N3DS_DecodeCacheEntry *e = &s_decodeCache[i];
+
+			if (e->used && (e->lastUsedFrame == s_frameCounter))
+			{
+				continue;
+			}
+
+			if (e->lastUsedFrame < oldestFrame)
+			{
+				oldestFrame = e->lastUsedFrame;
+				oldestSlot = i;
+			}
+			if (((i / N3DS_ATLAS_CELLS_PER_ATLAS) == preferredAtlas) && (e->lastUsedFrame < preferredFrame))
+			{
+				preferredFrame = e->lastUsedFrame;
+				preferredSlot = i;
+			}
 		}
 
-		if (e->lastUsedFrame < oldestFrame)
+		/* Atlas affinity (see N3DS_ATLAS_AFFINITY_MIN_AGE): redirect to the
+		 * run's own atlas when its best victim is old enough. */
+		if ((preferredSlot >= 0) && (preferredSlot != oldestSlot) &&
+		    ((preferredFrame + N3DS_ATLAS_AFFINITY_MIN_AGE) <= s_frameCounter))
 		{
-			oldestFrame = e->lastUsedFrame;
-			oldestSlot = i;
+			oldestSlot = preferredSlot;
+			s_fullPageAffinityPlacements++;
 		}
 	}
 
@@ -1016,8 +1223,13 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 
 	if (s_decodeCache[oldestSlot].used)
 	{
+		/* Not counted for the stale-twin reuse path (the goto skips here):
+		 * replacing a dead copy of this same key is not thrashing, which is
+		 * what this counter exists to measure. */
 		s_decodeCacheEvictions++;
 	}
+
+decodeIntoSlot:
 	if (s_decodeCache[oldestSlot].lastUsedFrame != s_frameCounter)
 	{
 		s_frameTouchedCells++;
@@ -1041,7 +1253,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 		 */
 		const int decodeWidth = N3DS_DECODE_TEXTURE_DIM;
 
-		N3DS_DecodeAndTilePage(texPage, clut, format, 0, 0, decodeWidth, N3DS_DECODE_TEXTURE_DIM,
+		N3DS_DecodeAndTilePage(texPage, clut, format, view, 0, 0, decodeWidth, N3DS_DECODE_TEXTURE_DIM,
 		                        N3DS_DECODE_TEXTURE_DIM / 8, s_decodeScratch);
 	}
 	{
@@ -1055,10 +1267,12 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
 	s_decodeCache[oldestSlot].page = texPage;
 	s_decodeCache[oldestSlot].clut = clut;
 	s_decodeCache[oldestSlot].format = format;
+	s_decodeCache[oldestSlot].view = (u8)view;
 	s_decodeCache[oldestSlot].pageGen = s_vramCellGen[pageCell];
 	s_decodeCache[oldestSlot].clutGenA = s_vramCellGen[clutCellA];
 	s_decodeCache[oldestSlot].clutGenB = s_vramCellGen[clutCellB];
 	s_decodeCache[oldestSlot].lastUsedFrame = s_frameCounter;
+	s_fullPageHashIdx[hashBucket] = (s16)oldestSlot;
 
 	return oldestSlot;
 }
@@ -1075,7 +1289,8 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format)
  * guard `> 0` must be `>= 0`, both scan loops start at `i = 0` not `i = 1`,
  * and the hazard-fallback victim is slot 0, not 1.
  */
-internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat format, int tileX, int tileY)
+internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat format, N3DS_TexView view, int tileX,
+                                              int tileY)
 {
 	const int pageOriginX = (texPage & 0xF) * 64;
 	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
@@ -1092,15 +1307,22 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 	const u32 clutGenB = s_vramCellGen[clutCellB];
 	int i, oldestSlot;
 	u32 oldestFrame;
+	u32 hashBucket;
 	int sawStaleKeyMatch = 0;
+	/* Stale-twin reuse, same rationale as the full-page tier -- and this is
+	 * the tier where it matters: the ~19 stale re-decodes/frame of race
+	 * content (s17 hardware) are nearly all here, and each one otherwise
+	 * pays a full N3DS_SUBPAGE_TOTAL_CELLS victim walk. */
+	int staleMatchSlot = -1;
 
 	/* Fast path: the cell that answered the previous lookup. See s_lastSubPageCellHit. */
 	if (s_lastSubPageCellHit >= 0)
 	{
 		N3DS_SubPageCacheEntry *e = &s_subPageCache[s_lastSubPageCellHit];
 
-		if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) && (e->tileX == tileX) &&
-		    (e->tileY == tileY) && (e->pageGen == pageGen) && (e->clutGenA == clutGenA) && (e->clutGenB == clutGenB))
+		if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) && (e->view == (u8)view) &&
+		    (e->tileX == tileX) && (e->tileY == tileY) && (e->pageGen == pageGen) && (e->clutGenA == clutGenA) &&
+		    (e->clutGenB == clutGenB))
 		{
 			if (e->lastUsedFrame != s_frameCounter)
 			{
@@ -1112,12 +1334,40 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 		}
 	}
 
+	/* Hash probe -- the sub-page tier is where the scan hurt most (up to
+	 * 496 entries per miss of the one-entry memo, per triangle). Same
+	 * verify-then-trust contract as the full-page probe. */
+	hashBucket = N3DS_TexKeyHash(texPage, clut, format, view, tileX, tileY) & (N3DS_SUBPAGE_HASH_SIZE - 1);
+	{
+		const int cand = s_subPageHashIdx[hashBucket];
+
+		if ((cand >= 0) && (cand < N3DS_SUBPAGE_TOTAL_CELLS))
+		{
+			N3DS_SubPageCacheEntry *e = &s_subPageCache[cand];
+
+			if (e->used && (e->page == texPage) && (e->clut == clut) && (e->format == format) && (e->view == (u8)view) &&
+			    (e->tileX == tileX) && (e->tileY == tileY) && (e->pageGen == pageGen) && (e->clutGenA == clutGenA) &&
+			    (e->clutGenB == clutGenB))
+			{
+				if (e->lastUsedFrame != s_frameCounter)
+				{
+					s_subPageFrameTouchedCells++;
+				}
+				e->lastUsedFrame = s_frameCounter;
+				s_subPageCacheHits++;
+				s_subPageHashHits++;
+				s_lastSubPageCellHit = cand;
+				return cand;
+			}
+		}
+	}
+
 	for (i = 0; i < N3DS_SUBPAGE_TOTAL_CELLS; i++)
 	{
 		N3DS_SubPageCacheEntry *e = &s_subPageCache[i];
 
-		if (!e->used || (e->page != texPage) || (e->clut != clut) || (e->format != format) || (e->tileX != tileX) ||
-		    (e->tileY != tileY))
+		if (!e->used || (e->page != texPage) || (e->clut != clut) || (e->format != format) || (e->view != (u8)view) ||
+		    (e->tileX != tileX) || (e->tileY != tileY))
 		{
 			continue;
 		}
@@ -1131,10 +1381,14 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 			e->lastUsedFrame = s_frameCounter;
 			s_subPageCacheHits++;
 			s_lastSubPageCellHit = i;
+			/* Reached only when the probe missed: repair the bucket. */
+			s_subPageHashIdx[hashBucket] = (s16)i;
+			s_subPageHashRepairs++;
 			return i;
 		}
 
 		sawStaleKeyMatch = 1;
+		staleMatchSlot = i;
 	}
 
 	s_subPageCacheMisses++;
@@ -1147,25 +1401,54 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 		s_subPageCacheCapacityMisses++;
 	}
 
+	/* Stale twin not referenced this frame: re-decode into it directly
+	 * (see staleMatchSlot's comment; same-frame guard = the hazard rule). */
+	if ((staleMatchSlot >= 0) && (s_subPageCache[staleMatchSlot].lastUsedFrame != s_frameCounter))
+	{
+		oldestSlot = staleMatchSlot;
+		goto decodeIntoSubSlot;
+	}
+
 	/* Victim search -- see N3DS_FindOrDecodeTexture's own comment above for
 	 * the full reasoning (mid-frame eviction hazard; frame-0 all-zero-
 	 * lastUsedFrame guard). Identical here except the hazard-fallback victim
 	 * is slot 0, not 1 -- see this function's own header comment. */
 	oldestSlot = -1;
 	oldestFrame = 0xFFFFFFFFu;
-	for (i = 0; i < N3DS_SUBPAGE_TOTAL_CELLS; i++)
 	{
-		N3DS_SubPageCacheEntry *e = &s_subPageCache[i];
+		int preferredSlot = -1;
+		u32 preferredFrame = 0xFFFFFFFFu;
+		const int preferredAtlas = s_runAtlas;
 
-		if (e->used && (e->lastUsedFrame == s_frameCounter))
+		for (i = 0; i < N3DS_SUBPAGE_TOTAL_CELLS; i++)
 		{
-			continue;
+			N3DS_SubPageCacheEntry *e = &s_subPageCache[i];
+
+			if (e->used && (e->lastUsedFrame == s_frameCounter))
+			{
+				continue;
+			}
+
+			if (e->lastUsedFrame < oldestFrame)
+			{
+				oldestFrame = e->lastUsedFrame;
+				oldestSlot = i;
+			}
+			if ((((N3DS_SUBPAGE_PHYSICAL_BASE + (i / N3DS_SUBPAGE_CELLS_PER_PHYSICAL)) / N3DS_ATLAS_CELLS_PER_ATLAS) ==
+			     preferredAtlas) &&
+			    (e->lastUsedFrame < preferredFrame))
+			{
+				preferredFrame = e->lastUsedFrame;
+				preferredSlot = i;
+			}
 		}
 
-		if (e->lastUsedFrame < oldestFrame)
+		/* Atlas affinity -- see the full-page walk above. */
+		if ((preferredSlot >= 0) && (preferredSlot != oldestSlot) &&
+		    ((preferredFrame + N3DS_ATLAS_AFFINITY_MIN_AGE) <= s_frameCounter))
 		{
-			oldestFrame = e->lastUsedFrame;
-			oldestSlot = i;
+			oldestSlot = preferredSlot;
+			s_subPageAffinityPlacements++;
 		}
 	}
 
@@ -1177,8 +1460,12 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 
 	if (s_subPageCache[oldestSlot].used)
 	{
+		/* Not counted for stale-twin reuse (the goto skips here) -- see the
+		 * full-page tier's comment. */
 		s_subPageCacheEvictions++;
 	}
+
+decodeIntoSubSlot:
 	if (s_subPageCache[oldestSlot].lastUsedFrame != s_frameCounter)
 	{
 		s_subPageFrameTouchedCells++;
@@ -1196,7 +1483,7 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 	 * s_subpageDecodeScratch, unlike the full-page tier's format-clamped
 	 * decodeWidth<256 cases, which leave stale columns from a prior decode.
 	 */
-	N3DS_DecodeAndTilePage(texPage, clut, format, tileX * 64, tileY * 64, N3DS_SUBPAGE_DIM, N3DS_SUBPAGE_DIM,
+	N3DS_DecodeAndTilePage(texPage, clut, format, view, tileX * 64, tileY * 64, N3DS_SUBPAGE_DIM, N3DS_SUBPAGE_DIM,
 	                        N3DS_SUBPAGE_DIM / 8, s_subpageDecodeScratch);
 	{
 		int atlasIdx, physCellX, physCellY, subX, subY;
@@ -1209,12 +1496,14 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 	s_subPageCache[oldestSlot].page = texPage;
 	s_subPageCache[oldestSlot].clut = clut;
 	s_subPageCache[oldestSlot].format = format;
+	s_subPageCache[oldestSlot].view = (u8)view;
 	s_subPageCache[oldestSlot].tileX = (u8)tileX;
 	s_subPageCache[oldestSlot].tileY = (u8)tileY;
 	s_subPageCache[oldestSlot].pageGen = s_vramCellGen[pageCell];
 	s_subPageCache[oldestSlot].clutGenA = s_vramCellGen[clutCellA];
 	s_subPageCache[oldestSlot].clutGenB = s_vramCellGen[clutCellB];
 	s_subPageCache[oldestSlot].lastUsedFrame = s_frameCounter;
+	s_subPageHashIdx[hashBucket] = (s16)oldestSlot;
 
 	return oldestSlot;
 }
@@ -1302,8 +1591,8 @@ internal inline int MAX3(int a, int b, int c)
  * one formula for both tiers -- see NativeRenderer_DrawTriangles.
  */
 internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1, const GrVertex *v2, s16 texPage,
-                                          s16 clut, TexFormat format, int *outAtlasIdx, int *outPixelBaseU,
-                                          int *outPixelBaseV, int *outOriginU, int *outOriginV)
+                                          s16 clut, TexFormat format, N3DS_TexView view, int *outAtlasIdx,
+                                          int *outPixelBaseU, int *outPixelBaseV, int *outOriginU, int *outOriginV)
 {
 	const int minU = MIN3(v0->u, v1->u, v2->u), maxU = MAX3(v0->u, v1->u, v2->u);
 	const int minV = MIN3(v0->v, v1->v, v2->v), maxV = MAX3(v0->v, v1->v, v2->v);
@@ -1330,10 +1619,7 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 		const int wordX0 = pageX + (minU >> shift);
 		const int wordX1 = pageX + (maxU >> shift);
 
-		if (N3DS_FBStoreOverlaps(wordX0, pageY + minV, (wordX1 - wordX0) + 1, (maxV - minV) + 1))
-		{
-			N3DS_RefreshFramebufferMirror();
-		}
+		N3DS_FBRefreshIfOverlaps(wordX0, pageY + minV, (wordX1 - wordX0) + 1, (maxV - minV) + 1);
 	}
 	const int tileX0 = minU / N3DS_SUBPAGE_DIM, tileX1 = maxU / N3DS_SUBPAGE_DIM;
 	const int tileY0 = minV / N3DS_SUBPAGE_DIM, tileY1 = maxV / N3DS_SUBPAGE_DIM;
@@ -1342,8 +1628,8 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 	{
 		int atlasIdx, physCellX, physCellY, subX, subY;
 
-		N3DS_SubCellIndexToAtlasCoord(N3DS_FindOrDecodeSubPageTexture(texPage, clut, format, tileX0, tileY0), &atlasIdx,
-		                               &physCellX, &physCellY, &subX, &subY);
+		N3DS_SubCellIndexToAtlasCoord(N3DS_FindOrDecodeSubPageTexture(texPage, clut, format, view, tileX0, tileY0),
+		                               &atlasIdx, &physCellX, &physCellY, &subX, &subY);
 		*outAtlasIdx = atlasIdx;
 		*outPixelBaseU = (physCellX * N3DS_DECODE_TEXTURE_DIM) + (subX * N3DS_SUBPAGE_DIM);
 		*outPixelBaseV = (physCellY * N3DS_DECODE_TEXTURE_DIM) + (subY * N3DS_SUBPAGE_DIM);
@@ -1356,7 +1642,7 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 	{
 		int atlasIdx, cellX, cellY;
 
-		N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(texPage, clut, format), &atlasIdx, &cellX, &cellY);
+		N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(texPage, clut, format, view), &atlasIdx, &cellX, &cellY);
 		*outAtlasIdx = atlasIdx;
 		*outPixelBaseU = cellX * N3DS_DECODE_TEXTURE_DIM;
 		*outPixelBaseV = cellY * N3DS_DECODE_TEXTURE_DIM;
@@ -1379,13 +1665,23 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 		return 0;
 	}
 
+	/* All-bits-set = -1 in every bucket (see the hash-index comment). */
+	memset(s_fullPageHashIdx, 0xFF, sizeof(s_fullPageHashIdx));
+	memset(s_subPageHashIdx, 0xFF, sizeof(s_subPageHashIdx));
+
 	s_rendererInitialised = 1;
 
 	printf("\x1b[2J");
 	printf("CTR-Native / Nintendo 3DS\n");
 	printf("-------------------------\n");
 	printf("%s\n", (windowName != NULL) ? windowName : "(no title)");
-	printf("PSX display: %dx%d\n", width, height);
+	/* width/height here are the PC path's SDL window request (main.c passes
+	 * 800x600) -- nothing on 3DS renders at them, and echoing them as "PSX
+	 * display" read as a live 800x600 pipeline (user-flagged, session 18).
+	 * Print what this platform actually does instead. */
+	(void)width;
+	(void)height;
+	printf("render: PSX-res -> 400x240 top screen (4:3 pillarbox)\n");
 	printf("VRAM mirror: %d KiB\n", (int)(sizeof(vram) / 1024));
 	printf("\nPhase 2a: citro3d is live on the top\nscreen (see file header for scope).\n\n");
 
@@ -1788,6 +2084,16 @@ void NativeRenderer_SwapWindow(void)
 			         (unsigned long)s_decodeCacheEvictions, evictionsWindow, (unsigned long)s_drawCallCount, drawsWindow);
 			N3DS_DebugLog(cacheLine);
 
+			/* Hash-index effectiveness: hashWindow ~= lookups the probe
+			 * served this window (the scan never ran); repairs = scan
+			 * fallbacks that DID find a fresh entry (bucket collision or
+			 * eviction churn re-pointing the bucket). */
+			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] cache hashHits=%lu hashWindow=%lu hashRepairs=%lu",
+			         (unsigned long)s_fullPageHashHits, (unsigned long)(s_fullPageHashHits - s_lastStatFullPageHashHits),
+			         (unsigned long)s_fullPageHashRepairs);
+			s_lastStatFullPageHashHits = s_fullPageHashHits;
+			N3DS_DebugLog(cacheLine);
+
 			snprintf(cacheLine, sizeof(cacheLine),
 			         "[CTR-3DS] miss capacity=%lu capacityWindow=%lu stale=%lu staleWindow=%lu setPeak=%lu/%d vramDirty=%lu",
 			         (unsigned long)s_decodeCacheCapacityMisses, capacityWindow, (unsigned long)s_decodeCacheStaleMisses,
@@ -1812,6 +2118,13 @@ void NativeRenderer_SwapWindow(void)
 				         "[CTR-3DS] batch atlasSwitchX10=%lu/frame distinctAtlasX10=%lu/frame distinctPeak=%lu dtriCallsTotal=%lu",
 				         (switchWindow * 10UL) / 32UL, (distinctWindow * 10UL) / 32UL,
 				         (unsigned long)s_frameDistinctAtlasPeak, (unsigned long)s_drawTrianglesCalls);
+				N3DS_DebugLog(cacheLine);
+
+				/* Affinity placements are cumulative (not windowed): the
+				 * mechanism only fires on misses, so per-window deltas are
+				 * mostly 0 outside warm-up/churn phases. */
+				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] affinity fullPage=%lu subPage=%lu",
+				         (unsigned long)s_fullPageAffinityPlacements, (unsigned long)s_subPageAffinityPlacements);
 				N3DS_DebugLog(cacheLine);
 			}
 
@@ -1853,6 +2166,12 @@ void NativeRenderer_SwapWindow(void)
 
 				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] subpage hazard evictInUse=%lu",
 				         (unsigned long)s_subPageEvictHazards);
+				N3DS_DebugLog(cacheLine);
+
+				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] subpage hashHits=%lu hashWindow=%lu hashRepairs=%lu",
+				         (unsigned long)s_subPageHashHits, (unsigned long)(s_subPageHashHits - s_lastStatSubPageHashHits),
+				         (unsigned long)s_subPageHashRepairs);
+				s_lastStatSubPageHashHits = s_subPageHashHits;
 				N3DS_DebugLog(cacheLine);
 
 				/* s_trianglesRoutedSubPage/FullPage: the single most important
@@ -1957,13 +2276,38 @@ void NativeRenderer_SwapWindow(void)
 
 void NativeRenderer_StoreFrameBuffer(int x, int y, int w, int h)
 {
+	N3DS_FBStoreSlot *slot;
+
 	/* Record-and-arm only; the actual refresh is pull-based -- see
-	 * N3DS_RefreshFramebufferMirror. */
-	s_fbStoreX = x;
-	s_fbStoreY = y;
-	s_fbStoreW = w;
-	s_fbStoreH = h;
-	s_fbMirrorStale = (w > 0) && (h > 0);
+	 * N3DS_RefreshFramebufferMirrorSlot. Slot selection by rect anchor:
+	 * re-arming a known buffer updates its slot in place, a new distinct
+	 * rect evicts the older slot (two live display buffers is the whole
+	 * point -- see the two-slot block comment). */
+	if ((w <= 0) || (h <= 0))
+	{
+		return;
+	}
+
+	if ((s_fbStore[0].x == x) && (s_fbStore[0].y == y))
+	{
+		slot = &s_fbStore[0];
+	}
+	else if ((s_fbStore[1].x == x) && (s_fbStore[1].y == y))
+	{
+		slot = &s_fbStore[1];
+	}
+	else
+	{
+		slot = &s_fbStore[1 - s_fbStoreLastArmed];
+	}
+
+	slot->x = x;
+	slot->y = y;
+	slot->w = w;
+	slot->h = h;
+	slot->stale = 1;
+	s_fbStoreLastArmed = (int)(slot - s_fbStore);
+	s_fbMirrorStale = 1;
 }
 
 /* Scratch for one tiled VRAM-display chunk; reused every call, never
@@ -2219,13 +2563,10 @@ void NativeRenderer_CopyVRAM(u16 *src, int x, int y, int w, int h, int dstX, int
 
 	if (src == NULL)
 	{
-		/* MoveImage: VRAM-to-VRAM. If the source overlaps the armed display
+		/* MoveImage: VRAM-to-VRAM. If the source overlaps an armed display
 		 * rect, pull the last presented frame into the mirror first --
 		 * screen-copy effects MoveImage the display area. */
-		if (N3DS_FBStoreOverlaps(x, y, w, h))
-		{
-			N3DS_RefreshFramebufferMirror();
-		}
+		N3DS_FBRefreshIfOverlaps(x, y, w, h);
 		src = vram;
 		stride = VRAM_WIDTH;
 	}
@@ -2250,10 +2591,7 @@ void NativeRenderer_ReadVRAM(u16 *dst, int x, int y, int dstW, int dstH)
 
 	/* StoreImage reading the display area (screenshot-style effects): same
 	 * freeze-frame pull as the decode-path trigger. */
-	if (N3DS_FBStoreOverlaps(x, y, dstW, dstH))
-	{
-		N3DS_RefreshFramebufferMirror();
-	}
+	N3DS_FBRefreshIfOverlaps(x, y, dstW, dstH);
 
 	src = vram + x + (VRAM_WIDTH * y);
 
@@ -2275,6 +2613,15 @@ void NativeRenderer_ReadFramebufferDataToVRAM(void)
 
 void NativeRenderer_DiscardFramebufferReadback(void)
 {
+	/* Pinned-VRAM presentation (movies, direct frame uploads) skips
+	 * StoreFrameBuffer, and the display-region VRAM already holds exact
+	 * LoadImage'd content -- a lingering armed slot from before the movie
+	 * would overwrite it with a resampled screen copy on the next
+	 * overlapping read. Disarm both slots (PC's version discards its
+	 * pending GPU readback for the same reason -- native_platform.c). */
+	s_fbStore[0].stale = 0;
+	s_fbStore[1].stale = 0;
+	s_fbMirrorStale = 0;
 }
 
 int NativeRenderer_GetVRAMStateSize(void)
@@ -2387,6 +2734,11 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 {
 	int i;
 	const int untextured = (s_currentTextureId == N3DS_TEXTURE_ID_WHITE);
+	/* Per-texel STP: which decode view this call's triangles resolve
+	 * through -- constant for the whole call, since s_semiTransPass is
+	 * latched per DrawSplit pass (see its comment). */
+	const N3DS_TexView texView = (s_semiTransPass == 1)   ? N3DS_TEXVIEW_PASS1
+	                           : ((s_semiTransPass == 2) ? N3DS_TEXVIEW_PASS2 : N3DS_TEXVIEW_OPAQUE);
 
 	s_drawTrianglesCalls++;
 
@@ -2417,15 +2769,6 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 
 	if ((startVertex < 0) || ((startVertex + (triangles * 3)) > s_pendingVertexCount))
 	{
-		return;
-	}
-
-	if (s_semiTransPass == 1)
-	{
-		/* PC's opaque-texels-only STP pass. Whole-prim first cut: this
-		 * pass draws nothing -- its texels are covered (blended) by pass 2
-		 * instead. Drawing it opaque AND drawing pass 2 blended on top
-		 * would double-draw the prim. See the s_semiTransPass comment. */
 		return;
 	}
 
@@ -2516,8 +2859,8 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 					s_forcedTexValid = 1;
 				}
 
-				N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(s_forcedPage, s_forcedClut, s_forcedFormat), &atlasIdx,
-				                            &fCellX, &fCellY);
+				N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(s_forcedPage, s_forcedClut, s_forcedFormat, N3DS_TEXVIEW_OPAQUE),
+				                            &atlasIdx, &fCellX, &fCellY);
 				pixelBaseU = fCellX * N3DS_DECODE_TEXTURE_DIM;
 				pixelBaseV = fCellY * N3DS_DECODE_TEXTURE_DIM;
 				originU = 0;
@@ -2526,7 +2869,8 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			else
 			{
 				N3DS_ResolveTriangleTexture(&triVerts[0], &triVerts[1], &triVerts[2], triVerts[0].page, triVerts[0].clut,
-				                             s_currentTexFormat, &atlasIdx, &pixelBaseU, &pixelBaseV, &originU, &originV);
+				                             s_currentTexFormat, texView, &atlasIdx, &pixelBaseU, &pixelBaseV, &originU,
+				                             &originV);
 			}
 		}
 		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
@@ -2699,10 +3043,13 @@ internal void N3DS_MetaWriteU32(FILE *f, u32 v)
  *   VRAM_CELL_DIM, VRAM_CELL_COLS, VRAM_CELL_ROWS, vramDirtyBumps,
  *   vramCellGen[COLS*ROWS],
  *   fullpage entries [0 .. FULLPAGE_RESERVED_CELLS]:
- *       used, page, clut, format, pageGen, clutGenA, clutGenB, lastUsedFrame
- *   subpage entries [0 .. SUBPAGE_TOTAL_CELLS):
- *       used, page, clut, format, tileX, tileY, pageGen, clutGenA, clutGenB,
+ *       used, page, clut, format, view, pageGen, clutGenA, clutGenB,
  *       lastUsedFrame
+ *   subpage entries [0 .. SUBPAGE_TOTAL_CELLS):
+ *       used, page, clut, format, view, tileX, tileY, pageGen, clutGenA,
+ *       clutGenB, lastUsedFrame
+ * version 2 (session 18): inserted `view` (N3DS_TexView, the per-texel STP
+ * decode variant) after `format` in both entry records.
  */
 /* Backend-callable (dumpreq 'subpage' toggle): drop every cached decode in
  * both tiers. Required on each toggle -- the tiers share physical atlas
@@ -2744,7 +3091,7 @@ void NativeRenderer3DS_DebugDumpCacheMeta(void)
 	}
 
 	N3DS_MetaWriteU32(f, 0x4D435443u); /* 'CTCM' little-endian */
-	N3DS_MetaWriteU32(f, 1u);
+	N3DS_MetaWriteU32(f, 2u); /* v2: +view field per entry (per-texel STP) */
 	N3DS_MetaWriteU32(f, s_frameCounter);
 	N3DS_MetaWriteU32(f, (u32)N3DS_FULLPAGE_RESERVED_CELLS);
 	N3DS_MetaWriteU32(f, (u32)N3DS_SUBPAGE_TOTAL_CELLS);
@@ -2771,6 +3118,7 @@ void NativeRenderer3DS_DebugDumpCacheMeta(void)
 		N3DS_MetaWriteU32(f, (u32)(u16)e->page);
 		N3DS_MetaWriteU32(f, (u32)(u16)e->clut);
 		N3DS_MetaWriteU32(f, (u32)e->format);
+		N3DS_MetaWriteU32(f, (u32)e->view);
 		N3DS_MetaWriteU32(f, e->pageGen);
 		N3DS_MetaWriteU32(f, e->clutGenA);
 		N3DS_MetaWriteU32(f, e->clutGenB);
@@ -2785,6 +3133,7 @@ void NativeRenderer3DS_DebugDumpCacheMeta(void)
 		N3DS_MetaWriteU32(f, (u32)(u16)e->page);
 		N3DS_MetaWriteU32(f, (u32)(u16)e->clut);
 		N3DS_MetaWriteU32(f, (u32)e->format);
+		N3DS_MetaWriteU32(f, (u32)e->view);
 		N3DS_MetaWriteU32(f, (u32)e->tileX);
 		N3DS_MetaWriteU32(f, (u32)e->tileY);
 		N3DS_MetaWriteU32(f, e->pageGen);

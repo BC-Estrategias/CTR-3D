@@ -319,10 +319,20 @@ void N3DS_C3DSetBlendMode(int blendMode);
 void N3DS_C3DUploadVramDisplayChunk(int slotIndex, const void *tiled256);
 void N3DS_C3DBindVramDisplayTex(int slotIndex);
 
+/* The top-screen CONTENT region: N3DS_C3DBeginFrame pillarboxes every
+ * presented frame to a centred 4:3 (320-wide) viewport, so screen columns
+ * 0..39 and 360..399 are always black bars, not picture. Consumers that
+ * read the presented frame back must sample only this region. Keep in
+ * lockstep with the C3D_SetViewport call in N3DS_C3DBeginFrame. */
+#define N3DS_TOP_CONTENT_X 40
+#define N3DS_TOP_CONTENT_W 320
+
 /* Copies the top screen's last completed frame (the gfx framebuffer the
  * present path fills every frame) into dstRGB as row-major RGB triplets,
- * nearest-resampled 400x240 -> dstW x dstH. May be one presentation old.
- * Returns 0 if no framebuffer. docs/PAUSE_FREEZE_FRAME_DESIGN.md. */
+ * nearest-resampled from the pillarboxed CONTENT region (N3DS_TOP_CONTENT_*,
+ * above -- NOT the full 400-wide panel) to dstW x dstH. May be one
+ * presentation old. Returns 0 if no framebuffer.
+ * docs/PAUSE_FREEZE_FRAME_DESIGN.md. */
 int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH);
 
 /* ---------------------------------------------------------------- input --- */

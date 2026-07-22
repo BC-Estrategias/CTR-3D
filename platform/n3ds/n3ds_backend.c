@@ -234,8 +234,9 @@ void N3DS_GfxPresent(void)
 
 /*
  * Copies the top screen's last completed gfx framebuffer into dstRGB as
- * row-major RGB triplets, nearest-resampled from the 400x240 panel to
- * dstW x dstH (docs/PAUSE_FREEZE_FRAME_DESIGN.md). The source costs nothing
+ * row-major RGB triplets, nearest-resampled from the pillarboxed CONTENT
+ * region (N3DS_TOP_CONTENT_*, header) to dstW x dstH
+ * (docs/PAUSE_FREEZE_FRAME_DESIGN.md). The source costs nothing
  * to produce: citro3d's C3D_FrameEnd already display-transfers every frame
  * into the linear-heap gfx framebuffers (GSP_BGR8_OES via gfxInitDefault;
  * the transfer's OUT_FORMAT is RGB8, which is what fills that byte layout),
@@ -270,7 +271,11 @@ int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH)
 
 		for (x = 0; x < dstW; x++)
 		{
-			const int sx = (x * 400) / dstW;
+			/* Sample the pillarboxed content region only (N3DS_TOP_CONTENT_*):
+			 * the full-panel form re-ingested the black side bars, so the
+			 * pause background showed them squeezed inside the picture
+			 * (user-reported on hardware, session 18). */
+			const int sx = N3DS_TOP_CONTENT_X + ((x * N3DS_TOP_CONTENT_W) / dstW);
 			const u8 *p = fb + (((sx * 240) + (239 - sy)) * 3);
 
 			dstRow[(x * 3) + 0] = p[2]; /* R */
@@ -382,14 +387,13 @@ int N3DS_C3DInit(void)
 	C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
 
 	/*
-	 * Punch-through sentinel. As of the GPU_RGBA5551 conversion (2026-07-20,
-	 * see N3DS_TILE_BYTES) the decode cache encodes alpha as a single bit: 0 =
-	 * "PS1 pure-black-is-invisible" texel, 1 = opaque or STP-on (no longer
-	 * distinguished -- that needs the STP bit recovered from VRAM directly
-	 * when 2b lands). Phase 2a is single-pass only (no STP 2-pass blending yet, that's
-	 * 2b), so one GEQUAL-1 test rejects exactly the punch-through case and
-	 * passes everything else -- exactly the design doc's "single-pass" mode.
-	 * Set once here rather than per-draw since 2a never needs a different test.
+	 * Visibility sentinel. The decode cache encodes alpha as a single bit,
+	 * with WHICH texels carry it decided per-cell at decode time (the
+	 * N3DS_TexView per-texel STP views, session 18: punch-through for
+	 * opaque cells, the STP split for semi-trans pass-1/pass-2 cells). One
+	 * GEQUAL-1 test therefore serves every pass unchanged -- the pass
+	 * distinction lives in the sampled cell, not in GPU state. Set once
+	 * here rather than per-draw since no draw ever needs a different test.
 	 */
 	C3D_AlphaTest(true, GPU_GEQUAL, 1);
 
@@ -549,8 +553,14 @@ void N3DS_C3DBeginFrame(void)
 	 * buffer's other axis (both screens are 240 tall, no vertical crop).
 	 * Fixed hardware constants, not DISPENV-dependent, so set once a frame
 	 * here rather than threaded through as a parameter.
+	 *
+	 * N3DS_TOP_CONTENT_* (n3ds_backend.h) mirror this crop for anything that
+	 * reads the presented frame back -- keep them in lockstep with this call
+	 * (N3DS_CopyDisplayedTopFrame samples only the content region, else the
+	 * pause background re-ingests the black bars and shows them squeezed
+	 * inside the picture -- user-reported on hardware, session 18).
 	 */
-	C3D_SetViewport(0, 40, 240, 320);
+	C3D_SetViewport(0, N3DS_TOP_CONTENT_X, 240, N3DS_TOP_CONTENT_W);
 
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
 
@@ -607,17 +617,17 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
  * Was RGBA8 until 2026-07-20. The decode cache encoded a three-level alpha
  * (0 punch-through / 128 opaque / 255 STP-on) but NOTHING ever read the
  * 128-vs-255 distinction: the only alpha test in this file is a single
- * C3D_AlphaTest(true, GPU_GEQUAL, 1), i.e. zero-vs-nonzero, because the STP
- * two-pass blend is phase 2b and is not built. So half of every cell's memory
- * was carrying a distinction no code consumed.
+ * C3D_AlphaTest(true, GPU_GEQUAL, 1), i.e. zero-vs-nonzero. So half of
+ * every cell's memory was carrying a distinction no code consumed.
  *
  * Halving the texel doubles the number of cache cells the same linear memory
  * buys, and cell COUNT was the measured bottleneck: playing the menu showed
  * 1441 capacity misses per 32-frame window (~45/frame) against a saturated
  * 63/63 working set, plus 2052 evictions of cells a queued draw still
- * referenced -- which is the visible texture corruption. When 2b arrives it
- * needs the STP bit back; recover it from VRAM then rather than paying for it
- * on every cell now.
+ * referenced -- which is the visible texture corruption. The STP two-pass
+ * blend (session 18) recovered the STP bit exactly as predicted here: from
+ * VRAM at decode time, baked into per-view cells (N3DS_TexView), keeping
+ * this format one bit of alpha.
  */
 #define N3DS_TILE_BYTES (64 * 2)
 
