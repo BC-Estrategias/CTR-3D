@@ -2545,8 +2545,9 @@ void NativeRenderer_SwapWindow(void)
 				 * ndspDrop = cumulative refused submits (pool full / sink
 				 * down). Worker-side lag lives in the [PERF] header's
 				 * audioBacklog/audioDropped, not here. */
-				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] audio voicesX10=%lu vblanks=%lu reverbSamples=%d xaActive=%d ndspQ=%d ndspDrop=%d",
-				         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive, N3DS_NdspGetQueuedBlocks(), N3DS_NdspGetDroppedBlocks());
+				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] audio voicesX10=%lu vblanks=%lu reverbSamples=%d xaActive=%d ndspQ=%d ndspDrop=%d hwKiB=%d denied=%d",
+				         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive, N3DS_NdspGetQueuedBlocks(), N3DS_NdspGetDroppedBlocks(),
+				         N3DS_HwVoiceStoreGetUsedKiB(), N3DS_HwVoiceGetDenied());
 				N3DS_DebugLog(cacheLine);
 			}
 

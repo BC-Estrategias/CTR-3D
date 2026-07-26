@@ -85,7 +85,17 @@ extern void NativeAudio_XAPumpForAudioThread(void);
  * reported in the renderer's audio shape line), never blocks the mixer.
  */
 #define N3DS_NDSP_BLOCK_COUNT 16
-#define N3DS_NDSP_CHANNEL     0
+/*
+ * Channel plan (ndsp has exactly 24): SPU voices 0..22 map 1:1 onto ndsp
+ * channels 0..22 as MONO_PCM16 hardware voices; channel 23 carries the
+ * music/parcel stream (XA + anything else MixFrame still renders). SPU
+ * voice 23 therefore has no audible channel -- its lifecycle still runs
+ * bit-exact for the game's benefit, and denials are counted
+ * (N3DS_HwVoiceGetDenied) so hardware data can tell us whether voice 23
+ * matters enough to earn a steal policy.
+ */
+#define N3DS_NDSP_CHANNEL     23
+#define N3DS_HW_VOICE_COUNT   23
 
 /* Protects s_audio (native_audio.c) during MixFrame -- backs
  * N3DS_AudioLock/N3DS_AudioUnlock, which back SDL_Lock/UnlockAudioStream. */
@@ -115,6 +125,12 @@ static s16 *s_ndspPcm;                                  /* linearAlloc: BLOCK_CO
 static ndspWaveBuf s_ndspBufs[N3DS_NDSP_BLOCK_COUNT];   /* statuses start 0 = NDSP_WBUF_FREE */
 static int s_ndspNextBuf;
 static u32 s_ndspDroppedBlocks;
+
+/* Hardware-voice linear store (see the plan-B section below for the full
+ * story); declared here because N3DS_NdspSinkShutdown frees it. */
+#define N3DS_HW_STORE_BYTES (3 * 1024 * 1024)
+static s16 *s_hwStore;    /* linearAlloc'd; NULL until first use */
+static u32 s_hwStoreUsed; /* bump allocator, bytes */
 
 static void N3DS_NdspSinkInit(void)
 {
@@ -176,6 +192,12 @@ static void N3DS_NdspSinkShutdown(void)
 	 * submit can be in flight here. */
 	if (s_ndspUp)
 	{
+		int v;
+
+		for (v = 0; v < N3DS_HW_VOICE_COUNT; v++)
+		{
+			ndspChnWaveBufClear(v);
+		}
 		ndspChnWaveBufClear(N3DS_NDSP_CHANNEL);
 		ndspExit();
 	}
@@ -183,6 +205,12 @@ static void N3DS_NdspSinkShutdown(void)
 	{
 		linearFree(s_ndspPcm);
 		s_ndspPcm = NULL;
+	}
+	if (s_hwStore != NULL)
+	{
+		linearFree(s_hwStore);
+		s_hwStore = NULL;
+		s_hwStoreUsed = 0;
 	}
 	s_ndspUp = 0;
 	s_ndspInitAttempted = 0; /* a later re-Init may bring the sink back up */
@@ -254,6 +282,181 @@ int N3DS_NdspGetQueuedBlocks(void)
 int N3DS_NdspGetDroppedBlocks(void)
 {
 	return (int)s_ndspDroppedBlocks;
+}
+
+/*
+ * ---- Hardware voices (plan B, session 20) -------------------------------
+ *
+ * The PS1's SPU was an autonomous mixer chip; software-mixing its 24 voices
+ * at 44.1kHz measured ~4x over real-time on this CPU even on a dedicated
+ * core (see PORT_FEASIBILITY_3DS.md, session 20). So the DSP's own 24
+ * channels do the playing, and the CPU is reduced to what it was on retail
+ * hardware: poking pitch/volume registers and starting/stopping notes.
+ * native_audio.c's per-vblank mirror decides WHAT to poke (it owns voice
+ * state); this side owns everything libctru: the linear-memory sample
+ * store the DSP reads from, wave-buffer chains, and the channel calls.
+ *
+ * Threading: all pokes arrive from the single mixing thread (worker, or
+ * the StepVBlank fallback -- never both), same invariant as the sink ring
+ * above. ndspChn* calls are internally locked by libctru.
+ */
+
+/* Decoded PCM16 the DSP can address must live in linear memory, and linear
+ * headroom after the renderer's atlases is ~4MB. The entire PS1 SPU RAM is
+ * 512KB of ADPCM ~= 1.75MB decoded, so 3MB (declared above with the sink
+ * statics -- shutdown frees it) holds a full bank of decodes with slack;
+ * the store resets whenever the game re-uploads over cached regions (bank
+ * reload), which also silences every hardware channel first so the DSP
+ * never reads freed samples. */
+static u32 s_hwStoreResets;   /* diagnostic */
+static u32 s_hwStoreFullDrops;
+static u32 s_hwVoice23Denied; /* keyons on the sacrificed SPU voice 23 */
+
+/* Two wave buffers per channel: [start..loopEnd) once, then [loopStart..
+ * loopEnd) looping forever until the CPU says stop. One-shots use only
+ * the first. */
+static ndspWaveBuf s_hwBufs[N3DS_HW_VOICE_COUNT][2];
+
+short *N3DS_HwVoiceStoreAlloc(int sampleCount)
+{
+	s16 *slot;
+	u32 bytes;
+
+	if (s_hwStore == NULL)
+	{
+		s_hwStore = (s16 *)linearAlloc(N3DS_HW_STORE_BYTES);
+		if (s_hwStore == NULL)
+		{
+			N3DS_DebugLog("[CTR-3DS] hw-voice store: linearAlloc FAILED -- voices silent");
+			return NULL;
+		}
+	}
+	if (sampleCount <= 0)
+	{
+		return NULL;
+	}
+
+	bytes = ((u32)sampleCount * sizeof(s16) + 31u) & ~31u; /* cache-line align keeps flushes exact */
+	if (s_hwStoreUsed + bytes > N3DS_HW_STORE_BYTES)
+	{
+		s_hwStoreFullDrops++;
+		return NULL;
+	}
+
+	slot = (s16 *)((u8 *)s_hwStore + s_hwStoreUsed);
+	s_hwStoreUsed += bytes;
+	return slot;
+}
+
+void N3DS_HwVoiceStoreCommit(const short *pcm, int sampleCount)
+{
+	DSP_FlushDataCache(pcm, (u32)sampleCount * sizeof(s16));
+}
+
+void N3DS_HwVoiceStoreReset(void)
+{
+	int v;
+
+	/* Channels first: the store's contents are about to be recycled. */
+	for (v = 0; v < N3DS_HW_VOICE_COUNT; v++)
+	{
+		ndspChnWaveBufClear(v);
+	}
+	s_hwStoreUsed = 0;
+	s_hwStoreResets++;
+}
+
+void N3DS_HwVoiceStart(int voice, const short *pcm, int sampleCount, int loopStart, int loopEnd, int loopEnabled, int startSample, float rateHz)
+{
+	ndspWaveBuf *bufs;
+	int firstEnd;
+
+	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_HW_VOICE_COUNT) || (pcm == NULL) || (sampleCount <= 0))
+	{
+		if (s_ndspUp && (voice == N3DS_HW_VOICE_COUNT))
+		{
+			s_hwVoice23Denied++;
+		}
+		return;
+	}
+
+	bufs = s_hwBufs[voice];
+	ndspChnWaveBufClear(voice); /* retrigger = PS1 keyon semantics */
+	ndspChnSetFormat(voice, NDSP_FORMAT_MONO_PCM16);
+	ndspChnSetInterp(voice, NDSP_INTERP_POLYPHASE);
+	ndspChnSetRate(voice, rateHz);
+
+	if (startSample < 0)
+	{
+		startSample = 0;
+	}
+	if (startSample >= sampleCount)
+	{
+		return;
+	}
+
+	/* First segment: from the start offset up to the loop end (or the
+	 * whole sample when not looping). The PS1 plays [start..loopEnd) then
+	 * jumps to loopStart; a start offset past loopEnd (restored state)
+	 * just plays out the tail before looping normally. */
+	firstEnd = (loopEnabled && (loopEnd > startSample) && (loopEnd <= sampleCount)) ? loopEnd : sampleCount;
+
+	memset(&bufs[0], 0, sizeof(bufs[0]));
+	bufs[0].data_pcm16 = (s16 *)pcm + startSample;
+	bufs[0].nsamples = (u32)(firstEnd - startSample);
+	bufs[0].looping = false;
+	ndspChnWaveBufAdd(voice, &bufs[0]);
+
+	if (loopEnabled && (loopEnd > loopStart) && (loopEnd <= sampleCount) && (loopStart >= 0))
+	{
+		memset(&bufs[1], 0, sizeof(bufs[1]));
+		bufs[1].data_pcm16 = (s16 *)pcm + loopStart;
+		bufs[1].nsamples = (u32)(loopEnd - loopStart);
+		bufs[1].looping = true;
+		ndspChnWaveBufAdd(voice, &bufs[1]);
+	}
+}
+
+void N3DS_HwVoiceSetRate(int voice, float rateHz)
+{
+	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_HW_VOICE_COUNT))
+	{
+		return;
+	}
+	ndspChnSetRate(voice, rateHz);
+}
+
+void N3DS_HwVoiceSetMix(int voice, float left, float right)
+{
+	float mix[12];
+
+	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_HW_VOICE_COUNT))
+	{
+		return;
+	}
+	memset(mix, 0, sizeof(mix));
+	mix[0] = left;
+	mix[1] = right;
+	ndspChnSetMix(voice, mix);
+}
+
+void N3DS_HwVoiceStop(int voice)
+{
+	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_HW_VOICE_COUNT))
+	{
+		return;
+	}
+	ndspChnWaveBufClear(voice);
+}
+
+int N3DS_HwVoiceGetDenied(void)
+{
+	return (int)s_hwVoice23Denied;
+}
+
+int N3DS_HwVoiceStoreGetUsedKiB(void)
+{
+	return (int)(s_hwStoreUsed >> 10);
 }
 
 static void N3DS_AudioThreadMain(void *arg)
@@ -361,6 +564,7 @@ void N3DS_AudioThreadInit(void)
 		 * assume -- never fall back to a same-core thread (see "What
 		 * changed from v1" in the design doc: core_id=-1 does NOT mean "any
 		 * free core", it means "all CPUs", which resolves to core 0 here). */
+		N3DS_DebugLog("[CTR-3DS] audio worker: NO (APT says not New3DS) -- main-thread fallback");
 		return;
 	}
 
@@ -377,6 +581,7 @@ void N3DS_AudioThreadInit(void)
 	{
 		/* Could not secure core 1 -- do NOT fall back to a same-core
 		 * thread; caller must keep rendering synchronously. */
+		N3DS_DebugLog("[CTR-3DS] audio worker: NO (AppCpuTimeLimit refused) -- main-thread fallback");
 		return;
 	}
 
@@ -403,6 +608,8 @@ void N3DS_AudioThreadInit(void)
 	 * mode, not a crash. If this happens, the caller falls back to
 	 * synchronous rendering, same as the two checks above. */
 	s_audioThreadRunning = (s_audioThread != NULL);
+	N3DS_DebugLog(s_audioThreadRunning ? "[CTR-3DS] audio worker: UP (core 1)"
+	                                   : "[CTR-3DS] audio worker: NO (threadCreate failed) -- main-thread fallback");
 }
 
 void N3DS_AudioThreadNotifyVBlank(void)

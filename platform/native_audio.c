@@ -25,6 +25,85 @@
  */
 #define NATIVE_AUDIO_VOICE_ARENA_RECLAIM_KEEP (256 * 1024)
 
+#if defined(__3DS__)
+/*
+ * Hardware voices (plan B, session 20; see n3ds_audio_thread.h): decoded
+ * PCM lives in the DSP-readable linear store, decoded ONCE per (addr,
+ * loop_addr) instead of per key-on -- SpuWrite already invalidates
+ * everything through NativeAudio_ResetVoicePcmArenaNoLock, which is the
+ * single reset hook for this cache too. Entry count: a full SPU bank is
+ * dozens of samples; 128 is generous and the table resets on every upload.
+ *
+ * The mirror shadows are deliberately OUTSIDE struct NativeAudioVoice:
+ * that struct is captured by save states, and these are per-boot DSP
+ * bookkeeping, not audio state.
+ */
+#define NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES 128
+
+struct NativeAudioHwSampleCacheEntry
+{
+	u32 addr;
+	u32 loopAddr;
+	s16 *pcm;
+	int count;
+	int loopStart;
+	int loopEnd;
+	b32 loopEnabled;
+	int used;
+};
+
+global_variable struct NativeAudioHwSampleCacheEntry s_hwSampleCache[NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES];
+
+struct NativeAudioHwVoiceShadow
+{
+	int keyonPending; /* set at SpuSetKey(on), consumed by the mirror */
+	int started;      /* a DSP channel is currently playing this voice */
+	u16 lastPitch;    /* SetRate pokes only on change */
+};
+
+global_variable struct NativeAudioHwVoiceShadow s_hwVoiceShadow[24];
+
+internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleCacheLookup(u32 addr, u32 loopAddr)
+{
+	int i;
+
+	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+	{
+		if (s_hwSampleCache[i].used && (s_hwSampleCache[i].addr == addr) && (s_hwSampleCache[i].loopAddr == loopAddr))
+		{
+			return &s_hwSampleCache[i];
+		}
+	}
+
+	return NULL;
+}
+
+internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleCacheInsert(u32 addr, u32 loopAddr)
+{
+	int i;
+
+	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+	{
+		if (!s_hwSampleCache[i].used)
+		{
+			s_hwSampleCache[i].used = 1;
+			s_hwSampleCache[i].addr = addr;
+			s_hwSampleCache[i].loopAddr = loopAddr;
+			return &s_hwSampleCache[i];
+		}
+	}
+
+	/* Table full between uploads: decode proceeds uncached (store-allocated
+	 * but not findable again). Bounded by the store size either way. */
+	return NULL;
+}
+
+internal void NativeAudio_HwSampleCacheReset(void)
+{
+	memset(s_hwSampleCache, 0, sizeof(s_hwSampleCache));
+}
+#endif
+
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 /*
  * Voice-start decode counters (docs/VOICE_START_DECODE_DESIGN.md step 1).
@@ -1739,6 +1818,19 @@ internal void NativeAudio_ResetVoicePcmArenaNoLock(int markDirty)
 			s_audio.voices[i].sampleDirty = 1;
 		}
 	}
+
+#if defined(__3DS__)
+	/* The linear store's pointers just went stale with the voices'.
+	 * StoreReset also silences every hardware channel BEFORE the store is
+	 * recycled; safe against the mirror because every caller of this
+	 * function holds the render lock the mirror runs under. */
+	NativeAudio_HwSampleCacheReset();
+	N3DS_HwVoiceStoreReset();
+	for (i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
+	{
+		s_hwVoiceShadow[i].started = 0;
+	}
+#endif
 }
 
 // Public entry point so the game side can drop the decoded-PCM cache on paths
@@ -1865,6 +1957,79 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 		return 0;
 	}
 
+#if defined(__3DS__)
+	/*
+	 * Hardware voices: decode ONCE per (addr, loop_addr) into the
+	 * DSP-readable linear store; every later key-on of the same sample is
+	 * a table hit, which is what deletes the audio_voice_start stalls the
+	 * session-20 hardware run measured (7-15ms/frame). SpuWrite resets
+	 * both table and store via NativeAudio_ResetVoicePcmArenaNoLock.
+	 */
+	{
+		struct NativeAudioHwSampleCacheEntry *entry = NativeAudio_HwSampleCacheLookup(voice->attr.addr, voice->attr.loop_addr);
+
+		(void)arenaMarker;
+		if (entry == NULL)
+		{
+			s16 *slot = (s16 *)N3DS_HwVoiceStoreAlloc(scanCount);
+
+			if (slot == NULL)
+			{
+				/* Store exhausted (counted backend-side): same failure
+				 * shape as an arena-exhausted decode on PC. */
+				NativeAudio_FreeVoicePcm(voice);
+				voice->active = 0;
+				voice->sampleDirty = 0;
+				return 0;
+			}
+
+			memset(&pcm, 0, sizeof(pcm));
+			pcm.samples = slot;
+			pcm.capacity = scanCount;
+			if (!NativeAudio_DecodeSpuSample(voice->attr.addr, &pcm))
+			{
+				NativeAudio_FreeVoicePcm(voice);
+				voice->active = 0;
+				voice->sampleDirty = 0;
+				return 0;
+			}
+			N3DS_HwVoiceStoreCommit(slot, pcm.count);
+
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+			s_voiceProf.windowDecodedSamples += pcm.count;
+#endif
+
+			entry = NativeAudio_HwSampleCacheInsert(voice->attr.addr, voice->attr.loop_addr);
+			if (entry != NULL)
+			{
+				entry->pcm = slot;
+				entry->count = pcm.count;
+				entry->loopStart = loopStart;
+				entry->loopEnd = loopEnd;
+				entry->loopEnabled = loopEnabled;
+			}
+
+			NativeAudio_FreeVoicePcm(voice);
+			voice->pcm = slot;
+			voice->sampleCount = pcm.count;
+		}
+		else
+		{
+			NativeAudio_FreeVoicePcm(voice);
+			voice->pcm = entry->pcm;
+			voice->sampleCount = entry->count;
+		}
+
+		/* Loop fields come from the scan just above either way -- for a
+		 * cache hit they are byte-identical to the entry's (same SPU
+		 * content between uploads decodes identically). */
+		voice->loopStart = loopStart;
+		voice->loopEnd = loopEnd;
+		voice->loopEnabled = loopEnabled;
+		voice->sampleDirty = 0;
+		return 1;
+	}
+#else
 	memset(&pcm, 0, sizeof(pcm));
 	if (!NativeAudio_PrepareVoicePcmBuffer(scanCount, &pcm, &arenaMarker))
 	{
@@ -1903,6 +2068,7 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 	voice->loopEnabled = loopEnabled;
 	voice->sampleDirty = 0;
 	return 1;
+#endif
 }
 
 /*
@@ -3530,6 +3696,21 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 				}
 			}
 
+#if defined(__3DS__)
+			/*
+			 * Hardware voices (plan B, session 20): this voice is PLAYED by
+			 * its own ndsp channel -- see NativeAudio_HwVoiceMirrorNoLock.
+			 * The per-sample loop keeps only the lifecycle arithmetic (ADSR
+			 * advance, position advance, loop wrap, stop detection) because
+			 * the game polls that state to sequence itself; measured once
+			 * already: skipping it stalls boot at mainGameState=0. Software
+			 * generation at 44.1kHz measured ~4x over real time on this CPU
+			 * even on a dedicated core -- that is why the DSP owns playback.
+			 */
+			(void)sample;
+			(void)left;
+			(void)right;
+#else
 			sample = NativeAudio_InterpolateVoiceSample(voice);
 			sample = NativeAudio_ApplyAdsrEnvelope(sample, voice->adsrLevel);
 			left = NativeAudio_ApplyVolume(sample, voice->attr.volume.left, s_audio.masterVolumeLeft);
@@ -3540,6 +3721,7 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 				NativeAudio_MixSample(&reverbSendLeft, &reverbSendRight, NativeAudio_ApplyMasterVolume(sample, voice->attr.volume.left),
 				                      NativeAudio_ApplyMasterVolume(sample, voice->attr.volume.right));
 			}
+#endif
 			NativeAudio_AdsrAdvance(voice);
 			if (!voice->active || voice->adsrPhase == NATIVE_AUDIO_ADSR_OFF)
 			{
@@ -3561,9 +3743,22 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 		}
 	}
 
+#if defined(__3DS__)
+	/*
+	 * Voices are dry on their DSP channels (v1 ships without PS1 reverb --
+	 * the DSP has its own aux effects to approximate it with later), and
+	 * with voice generation gated above the only reverb send left is XA's,
+	 * so this would be echoing the music alone at software-mixing prices.
+	 */
+	(void)reverbSendLeft;
+	(void)reverbSendRight;
+	(void)reverbWetLeft;
+	(void)reverbWetRight;
+#else
 	NativeAudio_ReverbProcessNoLock(reverbSendLeft, reverbSendRight, &reverbWetLeft, &reverbWetRight);
 	NativeAudio_MixSample(&mixLeft, &mixRight, NativeAudio_ApplyMasterVolume(reverbWetLeft, s_audio.masterVolumeLeft),
 	                      NativeAudio_ApplyMasterVolume(reverbWetRight, s_audio.masterVolumeRight));
+#endif
 
 	*outLeft = (s16)NativeAudio_Clamp16(mixLeft);
 	*outRight = (s16)NativeAudio_Clamp16(mixRight);
@@ -3596,6 +3791,90 @@ internal int NativeAudio_RenderFramesNoLock(s16 *out, int frameCount)
 
 #if defined(__3DS__)
 /*
+ * Hardware-voice mirror (plan B, session 20): once per vblank, translate
+ * the 24 software voices' state into DSP channel pokes. The lifecycle loop
+ * in MixFrame remains the AUTHORITY on game-visible state (ADSR phases,
+ * ENDX, position); the DSP channel is only the renderer. Because the DSP
+ * free-runs, sound stays real-time even when frames (and therefore vblank
+ * emission and this mirror) run slow -- the mirror just pokes less often.
+ *
+ * Envelope quantization: SetMix once per vblank steps the envelope at
+ * 60Hz instead of per-sample. PS1 attack/release curves faster than one
+ * vblank land on their target within one poke; audible difference is a
+ * slightly harder edge on very fast attacks, accepted for v1.
+ *
+ * Caller holds the render lock (worker's hold span, or the fallback's
+ * LockOutput bracket) -- same discipline as everything touching s_audio.
+ */
+internal void NativeAudio_HwVoiceMirrorNoLock(void)
+{
+	int i;
+
+	for (i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
+	{
+		struct NativeAudioVoice *voice = &s_audio.voices[i];
+		struct NativeAudioHwVoiceShadow *shadow = &s_hwVoiceShadow[i];
+		int audible = voice->active && (voice->adsrPhase != NATIVE_AUDIO_ADSR_OFF) && NativeAudio_VoiceHasSample(voice);
+
+		if (shadow->keyonPending)
+		{
+			shadow->keyonPending = 0;
+			if (audible)
+			{
+				float rateHz = (44100.0f * (float)voice->attr.pitch) / 4096.0f;
+
+				/* pitch 0 freezes a PS1 voice on its current sample; a
+				 * 1Hz rate is the closest silent-ish stand-in. */
+				if (rateHz < 1.0f)
+				{
+					rateHz = 1.0f;
+				}
+				N3DS_HwVoiceStart(i, voice->pcm, voice->sampleCount, voice->loopStart, voice->loopEnd, voice->loopEnabled ? 1 : 0,
+				                  (int)(voice->positionFp >> NATIVE_AUDIO_FP_SHIFT), rateHz);
+				shadow->started = 1;
+				shadow->lastPitch = voice->attr.pitch;
+			}
+		}
+
+		if (!shadow->started)
+		{
+			continue;
+		}
+
+		if (!audible)
+		{
+			N3DS_HwVoiceStop(i);
+			shadow->started = 0;
+			continue;
+		}
+
+		if (voice->attr.pitch != shadow->lastPitch)
+		{
+			float rateHz = (44100.0f * (float)voice->attr.pitch) / 4096.0f;
+
+			if (rateHz < 1.0f)
+			{
+				rateHz = 1.0f;
+			}
+			N3DS_HwVoiceSetRate(i, rateHz);
+			shadow->lastPitch = voice->attr.pitch;
+		}
+
+		{
+			/* Same three gain stages as the software mixer's
+			 * ApplyAdsrEnvelope + ApplyVolume, in float: level/ADSR_MAX,
+			 * then voice and master volumes at /0x8000 each (Q15 direct
+			 * mode; negative volume keeps its sign = PS1 phase invert). */
+			float level = s_audio.muted ? 0.0f : ((float)voice->adsrLevel / (float)NATIVE_AUDIO_ADSR_MAX);
+			float gainL = level * ((float)voice->attr.volume.left / 32768.0f) * ((float)s_audio.masterVolumeLeft / 32768.0f);
+			float gainR = level * ((float)voice->attr.volume.right / 32768.0f) * ((float)s_audio.masterVolumeRight / 32768.0f);
+
+			N3DS_HwVoiceSetMix(i, gainL, gainR);
+		}
+	}
+}
+
+/*
  * External-linkage entry point for n3ds_audio_thread.c's worker thread. That
  * file is its own translation unit (same isolation as n3ds_backend.c -- see
  * n3ds_backend.h) and cannot call NativeAudio_RenderFramesNoLock directly:
@@ -3620,7 +3899,8 @@ void NativeAudio_RenderVBlankForAudioThread(void)
 	s16 scratch[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
 
 	NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
-	N3DS_NdspSubmitVBlankBlock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
+	N3DS_NdspSubmitVBlankBlock(scratch, NATIVE_AUDIO_VBLANK_FRAMES); /* music/XA parcel -- voices are on their own channels */
+	NativeAudio_HwVoiceMirrorNoLock();
 }
 #endif
 
@@ -4013,6 +4293,7 @@ void NativeAudio_StepVBlank(void)
 			                              there is no worker thread */
 			NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
 			N3DS_NdspSubmitVBlankBlock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
+			NativeAudio_HwVoiceMirrorNoLock();
 			NativeAudio_UnlockOutput();
 		}
 	}
@@ -4429,6 +4710,9 @@ void NativeAudio_SpuSetKey(s32 on_off, u32 voice_bit)
 			if (voice->active)
 			{
 				NativeAudio_AdsrKeyOn(voice);
+#if defined(__3DS__)
+				s_hwVoiceShadow[i].keyonPending = 1; /* mirror starts the DSP channel next vblank */
+#endif
 			}
 			else
 			{

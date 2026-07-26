@@ -100,4 +100,27 @@ int N3DS_NdspIsUp(void);
 int N3DS_NdspGetQueuedBlocks(void);
 int N3DS_NdspGetDroppedBlocks(void);
 
+/*
+ * Hardware voices (plan B, session 20): SPU voices 0..22 play on ndsp's
+ * own channels; the parcel sink above becomes the music channel (23). SPU
+ * voice 23 is sacrificed (lifecycle only, denials counted). All functions
+ * are called from the single mixing thread (worker, or the StepVBlank
+ * fallback); pointers passed here must come from N3DS_HwVoiceStoreAlloc,
+ * whose linear memory the DSP reads directly.
+ *
+ * Store contract: Alloc a slot, decode into it, Commit (cache flush) --
+ * then it may be handed to N3DS_HwVoiceStart. StoreReset silences every
+ * hardware channel and recycles the whole store (SPU bank re-upload);
+ * callers must re-Alloc afterwards.
+ */
+short *N3DS_HwVoiceStoreAlloc(int sampleCount);
+void N3DS_HwVoiceStoreCommit(const short *pcm, int sampleCount);
+void N3DS_HwVoiceStoreReset(void);
+void N3DS_HwVoiceStart(int voice, const short *pcm, int sampleCount, int loopStart, int loopEnd, int loopEnabled, int startSample, float rateHz);
+void N3DS_HwVoiceSetRate(int voice, float rateHz);
+void N3DS_HwVoiceSetMix(int voice, float left, float right);
+void N3DS_HwVoiceStop(int voice);
+int N3DS_HwVoiceGetDenied(void);
+int N3DS_HwVoiceStoreGetUsedKiB(void);
+
 #endif
