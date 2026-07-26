@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h> /* fsync -- the SD log's timed durability commit */
 
 #include "n3ds_backend.h"
 #include "ctr_shbin.h"
@@ -23,6 +24,7 @@
  *     because the working directory is not dependable this early.
  */
 #define N3DS_LOG_PATH "sdmc:/ctr3ds.log"
+#define N3DS_LOG_PREV_PATH "sdmc:/ctr3ds.prev.log"
 
 static FILE *s_logFile = NULL;
 
@@ -86,12 +88,30 @@ static void N3DS_NetloadStreamInit(void)
 		return;
 	}
 
+	/* Batch the stream: newlib's stderr is unbuffered, so every log line was
+	 * a synchronous soc:u send -- the stats window's ~17 back-to-back lines
+	 * cost one IPC each, every 32 frames, and each send is a chance for a
+	 * transient WiFi failure to kill the whole stream (which is how session
+	 * 19's first netload lost everything after boot). Buffer + the shared 2s
+	 * timed flush in N3DS_DebugLog turns that into one send per window batch.
+	 * Must precede the first stderr write, hence before the active flag flips
+	 * (every stream write is gated on it). svcOutputDebugString stays the
+	 * per-line instant trail for crash forensics. */
+	setvbuf(stderr, NULL, _IOFBF, 8192);
+
 	s_netloadStreamActive = 1;
 }
 
 void N3DS_EarlyInit(void)
 {
 	consoleDebugInit(debugDevice_SVC);
+
+	/* One-deep rotation BEFORE the truncating open: "w" wipes the previous
+	 * boot's log, and that is exactly how session 19's hardware race numbers
+	 * were lost (crash -> relaunch -> the relaunch truncated the crashed
+	 * run's log). Keeps exactly the last two boots, never grows unbounded. */
+	remove(N3DS_LOG_PREV_PATH);
+	rename(N3DS_LOG_PATH, N3DS_LOG_PREV_PATH);
 
 	s_logFile = fopen(N3DS_LOG_PATH, "w");
 	if (s_logFile != NULL)
@@ -135,18 +155,37 @@ void N3DS_DebugLog(const char *msg)
 	{
 		fputs(msg, s_logFile);
 		fputc('\n', s_logFile);
-		/* Flush at most every ~2s. The SD file is the post-hoc trail and
-		 * tolerates a bounded tail loss on a hard crash -- the live trails
-		 * (netload stderr stream, svcOutputDebugString) still carry every
-		 * line the instant it happens. */
-		{
-			const u64 now = svcGetSystemTick();
+	}
 
-			if ((now - s_logLastFlushTick) > (SYSCLOCK_ARM11 * 2ull))
+	/* Flush BOTH buffered sinks at most every ~2s (SD file and, since
+	 * session 19, the netload stderr stream -- see the setvbuf in
+	 * N3DS_NetloadStreamInit). Both are post-hoc trails that tolerate a
+	 * bounded tail loss on a hard crash; svcOutputDebugString above is the
+	 * per-line instant trail. */
+	if ((s_logFile != NULL) || s_netloadStreamActive)
+	{
+		const u64 now = svcGetSystemTick();
+
+		if ((now - s_logLastFlushTick) > (SYSCLOCK_ARM11 * 2ull))
+		{
+			if (s_logFile != NULL)
 			{
 				fflush(s_logFile);
-				s_logLastFlushTick = now;
+				/* fflush alone moves bytes into the FS session; the FAT
+				 * size/allocation metadata only commits on an fs-level
+				 * flush. Without this, a hard freeze loses EVERYTHING
+				 * after the first flush -- the crashed s19 netload run's
+				 * log read 1.6KB (ending at vblank=120) despite minutes
+				 * of 2s flushes, and s18's crash-run log was never
+				 * recoverable for the same reason. One FSFILE_Flush per
+				 * 2s is the durability we thought we already had. */
+				fsync(fileno(s_logFile));
 			}
+			if (s_netloadStreamActive)
+			{
+				fflush(stderr);
+			}
+			s_logLastFlushTick = now;
 		}
 	}
 }
@@ -355,7 +394,15 @@ int N3DS_C3DInit(void)
 	C3D_BufInfo *bufInfo;
 	C3D_TexEnv *env;
 
-	if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE))
+	/* 4x citro3d's 256KB default. Both hardware crashes to date
+	 * (crash_dump_00000007, s18 build; crash_dump_00000008, s19 build) were
+	 * the SAME deliberate panic: prefetch abort, IFSR=debug event, svcBreak
+	 * from GPUCMD_AddInternal's overflow check (libctru gpu.c:33) under
+	 * C3D_DrawArrays <- N3DS_FlushRun -- a real race's draw volume (multiple
+	 * karts + effects; attract demos are lighter and never hit it) overflows
+	 * the default command list mid-frame. 1MB of linear heap is cheap here
+	 * (~6MB spare after the atlases) vs a hardware crash per overflow. */
+	if (!C3D_Init(4 * C3D_DEFAULT_CMDBUF_SIZE))
 	{
 		return 0;
 	}
