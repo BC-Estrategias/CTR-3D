@@ -2537,11 +2537,16 @@ void NativeRenderer_SwapWindow(void)
 				s_audioShapeVoiceAccum = 0;
 				s_audioShapeVblanks = 0;
 
-				printf("audio  voices ~%lu.%lu  reverbSmp %-6d xa %d\n", voicesX10 / 10UL, voicesX10 % 10UL,
-				       s_audioShapeReverbSamples, s_audioShapeXaActive);
+				printf("audio  voices ~%lu.%lu  reverbSmp %-6d xa %d  ndspQ %d drop %d\n", voicesX10 / 10UL, voicesX10 % 10UL,
+				       s_audioShapeReverbSamples, s_audioShapeXaActive, N3DS_NdspGetQueuedBlocks(), N3DS_NdspGetDroppedBlocks());
 
-				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] audio voicesX10=%lu vblanks=%lu reverbSamples=%d xaActive=%d",
-				         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive);
+				/* ndspQ = blocks queued at the sink right now (0..16; steady
+				 * nonzero = healthy cushion, pinned at 16 = drops imminent);
+				 * ndspDrop = cumulative refused submits (pool full / sink
+				 * down). Worker-side lag lives in the [PERF] header's
+				 * audioBacklog/audioDropped, not here. */
+				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] audio voicesX10=%lu vblanks=%lu reverbSamples=%d xaActive=%d ndspQ=%d ndspDrop=%d",
+				         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive, N3DS_NdspGetQueuedBlocks(), N3DS_NdspGetDroppedBlocks());
 				N3DS_DebugLog(cacheLine);
 			}
 

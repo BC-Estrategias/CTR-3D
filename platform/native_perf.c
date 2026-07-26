@@ -415,8 +415,10 @@ internal void NativePerf_Report3DSWindow(void)
 	toAvgUs = 1000.0 / (f64)s_windowFrames;
 
 	// spuMix is stamped into every window on purpose: these numbers mean
-	// something very different with the voice mixer skipped, and a perf figure
-	// recorded without that context has already misled this project once.
+	// something very different depending on whether real mixing + ndsp output
+	// are live ("ndsp") or the sink failed to come up and the build is
+	// effectively muted ("mute") -- a perf figure recorded without that
+	// context has already misled this project once.
 	s_perfConsoleTotalUs = (int)(s_windowTotalMs * toAvgUs);
 	s_perfConsoleWorkUs = (int)(s_windowWorkMs * toAvgUs);
 
@@ -427,7 +429,7 @@ internal void NativePerf_Report3DSWindow(void)
 	 * its wrong conclusions came from exactly that gap.
 	 */
 	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s lvl=%d mode=%d load=%d audioBacklog=%d audioDropped=%d", s_windowFrames, s_perfConsoleTotalUs,
-	         s_perfConsoleWorkUs, CTR_3DS_SKIP_SPU_MIX ? "SKIPPED" : "on", s_frameBeginInfo.levelID, s_frameBeginInfo.gameMode1,
+	         s_perfConsoleWorkUs, N3DS_NdspIsUp() ? "ndsp" : "mute", s_frameBeginInfo.levelID, s_frameBeginInfo.gameMode1,
 	         s_frameBeginInfo.loadingStage, N3DS_AudioThreadGetBacklog(), N3DS_AudioThreadGetDropped());
 	N3DS_DebugLog(header);
 

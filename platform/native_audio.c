@@ -15,34 +15,6 @@
 #include <string.h>
 
 /*
- * INTERIM, 3DS ONLY, AND TEMPORARY -- delete this once ndsp is wired up.
- *
- * The 3DS build has no audio output yet: the SPU emulation mixes as normal but
- * "only the final handoff to hardware is dropped" (platform/n3ds/
- * sdl3_compat_3ds.c). So every sample the voice mixer produces is computed and
- * then thrown away -- and that mixer measured 48-81% of total frame time,
- * because it runs a 24-voice loop per OUTPUT SAMPLE FRAME (735 per vblank, and
- * the vblank catch-up loop runs up to 8 of those per rendered frame).
- *
- * Skipping the generation of samples nobody can hear takes the frame from
- * 154-411ms to 35-49ms in Azahar. Voice lifecycle is deliberately left intact
- * -- see the block this gates in NativeAudio_MixFrame for why that is not
- * optional.
- *
- * Flip it off to measure mixer optimisations on 3DS:
- *   cmake -DCTR_3DS_SKIP_SPU_MIX=OFF ...
- * PC is untouched either way; this is never defined off-3DS.
- */
-#if defined(__3DS__)
-#if !defined(CTR_3DS_SKIP_SPU_MIX)
-#define CTR_3DS_SKIP_SPU_MIX 1
-#endif
-#else
-#undef CTR_3DS_SKIP_SPU_MIX
-#define CTR_3DS_SKIP_SPU_MIX 0
-#endif
-
-/*
  * Below this the idle-arena reclaim leaves decoded voice PCM alone, so a
  * re-triggered sound between-sounds re-keys for free instead of paying a
  * full re-decode (docs/VOICE_START_DECODE_DESIGN.md step 4). With the
@@ -1893,27 +1865,6 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 		return 0;
 	}
 
-#if CTR_3DS_SKIP_SPU_MIX
-	/*
-	 * Metadata-only fast path (docs/VOICE_START_DECODE_DESIGN.md step 3):
-	 * in the muted build nothing ever reads the decoded PCM --
-	 * NativeAudio_InterpolateVoiceSample is the only consumer and it lives
-	 * inside the #else of the mix gate -- so don't decode it and don't touch
-	 * the arena at all. The lifecycle fields the game actually observes
-	 * (sampleCount + loop points) come from the scan, so voices start, loop
-	 * and finish identically; NativeAudio_VoiceHasSample is the
-	 * pcm-replacing predicate. This block evaporates when ndsp lands.
-	 */
-	(void)pcm;
-	(void)arenaMarker;
-	NativeAudio_FreeVoicePcm(voice);
-	voice->sampleCount = scanCount;
-	voice->loopStart = loopStart;
-	voice->loopEnd = loopEnd;
-	voice->loopEnabled = loopEnabled;
-	voice->sampleDirty = 0;
-	return 1;
-#else
 	memset(&pcm, 0, sizeof(pcm));
 	if (!NativeAudio_PrepareVoicePcmBuffer(scanCount, &pcm, &arenaMarker))
 	{
@@ -1952,23 +1903,18 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 	voice->loopEnabled = loopEnabled;
 	voice->sampleDirty = 0;
 	return 1;
-#endif
 }
 
 /*
  * "Has a decoded sample" predicate for every site that used to test
- * voice->pcm != NULL. Under CTR_3DS_SKIP_SPU_MIX pcm legitimately stays NULL
- * (step 3 above never decodes), so voice liveness rides on sampleCount --
- * which NativeAudio_FreeVoicePcm zeroes alongside pcm on every teardown
- * path, keeping the two builds' predicates equivalent state-for-state.
+ * voice->pcm != NULL directly. Kept as a named predicate (rather than
+ * reverting the call sites) because it earned its name once already: the
+ * muted 3DS build's metadata-only fast path rode on it for a whole
+ * development phase.
  */
 internal int NativeAudio_VoiceHasSample(const struct NativeAudioVoice *voice)
 {
-#if CTR_3DS_SKIP_SPU_MIX
-	return voice->sampleCount > 0;
-#else
 	return voice->pcm != NULL;
-#endif
 }
 
 // NOTE(aalhendi): Assumes the caller already holds NativeAudio_LockOutput(),
@@ -3584,24 +3530,6 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 				}
 			}
 
-#if CTR_3DS_SKIP_SPU_MIX
-			/*
-			 * Sample GENERATION only. Everything below this block -- ADSR
-			 * advance, position advance, loop wrap, stop detection -- still
-			 * runs, so voices start, finish and report as finished exactly as
-			 * before. That matters: the game polls voice state to sequence
-			 * itself, and a voice that never finishes hangs it (measured --
-			 * skipping the whole loop stalls boot at mainGameState=0).
-			 *
-			 * InterpolateVoiceSample is also the part that actually touches
-			 * memory, reading each voice's PCM at a scattered address, so
-			 * dropping it removes the cache misses and keeps the cheap
-			 * arithmetic that carries the semantics.
-			 */
-			(void)sample;
-			(void)left;
-			(void)right;
-#else
 			sample = NativeAudio_InterpolateVoiceSample(voice);
 			sample = NativeAudio_ApplyAdsrEnvelope(sample, voice->adsrLevel);
 			left = NativeAudio_ApplyVolume(sample, voice->attr.volume.left, s_audio.masterVolumeLeft);
@@ -3612,7 +3540,6 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 				NativeAudio_MixSample(&reverbSendLeft, &reverbSendRight, NativeAudio_ApplyMasterVolume(sample, voice->attr.volume.left),
 				                      NativeAudio_ApplyMasterVolume(sample, voice->attr.volume.right));
 			}
-#endif
 			NativeAudio_AdsrAdvance(voice);
 			if (!voice->active || voice->adsrPhase == NATIVE_AUDIO_ADSR_OFF)
 			{
@@ -3634,24 +3561,9 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 		}
 	}
 
-#if CTR_3DS_SKIP_SPU_MIX
-	/*
-	 * With voice generation skipped, reverbSend is always zero -- this would
-	 * be computing the echo of silence. Measured: with only the voice loop
-	 * gated, the reverb chain alone still cost ~115ms/frame once the game
-	 * reached content that configures it (reverbSamples 0 -> 4000). Reverb
-	 * holds no game-visible state, so unlike voice lifecycle there is nothing
-	 * to preserve here.
-	 */
-	(void)reverbSendLeft;
-	(void)reverbSendRight;
-	(void)reverbWetLeft;
-	(void)reverbWetRight;
-#else
 	NativeAudio_ReverbProcessNoLock(reverbSendLeft, reverbSendRight, &reverbWetLeft, &reverbWetRight);
 	NativeAudio_MixSample(&mixLeft, &mixRight, NativeAudio_ApplyMasterVolume(reverbWetLeft, s_audio.masterVolumeLeft),
 	                      NativeAudio_ApplyMasterVolume(reverbWetRight, s_audio.masterVolumeRight));
-#endif
 
 	*outLeft = (s16)NativeAudio_Clamp16(mixLeft);
 	*outRight = (s16)NativeAudio_Clamp16(mixRight);
@@ -3693,19 +3605,22 @@ internal int NativeAudio_RenderFramesNoLock(s16 *out, int frameCount)
  * without including headers that collide with libctru (n3ds_backend.h's
  * documented three-way collision). This wrapper owns the scratch buffer
  * itself so nothing PSX-typed needs to cross that boundary -- the rendered
- * samples are discarded here, same as the StepVBlank fallback branch below
- * (this design's discard-not-queue decision). Caller (the worker thread)
- * holds s_audioRenderLock for the duration, which is the same lock
- * NativeAudio_LockOutput/UnlockOutput take on this platform via the
- * SDL_LockAudioStream/UnlockAudioStream shim -- so this still runs under
- * the equivalent of the normal lock discipline even though it does not call
- * those functions directly.
+ * samples go to the ndsp sink as a plain short pointer, one vblank block at
+ * a time (N3DS_NdspSubmitVBlankBlock copies out of this stack buffer before
+ * returning). Caller (the worker thread) holds s_audioRenderLock for the
+ * duration, which is the same lock NativeAudio_LockOutput/UnlockOutput take
+ * on this platform via the SDL_LockAudioStream/UnlockAudioStream shim -- so
+ * this still runs under the equivalent of the normal lock discipline even
+ * though it does not call those functions directly. A refused submit (sink
+ * down, pool full) is deliberate sample loss, counted on the sink side --
+ * the mixer's own state has already advanced identically either way.
  */
 void NativeAudio_RenderVBlankForAudioThread(void)
 {
 	s16 scratch[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
 
 	NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
+	N3DS_NdspSubmitVBlankBlock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
 }
 #endif
 
@@ -4087,15 +4002,17 @@ void NativeAudio_StepVBlank(void)
 		}
 		else
 		{
-			/* Fallback: no worker thread secured (Old3DS, couldn't claim
-			 * core 1, or CTR_3DS_SKIP_SPU_MIX is on). Behaves like today's
-			 * synchronous path, minus queueing (discard decision). */
+			/* Fallback: no worker thread secured (Old3DS, or couldn't claim
+			 * core 1). Renders synchronously on the main thread -- the full
+			 * mixer, so this path is SLOW, but correct and audible: it
+			 * submits to the same ndsp sink the worker would. */
 			s16 scratch[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
 
 			NativeAudio_LockOutput(); /* real on this path too -- harmless,
 			                              nothing else contends for it when
 			                              there is no worker thread */
 			NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
+			N3DS_NdspSubmitVBlankBlock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
 			NativeAudio_UnlockOutput();
 		}
 	}
@@ -4305,28 +4222,23 @@ s32 NativeAudio_SpuInit(void)
 	s_audio.init = 1;
 
 #if defined(__3DS__)
-	// Without a real output device nothing ever pulls PCM, and in the normal
-	// mode the SPU/XA clocks only advance inside that pull callback -- so XA
-	// playback would never progress and the boot sequence's
-	// "while (XA_State != 0)" wait would spin forever. Advancing from the
-	// VBlank clock is the correct model here, and matches how the 3DS renderer
-	// is paced. Revisit when ndsp is wired up and a real callback exists.
+	// The SPU/XA clocks advance from the VBlank clock on 3DS, not from an
+	// output-device pull callback: the worker thread (or the StepVBlank
+	// fallback) renders exactly one vblank of samples per emitted vblank and
+	// pushes it to the ndsp sink, which drains at its own fixed rate. ndsp is
+	// a sink here, never a clock -- keeping production on the vblank clock is
+	// what lets the boot sequence's "while (XA_State != 0)" wait progress, and
+	// matches how the 3DS renderer is paced.
 	NativeAudio_SetDeterministicRenderMode(1);
 
-	// 3DS audio subsystem finishing initialization: try to spin up the
-	// dedicated mixer thread (docs/AUDIO_THREADING_DESIGN.md). Safe to call
-	// every time this function runs, including the repeat calls
-	// NativeAudio_PlayXATrack/PlayXAFile make on every XA playback request --
-	// N3DS_AudioThreadInit no-ops if a worker is already running. Passing
-	// !CTR_3DS_SKIP_SPU_MIX rather than gating this call on it: that macro is
-	// only reliably normalized to 0/1 inside this translation unit (CMake
-	// only defines it explicitly when turned OFF; the default-ON case relies
-	// on this file's own #if !defined(CTR_3DS_SKIP_SPU_MIX) block above), so
-	// n3ds_audio_thread.c cannot safely re-derive it -- and gating the call
-	// itself away entirely would also skip the lock initialization
-	// N3DS_AudioLock/N3DS_AudioUnlock need for the ~30 existing call sites
-	// that keep running regardless of this flag.
-	N3DS_AudioThreadInit(!CTR_3DS_SKIP_SPU_MIX);
+	// 3DS audio subsystem finishing initialization: bring up the ndsp sink
+	// and try to spin up the dedicated core-1 mixer thread
+	// (docs/AUDIO_THREADING_DESIGN.md). Safe to call every time this function
+	// runs, including the repeat calls NativeAudio_PlayXATrack/PlayXAFile
+	// make on every XA playback request -- N3DS_AudioThreadInit no-ops if a
+	// worker is already running, and always initializes the locks
+	// N3DS_AudioLock/N3DS_AudioUnlock need for the ~30 existing call sites.
+	N3DS_AudioThreadInit();
 #endif
 
 	return 1;

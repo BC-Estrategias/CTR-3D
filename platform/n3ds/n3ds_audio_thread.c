@@ -5,11 +5,20 @@
  * docs/AUDIO_THREADING_DESIGN.md for the full design this implements,
  * including "What changed from v1" -- the lock-scoping and core-selection
  * fixes below are not incidental, they are the actual point of the design.
+ *
+ * This file also owns the ndsp output sink: a small ring of linear-memory
+ * wave buffers the mixer (worker thread, or the StepVBlank fallback) submits
+ * one vblank's rendered stereo PCM into. ndsp resamples 44100 Hz -> the
+ * DSP's native output rate per channel, so the mixer keeps producing the
+ * exact PSX SPU rate it always has.
  */
 
 #include <3ds.h>
+#include <string.h>
+#include <stdio.h>
 
 #include "n3ds_audio_thread.h"
+#include "n3ds_backend.h" /* N3DS_DebugLog only -- plain-scalar boundary header, no game types */
 
 /*
  * Defined in native_audio.c (the unity build's own translation unit).
@@ -20,8 +29,8 @@
  * is exactly the collision n3ds_backend.h's isolation exists to avoid.
  * NativeAudio_RenderVBlankForAudioThread is a small external-linkage wrapper
  * native_audio.c exposes specifically for this cross-TU call: it owns its
- * own scratch buffer and discards the rendered samples itself (this
- * design's discard-not-queue decision), so nothing PSX-typed needs to cross
+ * own scratch buffer and hands the rendered samples to
+ * N3DS_NdspSubmitVBlankBlock below, so nothing PSX-typed needs to cross
  * this boundary -- the signature is deliberately void->void. There is no
  * shared header enforcing this prototype; if that wrapper's signature ever
  * changes, this declaration must be updated by hand.
@@ -57,6 +66,27 @@ extern void NativeAudio_XAPumpForAudioThread(void);
  */
 #define NATIVE_AUDIO_THREAD_MAX_BACKLOG_VBLANKS 8
 
+/*
+ * One vblank of stereo PCM at the mixer's fixed PSX SPU rate. Hand-matched
+ * to NATIVE_AUDIO_VBLANK_FRAMES (native_audio.c: 44100/60 = 735) the same
+ * way the extern prototypes above are hand-matched: the game-side header
+ * cannot cross this boundary. N3DS_NdspSubmitVBlankBlock rejects (and
+ * counts) any submit whose frame count disagrees, so a drift here is loud
+ * in the counters rather than silent corruption.
+ */
+#define N3DS_NDSP_BLOCK_FRAMES 735
+/*
+ * Pool depth mirrors the PC output queue's cushion
+ * (NATIVE_AUDIO_SCHEDULED_QUEUE_FRAMES = 16 vblanks, ~267ms). Production is
+ * paced by the vblank emitter (60 Hz real-time, catch-up capped at 8) and
+ * ndsp drains at exactly 44100 frames/s, so steady-state queue depth stays
+ * wherever the last catch-up burst left it -- the pool only has to absorb
+ * that burst plus clock drift. A full pool drops the newest block (counted,
+ * reported in the renderer's audio shape line), never blocks the mixer.
+ */
+#define N3DS_NDSP_BLOCK_COUNT 16
+#define N3DS_NDSP_CHANNEL     0
+
 /* Protects s_audio (native_audio.c) during MixFrame -- backs
  * N3DS_AudioLock/N3DS_AudioUnlock, which back SDL_Lock/UnlockAudioStream. */
 static LightLock s_audioRenderLock;
@@ -71,6 +101,160 @@ static u32 s_droppedVBlanks;  /* diagnostic only, written only by main thread, u
 static Thread s_audioThread;  /* NULL if never created (fallback path) or after join */
 static volatile int s_audioThreadShouldStop;
 static volatile int s_audioThreadRunning; /* set true only after a real thread on core 1 is confirmed running */
+
+/*
+ * ndsp sink state. Written only from N3DS_AudioThreadInit/Shutdown (main
+ * thread) and N3DS_NdspSubmitVBlankBlock. Submit runs on exactly one thread
+ * at any point in the process lifetime -- the worker when one exists, else
+ * the main thread's StepVBlank fallback (N3DS_AudioThreadIsRunning never
+ * flips true after init) -- so the ring cursor needs no lock of its own.
+ */
+static int s_ndspInitAttempted;
+static int s_ndspUp;
+static s16 *s_ndspPcm;                                  /* linearAlloc: BLOCK_COUNT x BLOCK_FRAMES x stereo */
+static ndspWaveBuf s_ndspBufs[N3DS_NDSP_BLOCK_COUNT];   /* statuses start 0 = NDSP_WBUF_FREE */
+static int s_ndspNextBuf;
+static u32 s_ndspDroppedBlocks;
+
+static void N3DS_NdspSinkInit(void)
+{
+	Result rc;
+	char line[96];
+	float mix[12];
+
+	if (s_ndspInitAttempted)
+	{
+		/* Same idempotency contract as the worker thread below: Init is
+		 * re-entered on every XA play request via NativeAudio_SpuInit. */
+		return;
+	}
+	s_ndspInitAttempted = 1;
+
+	rc = ndspInit();
+	if (R_FAILED(rc))
+	{
+		/*
+		 * The classic homebrew cause is a missing DSP firmware dump
+		 * (sdmc:/3ds/dspfirm.cdc, dumped once with the DSP1 homebrew) --
+		 * newer Luma3DS setups load it from NAND without the file, so on
+		 * this project's target setup success is expected. Failing here is
+		 * clean: the mixer keeps rendering (lifecycle stays exact) and
+		 * every submit is refused, i.e. exactly the old muted behavior.
+		 */
+		snprintf(line, sizeof(line), "[CTR-3DS] ndsp init FAILED (0x%08lx) -- dspfirm.cdc? audio stays muted", (unsigned long)rc);
+		N3DS_DebugLog(line);
+		return;
+	}
+
+	s_ndspPcm = (s16 *)linearAlloc((size_t)N3DS_NDSP_BLOCK_COUNT * N3DS_NDSP_BLOCK_FRAMES * 2 * sizeof(s16));
+	if (s_ndspPcm == NULL)
+	{
+		N3DS_DebugLog("[CTR-3DS] ndsp: linearAlloc failed, audio stays muted");
+		ndspExit();
+		return;
+	}
+
+	ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+	ndspChnReset(N3DS_NDSP_CHANNEL);
+	ndspChnSetInterp(N3DS_NDSP_CHANNEL, NDSP_INTERP_POLYPHASE);
+	ndspChnSetRate(N3DS_NDSP_CHANNEL, 44100.0f); /* PSX SPU rate; DSP resamples to its native output rate */
+	ndspChnSetFormat(N3DS_NDSP_CHANNEL, NDSP_FORMAT_STEREO_PCM16);
+	memset(mix, 0, sizeof(mix));
+	mix[0] = 1.0f; /* front left */
+	mix[1] = 1.0f; /* front right */
+	ndspChnSetMix(N3DS_NDSP_CHANNEL, mix);
+
+	s_ndspUp = 1;
+	snprintf(line, sizeof(line), "[CTR-3DS] ndsp: up (%d blocks x %d frames)", N3DS_NDSP_BLOCK_COUNT, N3DS_NDSP_BLOCK_FRAMES);
+	N3DS_DebugLog(line);
+}
+
+static void N3DS_NdspSinkShutdown(void)
+{
+	/* Caller (N3DS_AudioThreadShutdown) has already joined the worker, and
+	 * the fallback submit path runs on the same thread this does -- no
+	 * submit can be in flight here. */
+	if (s_ndspUp)
+	{
+		ndspChnWaveBufClear(N3DS_NDSP_CHANNEL);
+		ndspExit();
+	}
+	if (s_ndspPcm != NULL)
+	{
+		linearFree(s_ndspPcm);
+		s_ndspPcm = NULL;
+	}
+	s_ndspUp = 0;
+	s_ndspInitAttempted = 0; /* a later re-Init may bring the sink back up */
+	s_ndspNextBuf = 0;
+	memset(s_ndspBufs, 0, sizeof(s_ndspBufs));
+}
+
+int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount)
+{
+	ndspWaveBuf *buf;
+	s16 *slot;
+
+	if (!s_ndspUp)
+	{
+		return 0;
+	}
+	if (frameCount != N3DS_NDSP_BLOCK_FRAMES)
+	{
+		/* Hand-matched constant drifted (see N3DS_NDSP_BLOCK_FRAMES) --
+		 * refuse loudly-in-counters rather than under/overrun the slot. */
+		s_ndspDroppedBlocks++;
+		return 0;
+	}
+
+	buf = &s_ndspBufs[s_ndspNextBuf];
+	if ((buf->status == NDSP_WBUF_QUEUED) || (buf->status == NDSP_WBUF_PLAYING))
+	{
+		/* Pool full: drop the newest block (this one), never stall the
+		 * mixer -- see the N3DS_NDSP_BLOCK_COUNT comment. */
+		s_ndspDroppedBlocks++;
+		return 0;
+	}
+
+	slot = s_ndspPcm + (size_t)s_ndspNextBuf * N3DS_NDSP_BLOCK_FRAMES * 2;
+	memcpy(slot, frames, (size_t)N3DS_NDSP_BLOCK_FRAMES * 2 * sizeof(s16));
+	DSP_FlushDataCache(slot, (u32)(N3DS_NDSP_BLOCK_FRAMES * 2 * sizeof(s16)));
+
+	memset(buf, 0, sizeof(*buf));
+	buf->data_pcm16 = slot;
+	buf->nsamples = N3DS_NDSP_BLOCK_FRAMES; /* per-channel frame count, not halfword total */
+	buf->looping = false;
+	ndspChnWaveBufAdd(N3DS_NDSP_CHANNEL, buf);
+
+	s_ndspNextBuf = (s_ndspNextBuf + 1) % N3DS_NDSP_BLOCK_COUNT;
+	return 1;
+}
+
+int N3DS_NdspIsUp(void)
+{
+	return s_ndspUp;
+}
+
+int N3DS_NdspGetQueuedBlocks(void)
+{
+	int queued = 0;
+	int i;
+
+	for (i = 0; i < N3DS_NDSP_BLOCK_COUNT; i++)
+	{
+		if ((s_ndspBufs[i].status == NDSP_WBUF_QUEUED) || (s_ndspBufs[i].status == NDSP_WBUF_PLAYING))
+		{
+			queued++;
+		}
+	}
+
+	return queued;
+}
+
+int N3DS_NdspGetDroppedBlocks(void)
+{
+	return (int)s_ndspDroppedBlocks;
+}
 
 static void N3DS_AudioThreadMain(void *arg)
 {
@@ -121,7 +305,7 @@ static void N3DS_AudioThreadMain(void *arg)
 	threadExit(0);
 }
 
-void N3DS_AudioThreadInit(int mixingEnabled)
+void N3DS_AudioThreadInit(void)
 {
 	bool isNew3DS;
 	s32 mainPriority;
@@ -145,7 +329,7 @@ void N3DS_AudioThreadInit(int mixingEnabled)
 
 	/*
 	 * Locks/event/counters are real and initialized unconditionally from
-	 * here down, no matter what mixingEnabled or the checks below decide --
+	 * here down, no matter what the checks below decide --
 	 * N3DS_AudioLock/N3DS_AudioUnlock (backing SDL_LockAudioStream/
 	 * UnlockAudioStream) are reachable from ~30 existing native_audio.c call
 	 * sites regardless of whether a worker thread ends up existing, and
@@ -161,19 +345,13 @@ void N3DS_AudioThreadInit(int mixingEnabled)
 	s_audioThread = NULL;
 	s_audioThreadRunning = 0;
 
-	if (!mixingEnabled)
-	{
-		/*
-		 * CTR_3DS_SKIP_SPU_MIX is on (today's default): MixFrame only runs
-		 * the cheap voice-lifecycle loop, so a dedicated worker thread would
-		 * earn nothing and just burn a core. Leave s_audioThreadRunning
-		 * false so the caller's StepVBlank fallback renders synchronously
-		 * instead -- at this flag setting that is exactly today's existing,
-		 * already-cheap behavior. Net effect: this whole feature is inert
-		 * in the current default build configuration.
-		 */
-		return;
-	}
+	/*
+	 * The ndsp sink comes up regardless of whether a worker thread does:
+	 * the StepVBlank fallback path submits to it from the main thread when
+	 * no worker could be secured. Guarded internally against the repeat
+	 * calls described above.
+	 */
+	N3DS_NdspSinkInit();
 
 	isNew3DS = false;
 	APT_CheckNew3DS(&isNew3DS);
@@ -244,19 +422,20 @@ void N3DS_AudioThreadNotifyVBlank(void)
 
 void N3DS_AudioThreadShutdown(void)
 {
-	if (!s_audioThreadRunning || (s_audioThread == NULL))
+	if (s_audioThreadRunning && (s_audioThread != NULL))
 	{
-		return; /* never created -- mixingEnabled was false, the fallback
-		           checks bailed, or shutdown was reached via the early
-		           init-failure path before Init ever ran */
+		s_audioThreadShouldStop = 1;
+		LightEvent_Signal(&s_audioWakeEvent);
+		threadJoin(s_audioThread, U64_MAX); /* documented infinite-wait sentinel */
+		threadFree(s_audioThread);          /* valid only because detached=false at creation */
+		s_audioThread = NULL;
+		s_audioThreadRunning = 0;
 	}
 
-	s_audioThreadShouldStop = 1;
-	LightEvent_Signal(&s_audioWakeEvent);
-	threadJoin(s_audioThread, U64_MAX); /* documented infinite-wait sentinel */
-	threadFree(s_audioThread);          /* valid only because detached=false at creation */
-	s_audioThread = NULL;
-	s_audioThreadRunning = 0;
+	/* After the join (or if no worker ever existed): nothing can be
+	 * submitting anymore, from any thread -- safe to tear the sink down.
+	 * No-op if the sink never came up. */
+	N3DS_NdspSinkShutdown();
 }
 
 int N3DS_AudioThreadIsRunning(void)

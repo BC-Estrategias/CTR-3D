@@ -161,18 +161,6 @@ if(CTR_NATIVE_PRIMMEM_WATERMARK)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_PRIMMEM_WATERMARK=1)
 endif()
 
-# 3DS only, and temporary: skip generating SPU voice samples while ndsp is not
-# wired up and nothing is audible anyway. Worth 48-81% of frame time. Voice
-# lifecycle still runs, so the game sequences itself normally -- see the comment
-# on CTR_3DS_SKIP_SPU_MIX in platform/native_audio.c. Turn OFF to measure mixer
-# optimisations on real 3DS timings. Delete this once ndsp exists.
-option(CTR_3DS_SKIP_SPU_MIX
-    "3DS: skip SPU voice sample generation while there is no audio output"
-    ON)
-if(NINTENDO_3DS AND NOT CTR_3DS_SKIP_SPU_MIX)
-    target_compile_definitions(ctr_native PRIVATE CTR_3DS_SKIP_SPU_MIX=0)
-endif()
-
 # Log every growth/reset of the decoded-voice PCM arena in the audio mixer.
 option(CTR_NATIVE_AUDIO_ARENA_LOG
     "Log decoded-voice PCM arena growth and resets"
