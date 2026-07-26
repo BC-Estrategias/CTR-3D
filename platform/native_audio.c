@@ -59,9 +59,16 @@ global_variable struct NativeAudioHwSampleCacheEntry s_hwSampleCache[NATIVE_AUDI
 
 struct NativeAudioHwVoiceShadow
 {
-	int keyonPending; /* set at SpuSetKey(on), consumed by the mirror */
-	int started;      /* a DSP channel is currently playing this voice */
-	u16 lastPitch;    /* SetRate pokes only on change */
+	int keyonPending;   /* set at SpuSetKey(on), consumed by the mirror */
+	int started;        /* a DSP channel is currently playing this voice */
+	u16 lastPitch;      /* SetRate pokes only on change */
+	float lastGainL;    /* SetMix pokes only on change: every ndspChn* call
+	                       crosses ndsp's command mutex, and 23 unconditional
+	                       pokes per vblank showed up as worker lag
+	                       (audioDropped creep) in hardware run 2. Gains are
+	                       exact float products of integers, so equality
+	                       compare is sound. */
+	float lastGainR;
 };
 
 global_variable struct NativeAudioHwVoiceShadow s_hwVoiceShadow[24];
@@ -3026,7 +3033,35 @@ internal void NativeAudio_XAStreamPump(void)
 		return;
 	}
 
+#if defined(__3DS__)
+	/*
+	 * Burst: refill up to 4 sectors per call. Each sector is a separate SD
+	 * read serialized against the main thread's bulk scene loads by the
+	 * FAT driver's global mutex -- hardware runs 2/3 showed that fine-
+	 * grained interleaving there makes BOTH sides pathologically slow
+	 * (136s race-end frame, 33.9s intro frame). Fewer, larger bursts cut
+	 * the crossing count; PC stays at one sector per vblank because replay
+	 * determinism depends on ring-fill timing staying as it always was.
+	 */
+	{
+		int pumped;
+
+		for (pumped = 0; pumped < 4; pumped++)
+		{
+			NativeAudio_XAStreamDecodeNextSector(&s_audio.xaStream);
+			NativeAudio_LockOutput();
+			active = s_audio.xa.active;
+			ahead = NativeAudio_XAStreamAheadCountNoLock(&s_audio.xaStream);
+			NativeAudio_UnlockOutput();
+			if (!active || (ahead >= NATIVE_AUDIO_XA_RING_AHEAD_TARGET))
+			{
+				break;
+			}
+		}
+	}
+#else
 	NativeAudio_XAStreamDecodeNextSector(&s_audio.xaStream);
+#endif
 }
 
 #if defined(__3DS__)
@@ -3758,7 +3793,20 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 	int voiceStopped = 0;
 	int i;
 
+#if defined(__3DS__)
+	/*
+	 * When the worker thread is alive, XA does NOT advance here: it runs on
+	 * the worker's own wall-clock via NativeAudio_RenderXAParcelNoLock --
+	 * real time regardless of frame rate, which is what the PS1's CD
+	 * hardware did (session 20, hardware run 3: per-vblank advance chopped
+	 * the boot announcer into starved fragments whenever frames ran slow).
+	 * The no-worker fallback still advances XA here, per vblank, exactly
+	 * as before.
+	 */
+	if (s_audio.xa.active && !N3DS_AudioThreadIsRunning())
+#else
 	if (s_audio.xa.active)
+#endif
 	{
 		u64 outputFrameCount = NativeAudio_GetXAOutputFrameCount(s_audio.xa.frameCount, s_audio.xa.sampleRate);
 
@@ -3979,6 +4027,8 @@ internal void NativeAudio_HwVoiceMirrorNoLock(void)
 				                  (int)(voice->positionFp >> NATIVE_AUDIO_FP_SHIFT), rateHz);
 				shadow->started = 1;
 				shadow->lastPitch = voice->attr.pitch;
+				shadow->lastGainL = -999.0f; /* force the first SetMix below */
+				shadow->lastGainR = -999.0f;
 			}
 		}
 
@@ -4015,7 +4065,12 @@ internal void NativeAudio_HwVoiceMirrorNoLock(void)
 			float gainL = level * ((float)voice->attr.volume.left / 32768.0f) * ((float)s_audio.masterVolumeLeft / 32768.0f);
 			float gainR = level * ((float)voice->attr.volume.right / 32768.0f) * ((float)s_audio.masterVolumeRight / 32768.0f);
 
-			N3DS_HwVoiceSetMix(i, gainL, gainR);
+			if ((gainL != shadow->lastGainL) || (gainR != shadow->lastGainR))
+			{
+				N3DS_HwVoiceSetMix(i, gainL, gainR);
+				shadow->lastGainL = gainL;
+				shadow->lastGainR = gainR;
+			}
 		}
 	}
 }
@@ -4044,9 +4099,79 @@ void NativeAudio_RenderVBlankForAudioThread(void)
 {
 	s16 scratch[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
 
+	/* Lifecycle + mirror only. The rendered frames are silence now (voices
+	 * play on their own channels, XA advances on the worker's wall-clock
+	 * below) -- submitting them would flood the music channel's queue with
+	 * zeros between real XA parcels. */
 	NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
-	N3DS_NdspSubmitVBlankBlock(scratch, NATIVE_AUDIO_VBLANK_FRAMES); /* music/XA parcel -- voices are on their own channels */
 	NativeAudio_HwVoiceMirrorNoLock();
+}
+
+/*
+ * Wall-clock XA: called by the worker at real-time 60Hz, independent of
+ * vblank emission (n3ds_audio_thread.c paces it by svcGetSystemTick).
+ * Renders one vblank's worth of the XA/CD music stream and submits it to
+ * the music channel; a starved game loop no longer starves the music.
+ * Takes the render lock itself -- the worker calls this OUTSIDE its
+ * lifecycle-drain lock span. Returns 1 if a parcel was submitted, 0 if XA
+ * was idle/silent -- the worker uses the idle->active edge to prime a
+ * small queue cushion.
+ */
+int NativeAudio_RenderXAParcelForAudioThread(void)
+{
+	s16 parcel[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
+	int frame;
+	int anyContent = 0;
+
+	NativeAudio_LockOutput();
+
+	if (!s_audio.init || !s_audio.xa.active)
+	{
+		NativeAudio_UnlockOutput();
+		return 0; /* no submit: the music channel just drains to silence */
+	}
+
+	for (frame = 0; frame < NATIVE_AUDIO_VBLANK_FRAMES; frame++)
+	{
+		int mixLeft = 0;
+		int mixRight = 0;
+
+		if (s_audio.xa.active)
+		{
+			u64 outputFrameCount = NativeAudio_GetXAOutputFrameCount(s_audio.xa.frameCount, s_audio.xa.sampleRate);
+
+			if ((outputFrameCount == 0) || (s_audio.xa.outputFrame >= outputFrameCount))
+			{
+				s_audio.xa.active = 0;
+			}
+			else if (!s_audio.cdMixEnabled)
+			{
+				NativeAudio_AdvanceXAOutputFrameNoLock();
+			}
+			else
+			{
+				int srcLeft = NativeAudio_GetXAMixSampleNoLock(0);
+				int srcRight = NativeAudio_GetXAMixSampleNoLock(1);
+
+				mixLeft = NativeAudio_ApplyVolume(srcLeft, s_audio.xa.volumeLeft, s_audio.masterVolumeLeft);
+				mixRight = NativeAudio_ApplyVolume(srcRight, s_audio.xa.volumeRight, s_audio.masterVolumeRight);
+				anyContent = 1;
+				NativeAudio_AdvanceXAOutputFrameNoLock();
+			}
+		}
+
+		parcel[frame * NATIVE_AUDIO_CHANNELS] = (s16)NativeAudio_Clamp16(mixLeft);
+		parcel[frame * NATIVE_AUDIO_CHANNELS + 1] = (s16)NativeAudio_Clamp16(mixRight);
+	}
+
+	NativeAudio_UnlockOutput();
+
+	if (anyContent)
+	{
+		N3DS_NdspSubmitVBlankBlock(parcel, NATIVE_AUDIO_VBLANK_FRAMES);
+	}
+
+	return anyContent;
 }
 #endif
 

@@ -59,6 +59,17 @@ extern void NativeAudio_RenderVBlankForAudioThread(void);
 extern void NativeAudio_XAPumpForAudioThread(void);
 
 /*
+ * Same hand-matched cross-TU contract as the two above. Renders one vblank
+ * of the XA/CD music stream and submits it to the music channel; takes the
+ * render lock itself, so it must be called OUTSIDE the drain loop's lock
+ * span. Returns 1 if a parcel was submitted, 0 if XA was idle. The worker
+ * paces it by wall-clock (svcGetSystemTick) below -- XA runs at real time
+ * no matter how slowly the game emits vblanks, which is what the PS1's CD
+ * hardware did.
+ */
+extern int NativeAudio_RenderXAParcelForAudioThread(void);
+
+/*
  * Reuses NATIVE_VSYNC_CATCHUP_MAX's existing value and precedent (the
  * render-side vblank catch-up loop, native_platform.c) -- same shape of
  * problem, same answer, not a new arbitrary number. See
@@ -103,8 +114,11 @@ static LightLock s_audioRenderLock;
 /* Protects ONLY the three counters below -- held for a handful of
  * instructions, never across rendering. */
 static LightLock s_audioCounterLock;
-/* RESET_ONESHOT -- main thread signals, worker thread wakes. */
-static LightEvent s_audioWakeEvent;
+/* Kernel event (RESET_STICKY), not a LightEvent: the worker's wait doubles
+ * as the wall-clock XA pacer via svcWaitSynchronization's timeout, which
+ * LightEvent cannot do. Signaled per vblank by the main thread and once at
+ * shutdown; ~60 syscalls/s, nothing like the per-triangle scope tax. */
+static Handle s_audioWakeHandle;
 static u32 s_targetVBlanks;   /* written only by main thread, under s_audioCounterLock */
 static u32 s_renderedVBlanks; /* written only by worker thread, under s_audioCounterLock */
 static u32 s_droppedVBlanks;  /* diagnostic only, written only by main thread, under s_audioCounterLock */
@@ -461,17 +475,28 @@ int N3DS_HwVoiceStoreGetUsedKiB(void)
 
 static void N3DS_AudioThreadMain(void *arg)
 {
+	const u64 xaPeriodTicks = SYSCLOCK_ARM11 / 60;
+	u64 nextXaTick = svcGetSystemTick() + xaPeriodTicks;
+
 	(void)arg;
 
 	for (;;)
 	{
-		LightEvent_Wait(&s_audioWakeEvent);
+		u64 now = svcGetSystemTick();
+		s64 waitNs = 0;
+
+		if ((s64)(nextXaTick - now) > 0)
+		{
+			waitNs = (s64)((nextXaTick - now) * 1000000000ULL / SYSCLOCK_ARM11);
+		}
+		svcWaitSynchronization(s_audioWakeHandle, waitNs); /* wake on vblank signal OR the XA deadline */
+		svcClearEvent(s_audioWakeHandle);
 		if (s_audioThreadShouldStop)
 		{
 			break;
 		}
 
-		for (;;) /* drain the current backlog, one vblank at a time */
+		for (;;) /* drain the current lifecycle backlog, one vblank at a time */
 		{
 			int hasWork;
 
@@ -489,20 +514,54 @@ static void N3DS_AudioThreadMain(void *arg)
 			                                          the "what changed from v1" fix: the render
 			                                          lock is never held across the whole drain. */
 
-			NativeAudio_XAPumpForAudioThread(); /* separate, sequential step, run AFTER
-			                                        s_audioRenderLock is released above, NOT nested
-			                                        inside it: NativeAudio_XAStreamPump (called
-			                                        inside this wrapper) takes that same lock itself
-			                                        via N3DS_AudioLock/N3DS_AudioUnlock, and LightLock
-			                                        is non-recursive, so calling it while still
-			                                        holding s_audioRenderLock would self-deadlock this
-			                                        thread. See docs/AUDIO_THREADING_DESIGN.md,
-			                                        "Verification findings". */
-
 			LightLock_Lock(&s_audioCounterLock);
 			s_renderedVBlanks++;
 			LightLock_Unlock(&s_audioCounterLock);
 		}
+
+		/*
+		 * Wall-clock XA: produce every parcel whose deadline has passed
+		 * (catch-up capped -- after a long stall we resync rather than
+		 * blast the queue). Independent of the lifecycle drain above, so
+		 * the music holds real time even when vblank emission crawls.
+		 */
+		now = svcGetSystemTick();
+		{
+			static int s_xaWasIdle = 1;
+			int produced = 0;
+			int lastSubmitted = 0;
+
+			while (((s64)(now - nextXaTick) >= 0) && (produced < 4))
+			{
+				lastSubmitted = NativeAudio_RenderXAParcelForAudioThread(); /* takes the render lock itself */
+				nextXaTick += xaPeriodTicks;
+				produced++;
+				now = svcGetSystemTick();
+			}
+			if (lastSubmitted && s_xaWasIdle)
+			{
+				/* Idle -> active edge: prime a ~50ms cushion so a single
+				 * contended lock or SD stall never gaps the track's first
+				 * seconds. Deadline clock resyncs to now. */
+				NativeAudio_RenderXAParcelForAudioThread();
+				NativeAudio_RenderXAParcelForAudioThread();
+				nextXaTick = svcGetSystemTick() + xaPeriodTicks;
+			}
+			if (produced > 0)
+			{
+				s_xaWasIdle = !lastSubmitted;
+			}
+			if ((s64)(now - nextXaTick) >= (s64)(8 * xaPeriodTicks))
+			{
+				nextXaTick = now + xaPeriodTicks; /* hard resync after a stall */
+			}
+		}
+
+		NativeAudio_XAPumpForAudioThread(); /* once per wake, burst-refilling inside; run with NO
+		                                        locks held -- NativeAudio_XAStreamPump takes the
+		                                        render lock itself via N3DS_AudioLock, and LightLock
+		                                        is non-recursive (docs/AUDIO_THREADING_DESIGN.md,
+		                                        "Verification findings"). */
 	}
 
 	threadExit(0);
@@ -540,7 +599,6 @@ void N3DS_AudioThreadInit(void)
 	 */
 	LightLock_Init(&s_audioRenderLock);
 	LightLock_Init(&s_audioCounterLock);
-	LightEvent_Init(&s_audioWakeEvent, RESET_ONESHOT);
 	s_targetVBlanks = 0;
 	s_renderedVBlanks = 0;
 	s_droppedVBlanks = 0;
@@ -555,6 +613,20 @@ void N3DS_AudioThreadInit(void)
 	 * calls described above.
 	 */
 	N3DS_NdspSinkInit();
+
+	/* The worker's wake event is a kernel handle (see its declaration);
+	 * created once and kept across repeat Init calls. Without it there can
+	 * be no worker, but the sink above stays up -- the StepVBlank fallback
+	 * still submits audibly. */
+	if (s_audioWakeHandle == 0)
+	{
+		if (R_FAILED(svcCreateEvent(&s_audioWakeHandle, RESET_STICKY)))
+		{
+			s_audioWakeHandle = 0;
+			N3DS_DebugLog("[CTR-3DS] audio worker: NO (svcCreateEvent failed) -- main-thread fallback");
+			return;
+		}
+	}
 
 	isNew3DS = false;
 	APT_CheckNew3DS(&isNew3DS);
@@ -624,7 +696,7 @@ void N3DS_AudioThreadNotifyVBlank(void)
 		s_droppedVBlanks++; /* non-silent cap -- see design doc's "XA lag question" */
 	}
 	LightLock_Unlock(&s_audioCounterLock);
-	LightEvent_Signal(&s_audioWakeEvent);
+	svcSignalEvent(s_audioWakeHandle);
 }
 
 void N3DS_AudioThreadShutdown(void)
@@ -632,11 +704,16 @@ void N3DS_AudioThreadShutdown(void)
 	if (s_audioThreadRunning && (s_audioThread != NULL))
 	{
 		s_audioThreadShouldStop = 1;
-		LightEvent_Signal(&s_audioWakeEvent);
+		svcSignalEvent(s_audioWakeHandle);
 		threadJoin(s_audioThread, U64_MAX); /* documented infinite-wait sentinel */
 		threadFree(s_audioThread);          /* valid only because detached=false at creation */
 		s_audioThread = NULL;
 		s_audioThreadRunning = 0;
+	}
+	if (s_audioWakeHandle != 0)
+	{
+		svcCloseHandle(s_audioWakeHandle);
+		s_audioWakeHandle = 0;
 	}
 
 	/* After the join (or if no worker ever existed): nothing can be
