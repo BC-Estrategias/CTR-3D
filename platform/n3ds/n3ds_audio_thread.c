@@ -525,37 +525,33 @@ static void N3DS_AudioThreadMain(void *arg)
 		 * blast the queue). Independent of the lifecycle drain above, so
 		 * the music holds real time even when vblank emission crawls.
 		 */
-		now = svcGetSystemTick();
+		/*
+		 * Cushion-driven XA (hardware run 4's log): keeping the queue at a
+		 * "just-in-time" depth meant every SD stall on this same thread
+		 * (the pump below, contending with main-thread bulk loads) gapped
+		 * the music -- ndspQ sat at 0 through the whole announcer, ring
+		 * full, zero underruns: delivery latency, not pacing, was the
+		 * bottleneck all along. So: top the queue up to ~200ms of parcels
+		 * whenever XA has content, every wake. Stalls drain cushion
+		 * instead of audio, catch-up refills it, and nothing is ever
+		 * discarded. The wall-clock wait below is just the wake cadence
+		 * now. XA position runs up to the cushion ahead of real time --
+		 * the PS1's CD buffered ahead the same way.
+		 */
 		{
-			static int s_xaWasIdle = 1;
-			int produced = 0;
-			int lastSubmitted = 0;
+			int guard = 0;
 
-			while (((s64)(now - nextXaTick) >= 0) && (produced < 4))
+			while ((N3DS_NdspGetQueuedBlocks() < 12) && (guard < 8))
 			{
-				lastSubmitted = NativeAudio_RenderXAParcelForAudioThread(); /* takes the render lock itself */
-				nextXaTick += xaPeriodTicks;
-				produced++;
-				now = svcGetSystemTick();
-			}
-			if (lastSubmitted && s_xaWasIdle)
-			{
-				/* Idle -> active edge: prime a ~50ms cushion so a single
-				 * contended lock or SD stall never gaps the track's first
-				 * seconds. Deadline clock resyncs to now. */
-				NativeAudio_RenderXAParcelForAudioThread();
-				NativeAudio_RenderXAParcelForAudioThread();
-				nextXaTick = svcGetSystemTick() + xaPeriodTicks;
-			}
-			if (produced > 0)
-			{
-				s_xaWasIdle = !lastSubmitted;
-			}
-			if ((s64)(now - nextXaTick) >= (s64)(8 * xaPeriodTicks))
-			{
-				nextXaTick = now + xaPeriodTicks; /* hard resync after a stall */
+				if (!NativeAudio_RenderXAParcelForAudioThread()) /* takes the render lock itself */
+				{
+					break; /* XA idle (or track just ended) */
+				}
+				guard++;
 			}
 		}
+		now = svcGetSystemTick();
+		nextXaTick = now + xaPeriodTicks; /* next top-up check one vblank out */
 
 		NativeAudio_XAPumpForAudioThread(); /* once per wake, burst-refilling inside; run with NO
 		                                        locks held -- NativeAudio_XAStreamPump takes the

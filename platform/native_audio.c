@@ -157,8 +157,27 @@ global_variable struct
 // see the session report for why a single hardcoded stride would corrupt
 // stereo frameIndex<->sector math.
 #define NATIVE_AUDIO_XA_SECTOR_FRAMES      4032  // 18*8*28, one ring slot's worst-case (mono) capacity in stereo output frames
+#if defined(__3DS__)
+/*
+ * Hardware runs 2/3 (session 20): the announcer/music "slow and stop-n-go"
+ * was this ring running dry -- 6 sectors is ~0.3s of cushion, and the
+ * worker's refill reads share the SD card (and its FAT mutex) with bulk
+ * scene loads that monopolize it for whole seconds. 32 sectors â‰ˆ 1.5-3s
+ * rides out those bursts; the memory (~2MB across both stream buffers) is
+ * cheap now that the decoded-voice arena is gone. The synchronous prime at
+ * track open stays SMALL (see NATIVE_AUDIO_XA_PRIME_TARGET) so starts do
+ * not stall the main thread; the worker's burst pump tops the rest up
+ * within a few wakes. PC keeps the original geometry: replay determinism
+ * depends on ring residency/underrun timing staying exactly as it was.
+ */
+#define NATIVE_AUDIO_XA_RING_SECTORS       32
+#define NATIVE_AUDIO_XA_RING_AHEAD_TARGET  28
+#define NATIVE_AUDIO_XA_PRIME_TARGET       4
+#else
 #define NATIVE_AUDIO_XA_RING_SECTORS       6     // resident sector-slots per stream (~94.5 KiB @ mono capacity)
 #define NATIVE_AUDIO_XA_RING_AHEAD_TARGET  4     // refill ceiling, sectors kept ahead of playback
+#define NATIVE_AUDIO_XA_PRIME_TARGET       NATIVE_AUDIO_XA_RING_AHEAD_TARGET
+#endif
 
 enum
 {
@@ -3028,25 +3047,35 @@ internal void NativeAudio_XAStreamPump(void)
 	ahead = NativeAudio_XAStreamAheadCountNoLock(&s_audio.xaStream);
 	NativeAudio_UnlockOutput();
 
-	if (!active || (ahead >= NATIVE_AUDIO_XA_RING_AHEAD_TARGET))
-	{
-		return;
-	}
-
 #if defined(__3DS__)
 	/*
-	 * Burst: refill up to 4 sectors per call. Each sector is a separate SD
-	 * read serialized against the main thread's bulk scene loads by the
-	 * FAT driver's global mutex -- hardware runs 2/3 showed that fine-
-	 * grained interleaving there makes BOTH sides pathologically slow
-	 * (136s race-end frame, 33.9s intro frame). Fewer, larger bursts cut
-	 * the crossing count; PC stays at one sector per vblank because replay
+	 * Hysteresis refill: every SD sector read crosses the FAT driver's
+	 * global mutex against main-thread bulk scene loads -- the session-20
+	 * freeze forensics (136s race-end frame, 33.9s intro frame) fingered
+	 * exactly that fine-grained interleaving. So instead of nibbling one
+	 * sector whenever we dip below target, let the ring drain to a low
+	 * water mark and refill toward target in one rare burst: SD contention
+	 * episodes become ~10x less frequent, and the deep 3DS ring (32
+	 * sectors) plus the ndsp parcel cushion ride out the episodes
+	 * themselves. PC keeps single-sector-per-vblank below -- replay
 	 * determinism depends on ring-fill timing staying as it always was.
 	 */
 	{
+		static int s_refilling;
 		int pumped;
 
-		for (pumped = 0; pumped < 4; pumped++)
+		if (!active)
+		{
+			s_refilling = 0;
+			return;
+		}
+		if (!s_refilling && (ahead >= (NATIVE_AUDIO_XA_RING_AHEAD_TARGET / 3)))
+		{
+			return; /* above low water; leave the SD card alone */
+		}
+		s_refilling = 1;
+
+		for (pumped = 0; pumped < 8; pumped++)
 		{
 			NativeAudio_XAStreamDecodeNextSector(&s_audio.xaStream);
 			NativeAudio_LockOutput();
@@ -3055,11 +3084,17 @@ internal void NativeAudio_XAStreamPump(void)
 			NativeAudio_UnlockOutput();
 			if (!active || (ahead >= NATIVE_AUDIO_XA_RING_AHEAD_TARGET))
 			{
+				s_refilling = 0;
 				break;
 			}
 		}
 	}
 #else
+	if (!active || (ahead >= NATIVE_AUDIO_XA_RING_AHEAD_TARGET))
+	{
+		return;
+	}
+
 	NativeAudio_XAStreamDecodeNextSector(&s_audio.xaStream);
 #endif
 }
@@ -3137,7 +3172,7 @@ internal int NativeAudio_XAStreamOpenTrack(struct NativeAudioXaStream *stream, i
 	}
 	stream->open = 1;
 
-	for (i = 0; i < NATIVE_AUDIO_XA_RING_AHEAD_TARGET; i++)
+	for (i = 0; i < NATIVE_AUDIO_XA_PRIME_TARGET; i++) /* small synchronous prime; the worker pump fills to AHEAD_TARGET */
 	{
 		if (!NativeAudio_XAStreamDecodeNextSector(stream))
 		{
@@ -3191,7 +3226,7 @@ internal int NativeAudio_XAStreamOpenFile(struct NativeAudioXaStream *stream, co
 	}
 	stream->open = 1;
 
-	for (i = 0; i < NATIVE_AUDIO_XA_RING_AHEAD_TARGET; i++)
+	for (i = 0; i < NATIVE_AUDIO_XA_PRIME_TARGET; i++) /* small synchronous prime; the worker pump fills to AHEAD_TARGET */
 	{
 		if (!NativeAudio_XAStreamDecodeNextSector(stream))
 		{
@@ -3272,7 +3307,7 @@ internal int NativeAudio_XAStreamOpenTrackSeek(struct NativeAudioXaStream *strea
 		{
 			targetSector = (int)(targetSourceFrame / (u64)stream->framesPerSector);
 		}
-		if ((targetSector >= 0) && (stream->decodedSectorCount > targetSector + NATIVE_AUDIO_XA_RING_AHEAD_TARGET))
+		if ((targetSector >= 0) && (stream->decodedSectorCount > targetSector + NATIVE_AUDIO_XA_PRIME_TARGET))
 		{
 			break;
 		}
