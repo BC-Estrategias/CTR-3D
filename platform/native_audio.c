@@ -45,11 +45,14 @@ struct NativeAudioHwSampleCacheEntry
 	u32 addr;
 	u32 loopAddr;
 	s16 *pcm;
+	int capacity; /* slot size in samples -- slots outlive their content */
 	int count;
 	int loopStart;
 	int loopEnd;
 	b32 loopEnabled;
+	u32 spuBytes; /* SPU-side extent (16 bytes per 28 samples), for overlap tests */
 	int used;
+	int stale; /* slot allocated but content invalidated by an SpuWrite */
 };
 
 global_variable struct NativeAudioHwSampleCacheEntry s_hwSampleCache[NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES];
@@ -62,47 +65,8 @@ struct NativeAudioHwVoiceShadow
 };
 
 global_variable struct NativeAudioHwVoiceShadow s_hwVoiceShadow[24];
-
-internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleCacheLookup(u32 addr, u32 loopAddr)
-{
-	int i;
-
-	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
-	{
-		if (s_hwSampleCache[i].used && (s_hwSampleCache[i].addr == addr) && (s_hwSampleCache[i].loopAddr == loopAddr))
-		{
-			return &s_hwSampleCache[i];
-		}
-	}
-
-	return NULL;
-}
-
-internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleCacheInsert(u32 addr, u32 loopAddr)
-{
-	int i;
-
-	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
-	{
-		if (!s_hwSampleCache[i].used)
-		{
-			s_hwSampleCache[i].used = 1;
-			s_hwSampleCache[i].addr = addr;
-			s_hwSampleCache[i].loopAddr = loopAddr;
-			return &s_hwSampleCache[i];
-		}
-	}
-
-	/* Table full between uploads: decode proceeds uncached (store-allocated
-	 * but not findable again). Bounded by the store size either way. */
-	return NULL;
-}
-
-internal void NativeAudio_HwSampleCacheReset(void)
-{
-	memset(s_hwSampleCache, 0, sizeof(s_hwSampleCache));
-}
 #endif
+
 
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 /*
@@ -1795,6 +1759,192 @@ internal void NativeAudio_FreeVoicePcm(struct NativeAudioVoice *voice)
 	voice->looped = 0;
 }
 
+#if defined(__3DS__)
+internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleCacheLookup(u32 addr, u32 loopAddr)
+{
+	int i;
+
+	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+	{
+		if (s_hwSampleCache[i].used && !s_hwSampleCache[i].stale && (s_hwSampleCache[i].addr == addr) && (s_hwSampleCache[i].loopAddr == loopAddr))
+		{
+			return &s_hwSampleCache[i];
+		}
+	}
+
+	return NULL;
+}
+
+/*
+ * Get an entry with a slot big enough for sampleCount, preferring (in
+ * order): the STALE entry for this same key (streaming rewrites the same
+ * address with same-shaped content -- reusing its slot is what bounds
+ * store growth), a never-used entry with a fresh allocation, then
+ * recycling any stale slot large enough. Recycling clears voices still
+ * pointing at the stolen slot so nothing plays recycled memory.
+ */
+internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleSlotAcquire(u32 addr, u32 loopAddr, int sampleCount)
+{
+	struct NativeAudioHwSampleCacheEntry *entry = NULL;
+	int i;
+
+	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+	{
+		if (s_hwSampleCache[i].used && s_hwSampleCache[i].stale && (s_hwSampleCache[i].addr == addr) && (s_hwSampleCache[i].loopAddr == loopAddr) &&
+		    (s_hwSampleCache[i].capacity >= sampleCount))
+		{
+			entry = &s_hwSampleCache[i];
+			break;
+		}
+	}
+
+	if (entry == NULL)
+	{
+		for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+		{
+			if (!s_hwSampleCache[i].used)
+			{
+				s16 *slot = (s16 *)N3DS_HwVoiceStoreAlloc(sampleCount);
+
+				if (slot == NULL)
+				{
+					break; /* store full -- try recycling below */
+				}
+				entry = &s_hwSampleCache[i];
+				entry->pcm = slot;
+				entry->capacity = sampleCount;
+				break;
+			}
+		}
+	}
+
+	if (entry == NULL)
+	{
+		for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+		{
+			if (s_hwSampleCache[i].used && s_hwSampleCache[i].stale && (s_hwSampleCache[i].capacity >= sampleCount))
+			{
+				int v;
+
+				entry = &s_hwSampleCache[i];
+				for (v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
+				{
+					if (s_audio.voices[v].pcm == entry->pcm)
+					{
+						NativeAudio_FreeVoicePcm(&s_audio.voices[v]);
+						s_audio.voices[v].sampleDirty = 1;
+					}
+				}
+				break;
+			}
+		}
+	}
+
+	if (entry != NULL)
+	{
+		entry->used = 1;
+		entry->stale = 0;
+		entry->addr = addr;
+		entry->loopAddr = loopAddr;
+	}
+
+	return entry;
+}
+
+internal void NativeAudio_HwSampleCacheReset(void)
+{
+	memset(s_hwSampleCache, 0, sizeof(s_hwSampleCache));
+}
+
+/*
+ * SpuWrite hit [writeStart, writeEnd). The PS1 technique this must honor
+ * is SPU streaming: long audio (the intro announcer, jingles, race-end
+ * music) plays by looping a voice over a small buffer whose contents the
+ * CPU rewrites continuously. So a write over a CURRENTLY-PLAYING entry is
+ * refreshed IN PLACE -- re-decoded into the same slot while the DSP
+ * channel keeps looping over it, which reproduces the hardware behavior
+ * with no restart, no click, no global invalidation. Only entries the
+ * write actually touched are affected at all; everything else keeps
+ * playing untouched (v1 reset ALL state on every write, which thrashed
+ * the whole cache dozens of times a second during speech -- the session-20
+ * "minutes-long race-end freeze").
+ */
+internal void NativeAudio_HwStreamInvalidateRange(u32 writeStart, u32 writeEnd)
+{
+	int i;
+
+	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+	{
+		struct NativeAudioHwSampleCacheEntry *entry = &s_hwSampleCache[i];
+		u32 entryEnd;
+		int playing = 0;
+		int v;
+
+		if (!entry->used || entry->stale || (entry->spuBytes == 0))
+		{
+			continue;
+		}
+		entryEnd = entry->addr + entry->spuBytes;
+		if ((entryEnd <= writeStart) || (entry->addr >= writeEnd))
+		{
+			continue;
+		}
+
+		for (v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
+		{
+			if ((s_audio.voices[v].pcm == entry->pcm) && s_audio.voices[v].active && (s_audio.voices[v].adsrPhase != NATIVE_AUDIO_ADSR_OFF))
+			{
+				playing = 1;
+				break;
+			}
+		}
+
+		if (playing)
+		{
+			int scanCount;
+			int loopStart;
+			int loopEnd;
+			b32 loopEnabled;
+
+			if (NativeAudio_ScanSpuSampleExtent(entry->addr, entry->loopAddr, &scanCount, &loopStart, &loopEnd, &loopEnabled) &&
+			    (scanCount <= entry->capacity))
+			{
+				struct NativeAudioPcmBuffer pcm;
+
+				memset(&pcm, 0, sizeof(pcm));
+				pcm.samples = entry->pcm;
+				pcm.capacity = entry->capacity;
+				if (NativeAudio_DecodeSpuSample(entry->addr, &pcm))
+				{
+					N3DS_HwVoiceStoreCommit(entry->pcm, pcm.count);
+					entry->count = pcm.count;
+					entry->loopStart = loopStart;
+					entry->loopEnd = loopEnd;
+					entry->loopEnabled = loopEnabled;
+					entry->spuBytes = ((u32)(pcm.count + 27) / 28u) * 16u;
+					/* Voices and channels deliberately untouched: the DSP
+					 * loop keeps reading this memory and simply hears the
+					 * fresh content -- that IS the streaming semantics. */
+					continue;
+				}
+			}
+			/* Couldn't refresh in place (extent grew past the slot, or the
+			 * scan failed mid-rewrite) -- fall through to stale. */
+		}
+
+		entry->stale = 1;
+		for (v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
+		{
+			if (s_audio.voices[v].pcm == entry->pcm)
+			{
+				NativeAudio_FreeVoicePcm(&s_audio.voices[v]);
+				s_audio.voices[v].sampleDirty = 1;
+			}
+		}
+	}
+}
+#endif
+
 internal void NativeAudio_ResetVoicePcmArenaNoLock(int markDirty)
 {
 	int i;
@@ -1971,12 +2121,11 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 		(void)arenaMarker;
 		if (entry == NULL)
 		{
-			s16 *slot = (s16 *)N3DS_HwVoiceStoreAlloc(scanCount);
-
-			if (slot == NULL)
+			entry = NativeAudio_HwSampleSlotAcquire(voice->attr.addr, voice->attr.loop_addr, scanCount);
+			if (entry == NULL)
 			{
-				/* Store exhausted (counted backend-side): same failure
-				 * shape as an arena-exhausted decode on PC. */
+				/* Store/table exhausted (counted backend-side): same
+				 * failure shape as an arena-exhausted decode on PC. */
 				NativeAudio_FreeVoicePcm(voice);
 				voice->active = 0;
 				voice->sampleDirty = 0;
@@ -1984,33 +2133,30 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 			}
 
 			memset(&pcm, 0, sizeof(pcm));
-			pcm.samples = slot;
-			pcm.capacity = scanCount;
+			pcm.samples = entry->pcm;
+			pcm.capacity = entry->capacity;
 			if (!NativeAudio_DecodeSpuSample(voice->attr.addr, &pcm))
 			{
+				entry->stale = 1;
 				NativeAudio_FreeVoicePcm(voice);
 				voice->active = 0;
 				voice->sampleDirty = 0;
 				return 0;
 			}
-			N3DS_HwVoiceStoreCommit(slot, pcm.count);
+			N3DS_HwVoiceStoreCommit(entry->pcm, pcm.count);
 
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 			s_voiceProf.windowDecodedSamples += pcm.count;
 #endif
 
-			entry = NativeAudio_HwSampleCacheInsert(voice->attr.addr, voice->attr.loop_addr);
-			if (entry != NULL)
-			{
-				entry->pcm = slot;
-				entry->count = pcm.count;
-				entry->loopStart = loopStart;
-				entry->loopEnd = loopEnd;
-				entry->loopEnabled = loopEnabled;
-			}
+			entry->count = pcm.count;
+			entry->loopStart = loopStart;
+			entry->loopEnd = loopEnd;
+			entry->loopEnabled = loopEnabled;
+			entry->spuBytes = ((u32)(pcm.count + 27) / 28u) * 16u;
 
 			NativeAudio_FreeVoicePcm(voice);
-			voice->pcm = slot;
+			voice->pcm = entry->pcm;
 			voice->sampleCount = pcm.count;
 		}
 		else
@@ -4558,9 +4704,17 @@ u32 NativeAudio_SpuWrite(const u8 *addr, u32 size)
 	}
 
 	memcpy(&s_audio.spu.memory[wptrOfs], addr, size);
+#if defined(__3DS__)
+	/* Range-precise: refresh playing entries in place (SPU streaming), mark
+	 * only actually-overwritten entries stale. The v1 nuke-everything here
+	 * thrashed the whole decoded cache dozens of times a second during
+	 * streamed speech -- see NativeAudio_HwStreamInvalidateRange. */
+	NativeAudio_HwStreamInvalidateRange((u32)wptrOfs, (u32)wptrOfs + size);
+#else
 	// NOTE(aalhendi): SPU RAM writes invalidate all decoded voice PCM. Drop cached buffers
 	// so stale samples do not accumulate in the arena during long sessions.
 	NativeAudio_ResetVoicePcmArenaNoLock(1);
+#endif
 
 	NativeAudio_UnlockOutput();
 
