@@ -10,6 +10,7 @@
 #include "n3ds/n3ds_audio_thread.h"
 #endif
 #include <limits.h>
+#include <stddef.h> /* offsetof -- NativeAudio_XAStreamSwap's partial swap */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -372,6 +373,17 @@ struct NativeAudioXaStream
 	int framesPerSector; // pinned from first matching sector: 2016 (stereo) or 4032 (mono)
 	b32 open, endOfStream;
 	u32 underrunEvents; // diagnostic counter, see stats update in native_renderer_3ds.c
+	/* Per-stream decode scratch. These were function-local statics in
+	 * NativeAudio_XAStreamDecodeNextSector for years -- safe while only the
+	 * main thread ever decoded. On 3DS the worker pumps the LIVE stream
+	 * while the main thread primes the PENDING one (PlayXATrack at e.g. the
+	 * race-start jingle), and session-20 hardware run 5 hard-wedged the
+	 * console right at that overlap: two threads trampling shared scratch
+	 * mid-decode. Per-stream buffers make the two concurrent decodes
+	 * disjoint; same-stream use stays single-threaded by the existing
+	 * design (the pump owns live; the Open and seek paths own pending). */
+	u8 sectorBuf[XA_FULL_SECTOR_SIZE];
+	s16 tempFrames[NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS];
 };
 
 internal int NativeAudio_XARingReadSampleNoLock(struct NativeAudioXaStream *stream, int channel, u64 frameIndex);
@@ -2255,18 +2267,32 @@ internal int NativeAudio_VoiceHasSample(const struct NativeAudioVoice *voice)
 	return voice->pcm != NULL;
 }
 
+/* What NativeAudio_FreeXA hands back for the deferred close: the source
+ * handle plus whether it was open -- nothing else survives the free. It
+ * used to be the whole stream struct, which was genuinely "a small struct
+ * copy" at ~100 bytes and silently became a 37KB stack object per caller
+ * when the decode scratch moved into the stream (session 20's stack-smash
+ * lesson, same as NativeAudio_XAStreamSwap). */
+struct NativeAudioXaClosedSource
+{
+	struct NativeAudioXaSource source;
+	b32 open;
+};
+
 // NOTE(aalhendi): Assumes the caller already holds NativeAudio_LockOutput(),
 // exactly like the old memset-only version did -- every existing call site
 // (StopXA, PlayXATrack, PlayXAFile, RestoreState) already calls this from
 // inside its own lock/unlock bracket. Captures and clears the live stream
-// in place (cheap: a small struct copy) and hands it back so the caller can
-// close its underlying file handle *after* unlocking, per the plan's
-// "expensive/blocking work outside the lock" rule -- fclose() while holding
-// the SDL audio lock would block the mixer thread on file-system I/O.
-internal struct NativeAudioXaStream NativeAudio_FreeXA(void)
+// in place and hands the source back so the caller can close its underlying
+// file handle *after* unlocking, per the plan's "expensive/blocking work
+// outside the lock" rule -- fclose() while holding the SDL audio lock would
+// block the mixer thread on file-system I/O.
+internal struct NativeAudioXaClosedSource NativeAudio_FreeXA(void)
 {
-	struct NativeAudioXaStream closed = s_audio.xaStream;
+	struct NativeAudioXaClosedSource closed;
 
+	closed.source = s_audio.xaStream.source;
+	closed.open = s_audio.xaStream.open;
 	NativeAudio_XAStreamClearNoLock(&s_audio.xaStream);
 	memset(&s_audio.xa, 0, sizeof(s_audio.xa));
 
@@ -2767,10 +2793,21 @@ internal void NativeAudio_XAStreamClearNoLock(struct NativeAudioXaStream *stream
 
 internal void NativeAudio_XAStreamSwap(struct NativeAudioXaStream *a, struct NativeAudioXaStream *b)
 {
-	struct NativeAudioXaStream tmp = *a;
+	/*
+	 * Swap everything EXCEPT the per-stream decode scratch (sectorBuf/
+	 * tempFrames): scratch contents are transient within a single
+	 * NativeAudio_XAStreamDecodeNextSector call and never need to cross a
+	 * swap. Doing it this way is not an optimization -- a whole-struct
+	 * temporary here is a ~37KB stack local now that the scratch lives in
+	 * the struct, and it smashed the thread stack at the first
+	 * pending->live track promote (session 20, wild PC=0 in Azahar the
+	 * moment the run-5 race fix landed).
+	 */
+	unsigned char tmp[offsetof(struct NativeAudioXaStream, sectorBuf)];
 
-	*a = *b;
-	*b = tmp;
+	memcpy(tmp, a, sizeof(tmp));
+	memcpy(a, b, sizeof(tmp));
+	memcpy(b, tmp, sizeof(tmp));
 }
 
 internal int NativeAudio_XASourceOpen(struct NativeAudioXaSource *source, const char *path, int channelFilter)
@@ -2889,8 +2926,6 @@ internal int NativeAudio_XAStreamCountAudioSectors(struct NativeAudioXaSource *s
 // exactly like the old whole-file DecodeXAFile's per-sector "continue".
 internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *stream)
 {
-	local_persist u8 s_sectorBuf[XA_FULL_SECTOR_SIZE];
-	local_persist s16 s_tempFrames[NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS];
 	struct NativeAudioPcmBuffer pcm;
 	const u8 *header;
 	int coding;
@@ -2913,13 +2948,13 @@ internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *st
 			return 0;
 		}
 
-		if (!NativeAudio_XASourceReadSector(&stream->source, stream->nextPhysicalSector, s_sectorBuf))
+		if (!NativeAudio_XASourceReadSector(&stream->source, stream->nextPhysicalSector, stream->sectorBuf))
 		{
 			stream->endOfStream = 1;
 			return 0;
 		}
 
-		if (NativeAudio_IsXAAudioSector(s_sectorBuf, stream->source.sectorBase, stream->source.channelFilter))
+		if (NativeAudio_IsXAAudioSector(stream->sectorBuf, stream->source.sectorBase, stream->source.channelFilter))
 		{
 			break;
 		}
@@ -2927,19 +2962,19 @@ internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *st
 		stream->nextPhysicalSector++;
 	}
 
-	header = &s_sectorBuf[stream->source.sectorBase];
+	header = &stream->sectorBuf[stream->source.sectorBase];
 	coding = header[3];
 	isStereo = (coding & 0x03) != 0;
 	srBits = (coding >> 2) & 0x03;
 	sampleRate = (srBits == 0) ? XA_SAMPLE_RATE_37800 : XA_SAMPLE_RATE_18900;
 
 	memset(&pcm, 0, sizeof(pcm));
-	pcm.samples = s_tempFrames;
+	pcm.samples = stream->tempFrames;
 	pcm.capacity = NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS;
 
 	if (isStereo)
 	{
-		if (!NativeAudio_DecodeXASectorStereo(s_sectorBuf, stream->source.sectorBase, &stream->decodeState, &pcm))
+		if (!NativeAudio_DecodeXASectorStereo(stream->sectorBuf, stream->source.sectorBase, &stream->decodeState, &pcm))
 		{
 			stream->endOfStream = 1;
 			return 0;
@@ -2950,7 +2985,7 @@ internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *st
 	{
 		int i;
 
-		if (!NativeAudio_DecodeXASectorMono(s_sectorBuf, stream->source.sectorBase, &stream->decodeState, &pcm))
+		if (!NativeAudio_DecodeXASectorMono(stream->sectorBuf, stream->source.sectorBase, &stream->decodeState, &pcm))
 		{
 			stream->endOfStream = 1;
 			return 0;
@@ -2958,8 +2993,8 @@ internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *st
 		framesThisSector = pcm.count; // 4032: duplicated below, count stays the frame count
 		for (i = pcm.count; i-- > 0;)
 		{
-			s_tempFrames[i * 2] = s_tempFrames[i];
-			s_tempFrames[i * 2 + 1] = s_tempFrames[i];
+			stream->tempFrames[i * 2] = stream->tempFrames[i];
+			stream->tempFrames[i * 2 + 1] = stream->tempFrames[i];
 		}
 	}
 
@@ -2976,7 +3011,7 @@ internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *st
 	slot = stream->decodedSectorCount % NATIVE_AUDIO_XA_RING_SECTORS;
 
 	NativeAudio_LockOutput();
-	memcpy(&stream->ringPcm[(size_t)slot * NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS], s_tempFrames,
+	memcpy(&stream->ringPcm[(size_t)slot * NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS], stream->tempFrames,
 	       (size_t)stream->framesPerSector * NATIVE_AUDIO_CHANNELS * sizeof(s16));
 	stream->nextPhysicalSector++;
 	stream->decodedSectorCount++;
@@ -3687,7 +3722,7 @@ int NativeAudio_CaptureState(void *dst, int dstSize)
 int NativeAudio_RestoreState(const void *src, int srcSize)
 {
 	const struct NativeAudioSnapshot *snapshot = (const struct NativeAudioSnapshot *)src;
-	struct NativeAudioXaStream closed;
+	struct NativeAudioXaClosedSource closed;
 	int xaFrameCount = 0;
 	int xaSampleRate = 0;
 	int i;
@@ -5210,7 +5245,7 @@ int NativeAudio_GetXATrackLength(int categoryID, int xaID)
 
 void NativeAudio_StopXA(void)
 {
-	struct NativeAudioXaStream closed;
+	struct NativeAudioXaClosedSource closed;
 
 	NativeAudio_LockOutput();
 
@@ -5252,7 +5287,7 @@ int NativeAudio_IsXAPlaying(void)
 
 int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volumeRight)
 {
-	struct NativeAudioXaStream closed;
+	struct NativeAudioXaClosedSource closed;
 	int sampleRate;
 	int frameCount;
 
@@ -5297,7 +5332,7 @@ int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volume
 
 int NativeAudio_PlayXAFile(const char *relativePath, int channelFilter, int volumeLeft, int volumeRight)
 {
-	struct NativeAudioXaStream closed;
+	struct NativeAudioXaClosedSource closed;
 	int sampleRate;
 	int frameCount;
 
