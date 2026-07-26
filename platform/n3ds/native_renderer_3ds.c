@@ -240,6 +240,22 @@ int g_dbg_atlasView = 0;
  * partial-output-write fix in shaders/ctr.v.pica (outtc0.zw). Keep at 0. */
 int g_dbg_skipSplashDraws = 0;
 
+/*
+ * Per-primitive perf scopes (2026-07-25, session 19): every NativePerf scope
+ * boundary is an svcGetSystemTick SYSCALL (sdl3_compat_3ds.c ->
+ * N3DS_GetTickCount), and the DrawTriangles-path scopes run per CALL (up to
+ * thousands/frame), per TRIANGLE (RESOLVE/CONVERT: 4 reads x ~2600 triangles
+ * in-race) and per RUN (APPEND/FLUSH) -- order 10k syscalls/frame of pure
+ * instrumentation tax, paid in every measured build to date, and the reason
+ * Azahar's draw_triangles_resolve ms never tracked hardware (emulated guest
+ * syscalls inflate far worse than native ones). Default OFF. Per-frame
+ * buckets (BEGIN_SCENE/FRAME_END/SWAP/GFX_PRESENT) and every event counter
+ * stay live either way; toggle via dumpreq 'triscopes' when the
+ * resolve/convert split is actually being read -- windows carrying the split
+ * in their bucket ranking are self-labelling as taxed.
+ */
+int g_dbg_perfTriScopes = 0;
+
 global_variable const GrVertex *s_pendingVertices = NULL;
 global_variable int s_pendingVertexCount = 0;
 
@@ -511,6 +527,9 @@ typedef struct
 	u32 pageGen;
 	u32 clutGenA;
 	u32 clutGenB;      /* == clutGenA when the CLUT doesn't straddle two VRAM cells */
+	u32 clutHash;      /* FNV-1a of the CLUT halfwords this cell decoded with (0 for
+	                    * CLUT-less formats) -- the variant-retarget key, see
+	                    * N3DS_HashClutContent */
 	u32 lastUsedFrame;
 } N3DS_DecodeCacheEntry;
 
@@ -598,6 +617,7 @@ typedef struct
 	u8 tileX, tileY;
 	u32 pageGen;
 	u32 clutGenA, clutGenB;
+	u32 clutHash;     /* same variant-retarget role as the full-page tier's field */
 	u32 lastUsedFrame;
 } N3DS_SubPageCacheEntry;
 
@@ -660,6 +680,31 @@ global_variable u32 s_subPageHashRepairs = 0;
 global_variable u32 s_lastStatFullPageHashHits = 0;
 global_variable u32 s_lastStatSubPageHashHits = 0;
 
+/*
+ * Stale-miss attribution (session 19). Steady-state race content re-decodes
+ * ~100k texels/frame per tier from staleness alone (full-page ~1.5/frame x
+ * 65k texels, sub-page ~19/frame x 4k -- s17/s18 windows), and the CAUSE
+ * picks the fix: pageGen movement = the sampled VRAM region was written
+ * (real texture animation, or false sharing from an unrelated write landing
+ * in the same 64x64 gen cell -- note the full-page tier keys freshness off
+ * the page's ORIGIN cell only, see N3DS_FindOrDecodeTexture); clutGen
+ * movement = palette animation, where every texel legitimately changes and
+ * a full re-decode is unavoidable. Both can move on one miss; both bump.
+ * The per-page histograms NAME the re-decoding pages (texPage & 0x1F),
+ * windowed -- reset after each stats print -- so the top offender is the
+ * current window's, not boot's.
+ */
+global_variable u32 s_fullPageStaleByPageGen = 0;
+global_variable u32 s_fullPageStaleByClutGen = 0;
+global_variable u32 s_subPageStaleByPageGen = 0;
+global_variable u32 s_subPageStaleByClutGen = 0;
+global_variable u32 s_lastStatFpStaleByPageGen = 0;
+global_variable u32 s_lastStatFpStaleByClutGen = 0;
+global_variable u32 s_lastStatSpStaleByPageGen = 0;
+global_variable u32 s_lastStatSpStaleByClutGen = 0;
+global_variable u32 s_fpStaleByPageId[32];
+global_variable u32 s_spStaleByPageId[32];
+
 internal u32 N3DS_TexKeyHash(s16 page, s16 clut, TexFormat format, N3DS_TexView view, int tileX, int tileY)
 {
 	/* Knuth/Murmur-style odd-constant multiplies. format/view/tile occupy
@@ -675,6 +720,58 @@ internal u32 N3DS_TexKeyHash(s16 page, s16 clut, TexFormat format, N3DS_TexView 
 	h ^= h >> 16;
 	return h;
 }
+
+/*
+ * CLUT-content variant caching (session 19). The staleattr counters showed
+ * CLUT-generation movement driving the majority of stale re-decodes in race
+ * content (sub-page ~80%, staleWindow ~14/frame; full-page ~60% of ~1.5/frame
+ * x 65k texels) -- palette ANIMATION, i.e. the game cycling a small, bounded
+ * set of palettes through one CLUT address every frame or two (water/glow,
+ * pages 15/6 sub-page and 2/3 full-page on Crash Cove). Address+generation
+ * keying makes every cycle step look like new content forever, so the same
+ * few palettes re-decode the same texels indefinitely.
+ *
+ * Fix: each cell also remembers the FNV-1a hash of the CLUT halfwords it
+ * decoded with. On a lookup whose key matches but whose CLUT generation
+ * moved (page data still fresh), hash the CURRENT palette bytes and rescan:
+ * a sibling cell holding this key decoded-with-identical-CLUT-content is
+ * byte-identical to what a fresh decode would produce (same source indices,
+ * same palette bytes, same format/view), so it is retargeted and its clut
+ * generations revalidated in place -- after one full cycle every palette
+ * step is a hit and the steady-state decode cost of the animation is zero.
+ * The hash is computed lazily, at most once per lookup, and only on the
+ * already-rare gen-stale path -- never on the hot fresh-hit paths.
+ *
+ * Hashing MUST mirror N3DS_DecodeAndTilePage's CLUT fetch exactly, including
+ * the S-wrap within the row (GL_REPEAT parity) -- 16 entries at 4bpp, 256 at
+ * 8bpp. CLUT-less formats return 0 and are additionally exempted from CLUT
+ * generation checks entirely at the lookup sites (a 16bpp page has no
+ * palette, so its old spurious clut-gen staleness was 100% false).
+ */
+internal u32 N3DS_HashClutContent(s16 clut, TexFormat format)
+{
+	const int clutOriginX = (clut & 0x3F) * 16;
+	const int clutOriginY = clut >> 6;
+	const int entries = (format == TF_4_BIT) ? 16 : ((format == TF_8_BIT) ? 256 : 0);
+	u32 h = 0x811C9DC5u;
+	int i;
+
+	for (i = 0; i < entries; i++)
+	{
+		const u16 c = vram[clutOriginY * VRAM_WIDTH + ((clutOriginX + i) & (VRAM_WIDTH - 1))];
+
+		h = (h ^ (u32)(c & 0xFF)) * 0x01000193u;
+		h = (h ^ (u32)(c >> 8)) * 0x01000193u;
+	}
+	return (entries == 0) ? 0u : h;
+}
+
+/* Variant retargets that avoided a re-decode, per tier -- the mechanism's
+ * receipt, windowed in the staleattr lines. */
+global_variable u32 s_fullPageClutVariantHits = 0;
+global_variable u32 s_subPageClutVariantHits = 0;
+global_variable u32 s_lastStatFpClutVariantHits = 0;
+global_variable u32 s_lastStatSpClutVariantHits = 0;
 
 /* Sub-page counterpart to N3DS_CellIndexToAtlasCoord -- reuses it unchanged,
  * offset into the physical-cell range the sub-page tier owns, then further
@@ -1036,8 +1133,15 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N
 	/* Hoisted out of the scan: these three were re-read from s_vramCellGen on
 	 * every one of up to 63 iterations, per triangle. */
 	const u32 pageGen = s_vramCellGen[pageCell];
-	const u32 clutGenA = s_vramCellGen[clutCellA];
-	const u32 clutGenB = s_vramCellGen[clutCellB];
+	/* CLUT-less formats have no palette to go stale: pin their clut gens to a
+	 * constant so palette-area VRAM writes can never fake-stale them. The
+	 * decode store below writes these same hoisted values, keeping lookup and
+	 * entry permanently consistent for such formats. */
+	const int hasClut = (format == TF_4_BIT) || (format == TF_8_BIT);
+	const u32 clutGenA = hasClut ? s_vramCellGen[clutCellA] : 0;
+	const u32 clutGenB = hasClut ? s_vramCellGen[clutCellB] : 0;
+	u32 curClutHash = 0;
+	int haveClutHash = 0;
 	int i, oldestSlot;
 	u32 oldestFrame;
 	u32 hashBucket;
@@ -1050,6 +1154,8 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N
 	 * churning a fresh slot per re-decode while their old cell decays into
 	 * LRU garbage (~19 stale re-decodes/frame in race content, s17 hardware). */
 	int sawStaleKeyMatch = 0;
+	int staleSawPageGen = 0;
+	int staleSawClutGen = 0;
 	int staleMatchSlot = -1;
 
 	/* Fast path: the cell that answered the previous lookup. See s_lastCellHit. */
@@ -1125,14 +1231,69 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N
 			return i;
 		}
 
+		/* CLUT gens moved but page data is fresh: palette-animation
+		 * candidate. Content match means a fresh decode would be
+		 * byte-identical (same source indices, same palette bytes, same
+		 * format/view), so adopt the cell and revalidate its gens in place
+		 * -- see N3DS_HashClutContent's block comment. */
+		if (hasClut && (e->pageGen == pageGen))
+		{
+			if (!haveClutHash)
+			{
+				curClutHash = N3DS_HashClutContent(clut, format);
+				haveClutHash = 1;
+			}
+			if (e->clutHash == curClutHash)
+			{
+				if (e->lastUsedFrame != s_frameCounter)
+				{
+					s_frameTouchedCells++;
+				}
+				e->clutGenA = clutGenA;
+				e->clutGenB = clutGenB;
+				e->lastUsedFrame = s_frameCounter;
+				s_decodeCacheHits++;
+				s_fullPageClutVariantHits++;
+				s_lastCellHit = i;
+				s_fullPageHashIdx[hashBucket] = (s16)i;
+				return i;
+			}
+		}
+
+		/* Key matched but generations moved. Attribute the cause here, with
+		 * the entry at hand, and pick the reuse policy: a page-DATA change
+		 * makes the old copy worthless, so it stays the in-place stale-twin
+		 * victim (s18). A pure CLUT change leaves a viable palette-step
+		 * variant -- claiming it for in-place re-decode would purge the
+		 * variant library on every cycle step and the retarget above could
+		 * never fire (the cycle needs one cell PER palette step to
+		 * materialize), so it is left alive and the miss below takes a
+		 * normal LRU victim instead. */
 		sawStaleKeyMatch = 1;
-		staleMatchSlot = i;
+		if (e->pageGen != pageGen)
+		{
+			staleSawPageGen = 1;
+			staleMatchSlot = i;
+		}
+		if ((e->clutGenA != clutGenA) || (e->clutGenB != clutGenB))
+		{
+			staleSawClutGen = 1;
+		}
 	}
 
 	s_decodeCacheMisses++;
 	if (sawStaleKeyMatch)
 	{
 		s_decodeCacheStaleMisses++;
+		if (staleSawPageGen)
+		{
+			s_fullPageStaleByPageGen++;
+		}
+		if (staleSawClutGen)
+		{
+			s_fullPageStaleByClutGen++;
+		}
+		s_fpStaleByPageId[(u32)(u16)texPage & 0x1F]++;
 	}
 	else
 	{
@@ -1268,9 +1429,16 @@ decodeIntoSlot:
 	s_decodeCache[oldestSlot].clut = clut;
 	s_decodeCache[oldestSlot].format = format;
 	s_decodeCache[oldestSlot].view = (u8)view;
-	s_decodeCache[oldestSlot].pageGen = s_vramCellGen[pageCell];
-	s_decodeCache[oldestSlot].clutGenA = s_vramCellGen[clutCellA];
-	s_decodeCache[oldestSlot].clutGenB = s_vramCellGen[clutCellB];
+	/* The hoisted gens, NOT re-reads: for CLUT-less formats these are the
+	 * pinned constants the lookup compares against (see the hoist). */
+	s_decodeCache[oldestSlot].pageGen = pageGen;
+	s_decodeCache[oldestSlot].clutGenA = clutGenA;
+	s_decodeCache[oldestSlot].clutGenB = clutGenB;
+	if (!haveClutHash)
+	{
+		curClutHash = N3DS_HashClutContent(clut, format);
+	}
+	s_decodeCache[oldestSlot].clutHash = curClutHash;
 	s_decodeCache[oldestSlot].lastUsedFrame = s_frameCounter;
 	s_fullPageHashIdx[hashBucket] = (s16)oldestSlot;
 
@@ -1303,16 +1471,24 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 	const int clutCellA = N3DS_VRAMCellIndex(clutOriginX, clutOriginY);
 	const int clutCellB = N3DS_VRAMCellIndex(clutOriginX + 255, clutOriginY);
 	const u32 pageGen = s_vramCellGen[pageCell];
-	const u32 clutGenA = s_vramCellGen[clutCellA];
-	const u32 clutGenB = s_vramCellGen[clutCellB];
+	/* Same CLUT-less pinning as the full-page tier's hoist -- see there. */
+	const int hasClut = (format == TF_4_BIT) || (format == TF_8_BIT);
+	const u32 clutGenA = hasClut ? s_vramCellGen[clutCellA] : 0;
+	const u32 clutGenB = hasClut ? s_vramCellGen[clutCellB] : 0;
+	u32 curClutHash = 0;
+	int haveClutHash = 0;
 	int i, oldestSlot;
 	u32 oldestFrame;
 	u32 hashBucket;
 	int sawStaleKeyMatch = 0;
+	int staleSawPageGen = 0;
+	int staleSawClutGen = 0;
 	/* Stale-twin reuse, same rationale as the full-page tier -- and this is
 	 * the tier where it matters: the ~19 stale re-decodes/frame of race
 	 * content (s17 hardware) are nearly all here, and each one otherwise
-	 * pays a full N3DS_SUBPAGE_TOTAL_CELLS victim walk. */
+	 * pays a full N3DS_SUBPAGE_TOTAL_CELLS victim walk. Since session 19 it
+	 * only claims PAGE-data-stale twins -- CLUT-stale cells are live palette
+	 * variants, see the full-page scan's comment. */
 	int staleMatchSlot = -1;
 
 	/* Fast path: the cell that answered the previous lookup. See s_lastSubPageCellHit. */
@@ -1387,14 +1563,59 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 			return i;
 		}
 
+		/* Palette-animation variant retarget, mirroring the full-page
+		 * tier's check -- see N3DS_HashClutContent's block comment. */
+		if (hasClut && (e->pageGen == pageGen))
+		{
+			if (!haveClutHash)
+			{
+				curClutHash = N3DS_HashClutContent(clut, format);
+				haveClutHash = 1;
+			}
+			if (e->clutHash == curClutHash)
+			{
+				if (e->lastUsedFrame != s_frameCounter)
+				{
+					s_subPageFrameTouchedCells++;
+				}
+				e->clutGenA = clutGenA;
+				e->clutGenB = clutGenB;
+				e->lastUsedFrame = s_frameCounter;
+				s_subPageCacheHits++;
+				s_subPageClutVariantHits++;
+				s_lastSubPageCellHit = i;
+				s_subPageHashIdx[hashBucket] = (s16)i;
+				return i;
+			}
+		}
+
+		/* Same split policy as the full-page scan: page-data stales reuse
+		 * in place, CLUT-stale cells stay alive as palette variants. */
 		sawStaleKeyMatch = 1;
-		staleMatchSlot = i;
+		if (e->pageGen != pageGen)
+		{
+			staleSawPageGen = 1;
+			staleMatchSlot = i;
+		}
+		if ((e->clutGenA != clutGenA) || (e->clutGenB != clutGenB))
+		{
+			staleSawClutGen = 1;
+		}
 	}
 
 	s_subPageCacheMisses++;
 	if (sawStaleKeyMatch)
 	{
 		s_subPageCacheStaleMisses++;
+		if (staleSawPageGen)
+		{
+			s_subPageStaleByPageGen++;
+		}
+		if (staleSawClutGen)
+		{
+			s_subPageStaleByClutGen++;
+		}
+		s_spStaleByPageId[(u32)(u16)texPage & 0x1F]++;
 	}
 	else
 	{
@@ -1499,9 +1720,16 @@ decodeIntoSubSlot:
 	s_subPageCache[oldestSlot].view = (u8)view;
 	s_subPageCache[oldestSlot].tileX = (u8)tileX;
 	s_subPageCache[oldestSlot].tileY = (u8)tileY;
-	s_subPageCache[oldestSlot].pageGen = s_vramCellGen[pageCell];
-	s_subPageCache[oldestSlot].clutGenA = s_vramCellGen[clutCellA];
-	s_subPageCache[oldestSlot].clutGenB = s_vramCellGen[clutCellB];
+	/* Hoisted gens, not re-reads -- same CLUT-less pinning contract as the
+	 * full-page tier's store. */
+	s_subPageCache[oldestSlot].pageGen = pageGen;
+	s_subPageCache[oldestSlot].clutGenA = clutGenA;
+	s_subPageCache[oldestSlot].clutGenB = clutGenB;
+	if (!haveClutHash)
+	{
+		curClutHash = N3DS_HashClutContent(clut, format);
+	}
+	s_subPageCache[oldestSlot].clutHash = curClutHash;
 	s_subPageCache[oldestSlot].lastUsedFrame = s_frameCounter;
 	s_subPageHashIdx[hashBucket] = (s16)oldestSlot;
 
@@ -1525,15 +1753,22 @@ decodeIntoSubSlot:
 internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 {
 	int baseVertex;
+	const int perfScopes = g_dbg_perfTriScopes;
 
 	if (vertCount <= 0)
 	{
 		return;
 	}
 
-	NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND);
+	if (perfScopes)
+	{
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND);
+	}
 	baseVertex = N3DS_C3DAppendVertices(s_convertScratch, vertCount);
-	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND);
+	if (perfScopes)
+	{
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND);
+	}
 	if (baseVertex < 0)
 	{
 		/* Frame vertex budget exhausted -- drop this run rather than draw
@@ -1545,10 +1780,16 @@ internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 		return;
 	}
 
-	NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_FLUSH);
+	if (perfScopes)
+	{
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_FLUSH);
+	}
 	N3DS_C3DBindAtlas(atlasIndex);
 	N3DS_C3DDrawTriangles(baseVertex, vertCount / 3);
-	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_FLUSH);
+	if (perfScopes)
+	{
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_FLUSH);
+	}
 	s_drawCallCount++;
 	s_frameAtlasMask |= (1u << (atlasIndex & 31));
 }
@@ -2101,6 +2342,43 @@ void NativeRenderer_SwapWindow(void)
 			         (unsigned long)s_vramDirtyBumps);
 			N3DS_DebugLog(cacheLine);
 
+			/* Stale attribution + windowed top-offender pages (see the
+			 * counter block's comment for what the split means). */
+			{
+				const unsigned long fpPageW = (unsigned long)(s_fullPageStaleByPageGen - s_lastStatFpStaleByPageGen);
+				const unsigned long fpClutW = (unsigned long)(s_fullPageStaleByClutGen - s_lastStatFpStaleByClutGen);
+				int topId = -1;
+				int nextId = -1;
+				u32 topN = 0;
+				u32 nextN = 0;
+				int p;
+
+				s_lastStatFpStaleByPageGen = s_fullPageStaleByPageGen;
+				s_lastStatFpStaleByClutGen = s_fullPageStaleByClutGen;
+				for (p = 0; p < 32; p++)
+				{
+					if (s_fpStaleByPageId[p] > topN)
+					{
+						nextN = topN;
+						nextId = topId;
+						topN = s_fpStaleByPageId[p];
+						topId = p;
+					}
+					else if (s_fpStaleByPageId[p] > nextN)
+					{
+						nextN = s_fpStaleByPageId[p];
+						nextId = p;
+					}
+				}
+				snprintf(cacheLine, sizeof(cacheLine),
+				         "[CTR-3DS] staleattr fp pageGenW=%lu clutGenW=%lu varHitW=%lu topPage=%d x%lu next=%d x%lu",
+				         fpPageW, fpClutW, (unsigned long)(s_fullPageClutVariantHits - s_lastStatFpClutVariantHits),
+				         topId, (unsigned long)topN, nextId, (unsigned long)nextN);
+				s_lastStatFpClutVariantHits = s_fullPageClutVariantHits;
+				N3DS_DebugLog(cacheLine);
+				memset(s_fpStaleByPageId, 0, sizeof(s_fpStaleByPageId));
+			}
+
 			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] hazard evictInUse=%lu", (unsigned long)s_evictHazards);
 			N3DS_DebugLog(cacheLine);
 
@@ -2163,6 +2441,43 @@ void NativeRenderer_SwapWindow(void)
 				         (unsigned long)s_subPageCacheStaleMisses, subStaleWindow, (unsigned long)s_subPageFrameTouchedPeak,
 				         (int)N3DS_SUBPAGE_TOTAL_CELLS);
 				N3DS_DebugLog(cacheLine);
+
+				/* Same attribution split as the full-page tier's staleattr
+				 * line -- see the counter block's comment. */
+				{
+					const unsigned long spPageW = (unsigned long)(s_subPageStaleByPageGen - s_lastStatSpStaleByPageGen);
+					const unsigned long spClutW = (unsigned long)(s_subPageStaleByClutGen - s_lastStatSpStaleByClutGen);
+					int topId = -1;
+					int nextId = -1;
+					u32 topN = 0;
+					u32 nextN = 0;
+					int p;
+
+					s_lastStatSpStaleByPageGen = s_subPageStaleByPageGen;
+					s_lastStatSpStaleByClutGen = s_subPageStaleByClutGen;
+					for (p = 0; p < 32; p++)
+					{
+						if (s_spStaleByPageId[p] > topN)
+						{
+							nextN = topN;
+							nextId = topId;
+							topN = s_spStaleByPageId[p];
+							topId = p;
+						}
+						else if (s_spStaleByPageId[p] > nextN)
+						{
+							nextN = s_spStaleByPageId[p];
+							nextId = p;
+						}
+					}
+					snprintf(cacheLine, sizeof(cacheLine),
+					         "[CTR-3DS] staleattr sp pageGenW=%lu clutGenW=%lu varHitW=%lu topPage=%d x%lu next=%d x%lu",
+					         spPageW, spClutW, (unsigned long)(s_subPageClutVariantHits - s_lastStatSpClutVariantHits),
+					         topId, (unsigned long)topN, nextId, (unsigned long)nextN);
+					s_lastStatSpClutVariantHits = s_subPageClutVariantHits;
+					N3DS_DebugLog(cacheLine);
+					memset(s_spStaleByPageId, 0, sizeof(s_spStaleByPageId));
+				}
 
 				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] subpage hazard evictInUse=%lu",
 				         (unsigned long)s_subPageEvictHazards);
@@ -2739,6 +3054,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	 * latched per DrawSplit pass (see its comment). */
 	const N3DS_TexView texView = (s_semiTransPass == 1)   ? N3DS_TEXVIEW_PASS1
 	                           : ((s_semiTransPass == 2) ? N3DS_TEXVIEW_PASS2 : N3DS_TEXVIEW_OPAQUE);
+	/* Read once per call: keeps every Begin/End below paired even if the
+	 * dumpreq toggle flips between calls (it polls in N3DS_ReadButtons, so
+	 * never mid-call -- this is belt-and-braces, not load-bearing). */
+	const int perfScopes = g_dbg_perfTriScopes;
 
 	s_drawTrianglesCalls++;
 
@@ -2774,7 +3093,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 
 	// Opened only after every early return above, so the scope is always
 	// balanced without an end on each bail-out path.
-	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
+	if (perfScopes)
+	{
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
+	}
 
 	/*
 	 * Cross-split flush points (the batching lever): a pending run from an
@@ -2828,7 +3150,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		const GrVertex *triVerts = &s_pendingVertices[startVertex + (i * 3)];
 		int atlasIdx, cellX = 0, cellY = 0, pixelBaseU = 0, pixelBaseV = 0, originU = 0, originV = 0, v;
 
-		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
+		if (perfScopes)
+		{
+			NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
+		}
 		if (untextured)
 		{
 			atlasIdx = N3DS_WHITE_ATLAS;
@@ -2873,7 +3198,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 				                             &originV);
 			}
 		}
-		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
+		if (perfScopes)
+		{
+			NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
+		}
 
 		if ((atlasIdx != s_runAtlas) || ((s_runVertCount + 3) > N3DS_MAX_RUN_VERTICES))
 		{
@@ -2894,7 +3222,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		N3DS_TriDumpRecord(triVerts, !untextured, untextured ? 255 : (int)s_currentTexFormat, atlasIdx, pixelBaseU, pixelBaseV, originU, originV);
 #endif
 
-		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+		if (perfScopes)
+		{
+			NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+		}
 		for (v = 0; v < 3; v++)
 		{
 			const GrVertex *src = &triVerts[v];
@@ -2986,7 +3317,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			dst->g = src->g;
 			dst->b = src->b;
 		}
-		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+		if (perfScopes)
+		{
+			NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+		}
 
 		s_runVertCount += 3;
 	}
@@ -2995,7 +3329,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	 * point of frame-scope run state). EndScene and the state guards above
 	 * are the flush points. */
 
-	NativePerf_EndScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
+	if (perfScopes)
+	{
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_RENDERER_DRAW_TRIANGLES);
+	}
 }
 
 void NativeRenderer_PushDebugLabel(const char *label)

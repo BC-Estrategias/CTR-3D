@@ -954,6 +954,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *   subpage     -- toggle g_dbg_disableSubPage (route all to full-page tier)
 	 *   single      -- toggle g_dbg_forceSingleTexture
 	 *   textureless -- toggle g_dbg_texturelessMode
+	 *   triscopes   -- toggle g_dbg_perfTriScopes (per-triangle perf split; taxed)
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -995,6 +996,14 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					g_dbg_texturelessMode ^= 1;
 					N3DS_DebugLog(g_dbg_texturelessMode ? "[CTR-3DS] textureless mode: 1" : "[CTR-3DS] textureless mode: 0");
+				}
+				else if (strncmp(word, "triscopes", 9) == 0)
+				{
+					extern int g_dbg_perfTriScopes;
+
+					g_dbg_perfTriScopes ^= 1;
+					N3DS_DebugLog(g_dbg_perfTriScopes ? "[CTR-3DS] per-tri perf scopes: ON (syscall tax ~10k/frame)"
+					                                  : "[CTR-3DS] per-tri perf scopes: off");
 				}
 				else if (strncmp(word, "atlasview", 9) == 0)
 				{
