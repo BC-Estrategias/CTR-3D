@@ -411,6 +411,9 @@ struct NativeAudioXaStream
 	 * to this stream's source and must trade places when the streams do.
 	 * Unused (never read, stays zero) on PC. */
 	u8 *spanBuf;
+	/* Disc-read staging for this stream's reads; travels with the stream for
+	 * the same reason spanBuf does. Unused (stays NULL) on PC. */
+	struct NativeDiscImageScratch *discScratch;
 	int spanStartSector;
 	int spanSectorCount;
 	struct NativeAudioXaSource source;
@@ -570,6 +573,21 @@ global_variable s16 s_xaRingPcmPending[NATIVE_AUDIO_XA_RING_SECTORS * NATIVE_AUD
 global_variable u8 s_xaSpanBufLive[NATIVE_AUDIO_XA_SPAN_SECTORS * XA_FULL_SECTOR_SIZE];
 global_variable u8 s_xaSpanBufPending[NATIVE_AUDIO_XA_SPAN_SECTORS * XA_FULL_SECTOR_SIZE];
 #endif
+/* Disc-image staging, same live/pending split and the same reason: the disc
+ * reader batches a run of raw sectors through a caller-owned scratch, and on
+ * 3DS the worker owns the live stream while the main thread owns the pending
+ * one, so one scratch per stream keeps the two threads off each other's
+ * buffer without a lock. Not 3DS-gated, unlike the span buffers above: PC
+ * reads XA one sector per vblank and wants no span, but tagging those reads
+ * with the audio ROLE is what lets [DISCIO] separate the music stream's drip
+ * from the level loader's bursts on either platform.
+ *
+ * Pending stays tagged MAIN on purpose: a pending stream is filled by the
+ * track-open path, which runs on the main thread on 3DS. Tagging it AUDIO
+ * would read as worker time in the counter and blur the one split the 3DS
+ * contention question actually needs. */
+global_variable struct NativeDiscImageScratch s_xaDiscScratchLive = {NATIVE_DISC_IMAGE_OWNER_AUDIO, {0}};
+global_variable struct NativeDiscImageScratch s_xaDiscScratchPending = {NATIVE_DISC_IMAGE_OWNER_MAIN, {0}};
 
 internal b32 NativeAudio_OutputOpen(void)
 {
@@ -3008,6 +3026,16 @@ internal void NativeAudio_XAStreamInitRingBackingIfNeeded(void)
 		s_audio.xaPendingStream.spanBuf = s_xaSpanBufPending;
 	}
 #endif
+	/* Both platforms: the span cache is 3DS-only but the read staging and its
+	 * role tag are not. */
+	if (s_audio.xaStream.discScratch == NULL)
+	{
+		s_audio.xaStream.discScratch = &s_xaDiscScratchLive;
+	}
+	if (s_audio.xaPendingStream.discScratch == NULL)
+	{
+		s_audio.xaPendingStream.discScratch = &s_xaDiscScratchPending;
+	}
 }
 
 // Preserves the assigned ring backing array across the clear -- ringPcm is
@@ -3017,10 +3045,12 @@ internal void NativeAudio_XAStreamClearNoLock(struct NativeAudioXaStream *stream
 {
 	s16 *ringPcm = stream->ringPcm;
 	u8 *spanBuf = stream->spanBuf;
+	struct NativeDiscImageScratch *discScratch = stream->discScratch;
 
 	memset(stream, 0, sizeof(*stream));
 	stream->ringPcm = ringPcm;
 	stream->spanBuf = spanBuf; /* spanSectorCount just went to 0 = span invalidated */
+	stream->discScratch = discScratch;
 }
 
 internal void NativeAudio_XAStreamSwap(struct NativeAudioXaStream *a, struct NativeAudioXaStream *b)
@@ -3097,7 +3127,14 @@ internal int NativeAudio_XASourceOpen(struct NativeAudioXaSource *source, const 
 	return source->totalSectors > 0;
 }
 
-internal int NativeAudio_XASourceReadSector(struct NativeAudioXaSource *source, int sectorIndex, u8 *dst)
+/*
+ * `scratch` names the disc-read staging this call may use, i.e. which thread
+ * is asking (see struct NativeDiscImageScratch). NULL means "main thread,
+ * use the shared main scratch" -- correct for the open/count path and for
+ * every PC caller, since PC pumps XA from the vblank caller. The 3DS worker
+ * must always pass its stream's own scratch.
+ */
+internal int NativeAudio_XASourceReadSector(struct NativeAudioXaSource *source, int sectorIndex, u8 *dst, struct NativeDiscImageScratch *scratch)
 {
 	if ((sectorIndex < 0) || (sectorIndex >= source->totalSectors))
 	{
@@ -3106,21 +3143,28 @@ internal int NativeAudio_XASourceReadSector(struct NativeAudioXaSource *source, 
 
 	if (source->useDiscImage)
 	{
+		if (scratch != NULL)
+		{
+			return NativeDiscImage_ReadRawSectorsScratch(&source->discFile, (u32)sectorIndex, 1, dst, scratch);
+		}
+
 		return NativeDiscImage_ReadRawSectors(&source->discFile, (u32)sectorIndex, 1, dst);
 	}
 
 	return NativeAssets_ReadHostRange(&source->hostFile, (long)sectorIndex * source->sectorSize, dst, (size_t)source->sectorSize);
 }
 
-#if defined(__3DS__)
 /*
  * One sequential read of `count` physical sectors -- both backends already
  * had a bulk primitive, the per-sector path just never used it. Layout in
  * dst matches the per-sector reads exactly: contiguous sectors at
  * source->sectorSize stride (the disc backend normalizes to 2336/sector,
  * the host backend is whatever the file's raw stride is).
+ *
+ * Not 3DS-gated: the span cache above it is, but the open-time header scan
+ * (NativeAudio_XAStreamCountAudioSectors) wants this on both platforms.
  */
-internal int NativeAudio_XASourceReadSectors(struct NativeAudioXaSource *source, int firstSector, int count, u8 *dst)
+internal int NativeAudio_XASourceReadSectors(struct NativeAudioXaSource *source, int firstSector, int count, u8 *dst, struct NativeDiscImageScratch *scratch)
 {
 	if ((firstSector < 0) || (count <= 0) || (firstSector > source->totalSectors - count))
 	{
@@ -3129,17 +3173,22 @@ internal int NativeAudio_XASourceReadSectors(struct NativeAudioXaSource *source,
 
 	if (source->useDiscImage)
 	{
-		return NativeDiscImage_ReadRawSectors(&source->discFile, (u32)firstSector, (u32)count, dst);
+		return NativeDiscImage_ReadRawSectorsScratch(&source->discFile, (u32)firstSector, (u32)count, dst, scratch);
 	}
 
 	return NativeAssets_ReadHostRange(&source->hostFile, (long)firstSector * source->sectorSize, dst, (size_t)((long)count * source->sectorSize));
 }
 
+#if defined(__3DS__)
 /*
  * Read one physical sector through the stream's span cache: a miss fetches
- * NATIVE_AUDIO_XA_SPAN_SECTORS sectors ahead in ONE bulk read, then this and
- * the following ~31 requests are memcpys. The decode loop asks for physical
- * sectors strictly in ascending order (nextPhysicalSector++), so one span
+ * NATIVE_AUDIO_XA_SPAN_SECTORS sectors ahead in one bulk call, then this and
+ * the following ~31 requests are memcpys. "Bulk" is now literal -- the call
+ * costs ceil(32 / NATIVE_DISC_IMAGE_CHUNK_SECTORS) SD reads. It was not:
+ * until the disc reader learned to read a run, this same call was a loop of
+ * 32 single-sector seek+read pairs, so the span cut FAT-mutex episodes per
+ * decoded sector without cutting SD round trips at all. The decode loop asks
+ * for physical sectors strictly in ascending order (nextPhysicalSector++), so one span
  * fill amortizes across everything it covers -- including the interleaved
  * other-channel sectors the caller will discard, which under per-sector
  * reads each cost their own trip through the FAT mutex.
@@ -3155,9 +3204,9 @@ internal int NativeAudio_XAStreamReadSectorBuffered(struct NativeAudioXaStream *
 {
 	struct NativeAudioXaSource *source = &stream->source;
 
-	if ((stream->spanBuf == NULL) || (source->sectorSize <= 0) || (source->sectorSize > XA_FULL_SECTOR_SIZE))
+	if ((stream->spanBuf == NULL) || (stream->discScratch == NULL) || (source->sectorSize <= 0) || (source->sectorSize > XA_FULL_SECTOR_SIZE))
 	{
-		return NativeAudio_XASourceReadSector(source, sectorIndex, dst);
+		return NativeAudio_XASourceReadSector(source, sectorIndex, dst, stream->discScratch);
 	}
 
 	if ((sectorIndex < stream->spanStartSector) || (sectorIndex >= stream->spanStartSector + stream->spanSectorCount))
@@ -3168,10 +3217,10 @@ internal int NativeAudio_XAStreamReadSectorBuffered(struct NativeAudioXaStream *
 		{
 			fill = source->totalSectors - sectorIndex;
 		}
-		if ((fill <= 0) || !NativeAudio_XASourceReadSectors(source, sectorIndex, fill, stream->spanBuf))
+		if ((fill <= 0) || !NativeAudio_XASourceReadSectors(source, sectorIndex, fill, stream->spanBuf, stream->discScratch))
 		{
 			stream->spanSectorCount = 0;
-			return NativeAudio_XASourceReadSector(source, sectorIndex, dst);
+			return NativeAudio_XASourceReadSector(source, sectorIndex, dst, stream->discScratch);
 		}
 		stream->spanStartSector = sectorIndex;
 		stream->spanSectorCount = fill;
@@ -3201,20 +3250,50 @@ internal void NativeAudio_XASourceClose(struct NativeAudioXaSource *source)
 // not a safe proxy for decodable frame count.
 internal int NativeAudio_XAStreamCountAudioSectors(struct NativeAudioXaSource *source)
 {
-	local_persist u8 s_countSectorBuf[XA_FULL_SECTOR_SIZE];
+	/* Chunked, not per-sector. This scan walks the WHOLE file to look at one
+	 * header per sector, and it used to spend one seek+read on each -- 2214
+	 * of them for TEST.STR on a boot-to-attract run, measured, which made it
+	 * the single largest source of disc reads in the process by a wide
+	 * margin. It runs on the main thread at track-open time, which is the
+	 * shape of the "race-start jingle takes forever" complaint. Reads are
+	 * strictly sequential, so a chunk buffer costs one read per 16 sectors
+	 * and changes nothing about what the scan sees. */
+	local_persist u8 s_countChunkBuf[NATIVE_DISC_IMAGE_CHUNK_SECTORS * XA_FULL_SECTOR_SIZE];
 	int count = 0;
-	int sector;
+	int sector = 0;
 
-	for (sector = 0; sector < source->totalSectors; sector++)
+	if ((source->sectorSize <= 0) || (source->sectorSize > XA_FULL_SECTOR_SIZE))
 	{
-		if (!NativeAudio_XASourceReadSector(source, sector, s_countSectorBuf))
+		return 0;
+	}
+
+	while (sector < source->totalSectors)
+	{
+		int chunk = source->totalSectors - sector;
+		int i;
+
+		if (chunk > NATIVE_DISC_IMAGE_CHUNK_SECTORS)
+		{
+			chunk = NATIVE_DISC_IMAGE_CHUNK_SECTORS;
+		}
+
+#if CTR_NATIVE_DISC_IO_PROFILE
+		s_nativeDiscIoSiteXaCount++;
+#endif
+		if (!NativeAudio_XASourceReadSectors(source, sector, chunk, s_countChunkBuf, &s_xaDiscScratchPending))
 		{
 			break;
 		}
-		if (NativeAudio_IsXAAudioSector(s_countSectorBuf, source->sectorBase, source->channelFilter))
+
+		for (i = 0; i < chunk; i++)
 		{
-			count++;
+			if (NativeAudio_IsXAAudioSector(&s_countChunkBuf[(size_t)i * (size_t)source->sectorSize], source->sectorBase, source->channelFilter))
+			{
+				count++;
+			}
 		}
+
+		sector += chunk;
 	}
 
 	return count;
@@ -3256,7 +3335,7 @@ internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *st
 		 * worker cost this session exists to remove. */
 		if (!NativeAudio_XAStreamReadSectorBuffered(stream, stream->nextPhysicalSector, stream->sectorBuf))
 #else
-		if (!NativeAudio_XASourceReadSector(&stream->source, stream->nextPhysicalSector, stream->sectorBuf))
+		if (!NativeAudio_XASourceReadSector(&stream->source, stream->nextPhysicalSector, stream->sectorBuf, stream->discScratch))
 #endif
 		{
 			stream->endOfStream = 1;

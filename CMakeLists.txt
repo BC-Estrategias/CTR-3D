@@ -227,6 +227,23 @@ if(CTR_NATIVE_AUDIO_DECODE_PROFILE)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_AUDIO_DECODE_PROFILE=1)
 endif()
 
+# Per-role disc-image read counters + two [DISCIO] report lines (XA streaming
+# vs everything else; on 3DS those are also the two threads). Every disc read
+# is one seek plus one read, and on 3DS that pair is an SD round trip -- but
+# nothing counted them, so "the SD pump blocks the worker for seconds" had no
+# way to separate raw read cost from time spent queued behind the other
+# thread. The run-shape fields (runs1, maxRun) and the per-call-site tallies
+# (dir/cd/xaCnt/sng) are what say WHICH caller is reading a sector at a time;
+# a mean sectors-per-call cannot, and reading one off a mean sent this
+# session's first two fix attempts at the wrong callers. Counts from profile
+# builds, timings from clean ones, same rule as CTR_NATIVE_OTWALK_PROFILE.
+option(CTR_NATIVE_DISC_IO_PROFILE
+    "Per-thread disc-image read counters ([DISCIO] window lines)"
+    OFF)
+if(CTR_NATIVE_DISC_IO_PROFILE)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_DISC_IO_PROFILE=1)
+endif()
+
 # Reset that arena on the LOAD_RESTART fast path (Time Trial "Retry"), which
 # reloads no audio banks and so never hits the only unconditional reset.
 option(CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART

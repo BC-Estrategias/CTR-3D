@@ -502,6 +502,16 @@ internal void NativePerf_Report3DSWindow(void)
 	s_windowMaxFrameKeyOns = 0;
 #endif
 
+#if CTR_NATIVE_DISC_IO_PROFILE
+	/* One line per disc-reading thread rather than one combined line: the
+	 * whole question this counter exists to answer is how the two divide the
+	 * SD card between them, and `out` is 224 bytes. */
+	NativeDiscImage_DebugFormatIoProfWindow(out, (int)sizeof(out), NATIVE_DISC_IMAGE_OWNER_MAIN);
+	N3DS_DebugLog(out);
+	NativeDiscImage_DebugFormatIoProfWindow(out, (int)sizeof(out), NATIVE_DISC_IMAGE_OWNER_AUDIO);
+	N3DS_DebugLog(out);
+#endif
+
 	s_windowFrames = 0;
 	s_windowTotalMs = 0.0;
 	s_windowWorkMs = 0.0;
@@ -525,6 +535,22 @@ internal void NativePerf_WriteSummary(FILE *file)
 	fprintf(file, "frames_over_40ms=%u\n", s_framesOver40);
 	fprintf(file, "frames_over_50ms=%u\n", s_framesOver50);
 	fprintf(file, "csv_path=%s\n", s_csvPath);
+
+#if CTR_NATIVE_DISC_IO_PROFILE
+	/* Same counters the 3DS prints per window, summarised once at exit. The
+	 * us fields read 0 here (the tick source is 3DS-only), but perCall does
+	 * not -- and perCall is what says whether the disc reader is batching, so
+	 * it can be checked on PC without spending a netload. */
+	{
+		char discIoLine[224];
+
+		fprintf(file, "\ndisc_io:\n");
+		NativeDiscImage_DebugFormatIoProfWindow(discIoLine, (int)sizeof(discIoLine), NATIVE_DISC_IMAGE_OWNER_MAIN);
+		fprintf(file, "  %s\n", discIoLine);
+		NativeDiscImage_DebugFormatIoProfWindow(discIoLine, (int)sizeof(discIoLine), NATIVE_DISC_IMAGE_OWNER_AUDIO);
+		fprintf(file, "  %s\n", discIoLine);
+	}
+#endif
 
 	fprintf(file, "\nbucket_totals_ms:\n");
 	for (s32 bucket = 0; bucket < NATIVE_PERF_BUCKET_COUNT; bucket++)

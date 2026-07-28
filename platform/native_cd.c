@@ -242,6 +242,10 @@ internal s32 NativeCD_ReadSectors(s32 sectors, void *dst)
 
 	if (s_nativeCdFiles[s_nativeCdCurrentFile].source == NATIVE_CD_FILE_DISC)
 	{
+#if CTR_NATIVE_DISC_IO_PROFILE
+		s_nativeDiscIoSiteCd++;
+		s_nativeDiscIoSiteCdSectors += (u32)sectors;
+#endif
 		if (!NativeDiscImage_ReadDataSectors(&s_nativeCdFiles[s_nativeCdCurrentFile].discFile, (u32)s_nativeCdCurrentSector, (u32)sectors, dst))
 		{
 			return 0;

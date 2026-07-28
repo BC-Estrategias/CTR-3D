@@ -12,7 +12,6 @@
 
 #define NATIVE_DISC_IMAGE_PATH_MAX          1024
 #define NATIVE_DISC_IMAGE_BIN_PATH          "ctr-u.bin"
-#define NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE   2352u
 #define NATIVE_DISC_IMAGE_FORM1_DATA_OFFSET 24u
 #define NATIVE_DISC_IMAGE_FORM1_DATA_SIZE   2048u
 #define NATIVE_DISC_IMAGE_MODE2_USER_OFFSET 16u
@@ -38,6 +37,89 @@ global_variable char s_nativeDiscImagePath[NATIVE_DISC_IMAGE_PATH_MAX];
 global_variable FILE *s_nativeDiscImageFile;
 global_variable struct NativeDiscImageFile s_nativeDiscImageRoot;
 global_variable int s_nativeDiscImageAvailable;
+
+/*
+ * Scratch for every main-thread read path (level loads via NativeCD, STR,
+ * whole-file reads). The audio worker owns its own -- see the header. If a
+ * new disc reader ever appears on a third thread it needs its own scratch
+ * too; there is no lock here and deliberately so, the fix for SD contention
+ * is fewer reads, not serialized ones.
+ */
+global_variable struct NativeDiscImageScratch s_nativeDiscImageMainScratch = {NATIVE_DISC_IMAGE_OWNER_MAIN, {0}};
+
+#if CTR_NATIVE_DISC_IO_PROFILE
+/*
+ * Per-owner disc-read counters. Each bucket has exactly ONE writer thread
+ * (that is what `owner` means), so the increments need no atomics; only the
+ * reporter reads across threads, and a torn window count is acceptable in a
+ * diagnostic that exists to size an effect, not to gate correctness.
+ *
+ * `headerFails` is the interesting one beyond the timings: the image FILE*
+ * and its file position are shared by both threads, and fseek+fread is not
+ * atomic across the pair, so an interleaved read can land on the other
+ * thread's position. That shows up here as a failed sector-header check
+ * rather than as corruption, and nothing counted it before.
+ */
+struct NativeDiscImageIoProf
+{
+	u32 calls;
+	u32 sectors;
+	u32 runsOf1;
+	u32 maxRun;
+	u32 headerFails;
+	u32 ioFails;
+	u64 ticks;
+	u64 worstTicks;
+};
+
+global_variable struct NativeDiscImageIoProf s_nativeDiscIoProf[NATIVE_DISC_IMAGE_OWNER_COUNT];
+
+/*
+ * Directory-walk reads, counted apart from payload. A mean sectors-per-call
+ * of 1.7 can be one big batched load hiding behind two thousand one-sector
+ * metadata reads, or it can be a load path that genuinely asks for 1.7
+ * sectors at a time -- and those two want completely different fixes, so the
+ * mean alone is not a finding. FindFile re-walks the tree from the root on
+ * every open with nothing cached, which makes this the suspect worth
+ * separating.
+ */
+global_variable u32 s_nativeDiscIoDirCalls;
+global_variable u32 s_nativeDiscIoDirSectors;
+
+/*
+ * Call-site tallies. 95% of reads being single-sector says the batching has
+ * nothing to batch, but not WHY -- and the fix differs completely depending
+ * on which caller is asking one sector at a time. These are bumped at the
+ * four sites that can produce a single-sector read, so the counter names the
+ * caller instead of leaving it to be inferred. Declared here because
+ * native_disc_image.c is first in the unity include order (main.c), so
+ * native_audio.c and native_cd.c can both reach them.
+ */
+global_variable u32 s_nativeDiscIoSiteCd;        /* NativeCD_ReadSectors -- the game's CdRead */
+global_variable u32 s_nativeDiscIoSiteCdSectors; /* ...and the sector counts it asks for */
+global_variable u32 s_nativeDiscIoSiteXaCount;   /* NativeAudio_XAStreamCountAudioSectors' header scan */
+global_variable u32 s_nativeDiscIoSiteSingle;    /* the single-sector helper (PVD / root lookup) */
+
+internal unsigned long long NativeDiscImage_ProfTick(void)
+{
+#if defined(__3DS__)
+	return N3DS_GetTickCount();
+#else
+	return 0ull;
+#endif
+}
+
+internal void NativeDiscImage_ProfAccumulate(struct NativeDiscImageIoProf *prof, unsigned long long beginTick)
+{
+	unsigned long long elapsed = NativeDiscImage_ProfTick() - beginTick;
+
+	prof->ticks += elapsed;
+	if (elapsed > prof->worstTicks)
+	{
+		prof->worstTicks = elapsed;
+	}
+}
+#endif
 
 internal int NativeDiscImage_FindHostImagePath(char *dst, size_t dstSize, NativeStr8 assetsDir)
 {
@@ -103,40 +185,82 @@ internal int NativeDiscImage_CheckRawSectorHeader(const u8 *sector)
 	return 1;
 }
 
-internal int NativeDiscImage_ReadRawSector(u32 lba, u8 *sector)
+/*
+ * THE choke point: every byte the game reads off the disc image arrives
+ * through here, and each call is one seek plus one read. Before this took a
+ * run, the caller-facing "bulk" reads were loops around a single-sector
+ * version of it, so a 2000-sector level load cost 2000 SD round trips and
+ * the XA pump's 32-sector span cost 32. Reading the whole run at once is the
+ * entire point -- keep it that way; do not reintroduce a per-sector loop
+ * above a per-sector read.
+ */
+internal int NativeDiscImage_ReadRawRun(u32 lba, u32 count, u8 *raw, int owner)
 {
 	u64 offset;
+	size_t bytes;
+	u32 i;
+#if CTR_NATIVE_DISC_IO_PROFILE
+	struct NativeDiscImageIoProf *prof = &s_nativeDiscIoProf[(owner == NATIVE_DISC_IMAGE_OWNER_AUDIO) ? NATIVE_DISC_IMAGE_OWNER_AUDIO : NATIVE_DISC_IMAGE_OWNER_MAIN];
+	unsigned long long beginTick;
+#else
+	(void)owner;
+#endif
 
-	if (s_nativeDiscImageFile == NULL)
+	if ((s_nativeDiscImageFile == NULL) || (count == 0))
 	{
 		return 0;
 	}
 
 	offset = (u64)lba * NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE;
-	if ((offset > (u64)LONG_MAX) || (fseek(s_nativeDiscImageFile, (long)offset, SEEK_SET) != 0))
+	bytes = (size_t)count * NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE;
+
+#if CTR_NATIVE_DISC_IO_PROFILE
+	prof->calls++;
+	prof->sectors += count;
+	if (count == 1u)
 	{
+		prof->runsOf1++;
+	}
+	if (count > prof->maxRun)
+	{
+		prof->maxRun = count;
+	}
+	beginTick = NativeDiscImage_ProfTick();
+#endif
+
+	if ((offset > (u64)LONG_MAX) || (fseek(s_nativeDiscImageFile, (long)offset, SEEK_SET) != 0) || (fread(raw, 1, bytes, s_nativeDiscImageFile) != bytes))
+	{
+#if CTR_NATIVE_DISC_IO_PROFILE
+		prof->ioFails++;
+		NativeDiscImage_ProfAccumulate(prof, beginTick);
+#endif
 		return 0;
 	}
 
-	if (fread(sector, 1, NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE, s_nativeDiscImageFile) != NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE)
+#if CTR_NATIVE_DISC_IO_PROFILE
+	NativeDiscImage_ProfAccumulate(prof, beginTick);
+#endif
+
+	for (i = 0; i < count; i++)
 	{
-		return 0;
+		if (!NativeDiscImage_CheckRawSectorHeader(&raw[(size_t)i * NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE]))
+		{
+#if CTR_NATIVE_DISC_IO_PROFILE
+			prof->headerFails++;
+#endif
+			return 0;
+		}
 	}
 
-	return NativeDiscImage_CheckRawSectorHeader(sector);
+	return 1;
 }
 
-internal int NativeDiscImage_ReadDataSector(u32 lba, u8 *payload)
+internal int NativeDiscImage_ReadRawSector(u32 lba, u8 *sector)
 {
-	u8 sector[NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE];
-
-	if (!NativeDiscImage_ReadRawSector(lba, sector))
-	{
-		return 0;
-	}
-
-	memcpy(payload, &sector[NATIVE_DISC_IMAGE_FORM1_DATA_OFFSET], NATIVE_DISC_IMAGE_FORM1_DATA_SIZE);
-	return 1;
+#if CTR_NATIVE_DISC_IO_PROFILE
+	s_nativeDiscIoSiteSingle++;
+#endif
+	return NativeDiscImage_ReadRawRun(lba, 1, sector, NATIVE_DISC_IMAGE_OWNER_MAIN);
 }
 
 internal int NativeDiscImage_ParseDirRecord(const u8 *src, size_t available, struct NativeDiscImageDirRecord *record)
@@ -256,7 +380,6 @@ internal int NativeDiscImage_ReadDirectoryBytes(const struct NativeDiscImageFile
 {
 	u32 sectorCount;
 	u8 *data;
-	u32 sector;
 
 	*dataOut = NULL;
 	*sizeOut = 0;
@@ -278,13 +401,20 @@ internal int NativeDiscImage_ReadDirectoryBytes(const struct NativeDiscImageFile
 		return 0;
 	}
 
-	for (sector = 0; sector < sectorCount; sector++)
+	/* Batched like every other multi-sector read. This one is easy to write
+	 * off as small -- a directory is a handful of sectors -- but FindFile
+	 * re-walks the tree from the root on EVERY file open, one
+	 * ReadDirectoryBytes per path component, and nothing caches the result.
+	 * Main-thread only, like FindFile itself. */
+#if CTR_NATIVE_DISC_IO_PROFILE
+	s_nativeDiscIoDirCalls++;
+	s_nativeDiscIoDirSectors += sectorCount;
+#endif
+
+	if (!NativeDiscImage_ReadDataSectorsScratch(dir, 0, sectorCount, data, &s_nativeDiscImageMainScratch))
 	{
-		if (!NativeDiscImage_ReadDataSector(dir->lba + sector, &data[sector * NATIVE_DISC_IMAGE_FORM1_DATA_SIZE]))
-		{
-			free(data);
-			return 0;
-		}
+		free(data);
+		return 0;
 	}
 
 	*dataOut = data;
@@ -446,12 +576,11 @@ int NativeDiscImage_FindFile(const char *path, struct NativeDiscImageFile *fileO
 	return 1;
 }
 
-internal int NativeDiscImage_ReadDataBytes(const struct NativeDiscImageFile *file, u32 offset, void *dst, size_t size)
+internal int NativeDiscImage_ReadDataBytesScratch(const struct NativeDiscImageFile *file, u32 offset, void *dst, size_t size, struct NativeDiscImageScratch *scratch)
 {
-	u8 sector[NATIVE_DISC_IMAGE_FORM1_DATA_SIZE];
 	u8 *out = (u8 *)dst;
 
-	if ((file == NULL) || (dst == NULL) || ((u64)offset + size > file->size))
+	if ((file == NULL) || (dst == NULL) || (scratch == NULL) || ((u64)offset + size > file->size))
 	{
 		return 0;
 	}
@@ -460,34 +589,41 @@ internal int NativeDiscImage_ReadDataBytes(const struct NativeDiscImageFile *fil
 	{
 		u32 sectorIndex = offset / NATIVE_DISC_IMAGE_FORM1_DATA_SIZE;
 		u32 sectorOffset = offset % NATIVE_DISC_IMAGE_FORM1_DATA_SIZE;
-		size_t copySize = NATIVE_DISC_IMAGE_FORM1_DATA_SIZE - sectorOffset;
+		u64 touched = ((u64)sectorOffset + size + NATIVE_DISC_IMAGE_FORM1_DATA_SIZE - 1u) / NATIVE_DISC_IMAGE_FORM1_DATA_SIZE;
+		u32 run = (touched > NATIVE_DISC_IMAGE_CHUNK_SECTORS) ? NATIVE_DISC_IMAGE_CHUNK_SECTORS : (u32)touched;
+		u32 i;
 
-		if (copySize > size)
-		{
-			copySize = size;
-		}
-
-		if (!NativeDiscImage_ReadDataSector(file->lba + sectorIndex, sector))
+		if (!NativeDiscImage_ReadRawRun(file->lba + sectorIndex, run, scratch->raw, scratch->owner))
 		{
 			return 0;
 		}
 
-		memcpy(out, &sector[sectorOffset], copySize);
-		out += copySize;
-		offset += (u32)copySize;
-		size -= copySize;
+		for (i = 0; (i < run) && (size != 0); i++)
+		{
+			size_t copySize = NATIVE_DISC_IMAGE_FORM1_DATA_SIZE - sectorOffset;
+
+			if (copySize > size)
+			{
+				copySize = size;
+			}
+
+			memcpy(out, &scratch->raw[((size_t)i * NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE) + NATIVE_DISC_IMAGE_FORM1_DATA_OFFSET + sectorOffset], copySize);
+			out += copySize;
+			offset += (u32)copySize;
+			size -= copySize;
+			sectorOffset = 0;
+		}
 	}
 
 	return 1;
 }
 
-int NativeDiscImage_ReadDataSectors(const struct NativeDiscImageFile *file, u32 sector, u32 sectorCount, void *dst)
+int NativeDiscImage_ReadDataSectorsScratch(const struct NativeDiscImageFile *file, u32 sector, u32 sectorCount, void *dst, struct NativeDiscImageScratch *scratch)
 {
 	u8 *out = (u8 *)dst;
 	u32 fileSectorCount;
-	u32 i;
 
-	if ((file == NULL) || (dst == NULL))
+	if ((file == NULL) || (dst == NULL) || (scratch == NULL))
 	{
 		return 0;
 	}
@@ -498,25 +634,36 @@ int NativeDiscImage_ReadDataSectors(const struct NativeDiscImageFile *file, u32 
 		return 0;
 	}
 
-	for (i = 0; i < sectorCount; i++)
+	while (sectorCount != 0)
 	{
-		if (!NativeDiscImage_ReadDataSector(file->lba + sector + i, &out[i * NATIVE_DISC_IMAGE_FORM1_DATA_SIZE]))
+		u32 run = (sectorCount > NATIVE_DISC_IMAGE_CHUNK_SECTORS) ? NATIVE_DISC_IMAGE_CHUNK_SECTORS : sectorCount;
+		u32 i;
+
+		if (!NativeDiscImage_ReadRawRun(file->lba + sector, run, scratch->raw, scratch->owner))
 		{
 			return 0;
 		}
+
+		for (i = 0; i < run; i++)
+		{
+			memcpy(&out[(size_t)i * NATIVE_DISC_IMAGE_FORM1_DATA_SIZE], &scratch->raw[((size_t)i * NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE) + NATIVE_DISC_IMAGE_FORM1_DATA_OFFSET],
+			       NATIVE_DISC_IMAGE_FORM1_DATA_SIZE);
+		}
+
+		out += (size_t)run * NATIVE_DISC_IMAGE_FORM1_DATA_SIZE;
+		sector += run;
+		sectorCount -= run;
 	}
 
 	return 1;
 }
 
-int NativeDiscImage_ReadRawSectors(const struct NativeDiscImageFile *file, u32 sector, u32 sectorCount, void *dst)
+int NativeDiscImage_ReadRawSectorsScratch(const struct NativeDiscImageFile *file, u32 sector, u32 sectorCount, void *dst, struct NativeDiscImageScratch *scratch)
 {
-	u8 raw[NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE];
 	u8 *out = (u8 *)dst;
 	u32 fileSectorCount;
-	u32 i;
 
-	if ((file == NULL) || (dst == NULL))
+	if ((file == NULL) || (dst == NULL) || (scratch == NULL))
 	{
 		return 0;
 	}
@@ -527,17 +674,38 @@ int NativeDiscImage_ReadRawSectors(const struct NativeDiscImageFile *file, u32 s
 		return 0;
 	}
 
-	for (i = 0; i < sectorCount; i++)
+	while (sectorCount != 0)
 	{
-		if (!NativeDiscImage_ReadRawSector(file->lba + sector + i, raw))
+		u32 run = (sectorCount > NATIVE_DISC_IMAGE_CHUNK_SECTORS) ? NATIVE_DISC_IMAGE_CHUNK_SECTORS : sectorCount;
+		u32 i;
+
+		if (!NativeDiscImage_ReadRawRun(file->lba + sector, run, scratch->raw, scratch->owner))
 		{
 			return 0;
 		}
 
-		memcpy(&out[i * NATIVE_DISC_IMAGE_MODE2_USER_SIZE], &raw[NATIVE_DISC_IMAGE_MODE2_USER_OFFSET], NATIVE_DISC_IMAGE_MODE2_USER_SIZE);
+		for (i = 0; i < run; i++)
+		{
+			memcpy(&out[(size_t)i * NATIVE_DISC_IMAGE_MODE2_USER_SIZE], &scratch->raw[((size_t)i * NATIVE_DISC_IMAGE_RAW_SECTOR_SIZE) + NATIVE_DISC_IMAGE_MODE2_USER_OFFSET],
+			       NATIVE_DISC_IMAGE_MODE2_USER_SIZE);
+		}
+
+		out += (size_t)run * NATIVE_DISC_IMAGE_MODE2_USER_SIZE;
+		sector += run;
+		sectorCount -= run;
 	}
 
 	return 1;
+}
+
+int NativeDiscImage_ReadDataSectors(const struct NativeDiscImageFile *file, u32 sector, u32 sectorCount, void *dst)
+{
+	return NativeDiscImage_ReadDataSectorsScratch(file, sector, sectorCount, dst, &s_nativeDiscImageMainScratch);
+}
+
+int NativeDiscImage_ReadRawSectors(const struct NativeDiscImageFile *file, u32 sector, u32 sectorCount, void *dst)
+{
+	return NativeDiscImage_ReadRawSectorsScratch(file, sector, sectorCount, dst, &s_nativeDiscImageMainScratch);
 }
 
 int NativeDiscImage_ReadFileBytes(const char *path, int rawSectors, u8 **dataOut, int *sizeOut)
@@ -585,7 +753,7 @@ int NativeDiscImage_ReadFileBytes(const char *path, int rawSectors, u8 **dataOut
 			return 0;
 		}
 	}
-	else if (!NativeDiscImage_ReadDataBytes(&file, 0, data, size))
+	else if (!NativeDiscImage_ReadDataBytesScratch(&file, 0, data, size, &s_nativeDiscImageMainScratch))
 	{
 		free(data);
 		return 0;
@@ -595,3 +763,60 @@ int NativeDiscImage_ReadFileBytes(const char *path, int rawSectors, u8 **dataOut
 	*sizeOut = (int)size;
 	return 1;
 }
+
+#if CTR_NATIVE_DISC_IO_PROFILE
+/*
+ * One [DISCIO] line per owner for native_perf.c's window report (same unity
+ * TU; perf forward-declares this). Window counters reset inside the format
+ * call so the report and the reset cannot drift apart -- same contract as
+ * NativeAudio_DebugFormatVoiceProfWindow. Integers only: devkitARM newlib
+ * does not link float formatting unless asked.
+ *
+ * `perCall` is the number to read first: it is sectors/calls, so it says
+ * directly whether a read run actually batched (~16 for a level load) or
+ * collapsed back to one sector per SD round trip (1).
+ */
+internal void NativeDiscImage_DebugFormatIoProfWindow(char *buf, int bufSize, int owner)
+{
+	struct NativeDiscImageIoProf *prof = &s_nativeDiscIoProf[(owner == NATIVE_DISC_IMAGE_OWNER_AUDIO) ? NATIVE_DISC_IMAGE_OWNER_AUDIO : NATIVE_DISC_IMAGE_OWNER_MAIN];
+	unsigned long long freq = 1ull;
+	u32 perCall;
+
+#if defined(__3DS__)
+	freq = N3DS_GetTickFrequency();
+#endif
+	if (freq == 0ull)
+	{
+		freq = 1ull;
+	}
+
+	perCall = (prof->calls == 0) ? 0u : (prof->sectors / prof->calls);
+
+	if (owner == NATIVE_DISC_IMAGE_OWNER_AUDIO)
+	{
+		snprintf(buf, (size_t)bufSize, "[DISCIO] audio calls=%u sec=%u perCall=%u runs1=%u maxRun=%u us=%d worstUs=%d hdrFail=%u ioFail=%u", prof->calls, prof->sectors, perCall,
+		         prof->runsOf1, prof->maxRun, (int)((prof->ticks * 1000000ull) / freq), (int)((prof->worstTicks * 1000000ull) / freq), prof->headerFails, prof->ioFails);
+	}
+	else
+	{
+		snprintf(buf, (size_t)bufSize, "[DISCIO] main calls=%u sec=%u runs1=%u maxRun=%u dir=%u cd=%u/%u xaCnt=%u sng=%u us=%d worstUs=%d hdrFail=%u ioFail=%u", prof->calls,
+		         prof->sectors, prof->runsOf1, prof->maxRun, s_nativeDiscIoDirCalls, s_nativeDiscIoSiteCd, s_nativeDiscIoSiteCdSectors, s_nativeDiscIoSiteXaCount,
+		         s_nativeDiscIoSiteSingle, (int)((prof->ticks * 1000000ull) / freq), (int)((prof->worstTicks * 1000000ull) / freq), prof->headerFails, prof->ioFails);
+		s_nativeDiscIoDirCalls = 0;
+		s_nativeDiscIoDirSectors = 0;
+		s_nativeDiscIoSiteCd = 0;
+		s_nativeDiscIoSiteCdSectors = 0;
+		s_nativeDiscIoSiteXaCount = 0;
+		s_nativeDiscIoSiteSingle = 0;
+	}
+
+	prof->calls = 0;
+	prof->sectors = 0;
+	prof->runsOf1 = 0;
+	prof->maxRun = 0;
+	prof->ticks = 0;
+	prof->worstTicks = 0;
+	prof->headerFails = 0;
+	prof->ioFails = 0;
+}
+#endif
