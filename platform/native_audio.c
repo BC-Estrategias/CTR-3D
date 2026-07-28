@@ -585,9 +585,14 @@ global_variable u8 s_xaSpanBufPending[NATIVE_AUDIO_XA_SPAN_SECTORS * XA_FULL_SEC
  * Pending stays tagged MAIN on purpose: a pending stream is filled by the
  * track-open path, which runs on the main thread on 3DS. Tagging it AUDIO
  * would read as worker time in the counter and blur the one split the 3DS
- * contention question actually needs. */
-global_variable struct NativeDiscImageScratch s_xaDiscScratchLive = {NATIVE_DISC_IMAGE_OWNER_AUDIO, {0}};
-global_variable struct NativeDiscImageScratch s_xaDiscScratchPending = {NATIVE_DISC_IMAGE_OWNER_MAIN, {0}};
+ * contention question actually needs.
+ *
+ * Owners are assigned at init, not in the initialiser: a non-zero initialiser
+ * puts the whole 147KB in .data, where it is 147KB of zeros carried in the
+ * binary (exactly the size the 3dsx grew by when the chunk went to 64). Left
+ * uninitialised they land in .bss. */
+global_variable struct NativeDiscImageScratch s_xaDiscScratchLive;
+global_variable struct NativeDiscImageScratch s_xaDiscScratchPending;
 
 internal b32 NativeAudio_OutputOpen(void)
 {
@@ -3030,10 +3035,12 @@ internal void NativeAudio_XAStreamInitRingBackingIfNeeded(void)
 	 * role tag are not. */
 	if (s_audio.xaStream.discScratch == NULL)
 	{
+		s_xaDiscScratchLive.owner = NATIVE_DISC_IMAGE_OWNER_AUDIO;
 		s_audio.xaStream.discScratch = &s_xaDiscScratchLive;
 	}
 	if (s_audio.xaPendingStream.discScratch == NULL)
 	{
+		s_xaDiscScratchPending.owner = NATIVE_DISC_IMAGE_OWNER_MAIN;
 		s_audio.xaPendingStream.discScratch = &s_xaDiscScratchPending;
 	}
 }
