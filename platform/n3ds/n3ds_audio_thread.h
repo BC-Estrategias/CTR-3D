@@ -67,6 +67,46 @@ int N3DS_AudioThreadGetBacklog(void);
 int N3DS_AudioThreadGetDropped(void);
 
 /*
+ * Where one reporting window of the worker's time went, in microseconds --
+ * the decomposition hardware run 6 asked for (audioDropped 7,661 on an
+ * XA-music track proved the worker is the frame governor there, but not
+ * which of its jobs is the cost). Reading this DRAINS it: every field is
+ * per-window, not since-boot, so the renderer can print it directly.
+ *
+ * Read the fields against each other, not in isolation: `wakes` should be
+ * ~60 per second of window -- materially fewer means the loop itself
+ * overruns its 16.7ms budget -- and lockWaitUs is time the game thread held
+ * the render lock against the worker, i.e. contention, not work.
+ * `renderUs` is the render call alone (lock wait excluded); `lifecycleUs` +
+ * `mirrorUs` are its two halves, timed on the game side of the boundary.
+ *
+ * `parcelUs` and `pumpUs` are wall time INCLUDING any wait for the render
+ * lock, because both take it deep inside native_audio.c. lockWaitUs is the
+ * worker's total wait across all three, so subtract it before calling either
+ * of them expensive -- a worker stuck behind a main-thread bulk load
+ * otherwise reads as costly XA work when it is really contention.
+ */
+struct N3DS_AudioWorkerProfile
+{
+	int wakes;
+	int vblanks;
+	int parcels;
+	int lockWaitUs;
+	int renderUs;
+	int lifecycleUs;
+	int mirrorUs;
+	int parcelUs;
+	int pumpUs;
+};
+
+void N3DS_AudioThreadGetProfile(struct N3DS_AudioWorkerProfile *out);
+
+/* svcGetSystemTick, exposed so the unity TU can time its own side of the
+ * boundary on the same clock the worker uses (it cannot include <3ds.h>).
+ * Returns 0 off-3DS callers never see -- this header is 3DS-only. */
+unsigned long long N3DS_AudioTicksNow(void);
+
+/*
  * Real lock backing SDL_LockAudioStream/SDL_UnlockAudioStream on 3DS (see
  * sdl3_compat_3ds.c). Protects s_audio (native_audio.c) during rendering --
  * the same role the real SDL_AudioStream lock already plays for PC via
@@ -99,6 +139,14 @@ int N3DS_NdspIsUp(void);
  * because the pool was full (or a submit was mis-sized). */
 int N3DS_NdspGetQueuedBlocks(void);
 int N3DS_NdspGetDroppedBlocks(void);
+
+/* Sink aggregation mode receipts (session 21): cumulative counts of full
+ * 8-parcel aggregate submissions vs early anti-underrun small flushes. On
+ * hardware, full >> early means the seam-rate fix actually engaged; early
+ * dominating means the DSP kept running dry and the sink degenerated to
+ * crumbs (Azahar always looks like the latter -- its HLE gulps the queue --
+ * so only a hardware log can score this). */
+void N3DS_NdspGetFlushCounts(int *fullFlushes, int *earlyFlushes);
 
 /*
  * Hardware voices (plan B, session 20): SPU voices 0..22 play on ndsp's

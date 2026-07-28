@@ -2549,6 +2549,39 @@ void NativeRenderer_SwapWindow(void)
 				         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive, N3DS_NdspGetQueuedBlocks(), N3DS_NdspGetDroppedBlocks(),
 				         N3DS_HwVoiceStoreGetUsedKiB(), N3DS_HwVoiceGetDenied());
 				N3DS_DebugLog(cacheLine);
+
+				/*
+				 * The per-wake budget breakdown (session 21). Run 6 established
+				 * THAT the worker governs frame rate on XA-music tracks; this
+				 * line is what says WHICH job does it. Read wakes first: a
+				 * healthy worker wakes ~60x per second of window, so
+				 * wakes << 60*seconds means the loop body itself is overrunning
+				 * the 16.7ms budget, and the largest of the five microsecond
+				 * buckets is then the thing to cut. lockWait is not work at all
+				 * -- it is the game thread holding the render lock against us.
+				 */
+				{
+					struct N3DS_AudioWorkerProfile prof;
+					int fullFlushes = 0;
+					int earlyFlushes = 0;
+					/* Its own buffer: nine fields with six-digit microsecond
+					 * values overrun cacheLine[128], and the first hardware
+					 * run of this line lost pumpUs to truncation. */
+					char profLine[224];
+
+					N3DS_NdspGetFlushCounts(&fullFlushes, &earlyFlushes);
+					snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] sink aggFull=%d aggEarly=%d", fullFlushes, earlyFlushes);
+					N3DS_DebugLog(cacheLine);
+
+					N3DS_AudioThreadGetProfile(&prof);
+					snprintf(profLine, sizeof(profLine),
+					         "[CTR-3DS] audioprof wakes=%d vbl=%d parcels=%d lockWaitUs=%d renderUs=%d lifeUs=%d mirrorUs=%d parcelUs=%d pumpUs=%d", prof.wakes,
+					         prof.vblanks, prof.parcels, prof.lockWaitUs, prof.renderUs, prof.lifecycleUs, prof.mirrorUs, prof.parcelUs, prof.pumpUs);
+					N3DS_DebugLog(profLine);
+
+					printf("aprof  wake %-5d life %-6d mir %-5d\n", prof.wakes, prof.lifecycleUs, prof.mirrorUs);
+					printf("aprof  parc %-6d pump %-6d lock %-6d\n", prof.parcelUs, prof.pumpUs, prof.lockWaitUs);
+				}
 			}
 
 			/*

@@ -13,6 +13,7 @@
 #include <stddef.h> /* offsetof -- NativeAudio_XAStreamSwap's partial swap */
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h> /* clock() -- NativeAudio_LifecycleBench only */
 #include <string.h>
 
 /*
@@ -73,6 +74,27 @@ struct NativeAudioHwVoiceShadow
 };
 
 global_variable struct NativeAudioHwVoiceShadow s_hwVoiceShadow[24];
+
+/*
+ * Where the audio worker's per-wake budget actually goes. Hardware run 6
+ * left the session with a verdict but not a breakdown: on an XA-music track
+ * the worker is the frame-rate governor (audioDropped 7,661, ndspQ pinned at
+ * 0 in-race), but "worker over budget" covers five different jobs sharing
+ * one loop. These split it -- the two halves timed here, the rest in
+ * n3ds_audio_thread.c, all reported together on the audio shape line -- so
+ * the next hardware log names the dominant cost instead of us inferring it.
+ *
+ * Written only by the mixing thread (worker, or the StepVBlank fallback --
+ * never both, same invariant as the sink ring). Read unlocked for reporting,
+ * which is the established precedent for this class of counter.
+ */
+struct NativeAudioWorkerProfile
+{
+	unsigned long long lifecycleTicks;
+	unsigned long long mirrorTicks;
+};
+
+global_variable struct NativeAudioWorkerProfile s_workerProfile;
 #endif
 
 
@@ -171,9 +193,24 @@ global_variable struct
  * within a few wakes. PC keeps the original geometry: replay determinism
  * depends on ring residency/underrun timing staying exactly as it was.
  */
-#define NATIVE_AUDIO_XA_RING_SECTORS       32
-#define NATIVE_AUDIO_XA_RING_AHEAD_TARGET  28
-#define NATIVE_AUDIO_XA_PRIME_TARGET       4
+#define NATIVE_AUDIO_XA_RING_SECTORS       64
+#define NATIVE_AUDIO_XA_RING_AHEAD_TARGET  56
+#define NATIVE_AUDIO_XA_PRIME_TARGET       8
+/*
+ * Span read-ahead (session 21). The hardware budget decomposition caught the
+ * worker spending 73% of the whole session inside the XA pump's SD reads --
+ * one wait measured 8.5 SECONDS -- and the mechanism is granularity: XA
+ * channels are interleaved on disc, so fetching ONE audio sector means up to
+ * 8+ separate 2.3KB reads (most discarded as other channels), each crossing
+ * the FAT driver's global mutex against main-thread bulk loads. ~150 tiny
+ * reads/sec for one music stream. The span layer replaces them with one
+ * 32-sector (~75KB) sequential read cached per stream; the decode loop then
+ * consumes physical sectors from memory. Fewer mutex crossings by ~32x, and
+ * each crossing does useful work. The deeper ring above (64 slots, ~3.4s of
+ * 37.8kHz stereo) is the cushion that rides out the load-burst stalls the
+ * span reads cannot avoid entirely.
+ */
+#define NATIVE_AUDIO_XA_SPAN_SECTORS       32
 #else
 #define NATIVE_AUDIO_XA_RING_SECTORS       6     // resident sector-slots per stream (~94.5 KiB @ mono capacity)
 #define NATIVE_AUDIO_XA_RING_AHEAD_TARGET  4     // refill ceiling, sectors kept ahead of playback
@@ -365,6 +402,17 @@ struct NativeAudioXaSource
 struct NativeAudioXaStream
 {
 	s16 *ringPcm;
+	/* Span read-ahead cache (3DS; see NATIVE_AUDIO_XA_SPAN_SECTORS). Backing
+	 * array is global like ringPcm's, assigned by the same lazy init,
+	 * preserved across ClearNoLock the same way -- and the clear's memset
+	 * zeroing spanSectorCount is exactly the invalidation every open/seek
+	 * path needs, since they all Clear first. Fields sit BEFORE sectorBuf so
+	 * XAStreamSwap carries them with their stream: the cached bytes belong
+	 * to this stream's source and must trade places when the streams do.
+	 * Unused (never read, stays zero) on PC. */
+	u8 *spanBuf;
+	int spanStartSector;
+	int spanSectorCount;
 	struct NativeAudioXaSource source;
 	struct NativeAudioXaDecodeState decodeState; // ADPCM predictor history; persists sector-to-sector
 	int nextPhysicalSector;
@@ -514,6 +562,14 @@ global_variable struct NativeAudioState s_audio;
 // 32 MiB and climbing.
 global_variable s16 s_xaRingPcmLive[NATIVE_AUDIO_XA_RING_SECTORS * NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS];
 global_variable s16 s_xaRingPcmPending[NATIVE_AUDIO_XA_RING_SECTORS * NATIVE_AUDIO_XA_SECTOR_FRAMES * NATIVE_AUDIO_CHANNELS];
+#if defined(__3DS__)
+/* Span read-ahead backing (one per stream, ~74KB each) -- global for the
+ * same reason the ring arrays above are: keeping big buffers out of the
+ * stream struct is what keeps XAStreamSwap's temp (and every future
+ * by-value use) off the 32KB thread stacks (session-20 lesson). */
+global_variable u8 s_xaSpanBufLive[NATIVE_AUDIO_XA_SPAN_SECTORS * XA_FULL_SECTOR_SIZE];
+global_variable u8 s_xaSpanBufPending[NATIVE_AUDIO_XA_SPAN_SECTORS * XA_FULL_SECTOR_SIZE];
+#endif
 
 internal b32 NativeAudio_OutputOpen(void)
 {
@@ -1232,17 +1288,27 @@ internal b32 NativeAudio_AdsrRateIsAllOnes(int shiftValue, int stepValue, int bi
 	return (stepValue | (shiftValue << 2)) == mask;
 }
 
-internal void NativeAudio_AdsrRunEnvelopeStep(struct NativeAudioVoice *voice, int shiftValue, int stepValue, b32 exponential, b32 decreasing, b32 phaseNegative,
-                                              b32 rateAllOnes)
+/*
+ * The two quantities an envelope step is made of: the delta applied to
+ * adsrLevel when the counter overflows, and the per-sample counter
+ * increment. Split out of NativeAudio_AdsrRunEnvelopeStep (which was their
+ * only consumer) so the 3DS lifecycle fast path can ask "how long until this
+ * counter overflows?" from the SAME arithmetic rather than a copy of it --
+ * a copy would silently drift the moment either is touched. Pure extraction:
+ * the body below is the original code verbatim, and the golden mixer test
+ * (docs/REPLAYS.md) is what proves it.
+ */
+struct NativeAudioAdsrStep
+{
+	int level;     /* signed delta applied to adsrLevel on counter overflow */
+	u32 increment; /* counter increment per sample; never 0 */
+};
+
+internal void NativeAudio_AdsrDeriveStep(const struct NativeAudioVoice *voice, int shiftValue, int stepValue, b32 exponential, b32 decreasing,
+                                         b32 phaseNegative, struct NativeAudioAdsrStep *out)
 {
 	int adsrStep;
 	u32 counterIncrement;
-	u32 counter;
-
-	if (rateAllOnes)
-	{
-		return;
-	}
 
 	adsrStep = 7 - stepValue;
 	if (decreasing != phaseNegative)
@@ -1292,14 +1358,31 @@ internal void NativeAudio_AdsrRunEnvelopeStep(struct NativeAudioVoice *voice, in
 		counterIncrement = 1;
 	}
 
-	counter = voice->adsrCounter + counterIncrement;
+	out->level = adsrStep;
+	out->increment = counterIncrement;
+}
+
+internal void NativeAudio_AdsrRunEnvelopeStep(struct NativeAudioVoice *voice, int shiftValue, int stepValue, b32 exponential, b32 decreasing, b32 phaseNegative,
+                                              b32 rateAllOnes)
+{
+	struct NativeAudioAdsrStep calc;
+	u32 counter;
+
+	if (rateAllOnes)
+	{
+		return;
+	}
+
+	NativeAudio_AdsrDeriveStep(voice, shiftValue, stepValue, exponential, decreasing, phaseNegative, &calc);
+
+	counter = voice->adsrCounter + calc.increment;
 	voice->adsrCounter = counter & (NATIVE_AUDIO_ADSR_STEP_BIT - 1);
 	if ((counter & NATIVE_AUDIO_ADSR_STEP_BIT) == 0)
 	{
 		return;
 	}
 
-	voice->adsrLevel += adsrStep;
+	voice->adsrLevel += calc.level;
 	if (!decreasing)
 	{
 		voice->adsrLevel = NativeAudio_ClampAdsrLevel(voice->adsrLevel);
@@ -1321,6 +1404,143 @@ internal void NativeAudio_AdsrRunEnvelopeStep(struct NativeAudioVoice *voice, in
 	}
 
 	voice->attr.envx = (s16)voice->adsrLevel;
+}
+
+/*
+ * The (shift, step, mode-flag) tuple NativeAudio_AdsrAdvance feeds the
+ * envelope step for the voice's CURRENT phase. Extracted for the same
+ * single-source-of-truth reason as NativeAudio_AdsrDeriveStep above: the 3DS
+ * lifecycle fast path needs the identical tuple to reason about how long the
+ * phase will sit still, and a second copy of these bit twiddles would be a
+ * silent-drift hazard. Returns 0 for phases with no envelope step (OFF and
+ * anything unrecognized), which is the caller's cue to force the voice off.
+ */
+internal b32 NativeAudio_AdsrPhaseParams(const struct NativeAudioVoice *voice, int *shiftValue, int *stepValue, b32 *exponential, b32 *decreasing,
+                                         b32 *phaseNegative, b32 *rateAllOnes)
+{
+	switch (voice->adsrPhase)
+	{
+	case NATIVE_AUDIO_ADSR_ATTACK:
+		*shiftValue = (voice->attr.ar >> 2) & 0x1f;
+		*stepValue = voice->attr.ar & 3;
+		*exponential = NativeAudio_AdsrModeIsExponential(voice->attr.a_mode);
+		*decreasing = 0;
+		*phaseNegative = NativeAudio_AdsrModeIsPhaseNegative(voice->attr.a_mode);
+		*rateAllOnes = NativeAudio_AdsrRateIsAllOnes(*shiftValue, *stepValue, 7);
+		return 1;
+
+	case NATIVE_AUDIO_ADSR_DECAY:
+		*shiftValue = voice->attr.dr & 0xf;
+		*stepValue = 0;
+		*exponential = 1;
+		*decreasing = 1;
+		*phaseNegative = 0;
+		*rateAllOnes = 0;
+		return 1;
+
+	case NATIVE_AUDIO_ADSR_SUSTAIN:
+		*shiftValue = (voice->attr.sr >> 2) & 0x1f;
+		*stepValue = voice->attr.sr & 3;
+		*exponential = NativeAudio_AdsrModeIsExponential(voice->attr.s_mode);
+		*decreasing = NativeAudio_AdsrModeIsDecreasing(voice->attr.s_mode);
+		*phaseNegative = NativeAudio_AdsrModeIsPhaseNegative(voice->attr.s_mode);
+		*rateAllOnes = NativeAudio_AdsrRateIsAllOnes(*shiftValue, *stepValue, 7);
+		return 1;
+
+	case NATIVE_AUDIO_ADSR_RELEASE:
+		*shiftValue = voice->attr.rr & 0x1f;
+		*stepValue = 0;
+		*exponential = NativeAudio_AdsrModeIsExponential(voice->attr.r_mode);
+		*decreasing = 1;
+		*phaseNegative = NativeAudio_AdsrModeIsPhaseNegative(voice->attr.r_mode);
+		*rateAllOnes = (*shiftValue == 0x1f);
+		return 1;
+
+	default:
+		return 0;
+	}
+}
+
+/*
+ * How many further samples this envelope can be advanced with NO observable
+ * effect beyond the counter accumulating -- i.e. how many consecutive
+ * NativeAudio_AdsrAdvance calls would amount to nothing but
+ * `adsrCounter += increment`. The 3DS lifecycle path uses this to jump over
+ * those samples in one multiply instead of walking them.
+ *
+ * Deliberately pessimistic: every case this cannot PROVE is inert reports 0,
+ * which sends the caller down the ordinary one-sample-at-a-time path. The
+ * three guards below are the ones that matter -- each is a phase transition
+ * that fires from an ENTRY test rather than from a level change, so it can
+ * happen on a sample where the counter did not overflow:
+ *   ATTACK  -- level already at/above max (post-test fires with no overflow)
+ *   DECAY   -- level already at/below the sustain target
+ *   RELEASE -- level already at/below zero
+ * Everything else in the state machine moves only when the level moves, and
+ * the level moves only on a counter overflow.
+ *
+ * `*counterIncrement` is what to add per skipped sample, or 0 when the rate
+ * is all-ones (RunEnvelopeStep bails before touching the counter, so the
+ * phase is frozen until the game writes new attributes -- the skip is then
+ * unbounded).
+ */
+internal int NativeAudio_AdsrIdleSamples(const struct NativeAudioVoice *voice, int maxSamples, u32 *counterIncrement)
+{
+	int shiftValue;
+	int stepValue;
+	b32 exponential;
+	b32 decreasing;
+	b32 phaseNegative;
+	b32 rateAllOnes;
+	struct NativeAudioAdsrStep calc;
+	u32 need;
+	u32 steps;
+
+	*counterIncrement = 0;
+
+	if (maxSamples <= 0)
+	{
+		return 0;
+	}
+	if (!NativeAudio_AdsrPhaseParams(voice, &shiftValue, &stepValue, &exponential, &decreasing, &phaseNegative, &rateAllOnes))
+	{
+		return 0;
+	}
+
+	if ((voice->adsrPhase == NATIVE_AUDIO_ADSR_ATTACK) && (voice->adsrLevel >= NATIVE_AUDIO_ADSR_MAX))
+	{
+		return 0;
+	}
+	if ((voice->adsrPhase == NATIVE_AUDIO_ADSR_DECAY) && (voice->adsrLevel <= NativeAudio_AdsrSustainTarget(voice)))
+	{
+		return 0;
+	}
+	if ((voice->adsrPhase == NATIVE_AUDIO_ADSR_RELEASE) && (voice->adsrLevel <= 0))
+	{
+		return 0;
+	}
+
+	if (rateAllOnes)
+	{
+		return maxSamples;
+	}
+
+	NativeAudio_AdsrDeriveStep(voice, shiftValue, stepValue, exponential, decreasing, phaseNegative, &calc);
+
+	/* adsrCounter is masked to < STEP_BIT on every write, so this cannot
+	 * underflow; `steps` is the sample that overflows, so the inert run is
+	 * one shorter. */
+	need = NATIVE_AUDIO_ADSR_STEP_BIT - voice->adsrCounter;
+	steps = (need + calc.increment - 1u) / calc.increment;
+	if (steps <= 1u)
+	{
+		return 0;
+	}
+
+	*counterIncrement = calc.increment;
+	steps--;
+
+	return (steps > (u32)maxSamples) ? maxSamples : (int)steps;
 }
 
 internal void NativeAudio_AdsrAdvance(struct NativeAudioVoice *voice)
@@ -2778,6 +2998,16 @@ internal void NativeAudio_XAStreamInitRingBackingIfNeeded(void)
 	{
 		s_audio.xaPendingStream.ringPcm = s_xaRingPcmPending;
 	}
+#if defined(__3DS__)
+	if (s_audio.xaStream.spanBuf == NULL)
+	{
+		s_audio.xaStream.spanBuf = s_xaSpanBufLive;
+	}
+	if (s_audio.xaPendingStream.spanBuf == NULL)
+	{
+		s_audio.xaPendingStream.spanBuf = s_xaSpanBufPending;
+	}
+#endif
 }
 
 // Preserves the assigned ring backing array across the clear -- ringPcm is
@@ -2786,9 +3016,11 @@ internal void NativeAudio_XAStreamInitRingBackingIfNeeded(void)
 internal void NativeAudio_XAStreamClearNoLock(struct NativeAudioXaStream *stream)
 {
 	s16 *ringPcm = stream->ringPcm;
+	u8 *spanBuf = stream->spanBuf;
 
 	memset(stream, 0, sizeof(*stream));
 	stream->ringPcm = ringPcm;
+	stream->spanBuf = spanBuf; /* spanSectorCount just went to 0 = span invalidated */
 }
 
 internal void NativeAudio_XAStreamSwap(struct NativeAudioXaStream *a, struct NativeAudioXaStream *b)
@@ -2880,6 +3112,76 @@ internal int NativeAudio_XASourceReadSector(struct NativeAudioXaSource *source, 
 	return NativeAssets_ReadHostRange(&source->hostFile, (long)sectorIndex * source->sectorSize, dst, (size_t)source->sectorSize);
 }
 
+#if defined(__3DS__)
+/*
+ * One sequential read of `count` physical sectors -- both backends already
+ * had a bulk primitive, the per-sector path just never used it. Layout in
+ * dst matches the per-sector reads exactly: contiguous sectors at
+ * source->sectorSize stride (the disc backend normalizes to 2336/sector,
+ * the host backend is whatever the file's raw stride is).
+ */
+internal int NativeAudio_XASourceReadSectors(struct NativeAudioXaSource *source, int firstSector, int count, u8 *dst)
+{
+	if ((firstSector < 0) || (count <= 0) || (firstSector > source->totalSectors - count))
+	{
+		return 0;
+	}
+
+	if (source->useDiscImage)
+	{
+		return NativeDiscImage_ReadRawSectors(&source->discFile, (u32)firstSector, (u32)count, dst);
+	}
+
+	return NativeAssets_ReadHostRange(&source->hostFile, (long)firstSector * source->sectorSize, dst, (size_t)((long)count * source->sectorSize));
+}
+
+/*
+ * Read one physical sector through the stream's span cache: a miss fetches
+ * NATIVE_AUDIO_XA_SPAN_SECTORS sectors ahead in ONE bulk read, then this and
+ * the following ~31 requests are memcpys. The decode loop asks for physical
+ * sectors strictly in ascending order (nextPhysicalSector++), so one span
+ * fill amortizes across everything it covers -- including the interleaved
+ * other-channel sectors the caller will discard, which under per-sector
+ * reads each cost their own trip through the FAT mutex.
+ *
+ * Threading: per-stream state only, same disjointness contract as the
+ * per-stream decode scratch (worker owns the live stream, main thread owns
+ * pending) -- see the sectorBuf comment on struct NativeAudioXaStream.
+ * Falls back to the single-sector path if the span cannot be filled (tail
+ * of file shorter than a span is handled by shrinking the fill; a failed
+ * bulk read falls through so the existing error handling stays in charge).
+ */
+internal int NativeAudio_XAStreamReadSectorBuffered(struct NativeAudioXaStream *stream, int sectorIndex, u8 *dst)
+{
+	struct NativeAudioXaSource *source = &stream->source;
+
+	if ((stream->spanBuf == NULL) || (source->sectorSize <= 0) || (source->sectorSize > XA_FULL_SECTOR_SIZE))
+	{
+		return NativeAudio_XASourceReadSector(source, sectorIndex, dst);
+	}
+
+	if ((sectorIndex < stream->spanStartSector) || (sectorIndex >= stream->spanStartSector + stream->spanSectorCount))
+	{
+		int fill = NATIVE_AUDIO_XA_SPAN_SECTORS;
+
+		if (fill > source->totalSectors - sectorIndex)
+		{
+			fill = source->totalSectors - sectorIndex;
+		}
+		if ((fill <= 0) || !NativeAudio_XASourceReadSectors(source, sectorIndex, fill, stream->spanBuf))
+		{
+			stream->spanSectorCount = 0;
+			return NativeAudio_XASourceReadSector(source, sectorIndex, dst);
+		}
+		stream->spanStartSector = sectorIndex;
+		stream->spanSectorCount = fill;
+	}
+
+	memcpy(dst, stream->spanBuf + (size_t)(sectorIndex - stream->spanStartSector) * (size_t)source->sectorSize, (size_t)source->sectorSize);
+	return 1;
+}
+#endif
+
 internal void NativeAudio_XASourceClose(struct NativeAudioXaSource *source)
 {
 	if (!source->useDiscImage)
@@ -2948,7 +3250,14 @@ internal int NativeAudio_XAStreamDecodeNextSector(struct NativeAudioXaStream *st
 			return 0;
 		}
 
+#if defined(__3DS__)
+		/* Through the span cache: one ~75KB bulk read per 32 sectors instead
+		 * of a FAT-mutex crossing per 2.3KB sector -- the measured 73%-of-
+		 * worker cost this session exists to remove. */
+		if (!NativeAudio_XAStreamReadSectorBuffered(stream, stream->nextPhysicalSector, stream->sectorBuf))
+#else
 		if (!NativeAudio_XASourceReadSector(&stream->source, stream->nextPhysicalSector, stream->sectorBuf))
+#endif
 		{
 			stream->endOfStream = 1;
 			return 0;
@@ -3110,7 +3419,11 @@ internal void NativeAudio_XAStreamPump(void)
 		}
 		s_refilling = 1;
 
-		for (pumped = 0; pumped < 8; pumped++)
+		/* 24 audio sectors per wake (was 8): with span reads one burst costs
+		 * a handful of bulk SD ops rather than ~200 single-sector ones, and
+		 * the deeper 64-slot ring gives the burst somewhere to go. Still
+		 * bounded so one wake cannot monopolize the worker. */
+		for (pumped = 0; pumped < 24; pumped++)
 		{
 			NativeAudio_XAStreamDecodeNextSector(&s_audio.xaStream);
 			NativeAudio_LockOutput();
@@ -4028,6 +4341,221 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 	*outRight = (s16)NativeAudio_Clamp16(mixRight);
 }
 
+/*
+ * ===================================================== lifecycle fast path ===
+ *
+ * On 3DS the DSP plays the voices (plan B, session 20), so MixFrame's inner
+ * loop generates nothing -- it exists purely to advance the state the GAME
+ * polls: ADSR level/phase, sample position, loop wraps, ENDX-by-way-of
+ * voice->active. Hardware run 6 measured what that bookkeeping costs when
+ * it is walked one sample at a time: 735 frames x up to 24 voices per
+ * vblank, with the worker over its per-wake budget badly enough to drop
+ * 7,661 vblanks in a single race and starve the music queue to zero.
+ *
+ * The observation that fixes it: between counter overflows the envelope
+ * state machine does NOTHING. The counter is a fixed increment per sample
+ * and the level only moves when it wraps past STEP_BIT, so the samples in
+ * between are a multiply, not a loop -- and for slow rates (shift 0x1f
+ * increments by 1, i.e. an overflow every 32,768 samples) that is over half
+ * a second of samples currently being walked one function call at a time.
+ * Position advance is likewise linear between loop wraps.
+ *
+ * So this walks EVENTS instead of samples: ask how many samples are provably
+ * inert (NativeAudio_AdsrIdleSamples), clamp that to the next position event,
+ * jump the whole run in constant time, then do the one sample that actually
+ * does something the ordinary way. Identical state by construction rather
+ * than by approximation -- the skipped samples are ones where the existing
+ * code demonstrably writes nothing but `adsrCounter += increment` and
+ * `positionFp += stepFp`.
+ *
+ * `maxBatch` caps a single jump. It exists for the differential self-test
+ * (NativeAudio_LifecycleSelfTest): at maxBatch=1 this degenerates to exactly
+ * the one-sample-at-a-time path, so the test can compare this function
+ * against itself and isolate the batching logic. Production callers pass the
+ * whole vblank.
+ */
+internal int NativeAudio_LifecycleClampToPositionEvent(const struct NativeAudioVoice *voice, u32 stepFp, int samples)
+{
+	u64 limitFp;
+	u64 room;
+	u64 n;
+
+	if (stepFp == 0)
+	{
+		return samples;
+	}
+
+	/*
+	 * Two position events can fire, and we stop at whichever comes first:
+	 * the loop wrap at the end of the sample body (loopEnabled, loopEnd) and
+	 * the past-the-end test at the top of the next one (sampleCount). Taking
+	 * the min means neither is ever jumped over even when the scanned loop
+	 * points sit outside the decoded extent.
+	 */
+	limitFp = (u64)voice->sampleCount << NATIVE_AUDIO_FP_SHIFT;
+	if (voice->loopEnabled)
+	{
+		u64 loopEndFp = (u64)voice->loopEnd << NATIVE_AUDIO_FP_SHIFT;
+
+		if (loopEndFp < limitFp)
+		{
+			limitFp = loopEndFp;
+		}
+	}
+
+	if (voice->positionFp >= limitFp)
+	{
+		return 0;
+	}
+
+	/* Largest n with positionFp + n*stepFp still strictly below the limit. */
+	room = limitFp - 1u - voice->positionFp;
+	n = room / stepFp;
+
+	return (n >= (u64)samples) ? samples : (int)n;
+}
+
+/* Bench-only accounting (NativeAudio_LifecycleBench): iterations of the
+ * segment loop and samples actually consumed, so a divergence can be blamed
+ * on the loop rather than guessed at. */
+global_variable unsigned long s_lifecycleDebugIters;
+global_variable unsigned long s_lifecycleDebugFrames;
+
+internal void NativeAudio_LifecycleAdvanceVoice(struct NativeAudioVoice *voice, int frames, int maxBatch, int *voiceStopped)
+{
+	while (frames > 0)
+	{
+		s_lifecycleDebugIters++;
+		u32 stepFp;
+		u64 sampleIndex;
+		u32 increment;
+		int idle;
+
+		if (voice->active && (!NativeAudio_VoiceHasSample(voice) || voice->sampleDirty))
+		{
+			NativePerf_BeginScope(NATIVE_PERF_BUCKET_AUDIO_VOICE_START);
+			if (!NativeAudio_UpdateVoiceSample(voice))
+			{
+				*voiceStopped = 1;
+			}
+			NativePerf_EndScope(NATIVE_PERF_BUCKET_AUDIO_VOICE_START);
+		}
+
+		if (!voice->active || !NativeAudio_VoiceHasSample(voice) || voice->sampleCount <= 0 || voice->adsrPhase == NATIVE_AUDIO_ADSR_OFF)
+		{
+			/* MixFrame `continue`s here every remaining sample; nothing in a
+			 * lifecycle-only pass can revive the voice mid-vblank, so the
+			 * whole remainder is that same no-op. */
+			return;
+		}
+
+		if (voice->attr.pitch == 0)
+		{
+			/* Envelope advances, position is frozen (MixFrame's pitch==0
+			 * branch) -- no position event can end the run. */
+			idle = NativeAudio_AdsrIdleSamples(voice, (frames < maxBatch) ? frames : maxBatch, &increment);
+			if (idle > 0)
+			{
+				voice->adsrCounter += (u32)idle * increment;
+				frames -= idle;
+				s_lifecycleDebugFrames += (unsigned long)idle;
+				continue;
+			}
+
+			NativeAudio_AdsrAdvance(voice);
+			if (!voice->active || voice->adsrPhase == NATIVE_AUDIO_ADSR_OFF)
+			{
+				*voiceStopped = 1;
+			}
+			frames--;
+			s_lifecycleDebugFrames++;
+			continue;
+		}
+
+		sampleIndex = voice->positionFp >> NATIVE_AUDIO_FP_SHIFT;
+		if (sampleIndex >= (u64)voice->sampleCount)
+		{
+			if (voice->loopEnabled && (voice->loopEnd > voice->loopStart))
+			{
+				NativeAudio_WrapVoiceLoop(voice);
+			}
+			else
+			{
+				NativeAudio_AdsrForceOff(voice);
+				*voiceStopped = 1;
+				return;
+			}
+		}
+
+		stepFp = ((u32)voice->attr.pitch << NATIVE_AUDIO_FP_SHIFT) / 0x1000u;
+
+		idle = NativeAudio_AdsrIdleSamples(voice, (frames < maxBatch) ? frames : maxBatch, &increment);
+		if (idle > 0)
+		{
+			idle = NativeAudio_LifecycleClampToPositionEvent(voice, stepFp, idle);
+		}
+		if (idle > 0)
+		{
+			/* increment is 0 for an all-ones rate: counter untouched, which
+			 * is exactly what RunEnvelopeStep's early return does. */
+			voice->adsrCounter += (u32)idle * increment;
+			voice->positionFp += (u64)idle * stepFp;
+			frames -= idle;
+			s_lifecycleDebugFrames += (unsigned long)idle;
+			continue;
+		}
+
+		NativeAudio_AdsrAdvance(voice);
+		if (!voice->active || voice->adsrPhase == NATIVE_AUDIO_ADSR_OFF)
+		{
+			*voiceStopped = 1;
+		}
+
+		voice->positionFp += stepFp;
+
+		if (voice->loopEnabled && ((voice->positionFp >> NATIVE_AUDIO_FP_SHIFT) >= (u64)voice->loopEnd))
+		{
+			NativeAudio_WrapVoiceLoop(voice);
+		}
+
+		frames--;
+		s_lifecycleDebugFrames++;
+	}
+}
+
+/*
+ * One vblank of voice lifecycle, no audio generated. Mirrors what MixFrame
+ * does to voice state over `frames` samples on 3DS -- where its XA branch is
+ * owned by the worker's wall-clock path, its per-sample generation is
+ * compiled out, and its reverb chain is off -- so the two are interchangeable
+ * for state purposes, which is what NativeAudio_LifecycleSelfTest checks.
+ *
+ * The arena reclaim runs once at the end rather than per sample: it only ever
+ * fires when NO voice is live (see NativeAudio_ReclaimVoicePcmArenaIfIdle-
+ * NoLock's guard loop), and once that is true no voice advances again this
+ * vblank, so the two placements cannot differ.
+ */
+internal void NativeAudio_LifecycleVBlankNoLock(int frames, int maxBatch)
+{
+	int voiceStopped = 0;
+	int i;
+
+	if (!s_audio.init || s_audio.muted || (frames <= 0))
+	{
+		return;
+	}
+
+	for (i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
+	{
+		NativeAudio_LifecycleAdvanceVoice(&s_audio.voices[i], frames, maxBatch, &voiceStopped);
+	}
+
+	if (voiceStopped)
+	{
+		NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock();
+	}
+}
+
 internal int NativeAudio_RenderFramesNoLock(s16 *out, int frameCount)
 {
 	int frame;
@@ -4167,14 +4695,49 @@ internal void NativeAudio_HwVoiceMirrorNoLock(void)
  */
 void NativeAudio_RenderVBlankForAudioThread(void)
 {
-	s16 scratch[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
+	unsigned long long lifecycleStart = N3DS_AudioTicksNow();
 
-	/* Lifecycle + mirror only. The rendered frames are silence now (voices
-	 * play on their own channels, XA advances on the worker's wall-clock
-	 * below) -- submitting them would flood the music channel's queue with
-	 * zeros between real XA parcels. */
-	NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
-	NativeAudio_HwVoiceMirrorNoLock();
+	/*
+	 * Lifecycle + mirror only -- no audio is generated here. Every frame
+	 * MixFrame would have produced on this path was a hard zero (voices play
+	 * on their own DSP channels, XA advances on the worker's wall clock), so
+	 * this drops the 2,940-byte scratch buffer and its 735 clamped stores
+	 * along with the mixing, and walks the voice state by events instead of
+	 * per sample. Same state out, per NativeAudio_LifecycleSelfTest; hardware
+	 * run 6's dropped-vblank count is what made the per-sample walk
+	 * untenable.
+	 */
+	NativeAudio_LifecycleVBlankNoLock(NATIVE_AUDIO_VBLANK_FRAMES, NATIVE_AUDIO_VBLANK_FRAMES);
+	s_workerProfile.lifecycleTicks += N3DS_AudioTicksNow() - lifecycleStart;
+
+	{
+		unsigned long long mirrorStart = N3DS_AudioTicksNow();
+
+		NativeAudio_HwVoiceMirrorNoLock();
+		s_workerProfile.mirrorTicks += N3DS_AudioTicksNow() - mirrorStart;
+	}
+}
+
+/*
+ * Drain this file's half of the worker profile (see
+ * struct NativeAudioWorkerProfile). Hand-matched cross-TU contract, same as
+ * the render/pump/parcel wrappers above: n3ds_audio_thread.c owns the
+ * reporting and the tick->microsecond conversion, this side owns the two
+ * buckets only it can see inside the render call.
+ */
+void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *lifecycleTicks, unsigned long long *mirrorTicks)
+{
+	if (lifecycleTicks != NULL)
+	{
+		*lifecycleTicks = s_workerProfile.lifecycleTicks;
+	}
+	if (mirrorTicks != NULL)
+	{
+		*mirrorTicks = s_workerProfile.mirrorTicks;
+	}
+
+	s_workerProfile.lifecycleTicks = 0;
+	s_workerProfile.mirrorTicks = 0;
 }
 
 /*
@@ -4500,12 +5063,385 @@ internal int NativeAudio_GoldenRun(const char *statePath, const char *rawPath)
 	return 0;
 }
 
+/*
+ * ================================================ lifecycle self-test ======
+ *
+ * The 3DS lifecycle fast path (NativeAudio_LifecycleVBlankNoLock) claims to
+ * leave voice state exactly where the mixer's per-sample loop would. That is
+ * a claim about the most correctness-critical code in the audio system, made
+ * for a platform whose only acceptance channel is a human with a console --
+ * so it gets checked here, on PC, against the real thing.
+ *
+ * The comparison is deliberately NOT against a hand-written reference copy
+ * of the per-sample loop (a transcription bug would then pass): it runs
+ * NativeAudio_RenderFramesNoLock -- the actual mixer, MixFrame and all --
+ * over a vblank of randomized voice states, then re-runs the same seed
+ * through the fast path and diffs every field the game can observe. On PC
+ * MixFrame additionally generates samples and processes reverb; neither
+ * writes voice state, so the two are directly comparable.
+ *
+ * The batching itself is exercised the same way twice over: maxBatch=1
+ * degenerates the fast path to one sample at a time, so a maxBatch=1 vs
+ * maxBatch=735 diff isolates the event-skipping arithmetic from everything
+ * else. Both diffs must be clean.
+ *
+ * Run: build/ctr_native --audio-lifecycle-selftest   (exits without booting)
+ */
+internal u32 NativeAudio_SelfTestRandom(u32 *state)
+{
+	*state = (*state * 1664525u) + 1013904223u;
+	return *state;
+}
+
+internal void NativeAudio_SelfTestSeedVoice(struct NativeAudioVoice *voice, s16 *pcm, int pcmCount, u32 *rng)
+{
+	static const int phases[] = {NATIVE_AUDIO_ADSR_ATTACK, NATIVE_AUDIO_ADSR_DECAY, NATIVE_AUDIO_ADSR_SUSTAIN, NATIVE_AUDIO_ADSR_RELEASE};
+	static const int modes[] = {SPU_VOICE_LINEARIncN, SPU_VOICE_LINEARIncR, SPU_VOICE_LINEARDecN, SPU_VOICE_LINEARDecR,
+	                            SPU_VOICE_EXPIncN,    SPU_VOICE_EXPIncR,    SPU_VOICE_EXPDec};
+	u32 r;
+
+	memset(voice, 0, sizeof(*voice));
+
+	voice->pcm = pcm;
+	voice->sampleCount = 64 + (int)(NativeAudio_SelfTestRandom(rng) % (u32)(pcmCount - 80));
+	voice->active = 1;
+	voice->sampleDirty = 0;
+
+	/*
+	 * Loop points sometimes deliberately out of order or past the decoded
+	 * extent: the scan produces those for malformed SPU data, and they are
+	 * exactly the cases where the fast path's position-event clamp has to
+	 * agree with the per-sample checks rather than reason about them.
+	 */
+	voice->loopEnabled = (NativeAudio_SelfTestRandom(rng) & 3u) != 0;
+	voice->loopStart = (int)(NativeAudio_SelfTestRandom(rng) % (u32)voice->sampleCount);
+	voice->loopEnd = (int)(NativeAudio_SelfTestRandom(rng) % (u32)(voice->sampleCount + 16));
+
+	voice->positionFp = ((u64)(NativeAudio_SelfTestRandom(rng) % (u32)voice->sampleCount) << NATIVE_AUDIO_FP_SHIFT) |
+	                    (NativeAudio_SelfTestRandom(rng) & 0xffffu);
+
+	voice->adsrPhase = (u8)phases[NativeAudio_SelfTestRandom(rng) % 4u];
+	voice->adsrLevel = (s32)(NativeAudio_SelfTestRandom(rng) % 0x8000u);
+	voice->adsrCounter = NativeAudio_SelfTestRandom(rng) % NATIVE_AUDIO_ADSR_STEP_BIT;
+
+	/* Rates span the whole range on purpose: shift <= 11 overflows the
+	 * counter every sample (no batching possible), 0x1f is one overflow per
+	 * 32,768 samples (the case the fast path exists for), and all-ones is
+	 * the frozen-phase early-out. */
+	voice->attr.ar = (u16)(NativeAudio_SelfTestRandom(rng) & 0x7fu);
+	voice->attr.dr = (u16)(NativeAudio_SelfTestRandom(rng) & 0x0fu);
+	voice->attr.sr = (u16)(NativeAudio_SelfTestRandom(rng) & 0x7fu);
+	voice->attr.rr = (u16)(NativeAudio_SelfTestRandom(rng) & 0x1fu);
+	voice->attr.sl = (u16)(NativeAudio_SelfTestRandom(rng) & 0x0fu);
+	voice->attr.a_mode = modes[NativeAudio_SelfTestRandom(rng) % 7u];
+	voice->attr.s_mode = modes[NativeAudio_SelfTestRandom(rng) % 7u];
+	voice->attr.r_mode = modes[NativeAudio_SelfTestRandom(rng) % 7u];
+
+	r = NativeAudio_SelfTestRandom(rng);
+	voice->attr.pitch = ((r & 7u) == 0) ? 0 : (u16)(r % 0x3fffu); /* pitch 0 is its own branch */
+	voice->attr.volume.left = 0x3fff;
+	voice->attr.volume.right = 0x3fff;
+	voice->reverb = 0;
+}
+
+internal int NativeAudio_SelfTestVoiceDiffers(const struct NativeAudioVoice *a, const struct NativeAudioVoice *b)
+{
+	return (a->positionFp != b->positionFp) || (a->adsrLevel != b->adsrLevel) || (a->adsrCounter != b->adsrCounter) || (a->adsrPhase != b->adsrPhase) ||
+	       (a->active != b->active) || (a->looped != b->looped) || (a->attr.envx != b->attr.envx) || (a->sampleCount != b->sampleCount) ||
+	       (a->loopStart != b->loopStart) || (a->loopEnd != b->loopEnd) || (a->loopEnabled != b->loopEnabled);
+}
+
+int NativeAudio_LifecycleSelfTest(void)
+{
+	enum
+	{
+		SELFTEST_CASES = 3000,
+		SELFTEST_PCM = 2048
+	};
+	static s16 pcm[SELFTEST_PCM];
+	static struct NativeAudioVoice seed[NATIVE_AUDIO_SPU_VOICE_COUNT];
+	static struct NativeAudioVoice fromMixer[NATIVE_AUDIO_SPU_VOICE_COUNT];
+	static struct NativeAudioVoice fromStepped[NATIVE_AUDIO_SPU_VOICE_COUNT];
+	static s16 scratch[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
+	u32 rng = 0x13579bdfu;
+	int mixerMismatches = 0;
+	int batchMismatches = 0;
+	int caseIndex;
+	int i;
+
+	for (i = 0; i < SELFTEST_PCM; i++)
+	{
+		pcm[i] = (s16)((NativeAudio_SelfTestRandom(&rng) & 0xffffu) - 0x8000);
+	}
+
+	/* Minimal mixer state: initialized, unmuted, no XA, no reverb -- the
+	 * 3DS worker path's own conditions, so MixFrame's voice handling is the
+	 * only thing that moves. */
+	memset(&s_audio, 0, sizeof(s_audio));
+	s_audio.init = 1;
+	s_audio.muted = 0;
+	s_audio.masterVolumeLeft = 0x3fff;
+	s_audio.masterVolumeRight = 0x3fff;
+	/* Set directly rather than via the setter: the memset above just cleared
+	 * it, and this keeps SDL's callback thread out of the mixer (it drains
+	 * only, in this mode) so it cannot advance the voices being compared. */
+	s_audio.output.deterministicRenderMode = 1;
+
+	for (caseIndex = 0; caseIndex < SELFTEST_CASES; caseIndex++)
+	{
+		for (i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
+		{
+			NativeAudio_SelfTestSeedVoice(&seed[i], pcm, SELFTEST_PCM, &rng);
+		}
+
+		/* Reference: the real mixer over one vblank. */
+		memcpy(s_audio.voices, seed, sizeof(seed));
+		NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
+		memcpy(fromMixer, s_audio.voices, sizeof(fromMixer));
+
+		/* Fast path, one sample at a time -- isolates transcription from
+		 * batching. */
+		memcpy(s_audio.voices, seed, sizeof(seed));
+		NativeAudio_LifecycleVBlankNoLock(NATIVE_AUDIO_VBLANK_FRAMES, 1);
+		memcpy(fromStepped, s_audio.voices, sizeof(fromStepped));
+
+		/* Fast path, batching the whole vblank -- what 3DS actually runs. */
+		memcpy(s_audio.voices, seed, sizeof(seed));
+		NativeAudio_LifecycleVBlankNoLock(NATIVE_AUDIO_VBLANK_FRAMES, NATIVE_AUDIO_VBLANK_FRAMES);
+
+		for (i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
+		{
+			if (NativeAudio_SelfTestVoiceDiffers(&fromMixer[i], &fromStepped[i]))
+			{
+				if (mixerMismatches < 4)
+				{
+					Platform_Log("[CTR AudioLifecycle] case %d voice %d: stepped != mixer (phase %d/%d level %d/%d pos %llu/%llu)\n", caseIndex, i,
+					             fromStepped[i].adsrPhase, fromMixer[i].adsrPhase, (int)fromStepped[i].adsrLevel, (int)fromMixer[i].adsrLevel,
+					             (unsigned long long)fromStepped[i].positionFp, (unsigned long long)fromMixer[i].positionFp);
+				}
+				mixerMismatches++;
+			}
+			if (NativeAudio_SelfTestVoiceDiffers(&s_audio.voices[i], &fromStepped[i]))
+			{
+				if (batchMismatches < 4)
+				{
+					Platform_Log("[CTR AudioLifecycle] case %d voice %d: batched != stepped (phase %d/%d level %d/%d pos %llu/%llu)\n", caseIndex, i,
+					             s_audio.voices[i].adsrPhase, fromStepped[i].adsrPhase, (int)s_audio.voices[i].adsrLevel, (int)fromStepped[i].adsrLevel,
+					             (unsigned long long)s_audio.voices[i].positionFp, (unsigned long long)fromStepped[i].positionFp);
+				}
+				batchMismatches++;
+			}
+		}
+	}
+
+	Platform_Log("[CTR AudioLifecycle] %d cases x %d voices x %d frames: mixer-vs-stepped %d mismatches, stepped-vs-batched %d mismatches -- %s\n",
+	             SELFTEST_CASES, NATIVE_AUDIO_SPU_VOICE_COUNT, NATIVE_AUDIO_VBLANK_FRAMES, mixerMismatches, batchMismatches,
+	             ((mixerMismatches == 0) && (batchMismatches == 0)) ? "PASS" : "FAIL");
+
+	return ((mixerMismatches == 0) && (batchMismatches == 0)) ? 0 : 1;
+}
+
+/*
+ * The same equivalence check plus a cost ratio, run against a REAL captured
+ * SPU state instead of randomized voices (debug/audio/*.spustate, produced
+ * by --audio-capture; see docs/REPLAYS.md). Randomized envelopes exercise
+ * the arithmetic but say nothing about how often CTR's actual voices sit at
+ * rates worth skipping, and this project has a history of measuring content
+ * that did not exercise the thing being measured. The ratio here is still
+ * only indicative -- x86 is not the ARM11, and one capture is not every
+ * track -- so it is a sanity bound, not the answer. The answer is `lifeUs`
+ * on the next hardware log.
+ *
+ * Run: build/ctr_native --audio-lifecycle-bench debug/audio/mixer.spustate
+ */
+int NativeAudio_LifecycleBench(const char *statePath)
+{
+	enum
+	{
+		BENCH_REPEATS = 20,
+		BENCH_VBLANKS = 300
+	};
+	const int stateSize = NativeAudio_GetStateSize();
+	void *blob = malloc((size_t)stateSize);
+	static struct NativeAudioVoice stepped[NATIVE_AUDIO_SPU_VOICE_COUNT];
+	FILE *file;
+	clock_t steppedClocks = 0;
+	clock_t batchedClocks = 0;
+	int mismatches = 0;
+	int repeat;
+	int vblank;
+	int i;
+
+	if (blob == NULL)
+	{
+		return 1;
+	}
+
+	file = fopen(statePath, "rb");
+	if ((file == NULL) || ((int)fread(blob, 1, (size_t)stateSize, file) != stateSize))
+	{
+		Platform_LogError("[CTR AudioLifecycle] cannot read %s (expected %d bytes)\n", statePath, stateSize);
+		if (file != NULL)
+		{
+			fclose(file);
+		}
+		free(blob);
+		return 1;
+	}
+	fclose(file);
+
+	/*
+	 * The audio device is open and its callback thread mixes s_audio -- it
+	 * will advance these very voices underneath the comparison and turn a
+	 * clean equivalence into noise (it did: the "divergence" moved vblank
+	 * every run). Deterministic mode is how --audio-golden already keeps the
+	 * callback off the mixer -- in that mode SDL only drains already-queued
+	 * PCM and never calls the mixer itself.
+	 */
+	NativeAudio_SetDeterministicRenderMode(1);
+
+	for (repeat = 0; repeat < BENCH_REPEATS; repeat++)
+	{
+		clock_t start;
+
+		if (!NativeAudio_RestoreState(blob, stateSize))
+		{
+			Platform_LogError("[CTR AudioLifecycle] RestoreState rejected %s\n", statePath);
+			free(blob);
+			return 1;
+		}
+		start = clock();
+		for (vblank = 0; vblank < BENCH_VBLANKS; vblank++)
+		{
+			NativeAudio_LifecycleVBlankNoLock(NATIVE_AUDIO_VBLANK_FRAMES, 1);
+		}
+		steppedClocks += clock() - start;
+		memcpy(stepped, s_audio.voices, sizeof(stepped));
+
+		if (!NativeAudio_RestoreState(blob, stateSize))
+		{
+			free(blob);
+			return 1;
+		}
+		start = clock();
+		for (vblank = 0; vblank < BENCH_VBLANKS; vblank++)
+		{
+			NativeAudio_LifecycleVBlankNoLock(NATIVE_AUDIO_VBLANK_FRAMES, NATIVE_AUDIO_VBLANK_FRAMES);
+		}
+		batchedClocks += clock() - start;
+
+		for (i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
+		{
+			if (NativeAudio_SelfTestVoiceDiffers(&s_audio.voices[i], &stepped[i]))
+			{
+				mismatches++;
+			}
+		}
+	}
+
+	/*
+	 * Any mismatch above is a divergence somewhere in 300 vblanks of
+	 * compounding state -- useless on its own. Re-run the two paths in
+	 * lockstep on a full mixer snapshot, comparing after EVERY vblank, so
+	 * the first one that differs is named along with the voice and field.
+	 */
+	if (mismatches != 0)
+	{
+		static struct NativeAudioState snapshot;
+		static struct NativeAudioVoice beforeVblank[NATIVE_AUDIO_SPU_VOICE_COUNT];
+		int reported = 0;
+
+		/* blob is still the loaded snapshot here -- the outer free is below. */
+		NativeAudio_RestoreState(blob, stateSize);
+
+		for (vblank = 0; (vblank < BENCH_VBLANKS) && (reported < 3); vblank++)
+		{
+			unsigned long steppedIters;
+			unsigned long steppedFrames;
+
+			memcpy(beforeVblank, s_audio.voices, sizeof(beforeVblank));
+
+			s_lifecycleDebugIters = 0;
+			s_lifecycleDebugFrames = 0;
+			NativeAudio_LifecycleVBlankNoLock(NATIVE_AUDIO_VBLANK_FRAMES, 1);
+			steppedIters = s_lifecycleDebugIters;
+			steppedFrames = s_lifecycleDebugFrames;
+			memcpy(&snapshot, &s_audio, sizeof(snapshot));
+			memcpy(stepped, s_audio.voices, sizeof(stepped));
+
+			memcpy(s_audio.voices, beforeVblank, sizeof(beforeVblank));
+			s_lifecycleDebugIters = 0;
+			s_lifecycleDebugFrames = 0;
+			NativeAudio_LifecycleVBlankNoLock(NATIVE_AUDIO_VBLANK_FRAMES, NATIVE_AUDIO_VBLANK_FRAMES);
+
+			for (i = 0; i < NATIVE_AUDIO_SPU_VOICE_COUNT; i++)
+			{
+				if (NativeAudio_SelfTestVoiceDiffers(&s_audio.voices[i], &stepped[i]) && (reported < 3))
+				{
+					const struct NativeAudioVoice *in = &beforeVblank[i];
+
+					Platform_Log("[CTR AudioLifecycle] first divergence vblank %d voice %d\n", vblank, i);
+					Platform_Log("  accounting: stepped %lu iters / %lu frames, batched %lu iters / %lu frames (expect %d frames each)\n", steppedIters,
+					             steppedFrames, s_lifecycleDebugIters, s_lifecycleDebugFrames, NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_SPU_VOICE_COUNT);
+					/* Positions as sample+fraction, not %llu: mingw's stdio
+					 * cannot be trusted with 64-bit conversions here, and a
+					 * mis-printed number would send this diagnosis somewhere
+					 * imaginary. */
+					Platform_Log("  in:      phase %d level %d counter %u pos %u+%u pitch %u count %d loop %d [%d,%d) dirty %d pcm %d\n", in->adsrPhase,
+					             (int)in->adsrLevel, (unsigned)in->adsrCounter, (unsigned)(in->positionFp >> NATIVE_AUDIO_FP_SHIFT),
+					             (unsigned)(in->positionFp & 0xffffu), (unsigned)in->attr.pitch, in->sampleCount, (int)in->loopEnabled, in->loopStart,
+					             in->loopEnd, (int)in->sampleDirty, in->pcm != NULL);
+					Platform_Log("  ar/dr/sr/rr/sl %u/%u/%u/%u/%u modes %d/%d/%d\n", (unsigned)in->attr.ar, (unsigned)in->attr.dr, (unsigned)in->attr.sr,
+					             (unsigned)in->attr.rr, (unsigned)in->attr.sl, in->attr.a_mode, in->attr.s_mode, in->attr.r_mode);
+					Platform_Log("  stepped: phase %d level %d counter %u pos %u+%u active %d looped %d count %d\n", stepped[i].adsrPhase,
+					             (int)stepped[i].adsrLevel, (unsigned)stepped[i].adsrCounter, (unsigned)(stepped[i].positionFp >> NATIVE_AUDIO_FP_SHIFT),
+					             (unsigned)(stepped[i].positionFp & 0xffffu), (int)stepped[i].active, (int)stepped[i].looped, stepped[i].sampleCount);
+					Platform_Log("  batched: phase %d level %d counter %u pos %u+%u active %d looped %d count %d\n", s_audio.voices[i].adsrPhase,
+					             (int)s_audio.voices[i].adsrLevel, (unsigned)s_audio.voices[i].adsrCounter,
+					             (unsigned)(s_audio.voices[i].positionFp >> NATIVE_AUDIO_FP_SHIFT), (unsigned)(s_audio.voices[i].positionFp & 0xffffu),
+					             (int)s_audio.voices[i].active, (int)s_audio.voices[i].looped, s_audio.voices[i].sampleCount);
+					reported++;
+				}
+			}
+
+			/* Continue from the stepped path's state so later vblanks are
+			 * compared from a known-good baseline rather than compounding. */
+			memcpy(&s_audio, &snapshot, sizeof(s_audio));
+		}
+	}
+
+	free(blob);
+
+	{
+		const double steppedMs = (1000.0 * (double)steppedClocks) / (double)CLOCKS_PER_SEC;
+		const double batchedMs = (1000.0 * (double)batchedClocks) / (double)CLOCKS_PER_SEC;
+		const int vblanksRun = BENCH_REPEATS * BENCH_VBLANKS;
+
+		Platform_Log("[CTR AudioLifecycle] %s: %d vblanks -- per-sample %.3f ms (%.1f us/vblank), batched %.3f ms (%.1f us/vblank), %.2fx, state mismatches %d\n",
+		             statePath, vblanksRun, steppedMs, (1000.0 * steppedMs) / (double)vblanksRun, batchedMs, (1000.0 * batchedMs) / (double)vblanksRun,
+		             (batchedMs > 0.0) ? (steppedMs / batchedMs) : 0.0, mismatches);
+	}
+
+	return (mismatches == 0) ? 0 : 1;
+}
+
 int NativeAudio_GoldenConfigureFromArgs(int argc, char **argv)
 {
 	const char *capturePath = NULL;
 	const char *captureVblank = NULL;
 	const char *goldenPath = NULL;
 	const char *rawPath = NULL;
+
+	/* Own scan: this flag takes no value, so the paired-argument loop below
+	 * would skip it whenever it lands last on the command line. */
+	for (int i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "--audio-lifecycle-selftest") == 0)
+		{
+			NativeAudio_LifecycleSelfTest();
+			return 1; /* nonzero: main() exits without entering the game */
+		}
+	}
 
 	for (int i = 1; i < argc; i++)
 	{
@@ -4529,6 +5465,11 @@ int NativeAudio_GoldenConfigureFromArgs(int argc, char **argv)
 		else if (strcmp(argv[i], "--audio-golden-raw") == 0)
 		{
 			rawPath = argv[i + 1];
+		}
+		else if (strcmp(argv[i], "--audio-lifecycle-bench") == 0)
+		{
+			NativeAudio_LifecycleBench(argv[i + 1]);
+			return 1; /* nonzero: main() exits without entering the game */
 		}
 	}
 

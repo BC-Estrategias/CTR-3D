@@ -70,6 +70,15 @@ extern void NativeAudio_XAPumpForAudioThread(void);
 extern int NativeAudio_RenderXAParcelForAudioThread(void);
 
 /*
+ * Same hand-matched cross-TU contract. Drains native_audio.c's own half of
+ * the worker profile (the lifecycle/mirror split inside the render call
+ * above, which only that file can see) in ticks from N3DS_AudioTicksNow, and
+ * zeroes it. Called from N3DS_AudioThreadGetProfile so the whole breakdown
+ * is reported and reset as one unit.
+ */
+extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *lifecycleTicks, unsigned long long *mirrorTicks);
+
+/*
  * Reuses NATIVE_VSYNC_CATCHUP_MAX's existing value and precedent (the
  * render-side vblank catch-up loop, native_platform.c) -- same shape of
  * problem, same answer, not a new arbitrary number. See
@@ -87,15 +96,34 @@ extern int NativeAudio_RenderXAParcelForAudioThread(void);
  */
 #define N3DS_NDSP_BLOCK_FRAMES 735
 /*
- * Pool depth mirrors the PC output queue's cushion
- * (NATIVE_AUDIO_SCHEDULED_QUEUE_FRAMES = 16 vblanks, ~267ms). Production is
- * paced by the vblank emitter (60 Hz real-time, catch-up capped at 8) and
- * ndsp drains at exactly 44100 frames/s, so steady-state queue depth stays
- * wherever the last catch-up burst left it -- the pool only has to absorb
- * that burst plus clock drift. A full pool drops the newest block (counted,
- * reported in the renderer's audio shape line), never blocks the mixer.
+ * Aggregation (session 21): the submit API still takes one 735-frame parcel
+ * per call, but the sink now accumulates N3DS_NDSP_AGG_PARCELS of them into
+ * one large wave buffer before handing it to the DSP.
+ *
+ * Why: the music channel was the ONLY channel fed as 60 separate wave
+ * buffers per second -- every SFX voice plays one long buffer -- and it was
+ * the only channel with the fluttery "talking into a fan" artifact, on
+ * hardware AND in Azahar (same submission structure, same artifact; the PC
+ * build plays byte-identical parcel content cleanly through SDL, pinning
+ * the defect to this hand-off, not the samples). Each wave-buffer seam is a
+ * stitch point for the DSP's resampler (44100 -> its native 32728 Hz);
+ * 60 seams/sec IS a 60 Hz flutter. Aggregating 8 parcels (~133ms) cuts
+ * that to ~7.5 seams/sec, and each seam sits between contiguous large
+ * blocks the polyphase filter can stride across.
+ *
+ * Latency cost: up to ~133ms extra before a parcel is audible, on top of
+ * the worker's ~200ms cushion -- fine for music/announcer (SFX latency is
+ * untouched; voices 0..22 are their own channels). To keep a track start
+ * from waiting for a full aggregate, a partial buffer is flushed early
+ * whenever the DSP is about to run dry (see SubmitVBlankBlock).
+ *
+ * Pool: 6 aggregate buffers x 5880 frames ~= 800ms capacity, comfortably
+ * above the worker's 12-parcel cushion target. Full pool drops the newest
+ * parcel (counted), never blocks the mixer.
  */
-#define N3DS_NDSP_BLOCK_COUNT 16
+#define N3DS_NDSP_AGG_PARCELS  8
+#define N3DS_NDSP_AGG_FRAMES   (N3DS_NDSP_BLOCK_FRAMES * N3DS_NDSP_AGG_PARCELS)
+#define N3DS_NDSP_BLOCK_COUNT  6
 /*
  * Channel plan (ndsp has exactly 24): SPU voices 0..22 map 1:1 onto ndsp
  * channels 0..22 as MONO_PCM16 hardware voices; channel 23 carries the
@@ -135,10 +163,18 @@ static volatile int s_audioThreadRunning; /* set true only after a real thread o
  */
 static int s_ndspInitAttempted;
 static int s_ndspUp;
-static s16 *s_ndspPcm;                                  /* linearAlloc: BLOCK_COUNT x BLOCK_FRAMES x stereo */
+static s16 *s_ndspPcm;                                  /* linearAlloc: BLOCK_COUNT x AGG_FRAMES x stereo */
 static ndspWaveBuf s_ndspBufs[N3DS_NDSP_BLOCK_COUNT];   /* statuses start 0 = NDSP_WBUF_FREE */
 static int s_ndspNextBuf;
+static int s_ndspAggFill; /* parcels accumulated in s_ndspBufs[s_ndspNextBuf] so far (0..AGG_PARCELS) */
 static u32 s_ndspDroppedBlocks;
+/* Which mode the sink actually ran in -- full 8-parcel aggregates (seams
+ * ~7.5/sec, the fix engaged) vs early anti-underrun flushes (small buffers,
+ * degenerates toward the old 60-crumb behavior). Azahar's HLE gulps the
+ * queue and forces the early path constantly, so it CANNOT exercise the
+ * batching; these counters are how a hardware log proves it engaged. */
+static u32 s_ndspFullFlushes;
+static u32 s_ndspEarlyFlushes;
 
 /* Hardware-voice linear store (see the plan-B section below for the full
  * story); declared here because N3DS_NdspSinkShutdown frees it. */
@@ -176,7 +212,7 @@ static void N3DS_NdspSinkInit(void)
 		return;
 	}
 
-	s_ndspPcm = (s16 *)linearAlloc((size_t)N3DS_NDSP_BLOCK_COUNT * N3DS_NDSP_BLOCK_FRAMES * 2 * sizeof(s16));
+	s_ndspPcm = (s16 *)linearAlloc((size_t)N3DS_NDSP_BLOCK_COUNT * N3DS_NDSP_AGG_FRAMES * 2 * sizeof(s16));
 	if (s_ndspPcm == NULL)
 	{
 		N3DS_DebugLog("[CTR-3DS] ndsp: linearAlloc failed, audio stays muted");
@@ -195,7 +231,7 @@ static void N3DS_NdspSinkInit(void)
 	ndspChnSetMix(N3DS_NDSP_CHANNEL, mix);
 
 	s_ndspUp = 1;
-	snprintf(line, sizeof(line), "[CTR-3DS] ndsp: up (%d blocks x %d frames)", N3DS_NDSP_BLOCK_COUNT, N3DS_NDSP_BLOCK_FRAMES);
+	snprintf(line, sizeof(line), "[CTR-3DS] ndsp: up (%d aggs x %d parcels x %d frames)", N3DS_NDSP_BLOCK_COUNT, N3DS_NDSP_AGG_PARCELS, N3DS_NDSP_BLOCK_FRAMES);
 	N3DS_DebugLog(line);
 }
 
@@ -229,7 +265,50 @@ static void N3DS_NdspSinkShutdown(void)
 	s_ndspUp = 0;
 	s_ndspInitAttempted = 0; /* a later re-Init may bring the sink back up */
 	s_ndspNextBuf = 0;
+	s_ndspAggFill = 0;
 	memset(s_ndspBufs, 0, sizeof(s_ndspBufs));
+}
+
+static int N3DS_NdspQueuedParcelsDspSide(void);
+
+/* Hand the accumulated aggregate (s_ndspAggFill parcels) to the DSP and
+ * advance to the next pool slot. Caller guarantees fill > 0 and the current
+ * slot is free (both checked by the submit path below). */
+static void N3DS_NdspFlushAggregate(void)
+{
+	ndspWaveBuf *buf = &s_ndspBufs[s_ndspNextBuf];
+	s16 *slot = s_ndspPcm + (size_t)s_ndspNextBuf * N3DS_NDSP_AGG_FRAMES * 2;
+	u32 frames = (u32)s_ndspAggFill * N3DS_NDSP_BLOCK_FRAMES;
+
+	DSP_FlushDataCache(slot, frames * 2 * sizeof(s16)); /* once per aggregate, not per parcel */
+
+	memset(buf, 0, sizeof(*buf));
+	buf->data_pcm16 = slot;
+	buf->nsamples = frames; /* per-channel frame count, not halfword total */
+	buf->looping = false;
+	ndspChnWaveBufAdd(N3DS_NDSP_CHANNEL, buf);
+
+	s_ndspNextBuf = (s_ndspNextBuf + 1) % N3DS_NDSP_BLOCK_COUNT;
+	s_ndspAggFill = 0;
+}
+
+/* Flush a partially-filled aggregate, if any. Called by the worker when XA
+ * goes idle -- without this, the last 1..7 parcels of a track (the tail of
+ * an announcer line) would sit unheard in the accumulating slot until the
+ * NEXT track's parcels pushed them out. No-op when empty or the slot is
+ * still held by the DSP (then the parcels are simply not lost -- they flush
+ * with the next append). */
+static void N3DS_NdspFlushPending(void)
+{
+	if (!s_ndspUp || (s_ndspAggFill <= 0))
+	{
+		return;
+	}
+	if ((s_ndspBufs[s_ndspNextBuf].status == NDSP_WBUF_QUEUED) || (s_ndspBufs[s_ndspNextBuf].status == NDSP_WBUF_PLAYING))
+	{
+		return;
+	}
+	N3DS_NdspFlushAggregate();
 }
 
 int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount)
@@ -252,23 +331,34 @@ int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount)
 	buf = &s_ndspBufs[s_ndspNextBuf];
 	if ((buf->status == NDSP_WBUF_QUEUED) || (buf->status == NDSP_WBUF_PLAYING))
 	{
-		/* Pool full: drop the newest block (this one), never stall the
+		/* Pool full: drop the newest parcel (this one), never stall the
 		 * mixer -- see the N3DS_NDSP_BLOCK_COUNT comment. */
 		s_ndspDroppedBlocks++;
 		return 0;
 	}
 
-	slot = s_ndspPcm + (size_t)s_ndspNextBuf * N3DS_NDSP_BLOCK_FRAMES * 2;
+	slot = s_ndspPcm + ((size_t)s_ndspNextBuf * N3DS_NDSP_AGG_FRAMES + (size_t)s_ndspAggFill * N3DS_NDSP_BLOCK_FRAMES) * 2;
 	memcpy(slot, frames, (size_t)N3DS_NDSP_BLOCK_FRAMES * 2 * sizeof(s16));
-	DSP_FlushDataCache(slot, (u32)(N3DS_NDSP_BLOCK_FRAMES * 2 * sizeof(s16)));
+	s_ndspAggFill++;
 
-	memset(buf, 0, sizeof(*buf));
-	buf->data_pcm16 = slot;
-	buf->nsamples = N3DS_NDSP_BLOCK_FRAMES; /* per-channel frame count, not halfword total */
-	buf->looping = false;
-	ndspChnWaveBufAdd(N3DS_NDSP_CHANNEL, buf);
+	/*
+	 * Flush when full -- or EARLY when the DSP is about to run dry, so a
+	 * track start (or recovery after a stall) begins playing on the next
+	 * parcel instead of waiting ~133ms for a full aggregate. The early
+	 * flush produces one small buffer; the queue behind it refills with
+	 * full-size ones, so the seam rate settles back to ~7.5/sec.
+	 */
+	if (s_ndspAggFill >= N3DS_NDSP_AGG_PARCELS)
+	{
+		s_ndspFullFlushes++;
+		N3DS_NdspFlushAggregate();
+	}
+	else if (N3DS_NdspQueuedParcelsDspSide() == 0)
+	{
+		s_ndspEarlyFlushes++;
+		N3DS_NdspFlushAggregate();
+	}
 
-	s_ndspNextBuf = (s_ndspNextBuf + 1) % N3DS_NDSP_BLOCK_COUNT;
 	return 1;
 }
 
@@ -277,7 +367,9 @@ int N3DS_NdspIsUp(void)
 	return s_ndspUp;
 }
 
-int N3DS_NdspGetQueuedBlocks(void)
+/* DSP-side queued parcels only (handed-over wave buffers, in 735-frame
+ * units) -- the early-flush trigger: 0 means the channel is running dry. */
+static int N3DS_NdspQueuedParcelsDspSide(void)
 {
 	int queued = 0;
 	int i;
@@ -286,16 +378,38 @@ int N3DS_NdspGetQueuedBlocks(void)
 	{
 		if ((s_ndspBufs[i].status == NDSP_WBUF_QUEUED) || (s_ndspBufs[i].status == NDSP_WBUF_PLAYING))
 		{
-			queued++;
+			queued += (int)(s_ndspBufs[i].nsamples / N3DS_NDSP_BLOCK_FRAMES);
 		}
 	}
 
 	return queued;
 }
 
+int N3DS_NdspGetQueuedBlocks(void)
+{
+	/* Still reported in PARCEL units (735-frame vblank blocks) even though
+	 * the pool holds aggregates -- the worker's ~12-parcel cushion target
+	 * and the ndspQ= log line both predate aggregation and keep their
+	 * meaning. Unflushed parcels in the accumulating slot count too: they
+	 * are already in the sink, just not handed to the DSP yet. */
+	return N3DS_NdspQueuedParcelsDspSide() + s_ndspAggFill;
+}
+
 int N3DS_NdspGetDroppedBlocks(void)
 {
 	return (int)s_ndspDroppedBlocks;
+}
+
+void N3DS_NdspGetFlushCounts(int *fullFlushes, int *earlyFlushes)
+{
+	if (fullFlushes != NULL)
+	{
+		*fullFlushes = (int)s_ndspFullFlushes;
+	}
+	if (earlyFlushes != NULL)
+	{
+		*earlyFlushes = (int)s_ndspEarlyFlushes;
+	}
 }
 
 /*
@@ -473,6 +587,78 @@ int N3DS_HwVoiceStoreGetUsedKiB(void)
 	return (int)(s_hwStoreUsed >> 10);
 }
 
+/*
+ * ---- Per-wake budget profile ---------------------------------------------
+ *
+ * Hardware run 6 proved the worker is the frame governor on XA-music tracks
+ * but could not say WHICH of its five jobs eats the wake: lifecycle drain,
+ * the 23-channel mirror, XA parcel render, the SD pump, or simply waiting on
+ * the render lock the game thread is holding (finding #2 of run 1). Each
+ * gets a bucket. Written only by the worker; drained and zeroed by
+ * N3DS_AudioThreadGetProfile for the renderer's periodic shape line, so the
+ * numbers reported are per-window, not since-boot.
+ *
+ * Cost of the instrumentation itself: ~6 svcGetSystemTick calls per wake, so
+ * ~360/sec -- three orders of magnitude below the per-triangle scope tax
+ * session 19 had to gate off, and this is the measurement the session exists
+ * to take.
+ */
+static u64 s_profLockWaitTicks;
+static u64 s_profRenderTicks;
+
+/*
+ * Take the render lock, charging the wait to the worker's profile. The
+ * parcel render and the XA pump take this same lock through
+ * N3DS_AudioLock rather than directly, so that function routes worker-thread
+ * callers here too -- otherwise a worker blocked behind a main-thread bulk
+ * load would show up as expensive XA work instead of as contention, which is
+ * exactly the misreading run 1's finding #2 warns about. `parcelUs`/`pumpUs`
+ * are therefore wall time INCLUDING any wait; subtract lockWaitUs to get
+ * work.
+ */
+static void N3DS_AudioRenderLockTimed(void);
+static u64 s_profParcelTicks;
+static u64 s_profPumpTicks;
+static u32 s_profWakes;
+static u32 s_profVBlanks;
+static u32 s_profParcels;
+
+unsigned long long N3DS_AudioTicksNow(void)
+{
+	return (unsigned long long)svcGetSystemTick();
+}
+
+void N3DS_AudioThreadGetProfile(struct N3DS_AudioWorkerProfile *out)
+{
+	unsigned long long lifecycleTicks = 0;
+	unsigned long long mirrorTicks = 0;
+
+	if (out == NULL)
+	{
+		return;
+	}
+
+	NativeAudio_TakeWorkerProfileForAudioThread(&lifecycleTicks, &mirrorTicks);
+
+	out->wakes = (int)s_profWakes;
+	out->vblanks = (int)s_profVBlanks;
+	out->parcels = (int)s_profParcels;
+	out->lockWaitUs = (int)(s_profLockWaitTicks / (SYSCLOCK_ARM11 / 1000000ULL));
+	out->renderUs = (int)(s_profRenderTicks / (SYSCLOCK_ARM11 / 1000000ULL));
+	out->lifecycleUs = (int)(lifecycleTicks / (SYSCLOCK_ARM11 / 1000000ULL));
+	out->mirrorUs = (int)(mirrorTicks / (SYSCLOCK_ARM11 / 1000000ULL));
+	out->parcelUs = (int)(s_profParcelTicks / (SYSCLOCK_ARM11 / 1000000ULL));
+	out->pumpUs = (int)(s_profPumpTicks / (SYSCLOCK_ARM11 / 1000000ULL));
+
+	s_profLockWaitTicks = 0;
+	s_profRenderTicks = 0;
+	s_profParcelTicks = 0;
+	s_profPumpTicks = 0;
+	s_profWakes = 0;
+	s_profVBlanks = 0;
+	s_profParcels = 0;
+}
+
 static void N3DS_AudioThreadMain(void *arg)
 {
 	const u64 xaPeriodTicks = SYSCLOCK_ARM11 / 60;
@@ -484,6 +670,7 @@ static void N3DS_AudioThreadMain(void *arg)
 	{
 		u64 now = svcGetSystemTick();
 		s64 waitNs = 0;
+		u64 mark;
 
 		if ((s64)(nextXaTick - now) > 0)
 		{
@@ -495,6 +682,7 @@ static void N3DS_AudioThreadMain(void *arg)
 		{
 			break;
 		}
+		s_profWakes++;
 
 		for (;;) /* drain the current lifecycle backlog, one vblank at a time */
 		{
@@ -508,11 +696,14 @@ static void N3DS_AudioThreadMain(void *arg)
 				break;
 			}
 
-			LightLock_Lock(&s_audioRenderLock); /* backs N3DS_AudioLock / NativeAudio_LockOutput */
+			N3DS_AudioRenderLockTimed(); /* backs N3DS_AudioLock / NativeAudio_LockOutput */
+			now = svcGetSystemTick();
 			NativeAudio_RenderVBlankForAudioThread();
 			LightLock_Unlock(&s_audioRenderLock); /* released BEFORE the next iteration -- this is
 			                                          the "what changed from v1" fix: the render
 			                                          lock is never held across the whole drain. */
+			s_profRenderTicks += svcGetSystemTick() - now;
+			s_profVBlanks++;
 
 			LightLock_Lock(&s_audioCounterLock);
 			s_renderedVBlanks++;
@@ -540,15 +731,24 @@ static void N3DS_AudioThreadMain(void *arg)
 		 */
 		{
 			int guard = 0;
+			int xaIdle = 0;
 
+			mark = svcGetSystemTick();
 			while ((N3DS_NdspGetQueuedBlocks() < 12) && (guard < 8))
 			{
 				if (!NativeAudio_RenderXAParcelForAudioThread()) /* takes the render lock itself */
 				{
-					break; /* XA idle (or track just ended) */
+					xaIdle = 1; /* XA idle (or track just ended) */
+					break;
 				}
 				guard++;
 			}
+			if (xaIdle)
+			{
+				N3DS_NdspFlushPending(); /* play out a track's tail parcels */
+			}
+			s_profParcelTicks += svcGetSystemTick() - mark;
+			s_profParcels += (u32)guard;
 		}
 		now = svcGetSystemTick();
 		nextXaTick = now + xaPeriodTicks; /* next top-up check one vblank out */
@@ -558,6 +758,7 @@ static void N3DS_AudioThreadMain(void *arg)
 		                                        render lock itself via N3DS_AudioLock, and LightLock
 		                                        is non-recursive (docs/AUDIO_THREADING_DESIGN.md,
 		                                        "Verification findings"). */
+		s_profPumpTicks += svcGetSystemTick() - now;
 	}
 
 	threadExit(0);
@@ -745,8 +946,25 @@ int N3DS_AudioThreadGetDropped(void)
 	return dropped;
 }
 
+static void N3DS_AudioRenderLockTimed(void)
+{
+	u64 mark = svcGetSystemTick();
+
+	LightLock_Lock(&s_audioRenderLock);
+	s_profLockWaitTicks += svcGetSystemTick() - mark;
+}
+
 void N3DS_AudioLock(void)
 {
+	/* threadGetCurrent() is NULL on the main thread and the worker's own
+	 * Thread handle on the worker, so this attributes the wait without a
+	 * thread-local or an extra syscall on the common path. */
+	if ((s_audioThread != NULL) && (threadGetCurrent() == s_audioThread))
+	{
+		N3DS_AudioRenderLockTimed();
+		return;
+	}
+
 	LightLock_Lock(&s_audioRenderLock);
 }
 
