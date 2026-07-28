@@ -147,16 +147,27 @@ global_variable u32 s_nativeDiscIoDirSectors;
 /*
  * Call-site tallies. 95% of reads being single-sector says the batching has
  * nothing to batch, but not WHY -- and the fix differs completely depending
- * on which caller is asking one sector at a time. These are bumped at the
- * four sites that can produce a single-sector read, so the counter names the
- * caller instead of leaving it to be inferred. Declared here because
- * native_disc_image.c is first in the unity include order (main.c), so
- * native_audio.c and native_cd.c can both reach them.
+ * on which caller is asking one sector at a time. These are bumped at every
+ * site that can put a read in the MAIN owner bucket, so the counter names
+ * the caller instead of leaving it to be inferred. Coverage must stay
+ * exhaustive: session 23 hardware run 4 had two windows of ~363 single-sector
+ * reads (~4.8s) that NO site tag explained, because file/STR/XA-single reads
+ * were untagged -- an untagged site turns the whole instrument into a guess.
+ * The audio owner bucket needs no tags: its only caller family is the XA
+ * worker, and its runs1 field already separates fallback singles from span
+ * fills. Declared here because native_disc_image.c is first in the unity
+ * include order (main.c), so native_audio.c, native_cd.c, and native_str.c
+ * can all reach them. Single writer (main thread) each, like the prof
+ * buckets.
  */
-global_variable u32 s_nativeDiscIoSiteCd;        /* NativeCD_ReadSectors -- the game's CdRead */
-global_variable u32 s_nativeDiscIoSiteCdSectors; /* ...and the sector counts it asks for */
-global_variable u32 s_nativeDiscIoSiteXaCount;   /* NativeAudio_XAStreamCountAudioSectors' header scan */
-global_variable u32 s_nativeDiscIoSiteSingle;    /* the single-sector helper (PVD / root lookup) */
+global_variable u32 s_nativeDiscIoSiteCd;          /* NativeCD_ReadSectors -- the game's CdRead */
+global_variable u32 s_nativeDiscIoSiteCdSectors;   /* ...and the sector counts it asks for */
+global_variable u32 s_nativeDiscIoSiteXaCount;     /* NativeAudio_XAStreamCountAudioSectors' header scan */
+global_variable u32 s_nativeDiscIoSiteSingle;      /* the single-sector helper (PVD / root lookup) */
+global_variable u32 s_nativeDiscIoSiteFile;        /* NativeDiscImage_ReadFileBytes -- whole-file asset reads */
+global_variable u32 s_nativeDiscIoSiteFileSectors; /* ...and the sector counts those files span */
+global_variable u32 s_nativeDiscIoSiteStr;         /* native_str.c FMV playback -- one sector per call by design */
+global_variable u32 s_nativeDiscIoSiteXaOne;       /* NativeAudio_XASourceReadSector main-bucket singles (open/prebuffer/PC pump) */
 
 internal unsigned long long NativeDiscImage_ProfTick(void)
 {
@@ -1022,6 +1033,11 @@ int NativeDiscImage_ReadFileBytes(const char *path, int rawSectors, u8 **dataOut
 		return 0;
 	}
 
+#if CTR_NATIVE_DISC_IO_PROFILE
+	s_nativeDiscIoSiteFile++;
+	s_nativeDiscIoSiteFileSectors += sectorCount;
+#endif
+
 	data = (u8 *)malloc((size_t)size);
 	if (data == NULL)
 	{
@@ -1085,9 +1101,11 @@ internal void NativeDiscImage_DebugFormatIoProfWindow(char *buf, int bufSize, in
 	else
 	{
 		snprintf(buf, (size_t)bufSize,
-		         "[DISCIO] main calls=%u sec=%u runs1=%u maxRun=%u dir=%u cd=%u/%u xaCnt=%u sng=%u us=%d worstUs=%d seekUs=%d readUs=%d wSeekUs=%d wReadUs=%d hdrFail=%u ioFail=%u",
+		         "[DISCIO] main calls=%u sec=%u runs1=%u maxRun=%u dir=%u cd=%u/%u xaCnt=%u sng=%u file=%u/%u str=%u xa1=%u us=%d worstUs=%d seekUs=%d readUs=%d wSeekUs=%d wReadUs=%d "
+		         "hdrFail=%u ioFail=%u",
 		         prof->calls, prof->sectors, prof->runsOf1, prof->maxRun, s_nativeDiscIoDirCalls, s_nativeDiscIoSiteCd, s_nativeDiscIoSiteCdSectors, s_nativeDiscIoSiteXaCount,
-		         s_nativeDiscIoSiteSingle, (int)((prof->ticks * 1000000ull) / freq), (int)((prof->worstTicks * 1000000ull) / freq), (int)((prof->seekTicks * 1000000ull) / freq),
+		         s_nativeDiscIoSiteSingle, s_nativeDiscIoSiteFile, s_nativeDiscIoSiteFileSectors, s_nativeDiscIoSiteStr, s_nativeDiscIoSiteXaOne,
+		         (int)((prof->ticks * 1000000ull) / freq), (int)((prof->worstTicks * 1000000ull) / freq), (int)((prof->seekTicks * 1000000ull) / freq),
 		         (int)((prof->readTicks * 1000000ull) / freq), (int)((prof->worstSeekTicks * 1000000ull) / freq), (int)((prof->worstReadTicks * 1000000ull) / freq),
 		         prof->headerFails, prof->ioFails);
 		s_nativeDiscIoDirCalls = 0;
@@ -1096,6 +1114,10 @@ internal void NativeDiscImage_DebugFormatIoProfWindow(char *buf, int bufSize, in
 		s_nativeDiscIoSiteCdSectors = 0;
 		s_nativeDiscIoSiteXaCount = 0;
 		s_nativeDiscIoSiteSingle = 0;
+		s_nativeDiscIoSiteFile = 0;
+		s_nativeDiscIoSiteFileSectors = 0;
+		s_nativeDiscIoSiteStr = 0;
+		s_nativeDiscIoSiteXaOne = 0;
 	}
 
 	prof->calls = 0;

@@ -405,7 +405,7 @@ internal void NativePerf_Report3DSWindow(void)
 {
 	char header[224];
 	char acc[192];
-	char out[224];
+	char out[256];
 	s32 taken[NATIVE_PERF_BUCKET_COUNT];
 	s32 offset = 0;
 	s32 emitted = 0;
@@ -505,7 +505,7 @@ internal void NativePerf_Report3DSWindow(void)
 #if CTR_NATIVE_DISC_IO_PROFILE
 	/* One line per disc-reading thread rather than one combined line: the
 	 * whole question this counter exists to answer is how the two divide the
-	 * SD card between them, and `out` is 224 bytes. */
+	 * SD card between them, and `out` is 256 bytes. */
 	NativeDiscImage_DebugFormatIoProfWindow(out, (int)sizeof(out), NATIVE_DISC_IMAGE_OWNER_MAIN);
 	N3DS_DebugLog(out);
 	NativeDiscImage_DebugFormatIoProfWindow(out, (int)sizeof(out), NATIVE_DISC_IMAGE_OWNER_AUDIO);
@@ -542,7 +542,7 @@ internal void NativePerf_WriteSummary(FILE *file)
 	 * not -- and perCall is what says whether the disc reader is batching, so
 	 * it can be checked on PC without spending a netload. */
 	{
-		char discIoLine[224];
+		char discIoLine[256];
 
 		fprintf(file, "\ndisc_io:\n");
 		NativeDiscImage_DebugFormatIoProfWindow(discIoLine, (int)sizeof(discIoLine), NATIVE_DISC_IMAGE_OWNER_MAIN);

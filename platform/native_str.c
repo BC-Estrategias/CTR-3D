@@ -477,6 +477,9 @@ internal s32 NativeSTR_ReadExtractedSector(u8 *sector)
 
 	if (s_str.source == NATIVE_STR_SOURCE_DISC)
 	{
+#if CTR_NATIVE_DISC_IO_PROFILE
+		s_nativeDiscIoSiteStr++;
+#endif
 		if (!NativeDiscImage_ReadDataSectors(&s_str.discFile, s_str.currentSector, 1, sector))
 		{
 			return 0;
@@ -498,6 +501,9 @@ internal s32 NativeSTR_ReadCdRecord(u8 *sector)
 
 	if (s_str.source == NATIVE_STR_SOURCE_DISC)
 	{
+#if CTR_NATIVE_DISC_IO_PROFILE
+		s_nativeDiscIoSiteStr++;
+#endif
 		if (!NativeDiscImage_ReadRawSectors(&s_str.discFile, s_str.currentSector, 1, sector))
 		{
 			return 0;

@@ -3157,6 +3157,16 @@ internal int NativeAudio_XASourceReadSector(struct NativeAudioXaSource *source, 
 
 	if (source->useDiscImage)
 	{
+#if CTR_NATIVE_DISC_IO_PROFILE
+		/* Main-bucket singles only: the worker's fallback reads land in the
+		 * audio [DISCIO] line, where runs1 already names them. Owner-MAIN
+		 * scratches are main-thread-only by contract, so this counter keeps
+		 * the one-writer rule the site tallies rely on. */
+		if ((scratch == NULL) || (scratch->owner == NATIVE_DISC_IMAGE_OWNER_MAIN))
+		{
+			s_nativeDiscIoSiteXaOne++;
+		}
+#endif
 		if (scratch != NULL)
 		{
 			return NativeDiscImage_ReadRawSectorsScratch(&source->discFile, (u32)sectorIndex, 1, dst, scratch);
