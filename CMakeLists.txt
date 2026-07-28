@@ -185,7 +185,7 @@ endif()
 # legal, which is where the fps payoff lives.
 option(CTR_NATIVE_OT_DEPTH
     "3DS: depth-test against per-prim emit ordinals (z-break substrate)"
-    OFF)
+    ON)
 if(CTR_NATIVE_OT_DEPTH)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_OT_DEPTH=1)
 endif()
@@ -199,7 +199,7 @@ endif()
 # opaque submission ORDER changes, pixels should not, and draws/frame must.
 option(CTR_NATIVE_DRAW_MERGE
     "3DS: cross-bucket state-sorted draw merge (needs CTR_NATIVE_OT_DEPTH)"
-    OFF)
+    ON)
 if(CTR_NATIVE_DRAW_MERGE)
     if(NOT CTR_NATIVE_OT_DEPTH)
         message(FATAL_ERROR "CTR_NATIVE_DRAW_MERGE requires CTR_NATIVE_OT_DEPTH=ON")
