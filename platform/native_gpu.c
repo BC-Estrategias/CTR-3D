@@ -154,10 +154,18 @@ typedef struct
 	u32 lastKey;
 	u32 frameHashCount;
 	u32 frameHashes[OTPROF_MAX_HASHES];
+	u32 frameShapeHashCount;
+	u32 frameShapeHashes[OTPROF_MAX_HASHES];
+	u32 frameShapeSkip;
+	u32 frameMHashCount;
+	u32 frameMHashes[OTPROF_MAX_HASHES];
+	u32 frameMNoModel;
 	u32 keySet[OTPROF_KEY_SET_SIZE];
 
 	/* previous frame's packet hashes, open-addressed (0 = empty) */
 	u32 prevSet[OTPROF_PREV_SET_SIZE];
+	u32 prevShapeSet[OTPROF_PREV_SET_SIZE];
+	u32 prevMSet[OTPROF_PREV_SET_SIZE];
 
 	/* window accumulators */
 	u32 winFrames;
@@ -170,6 +178,12 @@ typedef struct
 	u32 winKeyTransitions;
 	u32 winHashed;
 	u32 winReused;
+	u32 winShapeHashed;
+	u32 winShapeReused;
+	u32 winShapeSkip;
+	u32 winMHashed;
+	u32 winMReused;
+	u32 winMNoModel;
 	u32 winTruncated;
 	u32 winDryMismatch;
 } OTWalkProfileState;
@@ -202,6 +216,208 @@ internal void OTProf_RecordNode(const u8 *packet, u32 tagLength)
 	{
 		s_otprof.frameHashes[s_otprof.frameHashCount++] = OTProf_HashWords((const u32 *)packet + P_LEN, tagLength);
 	}
+}
+
+/*
+ * Position-masked node hash ("shape"): the same payload OTProf_RecordNode
+ * hashes, with every screen-XY word zeroed per the PS1 GPU command encoding.
+ * A frame-over-frame match then means "same colors/UVs/state, position free
+ * to move" -- the OPTIMISTIC ceiling for model-space retention, where
+ * pkreuse (full bytes, camera-sensitive) is the pessimistic floor. The truth
+ * for retained geometry sits between the two: this hash cannot see
+ * model-space vertex animation hiding behind a stable appearance.
+ *
+ * Word layouts must agree with ParsePrimitive/ParseTaglessPrimitive. The
+ * agreement is checked at runtime instead of trusted: a node whose computed
+ * prim lengths do not tile tagLength exactly is left unhashed and counted in
+ * shapeSkip -- nonzero shapeSkip means these tables and the real parser have
+ * diverged and shape%% is not to be believed.
+ */
+internal void OTProf_RecordNodeShape(const u8 *packet, u32 tagLength)
+{
+	if (tagLength == 0 || tagLength > 32)
+	{
+		return;
+	}
+
+	const u32 *words = (const u32 *)packet + P_LEN;
+	u32 masked[32];
+	u32 w = 0;
+	/* Model-identity companion ("mshape"): positions of the XY words this
+	 * node's polys carried, so the tail can swap each for its model-space
+	 * vector via the GTE-capture rendezvous. Any non-poly positioned prim
+	 * (line, sprite, tile, fill, polyline) makes the node model-opaque --
+	 * their positions ARE screen content, not projections of a mesh. */
+	u8 xyIdx[32];
+	u32 xyCount = 0;
+	int modelOpaque = 0;
+
+	for (u32 i = 0; i < tagLength; i++)
+	{
+		masked[i] = words[i];
+	}
+
+	while (w < tagLength)
+	{
+		const u32 code = masked[w] >> 24;
+		u32 next;
+
+		if (code >= 0x20 && code <= 0x3F)
+		{
+			const u32 gouraud = (code & 0x10u) ? 1u : 0u;
+			const u32 textured = (code & 0x04u) ? 1u : 0u;
+			const u32 numVerts = (code & 0x08u) ? 4u : 3u;
+			u32 c = w + 1;
+
+			for (u32 v = 0; v < numVerts; v++)
+			{
+				if (v > 0 && gouraud)
+				{
+					c++; /* per-vertex RGB */
+				}
+				if (c >= tagLength)
+				{
+					s_otprof.frameShapeSkip++;
+					return;
+				}
+				xyIdx[xyCount++] = (u8)c;
+				masked[c++] = 0; /* XY */
+				if (textured)
+				{
+					c++; /* UV + clut/tpage */
+				}
+			}
+			next = c;
+		}
+		else if (code >= 0x40 && code <= 0x5F)
+		{
+			modelOpaque = 1;
+			if (code & 0x08u)
+			{
+				/* Polyline: variable length with a terminator scan. Mask the
+				 * whole remainder rather than re-implement the scan; merges
+				 * any trailing prims into the masked span, which only makes
+				 * the ceiling reading slightly more optimistic. */
+				for (u32 i = w + 1; i < tagLength; i++)
+				{
+					masked[i] = 0;
+				}
+				next = tagLength;
+			}
+			else if (code & 0x10u)
+			{
+				next = w + 4; /* G2: cmd+RGB0, XY0, RGB1, XY1 */
+				if (next <= tagLength)
+				{
+					masked[w + 1] = 0;
+					masked[w + 3] = 0;
+				}
+			}
+			else
+			{
+				next = w + 3; /* F2: cmd+RGB, XY0, XY1 */
+				if (next <= tagLength)
+				{
+					masked[w + 1] = 0;
+					masked[w + 2] = 0;
+				}
+			}
+		}
+		else if (code >= 0x60 && code <= 0x7F)
+		{
+			/* Tiles/sprites: cmd+RGB, XY, [UV+clut if sprite], [WH if
+			 * free-size]. XY is the position; W/H and UV are appearance. */
+			const u32 sprite = (code & 0x04u) ? 1u : 0u;
+			const u32 freeSize = ((code & 0x18u) == 0) ? 1u : 0u;
+
+			modelOpaque = 1;
+			next = w + 2 + sprite + freeSize;
+			if (next <= tagLength)
+			{
+				masked[w + 1] = 0;
+			}
+		}
+		else if (code == 0x02)
+		{
+			modelOpaque = 1;
+			next = w + 3; /* fill: cmd+RGB, XY, WH */
+			if (next <= tagLength)
+			{
+				masked[w + 1] = 0;
+			}
+		}
+		else if (code >= 0xE0 && code <= 0xE7)
+		{
+			next = w + 1; /* draw-env settings; no position to mask */
+		}
+		else if (code == 0x00)
+		{
+			next = w + 1; /* NOP filler */
+		}
+		else
+		{
+			/* Unknown to these tables (MoveImage, IRQ, ...): don't guess. */
+			s_otprof.frameShapeSkip++;
+			return;
+		}
+
+		if (next > tagLength)
+		{
+			s_otprof.frameShapeSkip++;
+			return;
+		}
+		w = next;
+	}
+
+	if (s_otprof.frameShapeHashCount < OTPROF_MAX_HASHES)
+	{
+		s_otprof.frameShapeHashes[s_otprof.frameShapeHashCount++] = OTProf_HashWords(masked, tagLength);
+	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* Model-identity hash: appearance words as masked above, plus each XY's
+	 * model-space vector recovered through the GTE-capture rendezvous. A
+	 * repeat of THIS hash frame-over-frame is true retainability -- same
+	 * mesh data, same appearance, position free to be a matrix. UI-band
+	 * packets and any vertex that misses the table (LERP'd mid-band
+	 * geometry, procedural prims, collisions) make the node model-opaque:
+	 * counted, not hashed. */
+	if (modelOpaque
+#if CTR_NATIVE_VERTEX_DESNAP
+	    || GTECapture_LookupSuppressed()
+#endif
+	)
+	{
+		s_otprof.frameMNoModel++;
+		return;
+	}
+	{
+		u32 mwords[96];
+		u32 mcount = 0;
+
+		for (u32 i = 0; i < tagLength; i++)
+		{
+			mwords[mcount++] = masked[i];
+		}
+		for (u32 i = 0; i < xyCount; i++)
+		{
+			const u32 xy = words[xyIdx[i]];
+			s16 v[3];
+
+			if (!GTECapture_LookupModel((s16)(xy & 0xFFFFu), (s16)(xy >> 16), v))
+			{
+				s_otprof.frameMNoModel++;
+				return;
+			}
+			mwords[mcount++] = ((u32)(u16)v[1] << 16) | (u32)(u16)v[0];
+			mwords[mcount++] = (u32)(u16)v[2];
+		}
+		if (s_otprof.frameMHashCount < OTPROF_MAX_HASHES)
+		{
+			s_otprof.frameMHashes[s_otprof.frameMHashCount++] = OTProf_HashWords(mwords, mcount);
+		}
+	}
+#endif /* CTR_NATIVE_GTE_CAPTURE */
 }
 
 internal void OTProf_CountPrim(BlendMode blendMode, TexFormat texFormat, bool textured, int tpage)
@@ -280,6 +496,62 @@ internal void OTProf_FoldFrame(void)
 		s_otprof.prevSet[slot] = h;
 	}
 
+	u32 shapeReused = 0;
+	for (u32 i = 0; i < s_otprof.frameShapeHashCount; i++)
+	{
+		const u32 h = s_otprof.frameShapeHashes[i];
+		u32 slot = (h * 2654435761u) & (OTPROF_PREV_SET_SIZE - 1);
+		while (s_otprof.prevShapeSet[slot] != 0)
+		{
+			if (s_otprof.prevShapeSet[slot] == h)
+			{
+				shapeReused++;
+				break;
+			}
+			slot = (slot + 1) & (OTPROF_PREV_SET_SIZE - 1);
+		}
+	}
+
+	memset(s_otprof.prevShapeSet, 0, sizeof(s_otprof.prevShapeSet));
+	for (u32 i = 0; i < s_otprof.frameShapeHashCount; i++)
+	{
+		const u32 h = s_otprof.frameShapeHashes[i];
+		u32 slot = (h * 2654435761u) & (OTPROF_PREV_SET_SIZE - 1);
+		while (s_otprof.prevShapeSet[slot] != 0 && s_otprof.prevShapeSet[slot] != h)
+		{
+			slot = (slot + 1) & (OTPROF_PREV_SET_SIZE - 1);
+		}
+		s_otprof.prevShapeSet[slot] = h;
+	}
+
+	u32 mReused = 0;
+	for (u32 i = 0; i < s_otprof.frameMHashCount; i++)
+	{
+		const u32 h = s_otprof.frameMHashes[i];
+		u32 slot = (h * 2654435761u) & (OTPROF_PREV_SET_SIZE - 1);
+		while (s_otprof.prevMSet[slot] != 0)
+		{
+			if (s_otprof.prevMSet[slot] == h)
+			{
+				mReused++;
+				break;
+			}
+			slot = (slot + 1) & (OTPROF_PREV_SET_SIZE - 1);
+		}
+	}
+
+	memset(s_otprof.prevMSet, 0, sizeof(s_otprof.prevMSet));
+	for (u32 i = 0; i < s_otprof.frameMHashCount; i++)
+	{
+		const u32 h = s_otprof.frameMHashes[i];
+		u32 slot = (h * 2654435761u) & (OTPROF_PREV_SET_SIZE - 1);
+		while (s_otprof.prevMSet[slot] != 0 && s_otprof.prevMSet[slot] != h)
+		{
+			slot = (slot + 1) & (OTPROF_PREV_SET_SIZE - 1);
+		}
+		s_otprof.prevMSet[slot] = h;
+	}
+
 	s_otprof.winFrames++;
 	s_otprof.winNodes += s_otprof.frameNodes;
 	s_otprof.winPrims += s_otprof.framePrims;
@@ -293,6 +565,12 @@ internal void OTProf_FoldFrame(void)
 	s_otprof.winKeyTransitions += s_otprof.frameKeyTransitions;
 	s_otprof.winHashed += s_otprof.frameHashCount;
 	s_otprof.winReused += reused;
+	s_otprof.winShapeHashed += s_otprof.frameShapeHashCount;
+	s_otprof.winShapeReused += shapeReused;
+	s_otprof.winShapeSkip += s_otprof.frameShapeSkip;
+	s_otprof.winMHashed += s_otprof.frameMHashCount;
+	s_otprof.winMReused += mReused;
+	s_otprof.winMNoModel += s_otprof.frameMNoModel;
 	if (s_otprof.frameHashCount >= OTPROF_MAX_HASHES)
 	{
 		s_otprof.winTruncated++;
@@ -312,6 +590,10 @@ internal void OTProf_FoldFrame(void)
 	s_otprof.frameKeyTransitions = 0;
 	s_otprof.lastKey = 0;
 	s_otprof.frameHashCount = 0;
+	s_otprof.frameShapeHashCount = 0;
+	s_otprof.frameShapeSkip = 0;
+	s_otprof.frameMHashCount = 0;
+	s_otprof.frameMNoModel = 0;
 	memset(s_otprof.keySet, 0, sizeof(s_otprof.keySet));
 
 	if (s_otprof.winFrames < OTPROF_WINDOW_FRAMES)
@@ -330,6 +612,13 @@ internal void OTProf_FoldFrame(void)
 	             (unsigned long)(s_otprof.winBlend[BM_AVERAGE] * 100u / p), (unsigned long)(s_otprof.winBlend[BM_ADD] * 100u / p),
 	             (unsigned long)(s_otprof.winBlend[BM_SUBTRACT] * 100u / p), (unsigned long)(s_otprof.winBlend[BM_ADD_QUATER_SOURCE] * 100u / p),
 	             (unsigned long)(s_otprof.winTextured * 100u / p));
+	{
+		const u32 sh = s_otprof.winShapeHashed ? s_otprof.winShapeHashed : 1;
+		const u32 mh = s_otprof.winMHashed ? s_otprof.winMHashed : 1;
+		Platform_Log("[OTPROF] shape=%lu%% shp/f=%lu shapeSkip=%lu mshape=%lu%% mshp/f=%lu nomdl/f=%lu\n",
+		             (unsigned long)(s_otprof.winShapeReused * 100u / sh), (unsigned long)(s_otprof.winShapeHashed / f), (unsigned long)s_otprof.winShapeSkip,
+		             (unsigned long)(s_otprof.winMReused * 100u / mh), (unsigned long)(s_otprof.winMHashed / f), (unsigned long)(s_otprof.winMNoModel / f));
+	}
 
 	s_otprof.winFrames = 0;
 	s_otprof.winNodes = 0;
@@ -341,6 +630,12 @@ internal void OTProf_FoldFrame(void)
 	s_otprof.winKeyTransitions = 0;
 	s_otprof.winHashed = 0;
 	s_otprof.winReused = 0;
+	s_otprof.winShapeHashed = 0;
+	s_otprof.winShapeReused = 0;
+	s_otprof.winShapeSkip = 0;
+	s_otprof.winMHashed = 0;
+	s_otprof.winMReused = 0;
+	s_otprof.winMNoModel = 0;
 	s_otprof.winTruncated = 0;
 	s_otprof.winDryMismatch = 0;
 }
@@ -1557,6 +1852,7 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 
 #ifdef CTR_NATIVE_OTWALK_PROFILE
 			OTProf_RecordNode(basePacket, (u32)tagLength);
+			OTProf_RecordNodeShape(basePacket, (u32)tagLength);
 #endif
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP

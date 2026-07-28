@@ -28,6 +28,8 @@ typedef struct
 	u8 fracY8;
 	u16 sz3;      // reserved for stereo (unused by vertex de-snapping)
 	s32 hOverSz3; // reserved for perspective-correct UV (unused by vertex de-snapping)
+	s16 vx, vy, vz; // model-space input vector (retainability instrument)
+	s16 _pad;
 } GTECaptureEntry;
 
 global_variable GTECaptureEntry s_gteCaptureTable[GTE_CAPTURE_TABLE_SIZE];
@@ -56,7 +58,7 @@ void GTECapture_Clear(void)
 	}
 }
 
-void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3)
+void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3, s16 vx, s16 vy, s16 vz)
 {
 	u32 key = GTECapture_PackKey(sx, sy);
 	GTECaptureEntry *entry = &s_gteCaptureTable[GTECapture_Hash(key)];
@@ -67,6 +69,9 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 	entry->fracY8 = (u8)((syFull & 0xFFFF) >> 8);
 	entry->sz3 = sz3;
 	entry->hOverSz3 = hOverSz3;
+	entry->vx = vx;
+	entry->vy = vy;
+	entry->vz = vz;
 }
 
 int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8)
@@ -81,6 +86,22 @@ int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8)
 
 	*fracX8 = entry->fracX8;
 	*fracY8 = entry->fracY8;
+	return 1;
+}
+
+int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3])
+{
+	u32 key = GTECapture_PackKey(sx, sy);
+	const GTECaptureEntry *entry = &s_gteCaptureTable[GTECapture_Hash(key)];
+
+	if ((entry->generation != s_gteCaptureGeneration) || (entry->key != key))
+	{
+		return 0;
+	}
+
+	outV[0] = entry->vx;
+	outV[1] = entry->vy;
+	outV[2] = entry->vz;
 	return 1;
 }
 

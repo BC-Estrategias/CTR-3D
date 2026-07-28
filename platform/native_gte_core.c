@@ -340,7 +340,7 @@ internal int GTE_RotTransPers(int idx, int lm)
 	// coordinate is off-screen and the fraction is meaningless.
 	if ((sxFull >> 16) >= -0x400 && (sxFull >> 16) <= 0x3ff && (syFull >> 16) >= -0x400 && (syFull >> 16) <= 0x3ff)
 	{
-		GTECapture_Store((s16)C2_SX2, (s16)C2_SY2, sxFull, syFull, (u16)C2_SZ3, h_over_sz3);
+		GTECapture_Store((s16)C2_SX2, (s16)C2_SY2, sxFull, syFull, (u16)C2_SZ3, h_over_sz3, (s16)VX(idx), (s16)VY(idx), (s16)VZ(idx));
 	}
 #else
 	C2_SX2 = Lm_G1(F((s64)C2_OFX + ((s64)C2_IR1 * h_over_sz3)) >> 16);

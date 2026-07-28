@@ -9,8 +9,13 @@
 // always visible; each caller gates its own use behind CTR_NATIVE_GTE_CAPTURE,
 // so a flag-off build never emits a call and these never need to be defined.
 
-void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3);
+void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3, s16 vx, s16 vy, s16 vz);
 int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8);
+// Model-space vector that produced this screen coordinate (same rendezvous
+// and same miss-on-collision safety as GTECapture_Lookup). Consumed by the
+// OTWALK_PROFILE retainability instrument; the retained-geometry play proper
+// will grow its own keyed-by-content variant.
+int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3]);
 void GTECapture_Clear(void);
 
 // UI suppression. The frame's single DrawOTag walk renders world geometry
