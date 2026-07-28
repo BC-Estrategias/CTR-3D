@@ -9,11 +9,12 @@
 
 /*
  * Staging run for the bulk sector reader. Every disc-image read bottoms out
- * in one fseek+fread pair; on 3DS that pair is an FS-service IPC round trip
- * to the SD card, so what matters is how many of them a read costs, not how
- * many bytes it moves. Reading a run of raw sectors into this buffer and
- * splitting it into the caller's (narrower) destination stride turns an
- * N-sector read into N/NATIVE_DISC_IMAGE_CHUNK_SECTORS reads.
+ * in one seek+read pair (stdio on PC, a raw per-role fd on 3DS); on 3DS the
+ * read is an FS-service IPC round trip to the SD card, so what matters is
+ * how many of them a read costs, not how many bytes it moves. Reading a run
+ * of raw sectors into this buffer and splitting it into the caller's
+ * (narrower) destination stride turns an N-sector read into
+ * N/NATIVE_DISC_IMAGE_CHUNK_SECTORS reads.
  *
  * Caller-owned rather than a file-scope static because TWO threads read the
  * disc image on 3DS: the main thread (level loads, CD, STR) and the audio
@@ -23,13 +24,15 @@
  * static wedged run 5. The audio worker's stack is 32KB, so this cannot live
  * on the stack either.
  *
- * `owner` labels the profile counters only (NATIVE_DISC_IMAGE_OWNER_*); it is
- * unused unless CTR_NATIVE_DISC_IO_PROFILE is on. It names a ROLE -- who the
- * read is for -- not a thread: XA streaming vs everything else. On 3DS the
- * two roles happen to be the two threads, which is what makes the split
- * readable as contention there; on PC both roles run on the vblank thread and
- * the split is still the useful one, because it separates the music stream's
- * steady drip from the level loader's bursts.
+ * `owner` (NATIVE_DISC_IMAGE_OWNER_*) names a ROLE -- who the read is for --
+ * not a thread: XA streaming vs everything else. On 3DS it is LOAD-BEARING,
+ * not just a profile label: each role reads through its own devoptab fd
+ * (each fd's position is only ever touched by the one thread running that
+ * role at the time), which is what deletes the shared-file-position race.
+ * Tagging a scratch with the wrong role puts its reads on the other role's
+ * fd and quietly reintroduces that race. On PC both roles run on the vblank
+ * thread through one FILE*, and the split only feeds the profile counters,
+ * separating the music stream's steady drip from the level loader's bursts.
  */
 /*
  * 64, raised from 16 on hardware evidence (session 23 runs 1-2). An SD read

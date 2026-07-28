@@ -6,6 +6,10 @@
 #if !defined(_WIN32)
 #include <dirent.h>
 #endif
+#if defined(__3DS__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +38,30 @@ struct NativeDiscImageDirRecord
 };
 
 global_variable char s_nativeDiscImagePath[NATIVE_DISC_IMAGE_PATH_MAX];
+#if defined(__3DS__)
+/*
+ * On 3DS the image is read through raw devoptab fds, one per reader role
+ * (NATIVE_DISC_IMAGE_OWNER_*), not through stdio. Two reasons, both from
+ * session 23's hardware runs plus a read of libctru's devoptab source:
+ *
+ * 1. The measured ~11.5ms flat per-call seek cost was a newlib stdio
+ *    artifact, not an SD cost: the devoptab's seek(SEEK_SET) is pure local
+ *    bookkeeping (no FS service call), and its read hands the stored offset
+ *    straight to FSFILE_Read(fd, &bytes, offset, ptr, len). An lseek+read
+ *    pair therefore costs ONE SD round trip where fseek+fread cost the
+ *    equivalent of two.
+ *
+ * 2. One fd per role deletes the shared-file-position hazard (the hdrFail
+ *    counter's reason to exist) by construction: each role's fd has exactly
+ *    one thread using it at a time -- the same disjointness contract the
+ *    read scratches already rely on (owner names a role; on 3DS the roles
+ *    are the threads, and the main-thread XA-pump fallback only runs when
+ *    the worker does not). This supersedes the planned "handle split".
+ */
+global_variable int s_nativeDiscImageFd[NATIVE_DISC_IMAGE_OWNER_COUNT] = {-1, -1};
+#else
 global_variable FILE *s_nativeDiscImageFile;
+#endif
 global_variable struct NativeDiscImageFile s_nativeDiscImageRoot;
 global_variable int s_nativeDiscImageAvailable;
 
@@ -70,11 +97,13 @@ global_variable u32 s_nativeDiscImagePathCacheNext;
  * reporter reads across threads, and a torn window count is acceptable in a
  * diagnostic that exists to size an effect, not to gate correctness.
  *
- * `headerFails` is the interesting one beyond the timings: the image FILE*
- * and its file position are shared by both threads, and fseek+fread is not
- * atomic across the pair, so an interleaved read can land on the other
- * thread's position. That shows up here as a failed sector-header check
- * rather than as corruption, and nothing counted it before.
+ * `headerFails` used to be the interesting one beyond the timings: with one
+ * shared FILE*, fseek+fread was not atomic across the pair, so an
+ * interleaved read could land on the other thread's position and fail the
+ * sector-header check. On 3DS that hazard is gone by construction (one fd
+ * per role, see s_nativeDiscImageFd), so a non-zero count here now means a
+ * genuinely malformed read -- wrong image layout or a real I/O problem --
+ * not contention.
  */
 struct NativeDiscImageIoProf
 {
@@ -87,14 +116,13 @@ struct NativeDiscImageIoProf
 	u64 ticks;
 	u64 worstTicks;
 	/*
-	 * The seek/read split, and the whole question of session 23's second
-	 * half. Hardware run 1 measured ~45.8ms per call almost independently of
-	 * size -- 16 sectors cost 7% more than 1 -- so the cost is per-operation,
-	 * not per-byte. Two mechanisms fit that shape and they want different
-	 * fixes: if it is the fseek (a FAT cluster-chain walk on a 578MB file is
-	 * O(position) and size-blind), then skipping the seek when the file is
-	 * already positioned removes most of it, since these reads walk forward.
-	 * If it is the fread's FS-service round trip, only bigger reads help.
+	 * The seek/read split. Session 23 hardware measured the fseek at ~11.5ms
+	 * flat per call; libctru's devoptab source then showed the underlying
+	 * seek is pure local bookkeeping, indicting newlib stdio itself. The
+	 * stdio path is gone on 3DS (raw per-role fds, lseek+read), and this
+	 * split is now the verdict instrument: seekUs ~0 with total per-call
+	 * cost down confirms the theory; the cost migrating into readUs
+	 * refutes it and points back at the FS-service round trip.
 	 */
 	u64 seekTicks;
 	u64 readTicks;
@@ -190,6 +218,85 @@ internal int NativeDiscImage_FindHostImagePath(char *dst, size_t dstSize, Native
 #endif
 }
 
+internal void NativeDiscImage_ImageClose(void)
+{
+#if defined(__3DS__)
+	int i;
+
+	for (i = 0; i < NATIVE_DISC_IMAGE_OWNER_COUNT; i++)
+	{
+		if (s_nativeDiscImageFd[i] >= 0)
+		{
+			close(s_nativeDiscImageFd[i]);
+			s_nativeDiscImageFd[i] = -1;
+		}
+	}
+#else
+	if (s_nativeDiscImageFile != NULL)
+	{
+		fclose(s_nativeDiscImageFile);
+		s_nativeDiscImageFile = NULL;
+	}
+#endif
+}
+
+internal int NativeDiscImage_ImageOpen(const char *path)
+{
+#if defined(__3DS__)
+	/* Same read-only file opened once per role; if the first open succeeds
+	 * the rest can only fail on handle exhaustion, which is worth failing
+	 * loudly for rather than silently re-sharing one position. */
+	int i;
+
+	for (i = 0; i < NATIVE_DISC_IMAGE_OWNER_COUNT; i++)
+	{
+		s_nativeDiscImageFd[i] = open(path, O_RDONLY);
+		if (s_nativeDiscImageFd[i] < 0)
+		{
+			NativeDiscImage_ImageClose();
+			return 0;
+		}
+	}
+
+	return 1;
+#else
+	s_nativeDiscImageFile = fopen(path, "rb");
+	return s_nativeDiscImageFile != NULL;
+#endif
+}
+
+internal int NativeDiscImage_ImageIsOpen(void)
+{
+#if defined(__3DS__)
+	return s_nativeDiscImageFd[NATIVE_DISC_IMAGE_OWNER_MAIN] >= 0;
+#else
+	return s_nativeDiscImageFile != NULL;
+#endif
+}
+
+#if defined(__3DS__)
+/* One devoptab read maps to one FSFILE_Read of the full length, so this loop
+ * runs once in practice; it exists so a short read is an error only when no
+ * progress was made, not a silent truncation. */
+internal int NativeDiscImage_FdReadFull(int fd, u8 *dst, size_t bytes)
+{
+	while (bytes != 0)
+	{
+		ssize_t got = read(fd, dst, bytes);
+
+		if (got <= 0)
+		{
+			return 0;
+		}
+
+		dst += got;
+		bytes -= (size_t)got;
+	}
+
+	return 1;
+}
+#endif
+
 internal u32 NativeDiscImage_ReadLE32(const u8 *data)
 {
 	return ((u32)data[0]) | ((u32)data[1] << 8) | ((u32)data[2] << 16) | ((u32)data[3] << 24);
@@ -236,7 +343,7 @@ internal int NativeDiscImage_ReadRawRun(u32 lba, u32 count, u8 *raw, int owner)
 	(void)owner;
 #endif
 
-	if ((s_nativeDiscImageFile == NULL) || (count == 0))
+	if (!NativeDiscImage_ImageIsOpen() || (count == 0))
 	{
 		return 0;
 	}
@@ -270,10 +377,18 @@ internal int NativeDiscImage_ReadRawRun(u32 lba, u32 count, u8 *raw, int owner)
 	 * Seek and read are timed apart, and deliberately NOT folded back into
 	 * one condition: the split is the measurement. Three tick reads total
 	 * (begin / after seek / after read), so the combined us and worstUs
-	 * fields stay exactly what the previous hardware run reported.
+	 * fields stay exactly what the previous hardware run reported. On 3DS
+	 * the seek is now a devoptab lseek -- local bookkeeping, no FS call --
+	 * so seekUs collapsing to ~0 on the next hardware run confirms the
+	 * stdio-artifact theory; the cost reappearing in readUs refutes it.
 	 */
 	{
+#if defined(__3DS__)
+		int fd = s_nativeDiscImageFd[(owner == NATIVE_DISC_IMAGE_OWNER_AUDIO) ? NATIVE_DISC_IMAGE_OWNER_AUDIO : NATIVE_DISC_IMAGE_OWNER_MAIN];
+		int seekFailed = (lseek(fd, (off_t)offset, SEEK_SET) < 0);
+#else
 		int seekFailed = (fseek(s_nativeDiscImageFile, (long)offset, SEEK_SET) != 0);
+#endif
 #if CTR_NATIVE_DISC_IO_PROFILE
 		unsigned long long midTick = NativeDiscImage_ProfTick();
 		unsigned long long seekElapsed = midTick - beginTick;
@@ -294,7 +409,11 @@ internal int NativeDiscImage_ReadRawRun(u32 lba, u32 count, u8 *raw, int owner)
 			return 0;
 		}
 
+#if defined(__3DS__)
+		if (!NativeDiscImage_FdReadFull(fd, raw, bytes))
+#else
 		if (fread(raw, 1, bytes, s_nativeDiscImageFile) != bytes)
+#endif
 		{
 #if CTR_NATIVE_DISC_IO_PROFILE
 			prof->ioFails++;
@@ -590,34 +709,27 @@ int NativeDiscImage_Init(const char *assetsDir)
 	memset(s_nativeDiscImagePathCache, 0, sizeof(s_nativeDiscImagePathCache));
 	s_nativeDiscImagePathCacheNext = 0;
 
-	if (s_nativeDiscImageFile != NULL)
-	{
-		fclose(s_nativeDiscImageFile);
-		s_nativeDiscImageFile = NULL;
-	}
+	NativeDiscImage_ImageClose();
 
 	if ((assetsDir == NULL) || !NativeDiscImage_FindHostImagePath(path, sizeof(path), NativeStr8_FromCString(assetsDir)))
 	{
 		return 0;
 	}
 
-	s_nativeDiscImageFile = fopen(path, "rb");
-	if (s_nativeDiscImageFile == NULL)
+	if (!NativeDiscImage_ImageOpen(path))
 	{
 		return 0;
 	}
 
 	if (!NativeDiscImage_LoadRoot())
 	{
-		fclose(s_nativeDiscImageFile);
-		s_nativeDiscImageFile = NULL;
+		NativeDiscImage_ImageClose();
 		return 0;
 	}
 
 	if (!NativePath_NormalizeSlashes(s_nativeDiscImagePath, sizeof(s_nativeDiscImagePath), NativeStr8_FromCString(path)))
 	{
-		fclose(s_nativeDiscImageFile);
-		s_nativeDiscImageFile = NULL;
+		NativeDiscImage_ImageClose();
 		return 0;
 	}
 
