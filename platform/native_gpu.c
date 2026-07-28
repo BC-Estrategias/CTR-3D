@@ -114,6 +114,230 @@ typedef struct
 
 global_variable NativeGpuState s_gpu;
 
+#ifdef CTR_NATIVE_OTWALK_PROFILE
+/*
+ * OT-walk content counters ([OTPROF], every 64 rendered frames). Decision
+ * instrument for the render campaign: measures WHAT flows through the walk
+ * (retainability, blend classes, state-key ceiling), not how fast -- timings
+ * stay native_perf's job. Interpretation caveats the numbers depend on:
+ * packet hashing runs inside the walk, so draw_otag_parse_ms is inflated in
+ * profile builds -- take counts from a profile build, milliseconds from a
+ * clean one; "reuse" compares packet payloads against the previous frame as
+ * a multiset-blind set, so N identical packets matching one prior packet all
+ * count as reused; a "frame" here is the span between ClearSplits calls that
+ * saw content, which is one presented frame in the normal one-DrawOTag flow.
+ */
+#define OTPROF_WINDOW_FRAMES 64
+#define OTPROF_MAX_HASHES    16384
+#define OTPROF_PREV_SET_SIZE 32768 /* power of two, ~2x OTPROF_MAX_HASHES */
+#define OTPROF_KEY_SET_SIZE  512   /* power of two */
+
+typedef struct
+{
+	/* per-frame, reset by OTProf_FoldFrame */
+	u32 frameNodes;
+	u32 frameDryNodes;
+	u32 framePrims;
+	u32 frameBlend[5]; /* indexed by BlendMode */
+	u32 frameTextured;
+	u32 frameDraws;
+	u32 frameKeys;
+	u32 frameKeyTransitions;
+	u32 lastKey;
+	u32 frameHashCount;
+	u32 frameHashes[OTPROF_MAX_HASHES];
+	u32 keySet[OTPROF_KEY_SET_SIZE];
+
+	/* previous frame's packet hashes, open-addressed (0 = empty) */
+	u32 prevSet[OTPROF_PREV_SET_SIZE];
+
+	/* window accumulators */
+	u32 winFrames;
+	u32 winNodes;
+	u32 winPrims;
+	u32 winBlend[5];
+	u32 winTextured;
+	u32 winDraws;
+	u32 winKeys;
+	u32 winKeyTransitions;
+	u32 winHashed;
+	u32 winReused;
+	u32 winTruncated;
+	u32 winDryMismatch;
+} OTWalkProfileState;
+
+global_variable OTWalkProfileState s_otprof;
+
+internal u32 OTProf_HashWords(const u32 *words, u32 count)
+{
+	u32 h = 2166136261u;
+	for (u32 i = 0; i < count; i++)
+	{
+		h ^= words[i];
+		h *= 16777619u;
+	}
+	return h ? h : 1u; /* 0 is the empty-slot sentinel */
+}
+
+internal void OTProf_RecordNode(const u8 *packet, u32 tagLength)
+{
+	s_otprof.frameNodes++;
+
+	/* payload words only -- the tag word holds the OT link, which changes
+	 * every frame even when the packet content does not. Lengths outside
+	 * (0,32] are the walk's own error class; don't hash unvalidated bytes. */
+	if (tagLength == 0 || tagLength > 32)
+	{
+		return;
+	}
+	if (s_otprof.frameHashCount < OTPROF_MAX_HASHES)
+	{
+		s_otprof.frameHashes[s_otprof.frameHashCount++] = OTProf_HashWords((const u32 *)packet + P_LEN, tagLength);
+	}
+}
+
+internal void OTProf_CountPrim(BlendMode blendMode, TexFormat texFormat, bool textured, int tpage)
+{
+	s_otprof.framePrims++;
+	s_otprof.frameBlend[blendMode]++;
+	if (textured)
+	{
+		s_otprof.frameTextured++;
+	}
+
+	/* State key mirrors what a state-sorted submitter would bind: texture
+	 * page origin + format + blend class. CLUT variants excluded in v1, so
+	 * keys/f is a lower bound on 3DS decode-cache binds. */
+	const u32 key = ((u32)tpage & 0x81Fu) | ((u32)texFormat << 12) | ((u32)blendMode << 16) | ((u32)(textured ? 1 : 0) << 20);
+	if (key != s_otprof.lastKey)
+	{
+		s_otprof.frameKeyTransitions++;
+		s_otprof.lastKey = key;
+	}
+
+	u32 slot = (key * 2654435761u) & (OTPROF_KEY_SET_SIZE - 1);
+	for (u32 probes = 0; probes < OTPROF_KEY_SET_SIZE; probes++)
+	{
+		if (s_otprof.keySet[slot] == key)
+		{
+			return;
+		}
+		if (s_otprof.keySet[slot] == 0)
+		{
+			s_otprof.keySet[slot] = key;
+			s_otprof.frameKeys++;
+			return;
+		}
+		slot = (slot + 1) & (OTPROF_KEY_SET_SIZE - 1);
+	}
+}
+
+internal void OTProf_CountDraw(void)
+{
+	s_otprof.frameDraws++;
+}
+
+internal void OTProf_FoldFrame(void)
+{
+	if (s_otprof.frameNodes == 0 && s_otprof.framePrims == 0)
+	{
+		return; /* GPU-disabled or empty scene edge; not a rendered frame */
+	}
+
+	u32 reused = 0;
+	for (u32 i = 0; i < s_otprof.frameHashCount; i++)
+	{
+		const u32 h = s_otprof.frameHashes[i];
+		u32 slot = (h * 2654435761u) & (OTPROF_PREV_SET_SIZE - 1);
+		while (s_otprof.prevSet[slot] != 0)
+		{
+			if (s_otprof.prevSet[slot] == h)
+			{
+				reused++;
+				break;
+			}
+			slot = (slot + 1) & (OTPROF_PREV_SET_SIZE - 1);
+		}
+	}
+
+	memset(s_otprof.prevSet, 0, sizeof(s_otprof.prevSet));
+	for (u32 i = 0; i < s_otprof.frameHashCount; i++)
+	{
+		const u32 h = s_otprof.frameHashes[i];
+		u32 slot = (h * 2654435761u) & (OTPROF_PREV_SET_SIZE - 1);
+		while (s_otprof.prevSet[slot] != 0 && s_otprof.prevSet[slot] != h)
+		{
+			slot = (slot + 1) & (OTPROF_PREV_SET_SIZE - 1);
+		}
+		s_otprof.prevSet[slot] = h;
+	}
+
+	s_otprof.winFrames++;
+	s_otprof.winNodes += s_otprof.frameNodes;
+	s_otprof.winPrims += s_otprof.framePrims;
+	for (int i = 0; i < 5; i++)
+	{
+		s_otprof.winBlend[i] += s_otprof.frameBlend[i];
+	}
+	s_otprof.winTextured += s_otprof.frameTextured;
+	s_otprof.winDraws += s_otprof.frameDraws;
+	s_otprof.winKeys += s_otprof.frameKeys;
+	s_otprof.winKeyTransitions += s_otprof.frameKeyTransitions;
+	s_otprof.winHashed += s_otprof.frameHashCount;
+	s_otprof.winReused += reused;
+	if (s_otprof.frameHashCount >= OTPROF_MAX_HASHES)
+	{
+		s_otprof.winTruncated++;
+	}
+	if (s_otprof.frameDryNodes != s_otprof.frameNodes)
+	{
+		s_otprof.winDryMismatch++;
+	}
+
+	s_otprof.frameNodes = 0;
+	s_otprof.frameDryNodes = 0;
+	s_otprof.framePrims = 0;
+	memset(s_otprof.frameBlend, 0, sizeof(s_otprof.frameBlend));
+	s_otprof.frameTextured = 0;
+	s_otprof.frameDraws = 0;
+	s_otprof.frameKeys = 0;
+	s_otprof.frameKeyTransitions = 0;
+	s_otprof.lastKey = 0;
+	s_otprof.frameHashCount = 0;
+	memset(s_otprof.keySet, 0, sizeof(s_otprof.keySet));
+
+	if (s_otprof.winFrames < OTPROF_WINDOW_FRAMES)
+	{
+		return;
+	}
+
+	const u32 f = s_otprof.winFrames;
+	const u32 p = s_otprof.winPrims ? s_otprof.winPrims : 1;
+	const u32 hp = s_otprof.winHashed ? s_otprof.winHashed : 1;
+	Platform_Log("[OTPROF] f=%lu nodes/f=%lu prims/f=%lu draws/f=%lu keys/f=%lu ktrans/f=%lu pkreuse=%lu%% pk/f=%lu trunc=%lu drymis=%lu\n",
+	             (unsigned long)f, (unsigned long)(s_otprof.winNodes / f), (unsigned long)(s_otprof.winPrims / f), (unsigned long)(s_otprof.winDraws / f),
+	             (unsigned long)(s_otprof.winKeys / f), (unsigned long)(s_otprof.winKeyTransitions / f), (unsigned long)(s_otprof.winReused * 100u / hp),
+	             (unsigned long)(s_otprof.winHashed / f), (unsigned long)s_otprof.winTruncated, (unsigned long)s_otprof.winDryMismatch);
+	Platform_Log("[OTPROF] blend%%: opq=%lu avg=%lu add=%lu sub=%lu aq=%lu | tex=%lu%%\n", (unsigned long)(s_otprof.winBlend[BM_NONE] * 100u / p),
+	             (unsigned long)(s_otprof.winBlend[BM_AVERAGE] * 100u / p), (unsigned long)(s_otprof.winBlend[BM_ADD] * 100u / p),
+	             (unsigned long)(s_otprof.winBlend[BM_SUBTRACT] * 100u / p), (unsigned long)(s_otprof.winBlend[BM_ADD_QUATER_SOURCE] * 100u / p),
+	             (unsigned long)(s_otprof.winTextured * 100u / p));
+
+	s_otprof.winFrames = 0;
+	s_otprof.winNodes = 0;
+	s_otprof.winPrims = 0;
+	memset(s_otprof.winBlend, 0, sizeof(s_otprof.winBlend));
+	s_otprof.winTextured = 0;
+	s_otprof.winDraws = 0;
+	s_otprof.winKeys = 0;
+	s_otprof.winKeyTransitions = 0;
+	s_otprof.winHashed = 0;
+	s_otprof.winReused = 0;
+	s_otprof.winTruncated = 0;
+	s_otprof.winDryMismatch = 0;
+}
+#endif /* CTR_NATIVE_OTWALK_PROFILE */
+
 struct NativeGpuSnapshot
 {
 	u32 magic;
@@ -133,6 +357,9 @@ int NativeGpu_HasPendingSplits(void)
 
 void ClearSplits(void)
 {
+#ifdef CTR_NATIVE_OTWALK_PROFILE
+	OTProf_FoldFrame();
+#endif
 	// NOTE: the GTE capture table (native_gte_capture.c) is deliberately NOT
 	// cleared here -- this runs per-OT-draw, after this frame's captures and
 	// before this frame's vertex builds. Its clear lives in MainFrame_ResetDB.
@@ -884,6 +1111,12 @@ internal void AddSplit(bool semiTrans, bool textured, bool framebufferFeedback)
 	// on this bit surviving after the blended textured pass.
 	bool psxTextureOutputSTP = textured && s_gpu.overrideTexture == 0;
 
+#ifdef CTR_NATIVE_OTWALK_PROFILE
+	// Pre-override retail state: the counter wants what the game asked for,
+	// not the native debug-text override texture.
+	OTProf_CountPrim(blendMode, texFormat, textured, tpage);
+#endif
+
 	if (textured && s_gpu.overrideTexture != 0)
 	{
 		// override texture format, zero tpage
@@ -932,6 +1165,9 @@ internal void AddSplit(bool semiTrans, bool textured, bool framebufferFeedback)
 
 void DrawSplit(const GPUDrawSplit *split)
 {
+#ifdef CTR_NATIVE_OTWALK_PROFILE
+	OTProf_CountDraw();
+#endif
 	if (split->debugText)
 	{
 		NativeRenderer_PushDebugLabel(split->debugText);
@@ -1145,6 +1381,48 @@ internal void NativeGpu_FormatPointerRegion(char *dst, size_t dstSize, uintptr_t
 	snprintf(dst, dstSize, "unknown");
 }
 
+#ifdef CTR_NATIVE_OTWALK_PROFILE
+/*
+ * Links-only replica of the walk below: tag read, terminator test, link
+ * validity, nothing else. Runs FIRST, so the real walk that follows sees a
+ * warmed cache -- draw_otag_drywalk_ms is an upper bound on chase cost, not
+ * an exact split. Mirrors the real walk's exits (terminator, invalid link,
+ * 65536-iteration cycle cap) so frameDryNodes should equal frameNodes;
+ * drymis in the [OTPROF] line counts frames where it didn't.
+ */
+internal void OTProf_DryWalk(u8 *basePacket)
+{
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_OTAG_DRYWALK);
+
+	u32 iterations = 0;
+	while (true)
+	{
+		iterations++;
+		if (iterations > 65536)
+		{
+			break;
+		}
+
+		(void)getlen(basePacket);
+
+		if (isendprim(basePacket))
+		{
+			break;
+		}
+
+		u8 *nextPacket = nextPrim(basePacket);
+		if (!NativeGpu_IsValidOTLink((uintptr_t)nextPacket))
+		{
+			break;
+		}
+		basePacket = nextPacket;
+	}
+	s_otprof.frameDryNodes += iterations;
+
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_OTAG_DRYWALK);
+}
+#endif /* CTR_NATIVE_OTWALK_PROFILE */
+
 void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 {
 	if (!p)
@@ -1183,6 +1461,10 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 	{
 		// walk OT_TAG linked list
 		u8 *basePacket = (u8 *)p;
+
+#ifdef CTR_NATIVE_OTWALK_PROFILE
+		OTProf_DryWalk(basePacket);
+#endif
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
 		GTECapture_BeginOTWalk();
@@ -1228,6 +1510,10 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 			}
 
 			const int tagLength = getlen(basePacket);
+
+#ifdef CTR_NATIVE_OTWALK_PROFILE
+			OTProf_RecordNode(basePacket, (u32)tagLength);
+#endif
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
 			GTECapture_MarkOTNode(basePacket);

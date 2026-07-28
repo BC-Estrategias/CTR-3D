@@ -161,6 +161,21 @@ if(CTR_NATIVE_PRIMMEM_WATERMARK)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_PRIMMEM_WATERMARK=1)
 endif()
 
+# Per-frame OT-walk content counters ([OTPROF] log line every 64 rendered
+# frames): prim counts by blend class, distinct state keys vs actual draws,
+# packet-identical-to-last-frame share, plus a links-only dry walk timed as
+# draw_otag_drywalk_ms (chase vs translate split). This is the decision
+# instrument for the render campaign -- it prices the retained-geometry,
+# z-buffer-reorder, and render-thread candidates before any of them is built.
+# Counts are honest in profile builds; take draw_otag_parse_ms from a clean
+# build (the hashing runs inside the walk and inflates it).
+option(CTR_NATIVE_OTWALK_PROFILE
+    "Per-frame OT-walk counters + dry-walk chase timing"
+    OFF)
+if(CTR_NATIVE_OTWALK_PROFILE)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_OTWALK_PROFILE=1)
+endif()
+
 # Log every growth/reset of the decoded-voice PCM arena in the audio mixer.
 option(CTR_NATIVE_AUDIO_ARENA_LOG
     "Log decoded-voice PCM arena growth and resets"

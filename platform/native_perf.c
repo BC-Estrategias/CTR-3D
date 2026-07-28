@@ -128,6 +128,10 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
     {"draw_triangles_convert_ms", 0},
     {"draw_triangles_append_ms", 0},
     {"draw_triangles_flush_ms", 0},
+    /* dominantCandidate 0: the dry walk re-times part of draw_otag_ms, which
+     * is already a candidate -- letting it win "dominant" would double-report
+     * the same traversal. */
+    {"draw_otag_drywalk_ms", 0},
 };
 
 global_variable FILE *s_csvFile;

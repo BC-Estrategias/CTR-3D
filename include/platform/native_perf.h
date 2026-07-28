@@ -73,6 +73,15 @@ enum NativePerfBucket
 	NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT,
 	NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND,
 	NATIVE_PERF_BUCKET_DRAW_TRIANGLES_FLUSH,
+	/*
+	 * OT-walk profile (CTR_NATIVE_OTWALK_PROFILE): a links-only pre-walk of
+	 * the same OT the real walk is about to parse, isolating pointer-chase
+	 * cost from translate/submit. It runs BEFORE the real walk, so the real
+	 * walk then runs cache-warm: read this bucket as an upper bound on chase
+	 * and (draw_otag_parse_ms − draw_otag_drywalk_ms) as a rough translate
+	 * cost. Appended, never inserted: s_bucketInfo is indexed by this enum.
+	 */
+	NATIVE_PERF_BUCKET_DRAW_OTAG_DRYWALK,
 	NATIVE_PERF_BUCKET_COUNT
 };
 
