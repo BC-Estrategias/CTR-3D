@@ -26,6 +26,15 @@
 #define NATIVE_STR_IDCT_SCALE               (1 << NATIVE_STR_IDCT_SHIFT)
 #define NATIVE_STR_SCRAPBOOK_PATH           "TEST.STR"
 #define NATIVE_STR_SCRAPBOOK_FRAME_COUNT    0x1148
+/*
+ * Disc-source read-ahead depth. STR consumption is strictly sequential single
+ * sectors, but on 3DS a disc-image read costs ~26ms per CALL almost regardless
+ * of size (session 23), so a ~190-sector FMV consumed as singles paid ~5s of
+ * main-thread disc time. Refilling a full chunk at a time turns that into a
+ * handful of calls; sized to the chunk so one refill is exactly one disc call,
+ * which keeps the str= site tally equal to actual disc calls.
+ */
+#define NATIVE_STR_READAHEAD_SECTORS        NATIVE_DISC_IMAGE_CHUNK_SECTORS
 
 enum NativeSTRFormat
 {
@@ -57,6 +66,18 @@ struct NativeSTRState
 	s32 frameSize;
 	s32 width;
 	s32 height;
+	u32 readAheadStart;
+	u32 readAheadCount;
+	/*
+	 * Caller-owned scratch, main-thread role: every STR reader (track preview,
+	 * scrapbook) runs on the main thread, and on 3DS the owner picks which
+	 * per-role fd the read goes through -- tagging it AUDIO would put FMV reads
+	 * on the XA worker's fd and reintroduce the shared-position race the
+	 * per-role fds exist to delete. readAhead is sized for the wider CD-record
+	 * stride; extracted-format sectors (0x800) pack into it at their own stride.
+	 */
+	struct NativeDiscImageScratch discScratch;
+	u8 readAhead[NATIVE_STR_READAHEAD_SECTORS * NATIVE_STR_CD_SECTOR_SIZE];
 	u8 frameData[NATIVE_STR_MAX_FRAME_BYTES];
 	u16 rgb555[NATIVE_STR_MAX_WIDTH * NATIVE_STR_MAX_HEIGHT];
 };
@@ -468,6 +489,67 @@ internal void NativeSTR_CopySectorPayload(const u8 *sector, s32 headerOffset, co
 	*copied += copyBytes;
 }
 
+/*
+ * All disc-source STR reads come through here: one sector out of the
+ * read-ahead buffer, refilled a chunk at a time. Only the read granularity
+ * changes -- consumption stays strictly sequential and byte-identical, so FMV
+ * behavior cannot move. A loop rewind that lands inside the buffered window
+ * (track previews rewind to fileBaseSector) is served from the buffer; the
+ * image is read-only for the process lifetime, so the cached bytes cannot be
+ * stale.
+ */
+internal s32 NativeSTR_ReadDiscSectorBuffered(u8 *sector, s32 rawRecord)
+{
+	u32 stride = rawRecord ? NATIVE_STR_CD_SECTOR_SIZE : NATIVE_STR_EXTRACTED_SECTOR_SIZE;
+
+	if ((s_str.readAheadCount == 0) || (s_str.currentSector < s_str.readAheadStart) || (s_str.currentSector - s_str.readAheadStart >= s_str.readAheadCount))
+	{
+		/* Same-TU calls into native_disc_image.c's internal sector-count
+		 * helpers (it precedes this file in the unity include order), so the
+		 * EOF clamp cannot drift from the bounds check inside the Scratch
+		 * readers -- an unclamped final refill would fail that check and turn
+		 * a normal end-of-stream into a read error. */
+		u32 fileSectors = rawRecord ? NativeDiscImage_RawSectorCount(s_str.discFile.size) : NativeDiscImage_DataSectorCount(s_str.discFile.size);
+		u32 run;
+		s32 ok;
+
+		if (s_str.currentSector >= fileSectors)
+		{
+			return 0;
+		}
+
+		run = fileSectors - s_str.currentSector;
+		if (run > NATIVE_STR_READAHEAD_SECTORS)
+		{
+			run = NATIVE_STR_READAHEAD_SECTORS;
+		}
+
+#if CTR_NATIVE_DISC_IO_PROFILE
+		s_nativeDiscIoSiteStr++;
+#endif
+		if (rawRecord)
+		{
+			ok = NativeDiscImage_ReadRawSectorsScratch(&s_str.discFile, s_str.currentSector, run, s_str.readAhead, &s_str.discScratch);
+		}
+		else
+		{
+			ok = NativeDiscImage_ReadDataSectorsScratch(&s_str.discFile, s_str.currentSector, run, s_str.readAhead, &s_str.discScratch);
+		}
+
+		if (!ok)
+		{
+			return 0;
+		}
+
+		s_str.readAheadStart = s_str.currentSector;
+		s_str.readAheadCount = run;
+	}
+
+	memcpy(sector, &s_str.readAhead[(size_t)(s_str.currentSector - s_str.readAheadStart) * stride], stride);
+	s_str.currentSector++;
+	return 1;
+}
+
 internal s32 NativeSTR_ReadExtractedSector(u8 *sector)
 {
 	if (s_str.source == NATIVE_STR_SOURCE_HOST_FILE)
@@ -477,16 +559,7 @@ internal s32 NativeSTR_ReadExtractedSector(u8 *sector)
 
 	if (s_str.source == NATIVE_STR_SOURCE_DISC)
 	{
-#if CTR_NATIVE_DISC_IO_PROFILE
-		s_nativeDiscIoSiteStr++;
-#endif
-		if (!NativeDiscImage_ReadDataSectors(&s_str.discFile, s_str.currentSector, 1, sector))
-		{
-			return 0;
-		}
-
-		s_str.currentSector++;
-		return 1;
+		return NativeSTR_ReadDiscSectorBuffered(sector, 0);
 	}
 
 	return 0;
@@ -501,16 +574,7 @@ internal s32 NativeSTR_ReadCdRecord(u8 *sector)
 
 	if (s_str.source == NATIVE_STR_SOURCE_DISC)
 	{
-#if CTR_NATIVE_DISC_IO_PROFILE
-		s_nativeDiscIoSiteStr++;
-#endif
-		if (!NativeDiscImage_ReadRawSectors(&s_str.discFile, s_str.currentSector, 1, sector))
-		{
-			return 0;
-		}
-
-		s_str.currentSector++;
-		return 1;
+		return NativeSTR_ReadDiscSectorBuffered(sector, 1);
 	}
 
 	return 0;
@@ -710,6 +774,7 @@ s32 NativeSTR_StartTrackPreviewFromBigfileSector(s32 bigfileSector, s32 frameCou
 		s_str.source = NATIVE_STR_SOURCE_DISC;
 		s_str.discFile = discFile;
 		s_str.fileBaseSector = (u32)bigfileSector;
+		s_str.discScratch.owner = NATIVE_DISC_IMAGE_OWNER_MAIN;
 	}
 	else
 	{
@@ -751,6 +816,7 @@ s32 NativeSTR_StartScrapbook(void)
 	{
 		s_str.source = NATIVE_STR_SOURCE_DISC;
 		s_str.discFile = discFile;
+		s_str.discScratch.owner = NATIVE_DISC_IMAGE_OWNER_MAIN;
 	}
 	else
 	{
@@ -785,6 +851,8 @@ void NativeSTR_Stop(void)
 	s_str.fileBaseOffset = 0;
 	s_str.fileBaseSector = 0;
 	s_str.currentSector = 0;
+	s_str.readAheadStart = 0;
+	s_str.readAheadCount = 0;
 	s_str.frameIndex = 0;
 	s_str.frameLimit = 0;
 	s_str.width = 0;

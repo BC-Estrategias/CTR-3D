@@ -166,7 +166,7 @@ global_variable u32 s_nativeDiscIoSiteXaCount;     /* NativeAudio_XAStreamCountA
 global_variable u32 s_nativeDiscIoSiteSingle;      /* the single-sector helper (PVD / root lookup) */
 global_variable u32 s_nativeDiscIoSiteFile;        /* NativeDiscImage_ReadFileBytes -- whole-file asset reads */
 global_variable u32 s_nativeDiscIoSiteFileSectors; /* ...and the sector counts those files span */
-global_variable u32 s_nativeDiscIoSiteStr;         /* native_str.c FMV playback -- one sector per call by design */
+global_variable u32 s_nativeDiscIoSiteStr;         /* native_str.c FMV read-ahead refills -- counts disc CALLS (each up to one chunk), NOT consumed sectors */
 global_variable u32 s_nativeDiscIoSiteXaOne;       /* NativeAudio_XASourceReadSector main-bucket singles (open/prebuffer/PC pump) */
 
 internal unsigned long long NativeDiscImage_ProfTick(void)
