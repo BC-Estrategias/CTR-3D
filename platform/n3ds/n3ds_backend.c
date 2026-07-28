@@ -267,6 +267,17 @@ void N3DS_SleepMs(unsigned int ms)
 
 void N3DS_GfxInit(void)
 {
+	/*
+	 * New3DS 804MHz clock + the extra L2 cache. Nothing in this build asked
+	 * for them before: the only osSetSpeedupEnable in the tree is inside
+	 * SDL's 3DS main shim, and the 3DS build does not link SDL at all. The
+	 * owner's CFW (Luma/Rosalina) forces both on regardless, so this is not
+	 * expected to move the frame rate on THIS console -- it is here so the
+	 * build does not silently depend on someone else's CFW configuration.
+	 * Harmless on an Old3DS, where libctru makes it a no-op.
+	 */
+	osSetSpeedupEnable(true);
+
 	gfxInitDefault();
 
 	/*

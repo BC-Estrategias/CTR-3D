@@ -47,6 +47,22 @@ global_variable int s_nativeDiscImageAvailable;
  */
 global_variable struct NativeDiscImageScratch s_nativeDiscImageMainScratch = {NATIVE_DISC_IMAGE_OWNER_MAIN, {0}};
 
+/* Path lookup cache -- see NativeDiscImage_FindFile for what it is for and
+ * why it is main-thread only. Declared up here so Init can clear it. */
+#define NATIVE_DISC_IMAGE_PATH_CACHE_ENTRIES 128
+#define NATIVE_DISC_IMAGE_PATH_CACHE_KEY_MAX 96
+
+struct NativeDiscImagePathCacheEntry
+{
+	char path[NATIVE_DISC_IMAGE_PATH_CACHE_KEY_MAX];
+	struct NativeDiscImageFile file;
+	u8 valid;
+	u8 found;
+};
+
+global_variable struct NativeDiscImagePathCacheEntry s_nativeDiscImagePathCache[NATIVE_DISC_IMAGE_PATH_CACHE_ENTRIES];
+global_variable u32 s_nativeDiscImagePathCacheNext;
+
 #if CTR_NATIVE_DISC_IO_PROFILE
 /*
  * Per-owner disc-read counters. Each bucket has exactly ONE writer thread
@@ -569,6 +585,11 @@ int NativeDiscImage_Init(const char *assetsDir)
 	s_nativeDiscImageAvailable = 0;
 	s_nativeDiscImagePath[0] = '\0';
 
+	/* A re-Init can point at a different image, so entries from the old one
+	 * must not survive it. Cheap: this runs once in practice. */
+	memset(s_nativeDiscImagePathCache, 0, sizeof(s_nativeDiscImagePathCache));
+	s_nativeDiscImagePathCacheNext = 0;
+
 	if (s_nativeDiscImageFile != NULL)
 	{
 		fclose(s_nativeDiscImageFile);
@@ -604,15 +625,93 @@ int NativeDiscImage_Init(const char *assetsDir)
 	return 1;
 }
 
+/*
+ * Path lookup cache, and by session 23's third hardware run the single
+ * biggest remaining cost in a boot. Every FindFile re-walks the ISO tree from
+ * the root, one ReadDirectoryBytes per path component, and nothing remembered
+ * the answer -- 137 single-sector directory reads in the boot window alone,
+ * which at the measured ~40ms per-call floor is ~5.5s of the black screen.
+ * Once the payload reads were batched, those 137 calls were 62% of the
+ * window's calls and effectively all of its remaining time.
+ *
+ * Negative results are cached too: NativeAssets probes the disc image for
+ * files that are not on it (host-file-first precedence), and a miss costs a
+ * FULL tree walk, so misses were never the cheap case.
+ *
+ * The image is read-only for the process lifetime, so no invalidation exists
+ * beyond Init clearing it. Round-robin eviction rather than first-64-wins, so
+ * a boot-time working set cannot pin the table against a later one.
+ *
+ * MAIN THREAD ONLY, like every other FindFile caller (NativeCD_OpenFile,
+ * NativeAssets, native_str, and the XA track-open path, which all run there).
+ * A second writer would tear an entry; if a disc reader ever appears on the
+ * audio worker this needs a lock or a per-thread table.
+ */
+internal struct NativeDiscImagePathCacheEntry *NativeDiscImage_PathCacheFind(NativeStr8 key)
+{
+	u32 i;
+
+	for (i = 0; i < NATIVE_DISC_IMAGE_PATH_CACHE_ENTRIES; i++)
+	{
+		struct NativeDiscImagePathCacheEntry *entry = &s_nativeDiscImagePathCache[i];
+
+		/* Case-insensitive, matching NativeDiscImage_NameEquals -- otherwise
+		 * two spellings of one path would occupy two entries and, worse, a
+		 * hit could disagree with what a walk would have returned. */
+		if (entry->valid && NativeStr8_EqualsIgnoreCaseAscii(NativeStr8_FromCString(entry->path), key))
+		{
+			return entry;
+		}
+	}
+
+	return NULL;
+}
+
+internal void NativeDiscImage_PathCacheStore(NativeStr8 key, int found, const struct NativeDiscImageFile *file)
+{
+	struct NativeDiscImagePathCacheEntry *entry;
+
+	if (key.len >= NATIVE_DISC_IMAGE_PATH_CACHE_KEY_MAX)
+	{
+		return; /* too long to key on; it just keeps walking, which is correct */
+	}
+
+	entry = &s_nativeDiscImagePathCache[s_nativeDiscImagePathCacheNext % NATIVE_DISC_IMAGE_PATH_CACHE_ENTRIES];
+	s_nativeDiscImagePathCacheNext++;
+
+	memcpy(entry->path, key.ptr, key.len);
+	entry->path[key.len] = '\0';
+	entry->valid = 1;
+	entry->found = (u8)(found != 0);
+	if (found)
+	{
+		entry->file = *file;
+	}
+}
+
 int NativeDiscImage_FindFile(const char *path, struct NativeDiscImageFile *fileOut)
 {
 	NativeStr8 remaining = NativePath_SkipLeadingSeparators(NativeStr8_FromCString(path));
 	struct NativeDiscImageFile current = s_nativeDiscImageRoot;
 	u8 flags = NATIVE_DISC_IMAGE_DIRECTORY_FLAG;
+	NativeStr8 cacheKey;
+	struct NativeDiscImagePathCacheEntry *cached;
 
 	if (!s_nativeDiscImageAvailable || (path == NULL) || (fileOut == NULL))
 	{
 		return 0;
+	}
+
+	/* Key on the separator-stripped form, so "/FOO" and "FOO" share one entry. */
+	cacheKey = remaining;
+	cached = NativeDiscImage_PathCacheFind(cacheKey);
+	if (cached != NULL)
+	{
+		if (cached->found)
+		{
+			*fileOut = cached->file;
+		}
+		return cached->found;
 	}
 
 	while (remaining.len != 0)
@@ -626,20 +725,24 @@ int NativeDiscImage_FindFile(const char *path, struct NativeDiscImageFile *fileO
 
 		if ((flags & NATIVE_DISC_IMAGE_DIRECTORY_FLAG) == 0)
 		{
+			NativeDiscImage_PathCacheStore(cacheKey, 0, NULL);
 			return 0;
 		}
 
 		if (!NativeDiscImage_FindInDirectory(&current, component, &current, &flags))
 		{
+			NativeDiscImage_PathCacheStore(cacheKey, 0, NULL);
 			return 0;
 		}
 	}
 
 	if ((flags & NATIVE_DISC_IMAGE_DIRECTORY_FLAG) != 0)
 	{
+		NativeDiscImage_PathCacheStore(cacheKey, 0, NULL);
 		return 0;
 	}
 
+	NativeDiscImage_PathCacheStore(cacheKey, 1, &current);
 	*fileOut = current;
 	return 1;
 }

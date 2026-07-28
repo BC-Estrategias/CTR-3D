@@ -210,7 +210,14 @@ global_variable struct
  * 37.8kHz stereo) is the cushion that rides out the load-burst stalls the
  * span reads cannot avoid entirely.
  */
-#define NATIVE_AUDIO_XA_SPAN_SECTORS       32
+/* 64, raised from 32 once the disc reader's chunk reached 64 (session 23):
+ * a span fill is one read either way, and an SD read costs ~26ms fixed +
+ * ~0.24ms/sector, so covering twice the sectors per fill costs ~15ms more on
+ * a call that already costs ~45ms -- half the calls for a fifth more time
+ * each. The single blocking read the worker sits inside grows with it, which
+ * is why this tracks the chunk rather than exceeding it: the DSP cushion is
+ * ~200ms and a ~52ms fill sits comfortably under that. */
+#define NATIVE_AUDIO_XA_SPAN_SECTORS       64
 #else
 #define NATIVE_AUDIO_XA_RING_SECTORS       6     // resident sector-slots per stream (~94.5 KiB @ mono capacity)
 #define NATIVE_AUDIO_XA_RING_AHEAD_TARGET  4     // refill ceiling, sectors kept ahead of playback
