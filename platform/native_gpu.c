@@ -110,6 +110,14 @@ typedef struct
 	GPUDrawSplit splits[MAX_DRAW_SPLITS];
 	int vertexIndex;
 	int splitIndex;
+
+	/*
+	 * Next GrVertex.emitOrdinal value. Frame-scoped (reset in ClearSplits,
+	 * NOT by mid-frame DrawAllSplits flushes -- depth must stay monotonic
+	 * across the whole presented frame). Not part of NativeGpuSnapshot:
+	 * it is re-derived every frame, so save states don't carry it.
+	 */
+	u32 emitOrdinal;
 } NativeGpuState;
 
 global_variable NativeGpuState s_gpu;
@@ -353,6 +361,40 @@ struct NativeGpuSnapshot
 int NativeGpu_HasPendingSplits(void)
 {
 	return s_gpu.splitIndex > 0;
+}
+
+/*
+ * Stamp every vertex the last Parse*Primitive call appended with the current
+ * emission ordinal, then advance it. One ordinal per primitive, monotonic in
+ * OT-walk (= submission) order. Clamps at 0xFFFF instead of wrapping: a
+ * wrap would put late primitives BEHIND early ones; a clamp only collapses
+ * the >65535-prims tail to equal depth, where LEQUAL/GEQUAL-with-equal-pass
+ * still resolves by draw order -- i.e. degrades to painter, never inverts.
+ */
+internal void NativeGpu_StampEmitOrdinal(int firstVertex)
+{
+	const u16 ordinal = (u16)(s_gpu.emitOrdinal < 0xFFFFu ? s_gpu.emitOrdinal : 0xFFFFu);
+
+	for (int i = firstVertex; i < s_gpu.vertexIndex; i++)
+	{
+		s_gpu.vertexBuffer[i].emitOrdinal = ordinal;
+	}
+	s_gpu.emitOrdinal++;
+}
+
+/*
+ * Reset the emission ordinal. Called by the platform renderer when the DEPTH
+ * BUFFER clears (once per presented frame), NOT from ClearSplits: ClearSplits
+ * runs per-OT-draw, and frames that draw in multiple passes (the loading
+ * screen's flag pass + letters pass) would restart the ordinal mid-frame --
+ * the later pass then starts at far depth and LOSES the depth test against
+ * the earlier pass's already-written values. Found empirically: the depth
+ * build's loading screens rendered the flag but buried the "LOAD" letters.
+ * Ordinals must stay monotonic for the lifetime of one depth clear.
+ */
+void NativeGpu_ResetEmitOrdinal(void)
+{
+	s_gpu.emitOrdinal = 0;
 }
 
 void ClearSplits(void)
@@ -1452,7 +1494,9 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 	if (singlePrimitive)
 	{
 		P_TAG *polyTag = (P_TAG *)p;
+		const int firstVertex = s_gpu.vertexIndex;
 		ParsePrimitive(polyTag);
+		NativeGpu_StampEmitOrdinal(firstVertex);
 
 		GPUDrawSplit *lastSplit = &s_gpu.splits[s_gpu.splitIndex];
 		lastSplit->numVerts = s_gpu.vertexIndex - lastSplit->startVertex;
@@ -1534,16 +1578,20 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 				u8 *currentPacket = basePacket;
 				u8 *endPacket = basePacket + (tagLength + P_LEN) * sizeof(u32);
 				int primLength = 0;
+				int firstVertex = s_gpu.vertexIndex;
 				if (currentPacket < endPacket)
 				{
 					primLength = ParsePrimitive((P_TAG *)currentPacket);
 					currentPacket += (primLength + P_LEN) * sizeof(u32);
+					NativeGpu_StampEmitOrdinal(firstVertex);
 				}
 
 				while (currentPacket < endPacket)
 				{
+					firstVertex = s_gpu.vertexIndex;
 					primLength = ParseTaglessPrimitive((u32 *)currentPacket);
 					currentPacket += primLength * sizeof(u32);
+					NativeGpu_StampEmitOrdinal(firstVertex);
 				}
 
 				if (currentPacket != endPacket)

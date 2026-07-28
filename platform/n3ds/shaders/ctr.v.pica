@@ -39,14 +39,17 @@
 .out outclr color
 
 ; Inputs (regId order must match C3D_AttrInfo setup in native_renderer_3ds.c)
-.alias inpos v0 ; x, y
+.alias inpos v0 ; x, y, z (z = emit-ordinal depth substrate, biased s16)
 .alias intc  v1 ; u, v
 .alias inclr v2 ; r, g, b, a
 
 .proc main
-	; Force z=0, w=1 -- position is 2D screen space, not a 3D camera-space point.
-	mov r0.xy, inpos.xy
-	mov r0.z,  zeros
+	; x,y are 2D screen space (GTE already projected on the CPU). z is NOT a
+	; camera-space depth: it is the emit-ordinal depth substrate (biased s16,
+	; n3ds_backend.h N3DS_Vertex) and the ortho matrix spans its full range,
+	; so nothing clips. With CTR_NATIVE_OT_DEPTH off the depth test is never
+	; enabled and this value is inert. w=1.
+	mov r0.xyz, inpos.xyz
 	mov r0.w,  ones
 
 	dp4 outpos.x, projection[0], r0

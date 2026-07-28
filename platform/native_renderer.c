@@ -227,6 +227,9 @@ void NativeRenderer_UpdateSwapIntervalState(int swapInterval)
 void NativeRenderer_BeginScene(void)
 {
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);
+	/* PC consumes no depth from emitOrdinal; resetting per frame just keeps
+	 * its semantics identical to the 3DS renderer's (and off the clamp). */
+	NativeGpu_ResetEmitOrdinal();
 	s_lastBoundTexture = 0;
 
 	NativeRenderer_UpdatePresentationViewport();

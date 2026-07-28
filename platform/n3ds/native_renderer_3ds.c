@@ -2096,6 +2096,10 @@ void NativeRenderer_BeginScene(void)
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);
 	N3DS_C3DBeginFrame();
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_RENDERER_BEGIN_SCENE);
+	/* The depth buffer just cleared (C3D_RenderTargetClear in BeginFrame),
+	 * so this is the one legal place to restart the emission ordinal --
+	 * see NativeGpu_ResetEmitOrdinal's comment for the multi-pass trap. */
+	NativeGpu_ResetEmitOrdinal();
 
 	/* Fresh frame, fresh vertex-buffer cursor: no run can carry across
 	 * (EndScene flushed it). Reset the frame-scope run state and force the
@@ -2152,6 +2156,7 @@ void NativeRenderer_EndScene(void)
 		quad[5].x = x0; quad[5].y = y1; quad[5].u = u0; quad[5].v = v1;
 		for (i = 0; i < 6; i++)
 		{
+			quad[i].z = N3DS_DEPTH_TOPMOST;
 			quad[i].r = 255;
 			quad[i].g = 255;
 			quad[i].b = 255;
@@ -2826,6 +2831,7 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 				 * the main conversion loop above). Alpha is no longer a
 				 * struct field: the shader supplies a constant 1.0 for it
 				 * instead (design doc finding 3). */
+				verts[i].z = N3DS_DEPTH_TOPMOST;
 				verts[i].r = 255;
 				verts[i].g = 255;
 				verts[i].b = 255;
@@ -3280,6 +3286,9 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 
 			dst->x = (s16)src->x;
 			dst->y = (s16)src->y;
+			/* Emit-ordinal depth substrate, biased into s16 (see
+			 * n3ds_backend.h). Later-parsed prims get larger z. */
+			dst->z = (s16)((int)src->emitOrdinal - 32768);
 
 			/* Offset into the resolved region of the atlas, not the whole
 			 * atlas. Untextured uses the fixed white cell's centre

@@ -31,6 +31,17 @@ typedef struct
 	u8 r, g, b, a;
 
 	s8 tcx, tcy, _p0, _p1;
+
+	/*
+	 * Per-primitive emission ordinal, stamped in OT-walk order by the parse
+	 * layer (native_gpu.c). All vertices of one primitive share a value;
+	 * later primitives get larger ones. This is the depth substrate for the
+	 * 3DS z-break play: submission order can be changed without changing
+	 * layering, because depth = ordinal reproduces painter's order in the
+	 * depth buffer. Appended field: PC's GL attribute loaders address fields
+	 * by offset and never fetch it, so PC output is unaffected.
+	 */
+	u16 emitOrdinal;
 } GrVertex;
 #pragma pack(pop)
 

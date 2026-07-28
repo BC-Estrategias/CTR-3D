@@ -89,11 +89,24 @@ typedef uint8_t u8;
  * emulator screenshot -- see design doc finding 5 for the full reasoning. */
 typedef struct
 {
-	s16 x, y;
+	s16 x, y, z;
 	s16 u, v;
 	u8 r, g, b;
 	u8 _pad;
 } N3DS_Vertex;
+
+/*
+ * z carries the depth substrate (z-break play): GrVertex.emitOrdinal biased
+ * into s16 range (ordinal - 32768), so later-submitted primitives are
+ * "nearer". 14-byte stride keeps every rule the comment above establishes:
+ * position (3 x s16) at 0, texcoord at 6, color at 10 -- each on its
+ * element-size boundary, no inter-attribute padding, even stride. With
+ * CTR_NATIVE_OT_DEPTH off the depth test never turns on and z is inert.
+ * Overlay quads drawn outside the OT walk (VRAM present, atlas inspector)
+ * use N3DS_DEPTH_TOPMOST so they beat any world depth when the test is on;
+ * they also draw last, so either polarity keeps them on top.
+ */
+#define N3DS_DEPTH_TOPMOST 32767
 
 /* One-time setup: citro3d itself, the top-screen render target, the
  * compiled vertex shader, attribute layout, and the vertex buffer. Must be

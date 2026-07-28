@@ -385,7 +385,14 @@ void N3DS_C3DSetProjection(float left, float right, float bottom)
 	 * right edge and left a dead strip along the bottom. The extents now come
 	 * from the game's live DISPENV instead; see NativeRenderer_BeginScene.
 	 */
-	Mtx_OrthoTilt(&s_projection, left, right, bottom, 0.0f, 0.0f, 1.0f, true);
+	/*
+	 * Depth range covers the biased emit-ordinal in vertex z (s16, so
+	 * [-32768, 32767] -- see N3DS_Vertex in n3ds_backend.h). Must span the
+	 * full range even with CTR_NATIVE_OT_DEPTH off: real z values outside
+	 * near/far would be CLIPPED, so a narrow range plus stamped z would
+	 * erase geometry, not just mis-layer it.
+	 */
+	Mtx_OrthoTilt(&s_projection, left, right, bottom, 0.0f, -32769.0f, 32769.0f, true);
 }
 
 int N3DS_C3DInit(void)
@@ -433,7 +440,7 @@ int N3DS_C3DInit(void)
 
 	attrInfo = C3D_GetAttrInfo();
 	AttrInfo_Init(attrInfo);
-	AttrInfo_AddLoader(attrInfo, 0, GPU_SHORT, 2);         /* v0 = position (x, y) */
+	AttrInfo_AddLoader(attrInfo, 0, GPU_SHORT, 3);         /* v0 = position (x, y, z=emit-ordinal depth) */
 	AttrInfo_AddLoader(attrInfo, 1, GPU_SHORT, 2);         /* v1 = texcoord (u, v) */
 	AttrInfo_AddLoader(attrInfo, 2, GPU_UNSIGNED_BYTE, 3); /* v2 = color (r, g, b) -- alpha is a shader constant now, not fetched */
 
@@ -608,8 +615,29 @@ void N3DS_C3DBeginFrame(void)
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: enter (SYNCDRAW wait)");
 	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: returned");
-	C3D_RenderTargetClear(s_renderTarget, C3D_CLEAR_ALL, 0x000000FF, 0);
+	/* Depth clears to FAR. Mtx_OrthoTilt maps LARGER vertex z to SMALLER
+	 * stored depth (verified empirically, see below), so far = max. Harmless
+	 * when CTR_NATIVE_OT_DEPTH is off (depth buffer unused). */
+	C3D_RenderTargetClear(s_renderTarget, C3D_CLEAR_ALL, 0x000000FF, 0x00FFFFFF);
 	C3D_FrameDrawOn(s_renderTarget);
+
+#ifdef CTR_NATIVE_OT_DEPTH
+	/*
+	 * Depth substrate: every prim carries its OT-emission ordinal as z, so
+	 * later-submitted always wins the depth test -- painter's order in the
+	 * depth buffer, making submission REORDER legal for the cross-bucket
+	 * merge. Polarity was settled EMPIRICALLY and the first guess (GEQUAL +
+	 * clear 0) was wrong in an instructive way: inverted layering does NOT
+	 * look broken in back-to-front world scenes (far-wins camouflages as
+	 * plausible occlusion) -- it announces itself by ERASING late-drawn
+	 * content: the loading flag's LOADING letters, the DEMO MODE banner,
+	 * the karts. Mtx_OrthoTilt maps larger vertex z to smaller stored
+	 * depth, so the correct pair is LEQUAL + clear-to-max. If this ever
+	 * needs re-deriving, use the loading screen's letters as the canary,
+	 * not world layering.
+	 */
+	C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+#endif
 
 	/*
 	 * Pillarbox the top screen to the bottom screen's 4:3-equivalent width

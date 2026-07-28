@@ -176,6 +176,20 @@ if(CTR_NATIVE_OTWALK_PROFILE)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_OTWALK_PROFILE=1)
 endif()
 
+# 3DS z-break substrate: enable the PICA depth test against the per-prim
+# emit-ordinal carried in vertex z. Order-preserving by construction (equal
+# ordinal + equal-passes test = painter), so ON must be pixel-identical to
+# OFF -- that A/B is the acceptance. The ordinal stamping and vertex z
+# plumbing are unconditional; this gate only turns the depth TEST on. It
+# exists to make submission reorder (cross-bucket state-sorted batching)
+# legal, which is where the fps payoff lives.
+option(CTR_NATIVE_OT_DEPTH
+    "3DS: depth-test against per-prim emit ordinals (z-break substrate)"
+    OFF)
+if(CTR_NATIVE_OT_DEPTH)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_OT_DEPTH=1)
+endif()
+
 # Log every growth/reset of the decoded-voice PCM arena in the audio mixer.
 option(CTR_NATIVE_AUDIO_ARENA_LOG
     "Log decoded-voice PCM arena growth and resets"

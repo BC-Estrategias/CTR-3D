@@ -10,7 +10,10 @@
 #if defined(CTR_INTERNAL) && !defined(__3DS__)
 
 #define OFSCAP_MAGIC          0x474F5443u /* 'CTOG' little-endian */
-#define OFSCAP_VERSION        1u
+/* v2: GrVertex grew emitOrdinal (depth substrate), so raw vertex records are
+ * 22 bytes now. The header always recorded sizeof(GrVertex), so readers can
+ * self-adjust; the bump is so a v1 capture is rejected rather than misread. */
+#define OFSCAP_VERSION        2u
 #define OFSCAP_TAG_BEGIN      1u
 #define OFSCAP_TAG_SPLIT      2u
 #define OFSCAP_TAG_END        3u
@@ -18,7 +21,7 @@
 #define OFSCAP_PER_RECT_CAP   6
 #define OFSCAP_DETAIL_LOG_CAP OFSCAP_PER_RECT_CAP
 
-typedef char OfscapGrVertexSizeCheck[(sizeof(GrVertex) == 20) ? 1 : -1];
+typedef char OfscapGrVertexSizeCheck[(sizeof(GrVertex) == 22) ? 1 : -1];
 
 typedef struct
 {
