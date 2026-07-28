@@ -180,7 +180,9 @@ global_variable int s_semiTransPass = 0;
  * are stubs here (they'd each join the flush set when implemented).
  * Submission order never changes: merging is only ever "don't flush yet",
  * never reorder -- this renderer has no depth test and layers purely by
- * draw order.
+ * draw order. (CTR_NATIVE_DRAW_MERGE below is the exception that retires
+ * this rule: with the emit-ordinal depth test on, opaque submission order
+ * is free and the run machinery becomes the BLEND stream only.)
  */
 global_variable int s_runAtlas = -1;
 global_variable int s_runVertCount = 0;
@@ -188,6 +190,81 @@ global_variable int s_runVertCount = 0;
 global_variable int s_runUntextured = -1;
 /* Blend mode the pending run was opened under. */
 global_variable int s_runBlendMode = 0;
+
+#ifdef CTR_NATIVE_DRAW_MERGE
+#ifndef CTR_NATIVE_OT_DEPTH
+#error "CTR_NATIVE_DRAW_MERGE requires CTR_NATIVE_OT_DEPTH: reordered opaque submission is only correct when the emit-ordinal depth test resolves paint order (see n3ds_backend.c's C3D_DepthTest block)."
+#endif
+/*
+ * Cross-bucket draw merge (the z-break play's first consumer, 2026-07-28).
+ * The depth substrate makes opaque submission order irrelevant -- the depth
+ * test against per-prim emit ordinals reproduces painter's order regardless
+ * of the order draws are issued in. So instead of flushing a draw at every
+ * state transition of the OT walk (~26 distinct state keys but ~350
+ * transitions per race frame, [OTPROF] session 2026-07-28), opaque
+ * (BM_NONE) triangles accumulate in per-state BINS for the whole frame and
+ * flush as ONE draw per bin at the barrier.
+ *
+ * Bin key: on 3DS the only draw-relevant states are (atlas, TEV doubling,
+ * blend mode) -- clip/stencil/mask/STP-output are stubs or global here.
+ * Doubling is textured<=>1 without exception (native_gpu.c), and untextured
+ * always resolves to the white cell, so (atlas x doubling) collapses to 13
+ * bins: one per atlas for textured, plus one untextured/white bin.
+ *
+ * Blend (BM != NONE) content cannot reorder against itself -- BM_AVERAGE/
+ * BM_SUBTRACT do not commute -- so it keeps the existing run accumulation,
+ * but a closed run is RECORDED (verts appended to the frame VBO, draw
+ * deferred) instead of drawn. The barrier then emits: all opaque bins,
+ * then any spilled opaque segments, then blend segments in original order,
+ * then the still-open blend run. Opaque-vs-blend layering is resolved by
+ * the depth test (a blend prim fails LEQUAL wherever a later-ordinal opaque
+ * prim already wrote), which is exactly painter's semantics; blend-vs-blend
+ * order is preserved verbatim. A mid-frame barrier is ALWAYS legal: every
+ * prim parsed after it carries a larger ordinal than everything drawn by it.
+ *
+ * Barrier sites: EndScene, PresentVRAMRect (foreign draw), bin/segment
+ * capacity escalation. The blend run may stay OPEN across interleaved
+ * opaque calls -- adjacent same-state blend runs merge across them, which
+ * is legal for the same reason the barrier is.
+ *
+ * s_mergeActive is LATCHED from g_dbg_drawMerge at BeginScene so the
+ * dumpreq 'drawmerge' toggle can never flip mid-frame.
+ */
+#define N3DS_MERGE_BIN_COUNT (N3DS_ATLAS_COUNT + 1) /* [0..11] textured per atlas, [12] untextured/white */
+#define N3DS_MERGE_UNTEX_BIN N3DS_ATLAS_COUNT
+/* Multiple of 3. Sized so typical frames (measured peak 2937 verts TOTAL,
+ * n3ds_backend.h sizing note) never spill even into a single bin; overflow
+ * spills to a segment (one extra draw), never drops. */
+#define N3DS_MERGE_BIN_CAP_VERTS 3072
+typedef struct
+{
+	u8 blendMode; /* BlendMode as int; BM_NONE for opaque spills */
+	u8 doubling;  /* TEV color doubling to set for this draw */
+	u8 atlas;
+	int baseVertex; /* already appended to the frame VBO */
+	int vertCount;
+} N3DS_MergeSegment;
+/* Opaque segments only exist when a bin spills mid-frame -- rare. */
+#define N3DS_MERGE_MAX_OPAQUE_SEGS 64
+/* Blend runs per frame; list full escalates to a (legal) mid-frame barrier. */
+#define N3DS_MERGE_MAX_BLEND_SEGS 1024
+global_variable N3DS_Vertex s_mergeBinVerts[N3DS_MERGE_BIN_COUNT][N3DS_MERGE_BIN_CAP_VERTS];
+global_variable int s_mergeBinUsed[N3DS_MERGE_BIN_COUNT];
+global_variable N3DS_MergeSegment s_mergeOpaqueSegs[N3DS_MERGE_MAX_OPAQUE_SEGS];
+global_variable int s_mergeOpaqueSegCount = 0;
+global_variable N3DS_MergeSegment s_mergeBlendSegs[N3DS_MERGE_MAX_BLEND_SEGS];
+global_variable int s_mergeBlendSegCount = 0;
+global_variable int s_mergeActive = 0;
+/* Runtime A/B toggle (dumpreq 'drawmerge', n3ds_backend.c); the compile
+ * gate is the opt-in, so default ON when built. */
+int g_dbg_drawMerge = 1;
+/* Diagnostics for the stats block: draws emitted by the merge path split
+ * by class, plus the events that cost extra draws or a mid-frame barrier. */
+global_variable u32 s_mergeEmitOpaque = 0;
+global_variable u32 s_mergeEmitBlend = 0;
+global_variable u32 s_mergeBinSpills = 0;
+global_variable u32 s_mergeEscalations = 0;
+#endif /* CTR_NATIVE_DRAW_MERGE */
 
 /*
  * Debug-only, mirrors PC's g_dbg_texturelessMode (native_renderer.c:79,
@@ -1805,6 +1882,189 @@ internal void N3DS_FlushPendingRun(void)
 	s_runVertCount = 0;
 }
 
+#ifdef CTR_NATIVE_DRAW_MERGE
+internal void N3DS_MergeFlush(void);
+
+/*
+ * One deferred draw actually hitting the command list. Doubling is gated by
+ * the caller's tracker because N3DS_C3DSetColorDoubling dirties the TEV
+ * unconditionally; blend is set unconditionally because the backend dedups
+ * it internally (n3ds_backend.h). s_runBlendMode is kept equal to the last
+ * blend mode ACTUALLY set so the non-merge entry guard's change-gating stays
+ * truthful if the toggle flips next frame.
+ */
+internal void N3DS_MergeEmit(int blendMode, int doubling, int atlas, int baseVertex, int vertCount, int *lastDoubling)
+{
+	if (*lastDoubling != doubling)
+	{
+		N3DS_C3DSetColorDoubling(doubling);
+		*lastDoubling = doubling;
+	}
+	N3DS_C3DSetBlendMode(blendMode);
+	s_runBlendMode = blendMode;
+	N3DS_C3DBindAtlas(atlas);
+	N3DS_C3DDrawTriangles(baseVertex, vertCount / 3);
+	s_drawCallCount++;
+	s_frameAtlasMask |= (1u << (atlas & 31));
+}
+
+/*
+ * Closes the open blend run into a recorded segment (verts to the frame
+ * VBO now, draw deferred to the barrier). Only DrawTriangles calls this --
+ * the barrier itself emits the open run directly as its last draw, which
+ * is what makes the capacity escalation below non-recursive.
+ */
+internal void N3DS_MergeCloseBlendRun(void)
+{
+	int baseVertex;
+
+	if (s_runVertCount <= 0)
+	{
+		s_runAtlas = -1;
+		return;
+	}
+
+	if (s_mergeBlendSegCount >= N3DS_MERGE_MAX_BLEND_SEGS)
+	{
+		/* Mid-frame barrier is always legal (every later prim carries a
+		 * larger ordinal) and drains the open run as its last draw. */
+		s_mergeEscalations++;
+		N3DS_MergeFlush();
+		return;
+	}
+
+	baseVertex = N3DS_C3DAppendVertices(s_convertScratch, s_runVertCount);
+	if (baseVertex < 0)
+	{
+		s_droppedRuns++;
+	}
+	else
+	{
+		N3DS_MergeSegment *seg = &s_mergeBlendSegs[s_mergeBlendSegCount++];
+
+		seg->blendMode = (u8)s_runBlendMode;
+		seg->doubling = (u8)(s_runUntextured ? 0 : 1);
+		seg->atlas = (u8)s_runAtlas;
+		seg->baseVertex = baseVertex;
+		seg->vertCount = s_runVertCount;
+	}
+	s_runVertCount = 0;
+	s_runAtlas = -1;
+}
+
+/*
+ * The barrier: everything deferred this frame reaches the command list.
+ * Emission order is the correctness argument in the state block's header
+ * comment: opaque (bins, then spilled segments) first -- internally
+ * order-free, resolved by the depth test -- then blend segments verbatim,
+ * then the still-open blend run, which is by construction the latest blend
+ * content. Also the merge-off fallback for the shared call sites.
+ */
+internal void N3DS_MergeFlush(void)
+{
+	int lastDoubling = -1;
+	int i;
+
+	if (!s_mergeActive)
+	{
+		N3DS_FlushPendingRun();
+		return;
+	}
+
+	for (i = 0; i < N3DS_MERGE_BIN_COUNT; i++)
+	{
+		int baseVertex;
+
+		if (s_mergeBinUsed[i] <= 0)
+		{
+			continue;
+		}
+		baseVertex = N3DS_C3DAppendVertices(s_mergeBinVerts[i], s_mergeBinUsed[i]);
+		if (baseVertex < 0)
+		{
+			s_droppedRuns++;
+		}
+		else
+		{
+			N3DS_MergeEmit(0 /* BM_NONE */, (i == N3DS_MERGE_UNTEX_BIN) ? 0 : 1,
+			               (i == N3DS_MERGE_UNTEX_BIN) ? N3DS_WHITE_ATLAS : i, baseVertex, s_mergeBinUsed[i], &lastDoubling);
+			s_mergeEmitOpaque++;
+		}
+		s_mergeBinUsed[i] = 0;
+	}
+
+	for (i = 0; i < s_mergeOpaqueSegCount; i++)
+	{
+		const N3DS_MergeSegment *seg = &s_mergeOpaqueSegs[i];
+
+		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
+		s_mergeEmitOpaque++;
+	}
+	s_mergeOpaqueSegCount = 0;
+
+	for (i = 0; i < s_mergeBlendSegCount; i++)
+	{
+		const N3DS_MergeSegment *seg = &s_mergeBlendSegs[i];
+
+		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
+		s_mergeEmitBlend++;
+	}
+	s_mergeBlendSegCount = 0;
+
+	if (s_runVertCount > 0)
+	{
+		int baseVertex = N3DS_C3DAppendVertices(s_convertScratch, s_runVertCount);
+
+		if (baseVertex < 0)
+		{
+			s_droppedRuns++;
+		}
+		else
+		{
+			N3DS_MergeEmit(s_runBlendMode, s_runUntextured ? 0 : 1, s_runAtlas, baseVertex, s_runVertCount, &lastDoubling);
+			s_mergeEmitBlend++;
+		}
+	}
+	s_runVertCount = 0;
+	s_runAtlas = -1;
+	/* TEV doubling was left wherever the last emit put it; -1 forces the
+	 * next consumer (either path) to re-assert it. */
+	s_runUntextured = -1;
+}
+
+/* A bin hit capacity mid-frame: spill it as one opaque segment (order-free,
+ * so WHERE it lands in the segment list is irrelevant) and keep binning. */
+internal void N3DS_MergeSpillBin(int bin)
+{
+	int baseVertex;
+
+	s_mergeBinSpills++;
+	if (s_mergeOpaqueSegCount >= N3DS_MERGE_MAX_OPAQUE_SEGS)
+	{
+		s_mergeEscalations++;
+		N3DS_MergeFlush(); /* drains every bin, including this one */
+		return;
+	}
+
+	baseVertex = N3DS_C3DAppendVertices(s_mergeBinVerts[bin], s_mergeBinUsed[bin]);
+	if (baseVertex < 0)
+	{
+		s_droppedRuns++;
+	}
+	else
+	{
+		N3DS_MergeSegment *seg = &s_mergeOpaqueSegs[s_mergeOpaqueSegCount++];
+
+		seg->blendMode = 0; /* BM_NONE */
+		seg->doubling = (u8)((bin == N3DS_MERGE_UNTEX_BIN) ? 0 : 1);
+		seg->atlas = (u8)((bin == N3DS_MERGE_UNTEX_BIN) ? N3DS_WHITE_ATLAS : bin);
+		seg->baseVertex = baseVertex;
+		seg->vertCount = s_mergeBinUsed[bin];
+	}
+	s_mergeBinUsed[bin] = 0;
+}
+#endif /* CTR_NATIVE_DRAW_MERGE */
+
 /* This codebase has no 3-way min/max anywhere -- native_libgte.c's
  * fst_min/fst_max are 2-argument and, being defined in a different
  * translation unit's file scope, not usable from here regardless. Trivial
@@ -1818,6 +2078,115 @@ internal inline int MIN3(int a, int b, int c)
 internal inline int MAX3(int a, int b, int c)
 {
 	return (a > b) ? ((a > c) ? a : c) : ((b > c) ? b : c);
+}
+
+/*
+ * Converts one triangle's three GrVertex into dst[0..2] (any destination:
+ * the pending-run scratch, or a CTR_NATIVE_DRAW_MERGE bin). Extracted from
+ * the DrawTriangles loop 2026-07-28 so the merge path shares the exact
+ * conversion -- especially the UV numerator formulas, whose history of
+ * subtle wrongness (half-texel, V-flip) lives in the comments below. Keep
+ * ONE copy of these formulas, ever.
+ */
+internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVerts, int untextured, int cellX, int cellY,
+                                        int pixelBaseU, int pixelBaseV, int originU, int originV)
+{
+	int v;
+
+	for (v = 0; v < 3; v++)
+	{
+		const GrVertex *src = &triVerts[v];
+		N3DS_Vertex *dst = &dst3[v];
+		/* Vertex colour is the raw PSX colour only. The "bright" x2
+		 * multiplier (MakeTexcoordQuad/Triangle/Rect set bright=2 for
+		 * every textured primitive, MakeTexcoordZero* set 1 for every
+		 * untextured one -- native_gpu.c) is applied by the TEV output
+		 * scale instead, AFTER the texture modulate, matching PC. Baking
+		 * it here clamped the colour to 1.0 before the multiply and lost
+		 * all the headroom above it, which is what made textured surfaces
+		 * render darker than PC. See N3DS_C3DSetColorDoubling. */
+
+		dst->x = (s16)src->x;
+		dst->y = (s16)src->y;
+		/* Emit-ordinal depth substrate, biased into s16 (see
+		 * n3ds_backend.h). Later-parsed prims get larger z. */
+		dst->z = (s16)((int)src->emitOrdinal - 32768);
+
+		/* Offset into the resolved region of the atlas, not the whole
+		 * atlas. Untextured uses the fixed white cell's centre
+		 * (cellX,cellY); textured uses pixelBaseU/V -- a whole 256x256
+		 * full-page cell or a 64x64 sub-page sub-cell, whichever
+		 * N3DS_ResolveTriangleTexture resolved -- plus the triangle's own
+		 * (u,v) re-based against originU/V (0 on the full-page path, so
+		 * this reduces to exactly the old cellX*256+src->u there). Stored
+		 * as the exact integer atlas-texel numerator, range [0,1023] --
+		 * comfortably inside s16 -- with the old /N3DS_ATLAS_DIM divide
+		 * moved into the shader (ctr.v.pica's texcoordScale, design doc
+		 * finding 2, Option A) instead of done here. Do NOT divide here
+		 * too -- that would double-scale every UV. */
+		/*
+		 * Texel-CENTER numerators: 2*texel + 1, scaled by 1/2048 in the
+		 * shader, so the GPU samples at (texel + 0.5) -- the dead centre
+		 * of the intended texel, where nearest-neighbour needs no
+		 * boundary tie-break at all.
+		 *
+		 * CORRECTED RECORD (session 16). The previous 2*texel - 1 form
+		 * ("half-texel", e7ffe8d) cited PC vertices carrying tcx=tcy=-1;
+		 * that claim was wrong -- PC's tcx/tcy block is COMMENTED OUT
+		 * (native_gpu.c, g_cfg_bilinearFiltering), so PC simply floors
+		 * the centre-interpolated UV nudged by a small positive fudge
+		 * (c_UVFudge). Sampling at (texel - 0.5) put every 1:1-mapped
+		 * fragment (font glyphs, sprites, UI quads -- integer UV deltas
+		 * matching integer pixel deltas) EXACTLY ON a texel boundary,
+		 * where the pick is ambiguous, and at a sub-page tile's left/top
+		 * edge the losing side is the NEIGHBOURING 64x64 cache cell -- a
+		 * different texture entirely. Fresh-boot Azahar capture that led
+		 * here: VRAM byte-identical to PC, every fresh cache cell
+		 * byte-correct, screen still quilted garbage -- content was
+		 * fine, addressing was not.
+		 */
+		/*
+		 * V FLIP -- proven by direct observation (session 16 atlas
+		 * inspector, dumpreq 'atlasview'): the GPU's live view of an
+		 * atlas is the CPU-side memory VERTICALLY MIRRORED (white cell
+		 * at memory top renders at screen bottom; cell rows in exact
+		 * reverse order). PICA T=0 reads our tiler's LAST row: the
+		 * tex3ds parity probe used `tex3ds -r` (raw, unflipped), so it
+		 * validated Morton/tile math while silently inheriting the
+		 * wrong orientation, and PresentVRAMRect's empirical quad-V
+		 * swap (2026-07-20) was this same fact discovered locally.
+		 * Sample-side fix: numerator 2048-(2a+1) = 2047-2a targets
+		 * memory row a from the bottom-up T axis. Applies to the white
+		 * cell too -- the earlier "white renders fine unflipped"
+		 * counterargument fails because unflipped sampling read cell
+		 * (0,3)'s lightish content, which multiplies vertex colors
+		 * plausibly enough to pass eyeballing; the inspector picture
+		 * is the ground truth. U is NOT flipped (horizontal order
+		 * matches between the views).
+		 */
+		if (untextured)
+		{
+			dst->u = (s16)(((cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) + 1);
+			dst->v = (s16)(2047 - ((cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1));
+		}
+		else
+		{
+			dst->u = (s16)(((pixelBaseU + ((int)src->u - originU)) << 1) + 1);
+			dst->v = (s16)(2047 - ((pixelBaseV + ((int)src->v - originV)) << 1));
+		}
+
+		/* Raw u8 copy, no scale -- the *1/255 reciprocal-multiply that
+		 * used to live here (and the hot-path reasoning for why it was a
+		 * multiply, not a divide) moved into the shader's colorScale
+		 * constant instead (design doc finding 3). Alpha is no longer a
+		 * struct field: color is fetched at count=3 (RGB only) now, and
+		 * the shader writes a constant 1.0 for alpha -- dst->a was
+		 * already a hardcoded 1.0f here, never read from src->a, so
+		 * dropping the field loses no real value. */
+		dst->r = src->r;
+		dst->g = src->g;
+		dst->b = src->b;
+	}
 }
 
 /*
@@ -2108,6 +2477,24 @@ void NativeRenderer_BeginScene(void)
 	s_runAtlas = -1;
 	s_runVertCount = 0;
 	s_runUntextured = -1;
+
+#ifdef CTR_NATIVE_DRAW_MERGE
+	/* Latch the toggle so 'drawmerge' can never flip mid-frame, and
+	 * defensively drop any deferred state a frame that skipped EndScene
+	 * could have stranded -- the VBO cursor just reset, so stale recorded
+	 * baseVertex values must never survive into this frame. */
+	s_mergeActive = g_dbg_drawMerge;
+	{
+		int bin;
+
+		for (bin = 0; bin < N3DS_MERGE_BIN_COUNT; bin++)
+		{
+			s_mergeBinUsed[bin] = 0;
+		}
+	}
+	s_mergeOpaqueSegCount = 0;
+	s_mergeBlendSegCount = 0;
+#endif
 }
 
 void NativeRenderer_EndScene(void)
@@ -2117,9 +2504,14 @@ void NativeRenderer_EndScene(void)
 		return;
 	}
 
-	/* Last flush point of the frame: whatever run the final splits left
-	 * open has to be recorded before C3D_FrameEnd submits the frame. */
+	/* Last flush point of the frame: whatever the final splits left
+	 * deferred (merge bins/segments, or just the pending run) has to be
+	 * recorded before C3D_FrameEnd submits the frame. */
+#ifdef CTR_NATIVE_DRAW_MERGE
+	N3DS_MergeFlush();
+#else
 	N3DS_FlushPendingRun();
+#endif
 
 #ifdef CTR_INTERNAL
 	/*
@@ -2323,6 +2715,19 @@ void NativeRenderer_SwapWindow(void)
 			printf("hazard evictInUse %-8lu\n", (unsigned long)s_evictHazards);
 			printf("draws  total %-8lu +%-6lu/w  ~%lu.%lu draws/frame        \n", (unsigned long)s_drawCallCount, drawsWindow,
 			       drawsPerFrameAvgX10 / 10UL, drawsPerFrameAvgX10 % 10UL);
+#ifdef CTR_NATIVE_DRAW_MERGE
+			/* The A/B instrument for the cross-bucket merge: read
+			 * draws/frame above with merge on vs off ('drawmerge' in
+			 * dumpreq.txt). op/bl split says where the remaining draws come from;
+			 * spill/esc nonzero means capacity tuning is needed. */
+			printf("merge  %-3s op %-8lu bl %-8lu spill %-4lu esc %-4lu\n", s_mergeActive ? "ON" : "off",
+			       (unsigned long)s_mergeEmitOpaque, (unsigned long)s_mergeEmitBlend, (unsigned long)s_mergeBinSpills,
+			       (unsigned long)s_mergeEscalations);
+			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] merge active=%d emitOpaque=%lu emitBlend=%lu spills=%lu escalations=%lu",
+			         s_mergeActive, (unsigned long)s_mergeEmitOpaque, (unsigned long)s_mergeEmitBlend,
+			         (unsigned long)s_mergeBinSpills, (unsigned long)s_mergeEscalations);
+			N3DS_DebugLog(cacheLine);
+#endif
 
 			snprintf(cacheLine, sizeof(cacheLine),
 			         "[CTR-3DS] cache hits=%lu misses=%lu missesWindow=%lu evictions=%lu evictionsWindow=%lu draws=%lu drawsWindow=%lu",
@@ -2737,11 +3142,15 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 		return;
 	}
 
-	/* Foreign (non-atlas) draw: the pending atlas run must be recorded
+	/* Foreign (non-atlas) draw: everything deferred must be recorded
 	 * first, both for paint order and because the TEV change below would
 	 * otherwise apply to it. The TEV latch is invalidated so the next
 	 * DrawTriangles re-asserts its own scale. */
+#ifdef CTR_NATIVE_DRAW_MERGE
+	N3DS_MergeFlush();
+#else
 	N3DS_FlushPendingRun();
+#endif
 	s_runUntextured = -1;
 
 	N3DS_C3DSetColorDoubling(0);
@@ -3153,20 +3562,46 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	 * common case (consecutive same-state splits) costs two compares and
 	 * no flush: that is where the draws/frame reduction comes from.
 	 */
-	if (untextured != s_runUntextured)
+#ifdef CTR_NATIVE_DRAW_MERGE
+	if (s_mergeActive)
 	{
-		N3DS_FlushPendingRun();
-		/* bright is 2 for every textured primitive and 1 for every
-		 * untextured one, without exception (native_gpu.c), so the split's
-		 * texture sentinel determines it for the whole call. */
-		N3DS_C3DSetColorDoubling(untextured ? 0 : 1);
-		s_runUntextured = untextured;
+		/*
+		 * Merge frame: no immediate GPU state calls at all -- state is set
+		 * at the barrier, per emitted draw. Opaque calls touch nothing here
+		 * (bins are self-keyed and the blend run legally stays open across
+		 * them); a blend call closes the run only on a real state change,
+		 * then stamps the run descriptors with this call's state --
+		 * N3DS_MergeCloseBlendRun reads them at close time, so they must
+		 * always describe what the run is accumulating.
+		 */
+		if (s_currentBlendMode != 0 /* BM_NONE */)
+		{
+			if ((s_runVertCount > 0) && ((untextured != s_runUntextured) || (s_currentBlendMode != s_runBlendMode)))
+			{
+				N3DS_MergeCloseBlendRun();
+			}
+			s_runUntextured = untextured;
+			s_runBlendMode = s_currentBlendMode;
+		}
 	}
-	if (s_currentBlendMode != s_runBlendMode)
+	else
+#endif
 	{
-		N3DS_FlushPendingRun();
-		N3DS_C3DSetBlendMode(s_currentBlendMode);
-		s_runBlendMode = s_currentBlendMode;
+		if (untextured != s_runUntextured)
+		{
+			N3DS_FlushPendingRun();
+			/* bright is 2 for every textured primitive and 1 for every
+			 * untextured one, without exception (native_gpu.c), so the split's
+			 * texture sentinel determines it for the whole call. */
+			N3DS_C3DSetColorDoubling(untextured ? 0 : 1);
+			s_runUntextured = untextured;
+		}
+		if (s_currentBlendMode != s_runBlendMode)
+		{
+			N3DS_FlushPendingRun();
+			N3DS_C3DSetBlendMode(s_currentBlendMode);
+			s_runBlendMode = s_currentBlendMode;
+		}
 	}
 
 	/*
@@ -3193,7 +3628,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 	for (i = 0; i < triangles; i++)
 	{
 		const GrVertex *triVerts = &s_pendingVertices[startVertex + (i * 3)];
-		int atlasIdx, cellX = 0, cellY = 0, pixelBaseU = 0, pixelBaseV = 0, originU = 0, originV = 0, v;
+		int atlasIdx, cellX = 0, cellY = 0, pixelBaseU = 0, pixelBaseV = 0, originU = 0, originV = 0;
 
 		if (perfScopes)
 		{
@@ -3248,6 +3683,39 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
 		}
 
+#ifdef CTR_NATIVE_DRAW_MERGE
+		if (s_mergeActive && (s_currentBlendMode == 0 /* BM_NONE */))
+		{
+			/* Opaque under merge: no run, no order -- straight into the
+			 * per-state bin; the depth test owns layering. Untextured
+			 * always resolves to the white cell, so it gets the one
+			 * non-atlas-keyed bin. */
+			const int bin = untextured ? N3DS_MERGE_UNTEX_BIN : atlasIdx;
+
+			if ((s_mergeBinUsed[bin] + 3) > N3DS_MERGE_BIN_CAP_VERTS)
+			{
+				N3DS_MergeSpillBin(bin);
+			}
+
+#ifdef CTR_INTERNAL
+			N3DS_TriDumpRecord(triVerts, !untextured, untextured ? 255 : (int)s_currentTexFormat, atlasIdx, pixelBaseU, pixelBaseV, originU, originV);
+#endif
+
+			if (perfScopes)
+			{
+				NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+			}
+			N3DS_ConvertTriangleVerts(&s_mergeBinVerts[bin][s_mergeBinUsed[bin]], triVerts, untextured, cellX, cellY, pixelBaseU,
+			                          pixelBaseV, originU, originV);
+			if (perfScopes)
+			{
+				NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+			}
+			s_mergeBinUsed[bin] += 3;
+			continue;
+		}
+#endif
+
 		if ((atlasIdx != s_runAtlas) || ((s_runVertCount + 3) > N3DS_MAX_RUN_VERTICES))
 		{
 			/* Attribute the flush: only a MID-RUN atlas change is the
@@ -3259,7 +3727,17 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			{
 				s_atlasSwitchFlushes++;
 			}
-			N3DS_FlushPendingRun();
+#ifdef CTR_NATIVE_DRAW_MERGE
+			if (s_mergeActive)
+			{
+				/* Blend run under merge: recorded segment, not a draw. */
+				N3DS_MergeCloseBlendRun();
+			}
+			else
+#endif
+			{
+				N3DS_FlushPendingRun();
+			}
 			s_runAtlas = atlasIdx;
 		}
 
@@ -3271,100 +3749,10 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		{
 			NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
 		}
-		for (v = 0; v < 3; v++)
-		{
-			const GrVertex *src = &triVerts[v];
-			N3DS_Vertex *dst = &s_convertScratch[s_runVertCount + v];
-			/* Vertex colour is the raw PSX colour only. The "bright" x2
-			 * multiplier (MakeTexcoordQuad/Triangle/Rect set bright=2 for
-			 * every textured primitive, MakeTexcoordZero* set 1 for every
-			 * untextured one -- native_gpu.c) is applied by the TEV output
-			 * scale instead, AFTER the texture modulate, matching PC. Baking
-			 * it here clamped the colour to 1.0 before the multiply and lost
-			 * all the headroom above it, which is what made textured surfaces
-			 * render darker than PC. See N3DS_C3DSetColorDoubling. */
-
-			dst->x = (s16)src->x;
-			dst->y = (s16)src->y;
-			/* Emit-ordinal depth substrate, biased into s16 (see
-			 * n3ds_backend.h). Later-parsed prims get larger z. */
-			dst->z = (s16)((int)src->emitOrdinal - 32768);
-
-			/* Offset into the resolved region of the atlas, not the whole
-			 * atlas. Untextured uses the fixed white cell's centre
-			 * (cellX,cellY); textured uses pixelBaseU/V -- a whole 256x256
-			 * full-page cell or a 64x64 sub-page sub-cell, whichever
-			 * N3DS_ResolveTriangleTexture resolved -- plus the triangle's own
-			 * (u,v) re-based against originU/V (0 on the full-page path, so
-			 * this reduces to exactly the old cellX*256+src->u there). Stored
-			 * as the exact integer atlas-texel numerator, range [0,1023] --
-			 * comfortably inside s16 -- with the old /N3DS_ATLAS_DIM divide
-			 * moved into the shader (ctr.v.pica's texcoordScale, design doc
-			 * finding 2, Option A) instead of done here. Do NOT divide here
-			 * too -- that would double-scale every UV. */
-			/*
-			 * Texel-CENTER numerators: 2*texel + 1, scaled by 1/2048 in the
-			 * shader, so the GPU samples at (texel + 0.5) -- the dead centre
-			 * of the intended texel, where nearest-neighbour needs no
-			 * boundary tie-break at all.
-			 *
-			 * CORRECTED RECORD (session 16). The previous 2*texel - 1 form
-			 * ("half-texel", e7ffe8d) cited PC vertices carrying tcx=tcy=-1;
-			 * that claim was wrong -- PC's tcx/tcy block is COMMENTED OUT
-			 * (native_gpu.c, g_cfg_bilinearFiltering), so PC simply floors
-			 * the centre-interpolated UV nudged by a small positive fudge
-			 * (c_UVFudge). Sampling at (texel - 0.5) put every 1:1-mapped
-			 * fragment (font glyphs, sprites, UI quads -- integer UV deltas
-			 * matching integer pixel deltas) EXACTLY ON a texel boundary,
-			 * where the pick is ambiguous, and at a sub-page tile's left/top
-			 * edge the losing side is the NEIGHBOURING 64x64 cache cell -- a
-			 * different texture entirely. Fresh-boot Azahar capture that led
-			 * here: VRAM byte-identical to PC, every fresh cache cell
-			 * byte-correct, screen still quilted garbage -- content was
-			 * fine, addressing was not.
-			 */
-			/*
-			 * V FLIP -- proven by direct observation (session 16 atlas
-			 * inspector, dumpreq 'atlasview'): the GPU's live view of an
-			 * atlas is the CPU-side memory VERTICALLY MIRRORED (white cell
-			 * at memory top renders at screen bottom; cell rows in exact
-			 * reverse order). PICA T=0 reads our tiler's LAST row: the
-			 * tex3ds parity probe used `tex3ds -r` (raw, unflipped), so it
-			 * validated Morton/tile math while silently inheriting the
-			 * wrong orientation, and PresentVRAMRect's empirical quad-V
-			 * swap (2026-07-20) was this same fact discovered locally.
-			 * Sample-side fix: numerator 2048-(2a+1) = 2047-2a targets
-			 * memory row a from the bottom-up T axis. Applies to the white
-			 * cell too -- the earlier "white renders fine unflipped"
-			 * counterargument fails because unflipped sampling read cell
-			 * (0,3)'s lightish content, which multiplies vertex colors
-			 * plausibly enough to pass eyeballing; the inspector picture
-			 * is the ground truth. U is NOT flipped (horizontal order
-			 * matches between the views).
-			 */
-			if (untextured)
-			{
-				dst->u = (s16)(((cellX * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) + 1);
-				dst->v = (s16)(2047 - ((cellY * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1));
-			}
-			else
-			{
-				dst->u = (s16)(((pixelBaseU + ((int)src->u - originU)) << 1) + 1);
-				dst->v = (s16)(2047 - ((pixelBaseV + ((int)src->v - originV)) << 1));
-			}
-
-			/* Raw u8 copy, no scale -- the *1/255 reciprocal-multiply that
-			 * used to live here (and the hot-path reasoning for why it was a
-			 * multiply, not a divide) moved into the shader's colorScale
-			 * constant instead (design doc finding 3). Alpha is no longer a
-			 * struct field: color is fetched at count=3 (RGB only) now, and
-			 * the shader writes a constant 1.0 for alpha -- dst->a was
-			 * already a hardcoded 1.0f here, never read from src->a, so
-			 * dropping the field loses no real value. */
-			dst->r = src->r;
-			dst->g = src->g;
-			dst->b = src->b;
-		}
+		/* Conversion (and the UV-numerator record) lives in
+		 * N3DS_ConvertTriangleVerts, shared with the merge bins. */
+		N3DS_ConvertTriangleVerts(&s_convertScratch[s_runVertCount], triVerts, untextured, cellX, cellY, pixelBaseU, pixelBaseV,
+		                          originU, originV);
 		if (perfScopes)
 		{
 			NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);

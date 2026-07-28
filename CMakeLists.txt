@@ -190,6 +190,23 @@ if(CTR_NATIVE_OT_DEPTH)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_OT_DEPTH=1)
 endif()
 
+# First consumer of the depth substrate: defer the frame's draws, bin opaque
+# (BM_NONE) content by GPU state across OT buckets, replay blends in order.
+# Collapses the ~350 state transitions of a race frame's walk into ~a-draw-
+# per-state. Requires CTR_NATIVE_OT_DEPTH (the depth test is what makes
+# opaque reorder legal); runtime A/B via dumpreq 'drawmerge'. This is the
+# gate that deliberately gives up the substrate's ON==OFF pixel identity --
+# opaque submission ORDER changes, pixels should not, and draws/frame must.
+option(CTR_NATIVE_DRAW_MERGE
+    "3DS: cross-bucket state-sorted draw merge (needs CTR_NATIVE_OT_DEPTH)"
+    OFF)
+if(CTR_NATIVE_DRAW_MERGE)
+    if(NOT CTR_NATIVE_OT_DEPTH)
+        message(FATAL_ERROR "CTR_NATIVE_DRAW_MERGE requires CTR_NATIVE_OT_DEPTH=ON")
+    endif()
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_DRAW_MERGE=1)
+endif()
+
 # Log every growth/reset of the decoded-voice PCM arena in the audio mixer.
 option(CTR_NATIVE_AUDIO_ARENA_LOG
     "Log decoded-voice PCM arena growth and resets"

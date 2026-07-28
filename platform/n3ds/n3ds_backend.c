@@ -1030,6 +1030,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *   single      -- toggle g_dbg_forceSingleTexture
 	 *   textureless -- toggle g_dbg_texturelessMode
 	 *   triscopes   -- toggle g_dbg_perfTriScopes (per-triangle perf split; taxed)
+	 *   drawmerge   -- toggle g_dbg_drawMerge (CTR_NATIVE_DRAW_MERGE builds only)
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -1080,6 +1081,18 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_perfTriScopes ? "[CTR-3DS] per-tri perf scopes: ON (syscall tax ~10k/frame)"
 					                                  : "[CTR-3DS] per-tri perf scopes: off");
 				}
+#ifdef CTR_NATIVE_DRAW_MERGE
+				else if (strncmp(word, "drawmerge", 9) == 0)
+				{
+					extern int g_dbg_drawMerge;
+
+					/* Latched at BeginScene, so the flip lands on the next
+					 * frame boundary -- never mid-frame. */
+					g_dbg_drawMerge ^= 1;
+					N3DS_DebugLog(g_dbg_drawMerge ? "[CTR-3DS] draw merge: ON (deferred bins + segment replay)"
+					                              : "[CTR-3DS] draw merge: off (immediate runs)");
+				}
+#endif
 				else if (strncmp(word, "atlasview", 9) == 0)
 				{
 					extern int g_dbg_atlasView;
