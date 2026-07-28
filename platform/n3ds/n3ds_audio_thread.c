@@ -30,7 +30,7 @@
  * NativeAudio_RenderVBlankForAudioThread is a small external-linkage wrapper
  * native_audio.c exposes specifically for this cross-TU call: it owns its
  * own scratch buffer and hands the rendered samples to
- * N3DS_NdspSubmitVBlankBlock below, so nothing PSX-typed needs to cross
+ * N3DS_NdspSubmitMusicParcel below, so nothing PSX-typed needs to cross
  * this boundary -- the signature is deliberately void->void. There is no
  * shared header enforcing this prototype; if that wrapper's signature ever
  * changes, this declaration must be updated by hand.
@@ -87,14 +87,29 @@ extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *life
 #define NATIVE_AUDIO_THREAD_MAX_BACKLOG_VBLANKS 8
 
 /*
- * One vblank of stereo PCM at the mixer's fixed PSX SPU rate. Hand-matched
- * to NATIVE_AUDIO_VBLANK_FRAMES (native_audio.c: 44100/60 = 735) the same
- * way the extern prototypes above are hand-matched: the game-side header
- * cannot cross this boundary. N3DS_NdspSubmitVBlankBlock rejects (and
- * counts) any submit whose frame count disagrees, so a drift here is loud
- * in the counters rather than silent corruption.
+ * Upper bound on one parcel: one vblank of stereo PCM at the highest rate a
+ * producer can submit. Hand-matched to NATIVE_AUDIO_VBLANK_FRAMES
+ * (native_audio.c: 44100/60 = 735) the same way the extern prototypes above
+ * are hand-matched -- the game-side header cannot cross this boundary.
+ *
+ * A parcel is now "one vblank of audio", NOT "735 frames": session 22 feeds
+ * this channel XA source PCM at its native 37800/18900 rate (630/315 frames
+ * per vblank) so the DSP resamples in hardware and the CPU resampler --
+ * measured at 52-56ms per 16.7ms parcel on the ARM11, i.e. the "talking into
+ * a fan" announcer -- disappears entirely. The full-mixer StepVBlank
+ * fallback still submits 735 at 44100. Both go through the same sink; only
+ * the frame COUNT and the channel rate differ, and the parcel unit keeps its
+ * meaning for the worker's cushion target either way.
+ *
+ * N3DS_NdspSubmitMusicParcel rejects (and counts) anything outside
+ * 1..MAX, so a drift is loud in the counters rather than silent corruption.
  */
-#define N3DS_NDSP_BLOCK_FRAMES 735
+#define N3DS_NDSP_PARCEL_FRAMES_MAX 735
+/* The software mixer's fixed PSX SPU rate (native_audio.c
+ * NATIVE_AUDIO_SAMPLE_RATE, hand-matched like the frame count above). Only
+ * the StepVBlank fallback produces at this rate now; it is also the channel's
+ * starting rate before any producer has submitted. */
+#define N3DS_NDSP_MIXER_RATE_HZ     44100
 /*
  * Aggregation (session 21): the submit API still takes one 735-frame parcel
  * per call, but the sink now accumulates N3DS_NDSP_AGG_PARCELS of them into
@@ -115,14 +130,24 @@ extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *life
  * the worker's ~200ms cushion -- fine for music/announcer (SFX latency is
  * untouched; voices 0..22 are their own channels). To keep a track start
  * from waiting for a full aggregate, a partial buffer is flushed early
- * whenever the DSP is about to run dry (see SubmitVBlankBlock).
+ * whenever the DSP is about to run dry (see SubmitMusicParcel).
  *
  * Pool: 6 aggregate buffers x 5880 frames ~= 800ms capacity, comfortably
  * above the worker's 12-parcel cushion target. Full pool drops the newest
- * parcel (counted), never blocks the mixer.
+ * parcel (counted), never blocks the mixer. Sized for the worst case
+ * (8 x 735); native-rate XA parcels are smaller, so a full aggregate is
+ * 8 x 630 = 5040 frames and the slot simply has slack -- aggregation tracks
+ * FRAMES accumulated, not parcels x a fixed stride, so a variable (or even
+ * mid-track changing) parcel size stays contiguous inside the slot.
+ *
+ * Session-21 note that now becomes testable: aggFull was 0 on every hardware
+ * log because parcel production ran at 1/3 real time and the DSP was always
+ * about to run dry, so every flush was an early one. If the native-rate
+ * change lands, production reaches real time and aggFull should finally
+ * dominate -- that is the second receipt to read on the next log.
  */
 #define N3DS_NDSP_AGG_PARCELS  8
-#define N3DS_NDSP_AGG_FRAMES   (N3DS_NDSP_BLOCK_FRAMES * N3DS_NDSP_AGG_PARCELS)
+#define N3DS_NDSP_AGG_FRAMES   (N3DS_NDSP_PARCEL_FRAMES_MAX * N3DS_NDSP_AGG_PARCELS)
 #define N3DS_NDSP_BLOCK_COUNT  6
 /*
  * Channel plan (ndsp has exactly 24): SPU voices 0..22 map 1:1 onto ndsp
@@ -156,7 +181,7 @@ static volatile int s_audioThreadRunning; /* set true only after a real thread o
 
 /*
  * ndsp sink state. Written only from N3DS_AudioThreadInit/Shutdown (main
- * thread) and N3DS_NdspSubmitVBlankBlock. Submit runs on exactly one thread
+ * thread) and N3DS_NdspSubmitMusicParcel. Submit runs on exactly one thread
  * at any point in the process lifetime -- the worker when one exists, else
  * the main thread's StepVBlank fallback (N3DS_AudioThreadIsRunning never
  * flips true after init) -- so the ring cursor needs no lock of its own.
@@ -165,9 +190,16 @@ static int s_ndspInitAttempted;
 static int s_ndspUp;
 static s16 *s_ndspPcm;                                  /* linearAlloc: BLOCK_COUNT x AGG_FRAMES x stereo */
 static ndspWaveBuf s_ndspBufs[N3DS_NDSP_BLOCK_COUNT];   /* statuses start 0 = NDSP_WBUF_FREE */
+static int s_ndspBufParcels[N3DS_NDSP_BLOCK_COUNT];     /* vblanks of audio in each handed-over buffer */
 static int s_ndspNextBuf;
-static int s_ndspAggFill; /* parcels accumulated in s_ndspBufs[s_ndspNextBuf] so far (0..AGG_PARCELS) */
+static int s_ndspAggParcels; /* parcels accumulated in s_ndspBufs[s_ndspNextBuf] so far (0..AGG_PARCELS) */
+static int s_ndspAggFrames;  /* frames accumulated in that slot -- the append cursor, rate-agnostic */
 static u32 s_ndspDroppedBlocks;
+/* Channel state, so the pokes happen on change instead of per submit. Rate 0
+ * = never set. See N3DS_NdspApplyChannelState. */
+static int s_ndspRate;
+static float s_ndspGainLeft = -1.0f;
+static float s_ndspGainRight = -1.0f;
 /* Which mode the sink actually ran in -- full 8-parcel aggregates (seams
  * ~7.5/sec, the fix engaged) vs early anti-underrun flushes (small buffers,
  * degenerates toward the old 60-crumb behavior). Azahar's HLE gulps the
@@ -223,16 +255,75 @@ static void N3DS_NdspSinkInit(void)
 	ndspSetOutputMode(NDSP_OUTPUT_STEREO);
 	ndspChnReset(N3DS_NDSP_CHANNEL);
 	ndspChnSetInterp(N3DS_NDSP_CHANNEL, NDSP_INTERP_POLYPHASE);
-	ndspChnSetRate(N3DS_NDSP_CHANNEL, 44100.0f); /* PSX SPU rate; DSP resamples to its native output rate */
+	/* Starting rate only. The first submit re-pokes this to whatever the
+	 * producer actually rendered at -- 37800/18900 for native-rate XA, 44100
+	 * for the full-mixer fallback (N3DS_NdspApplyChannelState). */
+	ndspChnSetRate(N3DS_NDSP_CHANNEL, (float)N3DS_NDSP_MIXER_RATE_HZ);
 	ndspChnSetFormat(N3DS_NDSP_CHANNEL, NDSP_FORMAT_STEREO_PCM16);
 	memset(mix, 0, sizeof(mix));
 	mix[0] = 1.0f; /* front left */
 	mix[1] = 1.0f; /* front right */
 	ndspChnSetMix(N3DS_NDSP_CHANNEL, mix);
+	s_ndspRate = N3DS_NDSP_MIXER_RATE_HZ;
+	s_ndspGainLeft = 1.0f;
+	s_ndspGainRight = 1.0f;
 
 	s_ndspUp = 1;
-	snprintf(line, sizeof(line), "[CTR-3DS] ndsp: up (%d aggs x %d parcels x %d frames)", N3DS_NDSP_BLOCK_COUNT, N3DS_NDSP_AGG_PARCELS, N3DS_NDSP_BLOCK_FRAMES);
+	snprintf(line, sizeof(line), "[CTR-3DS] ndsp: up (%d aggs x %d parcels x <=%d frames)", N3DS_NDSP_BLOCK_COUNT, N3DS_NDSP_AGG_PARCELS,
+	         N3DS_NDSP_PARCEL_FRAMES_MAX);
 	N3DS_DebugLog(line);
+}
+
+/*
+ * Poke the music channel only when something actually changed -- the same
+ * on-change discipline the hardware-voice mirror uses for its per-vblank
+ * SetMix/SetRate updates.
+ *
+ * The rate change carries one deliberate side effect. XA pins its rate per
+ * track, so a change means a new track has taken over the channel; anything
+ * still queued is the previous track's tail, which the DSP would now replay
+ * at the new pitch. Dropping it is more correct than pitch-shifting it, and
+ * the partially-filled slot belongs to the old track as well.
+ */
+static int N3DS_NdspQueuedParcelsDspSide(void);
+
+static void N3DS_NdspApplyChannelState(int sampleRate, float gainLeft, float gainRight)
+{
+	if (sampleRate != s_ndspRate)
+	{
+		char line[128];
+		/* Named, not silent: this discard is a deliberate bounded loss, and an
+		 * unexplained gap at a track change is exactly the kind of thing a log
+		 * should account for rather than leave to inference. */
+		int discarded = N3DS_NdspQueuedParcelsDspSide() + s_ndspAggParcels;
+
+		ndspChnWaveBufClear(N3DS_NDSP_CHANNEL);
+		/* Safe to zero: the clear above dropped the DSP's references to these
+		 * buffers. Same reset N3DS_NdspSinkShutdown performs. */
+		memset(s_ndspBufs, 0, sizeof(s_ndspBufs));
+		memset(s_ndspBufParcels, 0, sizeof(s_ndspBufParcels));
+		s_ndspNextBuf = 0;
+		s_ndspAggParcels = 0;
+		s_ndspAggFrames = 0;
+
+		ndspChnSetRate(N3DS_NDSP_CHANNEL, (float)sampleRate);
+		s_ndspRate = sampleRate;
+
+		snprintf(line, sizeof(line), "[CTR-3DS] ndsp: music rate -> %d Hz (DSP resamples in hardware), dropped %d stale parcel(s)", sampleRate, discarded);
+		N3DS_DebugLog(line);
+	}
+
+	if ((gainLeft != s_ndspGainLeft) || (gainRight != s_ndspGainRight))
+	{
+		float mix[12];
+
+		memset(mix, 0, sizeof(mix));
+		mix[0] = gainLeft;
+		mix[1] = gainRight;
+		ndspChnSetMix(N3DS_NDSP_CHANNEL, mix);
+		s_ndspGainLeft = gainLeft;
+		s_ndspGainRight = gainRight;
+	}
 }
 
 static void N3DS_NdspSinkShutdown(void)
@@ -265,20 +356,25 @@ static void N3DS_NdspSinkShutdown(void)
 	s_ndspUp = 0;
 	s_ndspInitAttempted = 0; /* a later re-Init may bring the sink back up */
 	s_ndspNextBuf = 0;
-	s_ndspAggFill = 0;
+	s_ndspAggParcels = 0;
+	s_ndspAggFrames = 0;
+	s_ndspRate = 0;
+	s_ndspGainLeft = -1.0f;
+	s_ndspGainRight = -1.0f;
 	memset(s_ndspBufs, 0, sizeof(s_ndspBufs));
+	memset(s_ndspBufParcels, 0, sizeof(s_ndspBufParcels));
 }
 
 static int N3DS_NdspQueuedParcelsDspSide(void);
 
-/* Hand the accumulated aggregate (s_ndspAggFill parcels) to the DSP and
- * advance to the next pool slot. Caller guarantees fill > 0 and the current
+/* Hand the accumulated aggregate to the DSP and advance to the next pool
+ * slot. Caller guarantees at least one parcel is accumulated and the current
  * slot is free (both checked by the submit path below). */
 static void N3DS_NdspFlushAggregate(void)
 {
 	ndspWaveBuf *buf = &s_ndspBufs[s_ndspNextBuf];
 	s16 *slot = s_ndspPcm + (size_t)s_ndspNextBuf * N3DS_NDSP_AGG_FRAMES * 2;
-	u32 frames = (u32)s_ndspAggFill * N3DS_NDSP_BLOCK_FRAMES;
+	u32 frames = (u32)s_ndspAggFrames;
 
 	DSP_FlushDataCache(slot, frames * 2 * sizeof(s16)); /* once per aggregate, not per parcel */
 
@@ -288,8 +384,13 @@ static void N3DS_NdspFlushAggregate(void)
 	buf->looping = false;
 	ndspChnWaveBufAdd(N3DS_NDSP_CHANNEL, buf);
 
+	/* Remembered per buffer rather than recomputed from nsamples: parcels are
+	 * no longer a fixed frame count, so nsamples/PARCEL_FRAMES would be wrong
+	 * (and it was a division on the queue-depth query's hot path). */
+	s_ndspBufParcels[s_ndspNextBuf] = s_ndspAggParcels;
 	s_ndspNextBuf = (s_ndspNextBuf + 1) % N3DS_NDSP_BLOCK_COUNT;
-	s_ndspAggFill = 0;
+	s_ndspAggParcels = 0;
+	s_ndspAggFrames = 0;
 }
 
 /* Flush a partially-filled aggregate, if any. Called by the worker when XA
@@ -300,7 +401,7 @@ static void N3DS_NdspFlushAggregate(void)
  * with the next append). */
 static void N3DS_NdspFlushPending(void)
 {
-	if (!s_ndspUp || (s_ndspAggFill <= 0))
+	if (!s_ndspUp || (s_ndspAggParcels <= 0))
 	{
 		return;
 	}
@@ -311,7 +412,7 @@ static void N3DS_NdspFlushPending(void)
 	N3DS_NdspFlushAggregate();
 }
 
-int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount)
+int N3DS_NdspSubmitMusicParcel(const short *frames, int frameCount, int sampleRate, float gainLeft, float gainRight)
 {
 	ndspWaveBuf *buf;
 	s16 *slot;
@@ -320,13 +421,17 @@ int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount)
 	{
 		return 0;
 	}
-	if (frameCount != N3DS_NDSP_BLOCK_FRAMES)
+	if ((frames == NULL) || (frameCount <= 0) || (frameCount > N3DS_NDSP_PARCEL_FRAMES_MAX) || (sampleRate <= 0))
 	{
-		/* Hand-matched constant drifted (see N3DS_NDSP_BLOCK_FRAMES) --
-		 * refuse loudly-in-counters rather than under/overrun the slot. */
+		/* Producer disagrees with the hand-matched bound (see
+		 * N3DS_NDSP_PARCEL_FRAMES_MAX) -- refuse loudly-in-counters rather
+		 * than under/overrun the slot. */
 		s_ndspDroppedBlocks++;
 		return 0;
 	}
+
+	/* Before reading s_ndspNextBuf: a rate change resets the pool. */
+	N3DS_NdspApplyChannelState(sampleRate, gainLeft, gainRight);
 
 	buf = &s_ndspBufs[s_ndspNextBuf];
 	if ((buf->status == NDSP_WBUF_QUEUED) || (buf->status == NDSP_WBUF_PLAYING))
@@ -337,9 +442,26 @@ int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount)
 		return 0;
 	}
 
-	slot = s_ndspPcm + ((size_t)s_ndspNextBuf * N3DS_NDSP_AGG_FRAMES + (size_t)s_ndspAggFill * N3DS_NDSP_BLOCK_FRAMES) * 2;
-	memcpy(slot, frames, (size_t)N3DS_NDSP_BLOCK_FRAMES * 2 * sizeof(s16));
-	s_ndspAggFill++;
+	/* Slot cannot hold this parcel as well: hand off what is accumulated and
+	 * start a fresh one, so an aggregate is always contiguous. Unreachable at
+	 * a steady parcel size (AGG_PARCELS x PARCEL_FRAMES_MAX is exactly one
+	 * slot); reachable if the parcel size grew mid-slot. */
+	if ((s_ndspAggFrames + frameCount) > N3DS_NDSP_AGG_FRAMES)
+	{
+		s_ndspFullFlushes++;
+		N3DS_NdspFlushAggregate();
+		buf = &s_ndspBufs[s_ndspNextBuf];
+		if ((buf->status == NDSP_WBUF_QUEUED) || (buf->status == NDSP_WBUF_PLAYING))
+		{
+			s_ndspDroppedBlocks++;
+			return 0;
+		}
+	}
+
+	slot = s_ndspPcm + ((size_t)s_ndspNextBuf * N3DS_NDSP_AGG_FRAMES + (size_t)s_ndspAggFrames) * 2;
+	memcpy(slot, frames, (size_t)frameCount * 2 * sizeof(s16));
+	s_ndspAggFrames += frameCount;
+	s_ndspAggParcels++;
 
 	/*
 	 * Flush when full -- or EARLY when the DSP is about to run dry, so a
@@ -348,7 +470,7 @@ int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount)
 	 * flush produces one small buffer; the queue behind it refills with
 	 * full-size ones, so the seam rate settles back to ~7.5/sec.
 	 */
-	if (s_ndspAggFill >= N3DS_NDSP_AGG_PARCELS)
+	if (s_ndspAggParcels >= N3DS_NDSP_AGG_PARCELS)
 	{
 		s_ndspFullFlushes++;
 		N3DS_NdspFlushAggregate();
@@ -367,8 +489,8 @@ int N3DS_NdspIsUp(void)
 	return s_ndspUp;
 }
 
-/* DSP-side queued parcels only (handed-over wave buffers, in 735-frame
- * units) -- the early-flush trigger: 0 means the channel is running dry. */
+/* DSP-side queued parcels only (handed-over wave buffers, counted in vblanks
+ * of audio) -- the early-flush trigger: 0 means the channel is running dry. */
 static int N3DS_NdspQueuedParcelsDspSide(void)
 {
 	int queued = 0;
@@ -378,7 +500,7 @@ static int N3DS_NdspQueuedParcelsDspSide(void)
 	{
 		if ((s_ndspBufs[i].status == NDSP_WBUF_QUEUED) || (s_ndspBufs[i].status == NDSP_WBUF_PLAYING))
 		{
-			queued += (int)(s_ndspBufs[i].nsamples / N3DS_NDSP_BLOCK_FRAMES);
+			queued += s_ndspBufParcels[i];
 		}
 	}
 
@@ -387,12 +509,13 @@ static int N3DS_NdspQueuedParcelsDspSide(void)
 
 int N3DS_NdspGetQueuedBlocks(void)
 {
-	/* Still reported in PARCEL units (735-frame vblank blocks) even though
+	/* Still reported in PARCEL units (one vblank of audio each) even though
 	 * the pool holds aggregates -- the worker's ~12-parcel cushion target
 	 * and the ndspQ= log line both predate aggregation and keep their
-	 * meaning. Unflushed parcels in the accumulating slot count too: they
-	 * are already in the sink, just not handed to the DSP yet. */
-	return N3DS_NdspQueuedParcelsDspSide() + s_ndspAggFill;
+	 * meaning, at any source rate. Unflushed parcels in the accumulating
+	 * slot count too: they are already in the sink, just not handed to the
+	 * DSP yet. */
+	return N3DS_NdspQueuedParcelsDspSide() + s_ndspAggParcels;
 }
 
 int N3DS_NdspGetDroppedBlocks(void)

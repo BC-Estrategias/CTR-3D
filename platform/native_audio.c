@@ -3360,6 +3360,76 @@ internal int NativeAudio_XARingReadSampleNoLock(struct NativeAudioXaStream *stre
 	return stream->ringPcm[((size_t)slot * NATIVE_AUDIO_XA_SECTOR_FRAMES + (size_t)frameInSector) * NATIVE_AUDIO_CHANNELS + (size_t)channel];
 }
 
+#if defined(__3DS__)
+/*
+ * Bulk sibling of the per-sample reader above: copies a contiguous span of
+ * decoded stereo frames straight out of the ring, under the same residency
+ * contract (outside the resident window yields silence and bumps
+ * underrunEvents).
+ *
+ * Why it exists. The per-sample reader divides AND modulos a u64 by the
+ * runtime framesPerSector on every single access, and the 44.1kHz zig-zag
+ * resampler called it 29 taps x 2 channels x 735 frames = 42,630 times per
+ * parcel -- 42,630 software __aeabi_uldivmod calls per 16.7ms of music on a
+ * CPU with no divide instruction, plus 42,630 scattered reads across a ~1MB
+ * ring. Session 21 measured that parcel at 52-56ms on hardware (1,670
+ * parcels, two runs): production ran at a third of real time, which is what
+ * the owner heard as the announcer "talking into a fan". Here the divide
+ * happens once per sector the span touches -- one or two per parcel -- and
+ * the samples move by memcpy.
+ *
+ * 3DS-only on purpose: PC keeps the per-sample resampler and stays
+ * byte-identical (the mixer golden test gates that).
+ */
+internal void NativeAudio_XARingCopySpanNoLock(struct NativeAudioXaStream *stream, s16 *dst, u64 frameIndex, int frameCount)
+{
+	int remaining = frameCount;
+
+	if ((dst == NULL) || (frameCount <= 0))
+	{
+		return;
+	}
+	if (!stream->open || (stream->framesPerSector <= 0) || (stream->ringPcm == NULL))
+	{
+		memset(dst, 0, (size_t)frameCount * NATIVE_AUDIO_CHANNELS * sizeof(s16));
+		return;
+	}
+
+	while (remaining > 0)
+	{
+		int sector = (int)(frameIndex / (u64)stream->framesPerSector);
+		int frameInSector = (int)(frameIndex % (u64)stream->framesPerSector);
+		int oldestResidentSector = stream->decodedSectorCount - NATIVE_AUDIO_XA_RING_SECTORS;
+		int chunk = stream->framesPerSector - frameInSector;
+
+		if (chunk > remaining)
+		{
+			chunk = remaining;
+		}
+
+		if ((sector < oldestResidentSector) || (sector >= stream->decodedSectorCount))
+		{
+			/* One underrun event per non-resident slice instead of per
+			 * sample: the counter's units change, its meaning (the ring
+			 * could not serve playback) does not. */
+			stream->underrunEvents++;
+			memset(dst, 0, (size_t)chunk * NATIVE_AUDIO_CHANNELS * sizeof(s16));
+		}
+		else
+		{
+			int slot = sector % NATIVE_AUDIO_XA_RING_SECTORS;
+			const s16 *src = stream->ringPcm + ((size_t)slot * NATIVE_AUDIO_XA_SECTOR_FRAMES + (size_t)frameInSector) * NATIVE_AUDIO_CHANNELS;
+
+			memcpy(dst, src, (size_t)chunk * NATIVE_AUDIO_CHANNELS * sizeof(s16));
+		}
+
+		dst += (size_t)chunk * NATIVE_AUDIO_CHANNELS;
+		frameIndex += (u64)chunk;
+		remaining -= chunk;
+	}
+}
+#endif
+
 internal int NativeAudio_XAStreamAheadCountNoLock(const struct NativeAudioXaStream *stream)
 {
 	int currentSector;
@@ -4684,7 +4754,7 @@ internal void NativeAudio_HwVoiceMirrorNoLock(void)
  * documented three-way collision). This wrapper owns the scratch buffer
  * itself so nothing PSX-typed needs to cross that boundary -- the rendered
  * samples go to the ndsp sink as a plain short pointer, one vblank block at
- * a time (N3DS_NdspSubmitVBlankBlock copies out of this stack buffer before
+ * a time (N3DS_NdspSubmitMusicParcel copies out of this stack buffer before
  * returning). Caller (the worker thread) holds s_audioRenderLock for the
  * duration, which is the same lock NativeAudio_LockOutput/UnlockOutput take
  * on this platform via the SDL_LockAudioStream/UnlockAudioStream shim -- so
@@ -4745,6 +4815,16 @@ void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *lifecycleTi
  * vblank emission (n3ds_audio_thread.c paces it by svcGetSystemTick).
  * Renders one vblank's worth of the XA/CD music stream and submits it to
  * the music channel; a starved game loop no longer starves the music.
+ *
+ * "Renders" is now nearly a memcpy. Session 22: the parcel carries SOURCE
+ * PCM at the XA rate (37800/18900) and the DSP resamples it in hardware,
+ * per-channel, for free -- deleting the 29-tap zig-zag resampler that
+ * measured 52-56ms per 16.7ms parcel on the ARM11 (session 21, the
+ * "announcer talking into a fan" finding). What stays CPU-side is the
+ * game-visible XA clock, advanced in one step per parcel instead of 735.
+ * Volume moves to the channel (ndspChnSetMix) instead of every sample.
+ * PC is untouched and still runs the resampler -- see
+ * NativeAudio_XARingCopySpanNoLock.
  * Takes the render lock itself -- the worker calls this OUTSIDE its
  * lifecycle-drain lock span. Returns 1 if a parcel was submitted, 0 if XA
  * was idle/silent -- the worker uses the idle->active edge to prime a
@@ -4753,8 +4833,14 @@ void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *lifecycleTi
 int NativeAudio_RenderXAParcelForAudioThread(void)
 {
 	s16 parcel[NATIVE_AUDIO_VBLANK_FRAMES * NATIVE_AUDIO_CHANNELS];
-	int frame;
-	int anyContent = 0;
+	u64 outputFrameCount;
+	u64 sourceFrameStart;
+	u64 sourceFrameEnd;
+	int parcelFrames;
+	int sampleRate;
+	int cdMixEnabled;
+	float gainLeft;
+	float gainRight;
 
 	NativeAudio_LockOutput();
 
@@ -4764,47 +4850,83 @@ int NativeAudio_RenderXAParcelForAudioThread(void)
 		return 0; /* no submit: the music channel just drains to silence */
 	}
 
-	for (frame = 0; frame < NATIVE_AUDIO_VBLANK_FRAMES; frame++)
+	/* Hoisted out of what used to be a 735-iteration loop: both operands are
+	 * fixed for the whole parcel, so this was 735 identical u64 divides. */
+	outputFrameCount = NativeAudio_GetXAOutputFrameCount(s_audio.xa.frameCount, s_audio.xa.sampleRate);
+	if ((outputFrameCount == 0) || (s_audio.xa.outputFrame >= outputFrameCount))
 	{
-		int mixLeft = 0;
-		int mixRight = 0;
-
-		if (s_audio.xa.active)
-		{
-			u64 outputFrameCount = NativeAudio_GetXAOutputFrameCount(s_audio.xa.frameCount, s_audio.xa.sampleRate);
-
-			if ((outputFrameCount == 0) || (s_audio.xa.outputFrame >= outputFrameCount))
-			{
-				s_audio.xa.active = 0;
-			}
-			else if (!s_audio.cdMixEnabled)
-			{
-				NativeAudio_AdvanceXAOutputFrameNoLock();
-			}
-			else
-			{
-				int srcLeft = NativeAudio_GetXAMixSampleNoLock(0);
-				int srcRight = NativeAudio_GetXAMixSampleNoLock(1);
-
-				mixLeft = NativeAudio_ApplyVolume(srcLeft, s_audio.xa.volumeLeft, s_audio.masterVolumeLeft);
-				mixRight = NativeAudio_ApplyVolume(srcRight, s_audio.xa.volumeRight, s_audio.masterVolumeRight);
-				anyContent = 1;
-				NativeAudio_AdvanceXAOutputFrameNoLock();
-			}
-		}
-
-		parcel[frame * NATIVE_AUDIO_CHANNELS] = (s16)NativeAudio_Clamp16(mixLeft);
-		parcel[frame * NATIVE_AUDIO_CHANNELS + 1] = (s16)NativeAudio_Clamp16(mixRight);
+		s_audio.xa.active = 0;
+		NativeAudio_UnlockOutput();
+		return 0;
 	}
+
+	sampleRate = s_audio.xa.sampleRate;
+	cdMixEnabled = s_audio.cdMixEnabled;
+	sourceFrameStart = s_audio.xa.positionFp >> NATIVE_AUDIO_FP_SHIFT;
+
+	/*
+	 * Advance the game-visible XA clock by one vblank in a single step. The
+	 * per-sample walk this replaces did exactly this, 735 times: increment
+	 * outputFrame, clamp at the end of the track, re-derive positionFp. The
+	 * clock's units do not change -- outputFrame still counts 44.1kHz output
+	 * frames, which is what the game polls and what the stream pump's
+	 * ahead-count is measured against.
+	 */
+	s_audio.xa.outputFrame += NATIVE_AUDIO_VBLANK_FRAMES;
+	if (s_audio.xa.outputFrame >= outputFrameCount)
+	{
+		s_audio.xa.outputFrame = outputFrameCount;
+		s_audio.xa.active = 0; /* next call reports idle, which flushes the tail */
+	}
+	NativeAudio_UpdateXAPositionFromOutputFrameNoLock();
+	sourceFrameEnd = s_audio.xa.positionFp >> NATIVE_AUDIO_FP_SHIFT;
+
+	if (!cdMixEnabled)
+	{
+		/* CD mix off: the clock still runs (the game polls it), nothing is
+		 * audible. Reported as idle, exactly as the old path did by leaving
+		 * anyContent clear. */
+		NativeAudio_UnlockOutput();
+		return 0;
+	}
+
+	/*
+	 * The parcel is now the SOURCE frames one vblank of output covers, handed
+	 * to the DSP at the source rate for it to resample in hardware. Because
+	 * positionFp is derived from outputFrame by the same formula, the two
+	 * clocks cannot drift: 735 output frames is exactly 630 source frames at
+	 * 37800 and exactly 315 at 18900 (735 * 6/7 and 735 * 3/7).
+	 */
+	parcelFrames = (int)(sourceFrameEnd - sourceFrameStart);
+	if (parcelFrames > NATIVE_AUDIO_VBLANK_FRAMES)
+	{
+		/* Only reachable above 44100Hz, which XA never is. Clamp (which would
+		 * detune) rather than overrun the buffer. */
+		parcelFrames = NATIVE_AUDIO_VBLANK_FRAMES;
+	}
+	if (parcelFrames <= 0)
+	{
+		NativeAudio_UnlockOutput();
+		return 0;
+	}
+
+	NativeAudio_XARingCopySpanNoLock(&s_audio.xaStream, parcel, sourceFrameStart, parcelFrames);
+
+	/*
+	 * Volume rides the channel instead of every sample: the same two-stage
+	 * Q15 gain NativeAudio_ApplyVolume computes (CD volume, then master),
+	 * handed over once per parcel and poked into the DSP only on change.
+	 */
+	gainLeft = ((float)NativeAudio_VolumeScale(s_audio.xa.volumeLeft) * (float)NativeAudio_VolumeScale(s_audio.masterVolumeLeft)) /
+	           ((float)NATIVE_AUDIO_DIRECT_VOL_MAX * (float)NATIVE_AUDIO_DIRECT_VOL_MAX);
+	gainRight = ((float)NativeAudio_VolumeScale(s_audio.xa.volumeRight) * (float)NativeAudio_VolumeScale(s_audio.masterVolumeRight)) /
+	            ((float)NATIVE_AUDIO_DIRECT_VOL_MAX * (float)NATIVE_AUDIO_DIRECT_VOL_MAX);
 
 	NativeAudio_UnlockOutput();
 
-	if (anyContent)
-	{
-		N3DS_NdspSubmitVBlankBlock(parcel, NATIVE_AUDIO_VBLANK_FRAMES);
-	}
+	N3DS_NdspSubmitMusicParcel(parcel, parcelFrames, sampleRate, gainLeft, gainRight);
 
-	return anyContent;
+	return 1;
 }
 #endif
 
@@ -5574,7 +5696,12 @@ void NativeAudio_StepVBlank(void)
 			                              nothing else contends for it when
 			                              there is no worker thread */
 			NativeAudio_RenderFramesNoLock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
-			N3DS_NdspSubmitVBlankBlock(scratch, NATIVE_AUDIO_VBLANK_FRAMES);
+			/* Full software mixer, so this path produces at the SPU rate with
+			 * volume already applied per sample -- unlike the worker's XA
+			 * parcels, which ride the channel at the source rate. Exactly one
+			 * of the two producers exists per process lifetime, so the sink
+			 * only ever sees one rate regime. */
+			N3DS_NdspSubmitMusicParcel(scratch, NATIVE_AUDIO_VBLANK_FRAMES, NATIVE_AUDIO_SAMPLE_RATE, 1.0f, 1.0f);
 			NativeAudio_HwVoiceMirrorNoLock();
 			NativeAudio_UnlockOutput();
 		}

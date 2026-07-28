@@ -118,16 +118,29 @@ void N3DS_AudioLock(void);
 void N3DS_AudioUnlock(void);
 
 /*
- * ndsp output sink. Submit one vblank's rendered stereo PCM (interleaved
+ * ndsp output sink. Submit one vblank's worth of stereo PCM (interleaved
  * L,R s16 -- passed as plain short to keep this header free of game or
- * libctru types) for playback. frameCount must be exactly one vblank
- * (NATIVE_AUDIO_VBLANK_FRAMES = 735; hand-matched, see
- * N3DS_NDSP_BLOCK_FRAMES in the .c). Returns 1 if the block was queued, 0
- * if it was dropped (sink down, wrong size, or pool full -- all counted).
- * Called by exactly one thread at any point in the process lifetime: the
- * worker when one exists, else the main thread's StepVBlank fallback.
+ * libctru types) for playback.
+ *
+ * sampleRate is the rate the samples were PRODUCED at, not 44100 by
+ * assumption: session 22 feeds the music channel XA source PCM at its own
+ * 37800/18900 rate and lets the DSP resample in hardware, which deleted the
+ * CPU resampler that cost 52-56ms per 16.7ms parcel on the ARM11. The
+ * worker's XA path therefore submits 630 (or 315) frames at 37800 (or
+ * 18900); the no-worker StepVBlank fallback still submits 735 at 44100
+ * because it runs the full software mixer. Both are valid -- the sink pokes
+ * ndspChnSetRate on change and counts one vblank as one "parcel" either
+ * way, so the worker's cushion accounting is unit-stable across rates.
+ * Exactly one of those two producers exists for the whole process lifetime.
+ *
+ * gainLeft/gainRight scale the channel (ndspChnSetMix, poked on change):
+ * the XA path hands its CD+master volume here instead of multiplying every
+ * sample. The fallback passes 1.0f -- its mixer already applied volume.
+ *
+ * frameCount must be 1..N3DS_NDSP_PARCEL_FRAMES_MAX. Returns 1 if queued, 0
+ * if dropped (sink down, bad size, or pool full -- all counted).
  */
-int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount);
+int N3DS_NdspSubmitMusicParcel(const short *frames, int frameCount, int sampleRate, float gainLeft, float gainRight);
 
 /* Did ndspInit succeed? False also before audio init and after shutdown.
  * When false, submits are refused and the build behaves like the old muted
@@ -135,8 +148,9 @@ int N3DS_NdspSubmitVBlankBlock(const short *frames, int frameCount);
 int N3DS_NdspIsUp(void);
 
 /* Diagnostics for the renderer's periodic audio shape line: current
- * queued/playing block count (0..pool size), and cumulative blocks dropped
- * because the pool was full (or a submit was mis-sized). */
+ * queued/playing parcel count (one vblank of audio each, whatever the source
+ * rate), and cumulative parcels dropped because the pool was full (or a
+ * submit was mis-sized). */
 int N3DS_NdspGetQueuedBlocks(void);
 int N3DS_NdspGetDroppedBlocks(void);
 
