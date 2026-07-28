@@ -70,6 +70,20 @@ struct NativeDiscImageIoProf
 	u32 ioFails;
 	u64 ticks;
 	u64 worstTicks;
+	/*
+	 * The seek/read split, and the whole question of session 23's second
+	 * half. Hardware run 1 measured ~45.8ms per call almost independently of
+	 * size -- 16 sectors cost 7% more than 1 -- so the cost is per-operation,
+	 * not per-byte. Two mechanisms fit that shape and they want different
+	 * fixes: if it is the fseek (a FAT cluster-chain walk on a 578MB file is
+	 * O(position) and size-blind), then skipping the seek when the file is
+	 * already positioned removes most of it, since these reads walk forward.
+	 * If it is the fread's FS-service round trip, only bigger reads help.
+	 */
+	u64 seekTicks;
+	u64 readTicks;
+	u64 worstSeekTicks;
+	u64 worstReadTicks;
 };
 
 global_variable struct NativeDiscImageIoProf s_nativeDiscIoProf[NATIVE_DISC_IMAGE_OWNER_COUNT];
@@ -228,18 +242,72 @@ internal int NativeDiscImage_ReadRawRun(u32 lba, u32 count, u8 *raw, int owner)
 	beginTick = NativeDiscImage_ProfTick();
 #endif
 
-	if ((offset > (u64)LONG_MAX) || (fseek(s_nativeDiscImageFile, (long)offset, SEEK_SET) != 0) || (fread(raw, 1, bytes, s_nativeDiscImageFile) != bytes))
+	if (offset > (u64)LONG_MAX)
 	{
 #if CTR_NATIVE_DISC_IO_PROFILE
 		prof->ioFails++;
-		NativeDiscImage_ProfAccumulate(prof, beginTick);
 #endif
 		return 0;
 	}
 
+	/*
+	 * Seek and read are timed apart, and deliberately NOT folded back into
+	 * one condition: the split is the measurement. Three tick reads total
+	 * (begin / after seek / after read), so the combined us and worstUs
+	 * fields stay exactly what the previous hardware run reported.
+	 */
+	{
+		int seekFailed = (fseek(s_nativeDiscImageFile, (long)offset, SEEK_SET) != 0);
 #if CTR_NATIVE_DISC_IO_PROFILE
-	NativeDiscImage_ProfAccumulate(prof, beginTick);
+		unsigned long long midTick = NativeDiscImage_ProfTick();
+		unsigned long long seekElapsed = midTick - beginTick;
+
+		prof->seekTicks += seekElapsed;
+		if (seekElapsed > prof->worstSeekTicks)
+		{
+			prof->worstSeekTicks = seekElapsed;
+		}
 #endif
+
+		if (seekFailed)
+		{
+#if CTR_NATIVE_DISC_IO_PROFILE
+			prof->ioFails++;
+			NativeDiscImage_ProfAccumulate(prof, beginTick);
+#endif
+			return 0;
+		}
+
+		if (fread(raw, 1, bytes, s_nativeDiscImageFile) != bytes)
+		{
+#if CTR_NATIVE_DISC_IO_PROFILE
+			prof->ioFails++;
+			prof->readTicks += NativeDiscImage_ProfTick() - midTick;
+			NativeDiscImage_ProfAccumulate(prof, beginTick);
+#endif
+			return 0;
+		}
+
+#if CTR_NATIVE_DISC_IO_PROFILE
+		{
+			unsigned long long endTick = NativeDiscImage_ProfTick();
+			unsigned long long readElapsed = endTick - midTick;
+			unsigned long long totalElapsed = endTick - beginTick;
+
+			prof->readTicks += readElapsed;
+			if (readElapsed > prof->worstReadTicks)
+			{
+				prof->worstReadTicks = readElapsed;
+			}
+
+			prof->ticks += totalElapsed;
+			if (totalElapsed > prof->worstTicks)
+			{
+				prof->worstTicks = totalElapsed;
+			}
+		}
+#endif
+	}
 
 	for (i = 0; i < count; i++)
 	{
@@ -794,14 +862,19 @@ internal void NativeDiscImage_DebugFormatIoProfWindow(char *buf, int bufSize, in
 
 	if (owner == NATIVE_DISC_IMAGE_OWNER_AUDIO)
 	{
-		snprintf(buf, (size_t)bufSize, "[DISCIO] audio calls=%u sec=%u perCall=%u runs1=%u maxRun=%u us=%d worstUs=%d hdrFail=%u ioFail=%u", prof->calls, prof->sectors, perCall,
-		         prof->runsOf1, prof->maxRun, (int)((prof->ticks * 1000000ull) / freq), (int)((prof->worstTicks * 1000000ull) / freq), prof->headerFails, prof->ioFails);
+		snprintf(buf, (size_t)bufSize, "[DISCIO] audio calls=%u sec=%u perCall=%u runs1=%u maxRun=%u us=%d worstUs=%d seekUs=%d readUs=%d wSeekUs=%d wReadUs=%d hdrFail=%u ioFail=%u",
+		         prof->calls, prof->sectors, perCall, prof->runsOf1, prof->maxRun, (int)((prof->ticks * 1000000ull) / freq), (int)((prof->worstTicks * 1000000ull) / freq),
+		         (int)((prof->seekTicks * 1000000ull) / freq), (int)((prof->readTicks * 1000000ull) / freq), (int)((prof->worstSeekTicks * 1000000ull) / freq),
+		         (int)((prof->worstReadTicks * 1000000ull) / freq), prof->headerFails, prof->ioFails);
 	}
 	else
 	{
-		snprintf(buf, (size_t)bufSize, "[DISCIO] main calls=%u sec=%u runs1=%u maxRun=%u dir=%u cd=%u/%u xaCnt=%u sng=%u us=%d worstUs=%d hdrFail=%u ioFail=%u", prof->calls,
-		         prof->sectors, prof->runsOf1, prof->maxRun, s_nativeDiscIoDirCalls, s_nativeDiscIoSiteCd, s_nativeDiscIoSiteCdSectors, s_nativeDiscIoSiteXaCount,
-		         s_nativeDiscIoSiteSingle, (int)((prof->ticks * 1000000ull) / freq), (int)((prof->worstTicks * 1000000ull) / freq), prof->headerFails, prof->ioFails);
+		snprintf(buf, (size_t)bufSize,
+		         "[DISCIO] main calls=%u sec=%u runs1=%u maxRun=%u dir=%u cd=%u/%u xaCnt=%u sng=%u us=%d worstUs=%d seekUs=%d readUs=%d wSeekUs=%d wReadUs=%d hdrFail=%u ioFail=%u",
+		         prof->calls, prof->sectors, prof->runsOf1, prof->maxRun, s_nativeDiscIoDirCalls, s_nativeDiscIoSiteCd, s_nativeDiscIoSiteCdSectors, s_nativeDiscIoSiteXaCount,
+		         s_nativeDiscIoSiteSingle, (int)((prof->ticks * 1000000ull) / freq), (int)((prof->worstTicks * 1000000ull) / freq), (int)((prof->seekTicks * 1000000ull) / freq),
+		         (int)((prof->readTicks * 1000000ull) / freq), (int)((prof->worstSeekTicks * 1000000ull) / freq), (int)((prof->worstReadTicks * 1000000ull) / freq),
+		         prof->headerFails, prof->ioFails);
 		s_nativeDiscIoDirCalls = 0;
 		s_nativeDiscIoDirSectors = 0;
 		s_nativeDiscIoSiteCd = 0;
@@ -816,6 +889,10 @@ internal void NativeDiscImage_DebugFormatIoProfWindow(char *buf, int bufSize, in
 	prof->maxRun = 0;
 	prof->ticks = 0;
 	prof->worstTicks = 0;
+	prof->seekTicks = 0;
+	prof->readTicks = 0;
+	prof->worstSeekTicks = 0;
+	prof->worstReadTicks = 0;
 	prof->headerFails = 0;
 	prof->ioFails = 0;
 }
