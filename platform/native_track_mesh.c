@@ -77,6 +77,85 @@ static const u8 sTrackFaceCorners[4][4] = {
     {6, 7, 8, 3},
 };
 
+/*
+ * Weld-at-load (design INST-1 closure): the census measured 0-86 edges per
+ * level where two quadblocks share an edge (same endpoint positions) but
+ * carry different edge-mid positions -- genuine T-junction crack candidates
+ * in the authored data. Since we build the mesh, they are repaired here: a
+ * pre-pass records one canonical mid per matched edge (first sighting wins),
+ * and the emit loop snaps any divergent mid onto it. Load-time only.
+ */
+#define TRACK_WELD_SLOTS 32768
+
+struct NativeTrackWeldTable
+{
+	u64 keys[TRACK_WELD_SLOTS];
+	u64 mid[TRACK_WELD_SLOTS]; /* packed 48-bit position + 1 */
+};
+
+/* Outer edges of the 3x3 grid: corner pair + the mid between them (same
+ * table as the census edge-matcher). */
+static const u8 sTrackOuterEdges[4][3] = {{0, 1, 4}, {0, 2, 5}, {1, 3, 7}, {2, 3, 8}};
+
+/*
+ * Per-face UV rotation/flip (design risk #4). faceFlags per face =
+ * (draw_order_low >> (8 + 5*face)) & 0x1f: low 3 bits are a RotateFlipType,
+ * next 2 bits faceMode. The eight permutations below are derived by
+ * replaying ctr-tools' QuadTexRotate (per rotation: swap(0,1), swap(0,2),
+ * swap(2,3)) and QuadTexFlip (swap(0,1), swap(2,3)) swap sequences on the
+ * TL,TR,BL,BR corner order. Entry [rot][corner] = which TextureLayout UV
+ * index that corner takes. Audit status: matches ctr-tools' exporter
+ * exactly; confirmation against retail pixels lands with the first textured
+ * draw (Azahar side-by-side).
+ */
+static const u8 sTrackUvPerm[8][4] = {
+    {0, 1, 2, 3}, /* None */
+    {2, 0, 3, 1}, /* Rotate90 */
+    {3, 2, 1, 0}, /* Rotate180 */
+    {1, 3, 0, 2}, /* Rotate270 */
+    {0, 2, 1, 3}, /* FlipRotate270 */
+    {2, 3, 0, 1}, /* FlipRotate180 */
+    {3, 1, 2, 0}, /* FlipRotate90 */
+    {1, 0, 3, 2}, /* Flip */
+};
+
+/* TextureLayout corner byte offsets relative to &layout->u0: (u,v) pairs for
+ * UV indices 0-3 sit at +0, +4, +8, +10 (clut/tpage interleave between). */
+static const u8 sTrackUvByteOfs[4] = {0, 4, 8, 10};
+
+static u64 NativeTrackMesh_PackPos(const struct LevVertex *v)
+{
+	return (((u64)(u16)v->pos.x << 32) | ((u64)(u16)v->pos.y << 16) | (u64)(u16)v->pos.z) + 1;
+}
+
+static u64 NativeTrackMesh_EdgeKey(u64 ka, u64 kb)
+{
+	u64 lo = (ka < kb) ? ka : kb;
+	u64 hi = (ka < kb) ? kb : ka;
+	u64 key = lo * 0x9e3779b97f4a7c15ull ^ (hi + 0x517cc1b727220a95ull);
+
+	return key ? key : 1;
+}
+
+/* Probe for an edge key; returns the slot, or -1 when the table is full.
+ * Insert semantics live at the call sites. */
+static int NativeTrackMesh_WeldSlot(struct NativeTrackWeldTable *table, u64 key)
+{
+	u32 slot = (u32)((key ^ (key >> 31)) % TRACK_WELD_SLOTS);
+	int probes = 0;
+
+	while ((table->keys[slot] != 0) && (table->keys[slot] != key))
+	{
+		slot = (slot + 1) % TRACK_WELD_SLOTS;
+		if (++probes >= TRACK_WELD_SLOTS)
+		{
+			return -1;
+		}
+	}
+
+	return (int)slot;
+}
+
 static void NativeTrackMesh_Free(void)
 {
 	free(s_trackMesh.verts);
@@ -214,7 +293,52 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		return;
 	}
 
+	/* Weld pre-pass: canonical mid per matched edge, over ALL quadblocks so
+	 * the choice is stable regardless of which leaves end up resident. */
+	struct NativeTrackWeldTable *weldTable = (struct NativeTrackWeldTable *)calloc(1, sizeof(struct NativeTrackWeldTable));
+
+	if (weldTable != NULL)
+	{
+		for (int qb = 0; qb < numQuadBlock; qb++)
+		{
+			for (int e = 0; e < 4; e++)
+			{
+				u16 ia = quadBlocks[qb].index[sTrackOuterEdges[e][0]];
+				u16 ib = quadBlocks[qb].index[sTrackOuterEdges[e][1]];
+				u16 im = quadBlocks[qb].index[sTrackOuterEdges[e][2]];
+
+				if ((int)ia >= numVertex || (int)ib >= numVertex || (int)im >= numVertex)
+				{
+					continue;
+				}
+
+				u64 key = NativeTrackMesh_EdgeKey(NativeTrackMesh_PackPos(&vertexArray[ia]), NativeTrackMesh_PackPos(&vertexArray[ib]));
+				int slot = NativeTrackMesh_WeldSlot(weldTable, key);
+
+				if (slot < 0)
+				{
+					continue;
+				}
+
+				if (weldTable->keys[slot] == 0)
+				{
+					weldTable->keys[slot] = key;
+					weldTable->mid[slot] = NativeTrackMesh_PackPos(&vertexArray[im]);
+				}
+			}
+		}
+	}
+
+	/* Grid slot -> outer-edge index for the emit-time snap. */
+	static const s8 sEdgeOfSlot[9] = {-1, -1, -1, -1, 0, 1, -1, 2, 3};
+	int weldCount = 0;
+
 	int leavesTotal = 0, leavesExcluded = 0, facesDoubleSided = 0, facesNoTexture = 0, facesAnimTex = 0;
+	/* notex classification (s27: the water track reported 368 unclassified
+	 * faces): null pointer / AnimTex with null active frame / implausible
+	 * tpage word. Two raw samples of the bad-tpage case ride in the log. */
+	int notexNull = 0, notexAnimNull = 0, notexBadWord = 0;
+	u32 notexSample[2] = {0, 0};
 
 	for (int n = 0; n < mesh->numBspNodes; n++)
 	{
@@ -261,6 +385,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				if (texPtr == 0)
 				{
 					facesNoTexture++;
+					notexNull++;
 					continue;
 				}
 
@@ -276,15 +401,28 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					{
 						layout = (const struct TextureLayout *)anim->ptrActiveTex + 2; /* near */
 					}
+					else
+					{
+						facesNoTexture++;
+						notexAnimNull++;
+						continue;
+					}
 				}
 				else
 				{
 					layout = (const struct TextureLayout *)texPtr + 2; /* near */
 				}
 
-				if ((layout == NULL) || ((CTR_ReadU16LE(&layout->tpage) & 0xfe00) != 0))
+				if ((CTR_ReadU16LE(&layout->tpage) & 0xfe00) != 0)
 				{
 					facesNoTexture++;
+
+					if (notexBadWord < 2)
+					{
+						notexSample[notexBadWord] = ((u32)CTR_ReadU16LE(&layout->tpage) << 16) | CTR_ReadU16LE(&layout->clut);
+					}
+
+					notexBadWord++;
 					continue;
 				}
 
@@ -321,33 +459,59 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				s8 drawOrder = (s8)((const u8 *)&block->draw_order_high)[face];
 				u32 baseVert = s_trackMesh.vertCount;
 
-				/* TextureLayout corners are (u0,v0)=TL (u1,v1)=TR (u2,v2)=BL
-				 * (u3,v3)=BR in face-local space. Grid corner order in
-				 * sTrackFaceCorners is TL,TR,BL,BR, so corner c takes UV c.
-				 * faceFlags rotation/flip swizzles are NOT applied yet --
-				 * design risk #4, audited against ctr-tools before the first
-				 * textured draw. Scaffold records the raw assignment. */
+				/* Per-face rotation/flip: corner c takes UV index
+				 * sTrackUvPerm[rot][c] (see the table's derivation note). */
+				u32 faceBits = (drawOrderLow >> (8 + 5 * face)) & 0x1f;
+				const u8 *uvPerm = sTrackUvPerm[faceBits & 7];
+				u8 faceMode = (u8)((faceBits >> 3) & 3);
 				const u8 *uvBytes = &layout->u0;
 
 				for (int c = 0; c < 4; c++)
 				{
-					const struct LevVertex *src = &vertexArray[block->index[sTrackFaceCorners[face][c]]];
+					int gridSlot = sTrackFaceCorners[face][c];
+					const struct LevVertex *src = &vertexArray[block->index[gridSlot]];
 					struct NativeTrackVert *dst = &s_trackMesh.verts[s_trackMesh.vertCount++];
 
 					dst->x = src->pos.x;
 					dst->y = src->pos.y;
 					dst->z = src->pos.z;
+
+					/* Weld snap: an edge-mid whose matched edge carries a
+					 * different canonical mid takes the canonical position. */
+					if ((weldTable != NULL) && (sEdgeOfSlot[gridSlot] >= 0))
+					{
+						const u8 *edge = sTrackOuterEdges[(int)sEdgeOfSlot[gridSlot]];
+						u16 ea = block->index[edge[0]];
+						u16 eb = block->index[edge[1]];
+
+						if ((int)ea < numVertex && (int)eb < numVertex)
+						{
+							u64 key = NativeTrackMesh_EdgeKey(NativeTrackMesh_PackPos(&vertexArray[ea]), NativeTrackMesh_PackPos(&vertexArray[eb]));
+							int slot = NativeTrackMesh_WeldSlot(weldTable, key);
+
+							if ((slot >= 0) && (weldTable->keys[slot] == key))
+							{
+								u64 canon = weldTable->mid[slot];
+								u64 mine = NativeTrackMesh_PackPos(src);
+
+								if (canon != mine)
+								{
+									dst->x = (s16)(u16)((canon - 1) >> 32);
+									dst->y = (s16)(u16)((canon - 1) >> 16);
+									dst->z = (s16)(u16)(canon - 1);
+									weldCount++;
+								}
+							}
+						}
+					}
 					dst->drawOrder = drawOrder;
-					dst->faceFlags = (u8)doubleSided;
+					dst->faceFlags = (u8)(doubleSided | (faceMode << 1));
 					dst->r = src->color_hi[0];
 					dst->g = src->color_hi[1];
 					dst->b = src->color_hi[2];
 					dst->a = 0xff;
-					/* Corner UV pairs sit at +0,+4,+8,+10 in TextureLayout
-					 * (clut/tpage interleave) -- use the named fields via
-					 * offsets 0/4/8/10. */
-					dst->u = uvBytes[(c == 0) ? 0 : (c == 1) ? 4 : (c == 2) ? 8 : 10];
-					dst->v = uvBytes[(c == 0) ? 1 : (c == 1) ? 5 : (c == 2) ? 9 : 11];
+					dst->u = uvBytes[sTrackUvByteOfs[uvPerm[c]]];
+					dst->v = uvBytes[sTrackUvByteOfs[uvPerm[c]] + 1];
 					dst->texRef = texRef;
 				}
 
@@ -375,16 +539,59 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	}
 
 	free(animMark);
+	free(weldTable);
 
 	/* Latch only now, on success -- see the fingerprint comment up top. */
 	s_trackMesh.builtFor = mesh;
 	s_builtQb = numQuadBlock;
 	s_builtVtx = numVertex;
 
-	Platform_Log("[TRKMESH] lev=%p leaves=%u/%d (excl=%d) verts=%u idx=%u tex=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d\n", (void *)level,
-	             s_trackMesh.leafCount, leavesTotal, leavesExcluded, s_trackMesh.vertCount, s_trackMesh.indexCount, s_trackMesh.texCount,
+#if !defined(__3DS__)
+	/* Geometry/UV audit artifact: one OBJ per level into the gitignored
+	 * debug/ tree (positions + per-vertex color extension + UVs in page
+	 * space /256). Deterministic name -> self-deduping across runs. Skipped
+	 * silently if debug/ is absent (fresh checkouts). */
+	{
+		char objPath[128];
+
+		snprintf(objPath, sizeof(objPath), "debug/trackmesh_qb%d_vtx%d.obj", numQuadBlock, numVertex);
+
+		FILE *obj = fopen(objPath, "w");
+
+		if (obj != NULL)
+		{
+			fprintf(obj, "# ctr-native track mesh dump: verts=%u idx=%u leaves=%u welds=%d\n", s_trackMesh.vertCount, s_trackMesh.indexCount,
+			        s_trackMesh.leafCount, weldCount);
+
+			for (u32 i = 0; i < s_trackMesh.vertCount; i++)
+			{
+				const struct NativeTrackVert *v = &s_trackMesh.verts[i];
+
+				fprintf(obj, "v %d %d %d %.3f %.3f %.3f\n", v->x, -v->y, v->z, v->r / 255.0f, v->g / 255.0f, v->b / 255.0f);
+				fprintf(obj, "vt %.5f %.5f\n", v->u / 256.0f, 1.0f - (v->v / 256.0f));
+			}
+
+			for (u32 i = 0; i + 2 < s_trackMesh.indexCount; i += 3)
+			{
+				fprintf(obj, "f %u/%u %u/%u %u/%u\n", s_trackMesh.indices[i] + 1, s_trackMesh.indices[i] + 1, s_trackMesh.indices[i + 1] + 1,
+				        s_trackMesh.indices[i + 1] + 1, s_trackMesh.indices[i + 2] + 1, s_trackMesh.indices[i + 2] + 1);
+			}
+
+			fclose(obj);
+		}
+	}
+#endif
+
+	Platform_Log("[TRKMESH] lev=%p leaves=%u/%d (excl=%d) verts=%u idx=%u tex=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d | welds=%d\n",
+	             (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, s_trackMesh.vertCount, s_trackMesh.indexCount, s_trackMesh.texCount,
 	             (u32)(s_trackMesh.vertCount * sizeof(struct NativeTrackVert) / 1024), (u32)(s_trackMesh.indexCount * sizeof(u16) / 1024), facesDoubleSided,
-	             facesAnimTex, facesNoTexture);
+	             facesAnimTex, facesNoTexture, weldCount);
+
+	if (facesNoTexture != 0)
+	{
+		Platform_Log("[TRKMESH] notex: null=%d animNull=%d badWord=%d sample0=%08x sample1=%08x\n", notexNull, notexAnimNull, notexBadWord, notexSample[0],
+		             notexSample[1]);
+	}
 }
 
 #endif /* CTR_NATIVE_TRACK_RENDERER */
