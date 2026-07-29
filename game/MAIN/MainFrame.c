@@ -25,6 +25,11 @@ static void MainFrame_RegisterGpuLinkRanges(struct GameTracker *gGT)
 	{
 		NativeGpuLinks_RegisterRangeChecked(swapchainLabels[i], gGT->otSwapchainDB[i], swapchainOTBytes);
 	}
+
+	// Registration goes to a pending table; this promotes it for token
+	// resolution -- a no-op while the ranges are stable, and the fence point
+	// for the render worker when a level load moves them.
+	NativeGpuLinks_Commit();
 }
 #endif
 

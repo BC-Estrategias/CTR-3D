@@ -6,6 +6,7 @@
 #include "platform/native_checkpoint.h"
 #include "platform/native_checkpoint_file.h"
 #include "platform/native_log.h"
+#include "platform/native_render_queue.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -164,6 +165,15 @@ void NativeSaveState_RequestLoad(void)
 
 void NativeSaveState_BeginFrame(void)
 {
+	if ((s_quickSaveRequested != 0) || (s_quickLoadRequested != 0))
+	{
+		// State capture/apply touches renderer-owned state (VRAM shadow, GPU
+		// bookkeeping) while a posted walk may still be running; drain the
+		// render worker first. Request-gated, so frames without a request
+		// never pay it.
+		NativeRenderQueue_Fence();
+	}
+
 	if (s_quickSaveRequested != 0)
 	{
 		s_quickSaveRequested = 0;

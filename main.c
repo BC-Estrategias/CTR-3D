@@ -85,6 +85,7 @@
 #include "platform/native_memcard_adapter.c"
 #include "platform/native_perf.c"
 #include "platform/native_platform.c"
+#include "platform/native_render_queue.c"
 #include "platform/native_replay_scheduler.c"
 #if defined(__3DS__)
 #include "platform/n3ds/native_renderer_3ds.c"

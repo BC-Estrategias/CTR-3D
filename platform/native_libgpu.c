@@ -11,6 +11,7 @@
 #include <platform/native_renderer.h>
 #include <platform/native_gpu.h>
 #include <platform/native_perf.h>
+#include <platform/native_render_queue.h>
 #include <gpu.h>
 #include <platform.h>
 
@@ -19,11 +20,18 @@
 // NOTE(aalhendi): Native libgpu preserves the retail-shaped PsyQ GPU facade
 // while keeping the game-facing GPU symbols under ctr-native ownership. The
 // primitive parser and GL backend live behind this native platform boundary.
+//
+// Render-thread builds (3DS): every entry point that touches renderer state
+// splits into a facade wrapper (game thread: post to the core-2 worker when
+// NativeRenderQueue_Route says so) and a CtrGpu_Exec* body (the pre-queue
+// implementation, unchanged -- the direct path when the queue is inactive,
+// which is always the case on PC). Exec bodies call only other Exec bodies
+// and renderer internals, never wrappers. docs/RENDER_THREAD_DESIGN.md.
 
 int g_dbg_emulatorPaused = 0;
 void (*drawsync_callback)(void) = NULL;
 
-int ClearImage(RECT16 *rect, uint8_t r, uint8_t g, uint8_t b)
+int CtrGpu_ExecClearImage(RECT16 *rect, unsigned char r, unsigned char g, unsigned char b)
 {
 #if defined(CTR_INTERNAL) && !defined(__3DS__)
 	NativeVramTrace_Op("CLEAR", rect->x, rect->y, rect->w, rect->h, -1, -1);
@@ -33,22 +41,58 @@ int ClearImage(RECT16 *rect, uint8_t r, uint8_t g, uint8_t b)
 	return 0;
 }
 
+int ClearImage(RECT16 *rect, uint8_t r, uint8_t g, uint8_t b)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_CLEAR_IMAGE);
+		job.rect = *rect;
+		job.r = r;
+		job.g = g;
+		job.b = b;
+		NativeRenderQueue_RunSync(&job);
+		return 0;
+	}
+
+	return CtrGpu_ExecClearImage(rect, r, g, b);
+}
+
 int ClearImage2(RECT16 *rect, uint8_t r, uint8_t g, uint8_t b)
 {
 	return ClearImage(rect, r, g, b);
 }
 
-int DrawSync(int mode)
+void CtrGpu_ExecDrawSync(void)
 {
-	(void)mode;
-
 	NativeRenderer_UpdateVRAM();
 	if (NativeGpu_HasPendingSplits())
 	{
 		DrawAllSplits();
 	}
 	NativeRenderer_ReadFramebufferDataToVRAM();
+}
 
+int DrawSync(int mode)
+{
+	(void)mode;
+
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_DRAW_SYNC);
+		NativeRenderQueue_RunSync(&job);
+	}
+	else
+	{
+		CtrGpu_ExecDrawSync();
+	}
+
+	// The callback flips game state (bool_DrawOTag_InProgress), so it always
+	// runs here on the game thread, after the queued work has completed --
+	// same order retail's GPU IRQ delivered it in.
 	if (drawsync_callback != NULL)
 	{
 		drawsync_callback();
@@ -57,38 +101,103 @@ int DrawSync(int mode)
 	return 0;
 }
 
-int LoadImage(RECT16 *rect, void *p)
+void CtrGpu_ExecLoadImage(RECT16 *rect, void *p)
 {
 #if defined(CTR_INTERNAL) && !defined(__3DS__)
 	NativeVramTrace_Op("LOAD", rect->x, rect->y, rect->w, rect->h, -1, -1);
 #endif
 	NativeRenderer_CopyVRAM((unsigned short *)p, 0, 0, rect->w, rect->h, rect->x, rect->y);
+}
+
+int LoadImage(RECT16 *rect, void *p)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_LOAD_IMAGE);
+		job.rect = *rect;
+		job.ptr = p;
+		NativeRenderQueue_RunSync(&job);
+		return 0;
+	}
+
+	CtrGpu_ExecLoadImage(rect, p);
 	return 0;
+}
+
+void CtrGpu_ExecLoadImage2(RECT16 *rect, void *p)
+{
+	CtrGpu_ExecLoadImage(rect, p);
+	NativeRenderer_UpdateVRAM();
+	NativeRenderer_ReadFramebufferDataToVRAM();
 }
 
 int LoadImage2(RECT16 *rect, void *p)
 {
-	LoadImage(rect, p);
-	NativeRenderer_UpdateVRAM();
-	NativeRenderer_ReadFramebufferDataToVRAM();
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_LOAD_IMAGE2);
+		job.rect = *rect;
+		job.ptr = p;
+		NativeRenderQueue_RunSync(&job);
+		return 0;
+	}
+
+	CtrGpu_ExecLoadImage2(rect, p);
 	return 0;
 }
 
-int MoveImage(RECT16 *rect, int x, int y)
+void CtrGpu_ExecMoveImage(RECT16 *rect, int x, int y)
 {
 #if defined(CTR_INTERNAL) && !defined(__3DS__)
 	NativeVramTrace_Op("MOVE", x, y, rect->w, rect->h, rect->x, rect->y);
 #endif
 	NativeRenderer_CopyVRAM(NULL, rect->x, rect->y, rect->w, rect->h, x, y);
+}
+
+int MoveImage(RECT16 *rect, int x, int y)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_MOVE_IMAGE);
+		job.rect = *rect;
+		job.i0 = x;
+		job.i1 = y;
+		NativeRenderQueue_RunSync(&job);
+		return 0;
+	}
+
+	CtrGpu_ExecMoveImage(rect, x, y);
 	return 0;
 }
 
-int StoreImage(RECT16 *rect, uint32_t *p)
+void CtrGpu_ExecStoreImage(RECT16 *rect, void *p)
 {
 #if defined(CTR_INTERNAL) && !defined(__3DS__)
 	NativeVramTrace_Op("STORE", rect->x, rect->y, rect->w, rect->h, -1, -1);
 #endif
 	NativeRenderer_ReadVRAM((unsigned short *)p, rect->x, rect->y, rect->w, rect->h);
+}
+
+int StoreImage(RECT16 *rect, uint32_t *p)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_STORE_IMAGE);
+		job.rect = *rect;
+		job.ptr = p;
+		NativeRenderQueue_RunSync(&job);
+		return 0;
+	}
+
+	CtrGpu_ExecStoreImage(rect, p);
 	return 0;
 }
 
@@ -97,12 +206,12 @@ int StoreImage2(RECT16 *rect, uint32_t *p)
 	return StoreImage(rect, p);
 }
 
-int ResetGraph(int mode)
+void CtrGpu_ExecResetGraph(int mode)
 {
 	if (mode == 0)
 	{
 		g_GPUDisabledState = 0;
-		ClearImage(&activeDrawEnv.clip, 0, 0, 0);
+		CtrGpu_ExecClearImage(&activeDrawEnv.clip, 0, 0, 0);
 		ClearSplits();
 		Platform_EndScene();
 	}
@@ -111,7 +220,21 @@ int ResetGraph(int mode)
 		ClearSplits();
 		Platform_EndScene();
 	}
+}
 
+int ResetGraph(int mode)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_RESET_GRAPH);
+		job.i0 = mode;
+		NativeRenderQueue_RunSync(&job);
+		return 0;
+	}
+
+	CtrGpu_ExecResetGraph(mode);
 	return 0;
 }
 
@@ -167,20 +290,55 @@ uint32_t *ClearOTagR(uint32_t *ot, int n)
 	return NULL;
 }
 
-void SetDispMask(int mask)
+void CtrGpu_ExecSetDispMask(int mask)
 {
 	g_GPUDisabledState = (mask == 0);
 }
 
+void SetDispMask(int mask)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		// Ordered-async: the walk job behind it in the FIFO sees the same
+		// enable/disable sequence the game issued.
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_SET_DISP_MASK);
+		job.i0 = mask;
+		NativeRenderQueue_Post(&job);
+		return;
+	}
+
+	CtrGpu_ExecSetDispMask(mask);
+}
+
 DISPENV *GetDispEnv(DISPENV *env)
 {
+	// activeDispEnv is worker-owned while the queue is active; drain any
+	// pending env installs so this read observes the game's own order.
+	NativeRenderQueue_Fence();
 	memcpy(env, &activeDispEnv, sizeof(DISPENV));
 	return env;
 }
 
-DISPENV *PutDispEnv(DISPENV *env)
+void CtrGpu_ExecPutDispEnv(const DISPENV *env)
 {
 	memcpy(&activeDispEnv, env, sizeof(DISPENV));
+}
+
+DISPENV *PutDispEnv(DISPENV *env)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_PUT_DISPENV);
+		job.dispEnv = *env;
+		NativeRenderQueue_Post(&job);
+		return 0;
+	}
+
+	CtrGpu_ExecPutDispEnv(env);
 	return 0;
 }
 
@@ -204,9 +362,24 @@ DISPENV *SetDefDispEnv(DISPENV *env, int x, int y, int w, int h)
 	return 0;
 }
 
-DRAWENV *PutDrawEnv(DRAWENV *env)
+void CtrGpu_ExecPutDrawEnv(const DRAWENV *env)
 {
 	memcpy(&activeDrawEnv, env, sizeof(DRAWENV));
+}
+
+DRAWENV *PutDrawEnv(DRAWENV *env)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_PUT_DRAWENV);
+		job.drawEnv = *env;
+		NativeRenderQueue_Post(&job);
+		return 0;
+	}
+
+	CtrGpu_ExecPutDrawEnv(env);
 	return 0;
 }
 
@@ -279,7 +452,7 @@ uint32_t DrawSyncCallback(void (*func)(void))
 	return 0;
 }
 
-void DrawOTag(void *p)
+void CtrGpu_ExecDrawOTag(void *p)
 {
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_OTAG);
 	do
@@ -302,7 +475,27 @@ void DrawOTag(void *p)
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_OTAG);
 }
 
-void DrawPrim(void *p)
+void DrawOTag(void *p)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		// The async post that pays for this whole file's plumbing: the game
+		// thread returns to building frame N+1 while the worker walks N. The
+		// OT's lifetime is the double-buffer protocol's problem, and it
+		// already solves it (MainFrame_ResetDB flips before touching cursors,
+		// RenderVSYNC fences through DrawSync before the next submit).
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_DRAW_OTAG);
+		job.ptr = p;
+		NativeRenderQueue_Post(&job);
+		return;
+	}
+
+	CtrGpu_ExecDrawOTag(p);
+}
+
+void CtrGpu_ExecDrawPrim(void *p)
 {
 	if (g_GPUDisabledState)
 	{
@@ -316,6 +509,21 @@ void DrawPrim(void *p)
 	}
 
 	ParsePrimitivesLinkedList((uint32_t *)p, 1);
+}
+
+void DrawPrim(void *p)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_DRAW_PRIM);
+		job.ptr = p;
+		NativeRenderQueue_RunSync(&job);
+		return;
+	}
+
+	CtrGpu_ExecDrawPrim(p);
 }
 
 void AddPrim(void *ot, void *p)

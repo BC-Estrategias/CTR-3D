@@ -8,6 +8,7 @@
 #include "platform/native_input.h"
 #include "platform/native_log.h"
 #include "platform/native_perf.h"
+#include "platform/native_render_queue.h"
 #include "platform/native_renderer.h"
 #include "platform/native_replay_scheduler.h"
 #include "platform/native_savestate.h"
@@ -270,6 +271,10 @@ void Platform_Init(const char *title, int width, int height)
 		return;
 	}
 
+	// After the renderer is fully initialised (init stays on this thread; the
+	// worker only ever executes queued frame work). No-op on PC.
+	NativeRenderQueue_Init();
+
 	atexit(Platform_Shutdown);
 	Platform_UpdateCursorVisibility();
 	Platform_InputInit();
@@ -283,6 +288,11 @@ void Platform_Shutdown(void)
 	}
 
 	s_platformInitialized = 0;
+
+	// Drain and join the render worker before anything below tears down what
+	// its jobs touch. Posts STOP synchronously; no-op if it never came up.
+	NativeRenderQueue_Shutdown();
+
 #if defined(CTR_INTERNAL)
 	NativePerf_Shutdown();
 	NativeReplayScheduler_Shutdown();
@@ -387,7 +397,7 @@ void Platform_EndScene(void)
 
 // NOTE(aalhendi): Frame timing is handled by VSync() in the platform layer,
 // matching PS1 hardware behavior. Platform_EndFrame only does buffer swap + FPS.
-void Platform_EndFrame(void)
+void Platform_ExecEndFrame(void)
 {
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_PLATFORM_END_FRAME);
 	Platform_EndScene();
@@ -395,15 +405,49 @@ void Platform_EndFrame(void)
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_PLATFORM_END_FRAME);
 }
 
-void Platform_PresentVRAMDisplay(void)
+void Platform_EndFrame(void)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		// Async: C3D_FrameEnd's submit wait and the swap leave the game
+		// thread's frame entirely. CalcFPS rides along -- it has to run
+		// after the swap to mean anything.
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_END_FRAME);
+		NativeRenderQueue_Post(&job);
+		return;
+	}
+
+	Platform_ExecEndFrame();
+}
+
+void Platform_ExecPresentVRAMDisplay(void)
 {
 	Platform_BeginScene();
 	NativeRenderer_PresentVRAMDisplay();
-	Platform_EndFrame();
+	Platform_ExecEndFrame();
+}
+
+void Platform_PresentVRAMDisplay(void)
+{
+	if (NativeRenderQueue_Route())
+	{
+		struct NativeRenderJob job;
+
+		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_PRESENT_VRAM_DISPLAY);
+		NativeRenderQueue_RunSync(&job);
+		return;
+	}
+
+	Platform_ExecPresentVRAMDisplay();
 }
 
 void Platform_PinVRAMDisplayFrames(int frameCount)
 {
+	// s_pinned* state is read by EndScene on the worker; drain before the
+	// game thread writes it (same guard on the Rect variant below).
+	NativeRenderQueue_Fence();
 	if (frameCount > s_pinnedVramDisplayFrames)
 	{
 		s_pinnedVramDisplayFrames = frameCount;
@@ -417,6 +461,8 @@ void Platform_PinVRAMDisplayRect(int x, int y, int w, int h, int frameCount)
 	{
 		return;
 	}
+
+	NativeRenderQueue_Fence();
 
 	s_pinnedVramDisplayX = x;
 	s_pinnedVramDisplayY = y;

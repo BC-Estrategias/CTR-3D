@@ -6,6 +6,7 @@
 #include "platform/native_audio.h"
 #include "platform/native_log.h"
 #include "platform/native_path.h"
+#include "platform/native_render_queue.h"
 
 #if !defined(__3DS__)
 #include <SDL3/SDL.h>
@@ -415,6 +416,13 @@ internal void NativePerf_Report3DSWindow(void)
 	{
 		return;
 	}
+
+	// Render-thread builds: draw_otag/begin_scene/end_scene accumulate on the
+	// worker. Drain it before reading, or a mid-write u64 on the other core
+	// can print a garbage spike -- this project has chased enough phantom
+	// numbers. Costs at most one walk, once per 64-frame window; no-op when
+	// the queue is inactive.
+	NativeRenderQueue_Fence();
 
 	toAvgUs = 1000.0 / (f64)s_windowFrames;
 

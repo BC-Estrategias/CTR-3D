@@ -1,9 +1,11 @@
 #include <platform/native_gpu_links.h>
+#include <platform/native_render_queue.h>
 
 #include <macros.h>
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define NATIVE_GPU_LINK_MAX_RANGES          64
 #define NATIVE_GPU_LINK_FIRST_DYNAMIC_TOKEN 0x00f00000u
@@ -16,8 +18,19 @@ struct NativeGpuLinkRange
 	uint32_t tokenEnd;
 };
 
+/*
+ * Two tables: registration (Reset/Register, game thread, every ResetDB)
+ * builds the PENDING one; token resolution during the walk reads the LIVE
+ * one. Commit promotes pending to live -- a memcmp no-op every frame the
+ * ranges did not move (steady state within a level), and on real change
+ * (level load resizes primMem) it fences the render queue first, so the
+ * worker can never resolve against a half-rewritten table. Before the render
+ * thread existed the split was free; with it, it is the correctness.
+ */
 global_variable struct NativeGpuLinkRange s_nativeGpuLinkRanges[NATIVE_GPU_LINK_MAX_RANGES];
 global_variable int s_nativeGpuLinkRangeCount;
+global_variable struct NativeGpuLinkRange s_nativeGpuLinkPending[NATIVE_GPU_LINK_MAX_RANGES];
+global_variable int s_nativeGpuLinkPendingCount;
 global_variable uint32_t s_nativeGpuLinkNextToken = NATIVE_GPU_LINK_FIRST_DYNAMIC_TOKEN;
 
 static int NativeGpuLinks_AlignTokenSize(size_t size, uint32_t *tokenSizeOut)
@@ -41,8 +54,22 @@ static int NativeGpuLinks_AlignTokenSize(size_t size, uint32_t *tokenSizeOut)
 
 void NativeGpuLinks_Reset(void)
 {
-	s_nativeGpuLinkRangeCount = 0;
+	s_nativeGpuLinkPendingCount = 0;
 	s_nativeGpuLinkNextToken = NATIVE_GPU_LINK_FIRST_DYNAMIC_TOKEN;
+}
+
+void NativeGpuLinks_Commit(void)
+{
+	size_t liveBytes = (size_t)s_nativeGpuLinkPendingCount * sizeof(s_nativeGpuLinkPending[0]);
+
+	if ((s_nativeGpuLinkPendingCount == s_nativeGpuLinkRangeCount) && (memcmp(s_nativeGpuLinkPending, s_nativeGpuLinkRanges, liveBytes) == 0))
+	{
+		return;
+	}
+
+	NativeRenderQueue_Fence();
+	memcpy(s_nativeGpuLinkRanges, s_nativeGpuLinkPending, liveBytes);
+	s_nativeGpuLinkRangeCount = s_nativeGpuLinkPendingCount;
 }
 
 int NativeGpuLinks_IsTerminator(uint32_t token)
@@ -61,7 +88,7 @@ int NativeGpuLinks_RegisterRange(const void *hostStart, size_t size, uint32_t *t
 		return 0;
 	}
 
-	if (s_nativeGpuLinkRangeCount >= NATIVE_GPU_LINK_MAX_RANGES)
+	if (s_nativeGpuLinkPendingCount >= NATIVE_GPU_LINK_MAX_RANGES)
 	{
 		return 0;
 	}
@@ -80,7 +107,7 @@ int NativeGpuLinks_RegisterRange(const void *hostStart, size_t size, uint32_t *t
 
 	s_nativeGpuLinkNextToken -= tokenSize;
 
-	struct NativeGpuLinkRange *range = &s_nativeGpuLinkRanges[s_nativeGpuLinkRangeCount++];
+	struct NativeGpuLinkRange *range = &s_nativeGpuLinkPending[s_nativeGpuLinkPendingCount++];
 	range->hostStart = start;
 	range->hostEnd = end;
 	range->tokenStart = s_nativeGpuLinkNextToken;

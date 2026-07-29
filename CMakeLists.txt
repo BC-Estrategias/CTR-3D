@@ -105,6 +105,7 @@ set(CTR_NATIVE_SOURCES main.c)
 if(NINTENDO_3DS)
     list(APPEND CTR_NATIVE_SOURCES platform/n3ds/n3ds_backend.c)
     list(APPEND CTR_NATIVE_SOURCES platform/n3ds/n3ds_audio_thread.c)
+    list(APPEND CTR_NATIVE_SOURCES platform/n3ds/n3ds_render_thread.c)
 endif()
 
 add_executable(ctr_native ${CTR_NATIVE_SOURCES})
@@ -114,7 +115,7 @@ if(NINTENDO_3DS)
     # default short enums. Nothing enum-typed crosses n3ds_backend.h -- it
     # exposes only plain scalars -- so this file can match libctru's ABI while
     # the game TU keeps the 4-byte enums its struct layouts require.
-    set_source_files_properties(platform/n3ds/n3ds_backend.c platform/n3ds/n3ds_audio_thread.c
+    set_source_files_properties(platform/n3ds/n3ds_backend.c platform/n3ds/n3ds_audio_thread.c platform/n3ds/n3ds_render_thread.c
         PROPERTIES COMPILE_OPTIONS "-fshort-enums")
 endif()
 target_include_directories(ctr_native PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -205,6 +206,24 @@ if(CTR_NATIVE_DRAW_MERGE)
         message(FATAL_ERROR "CTR_NATIVE_DRAW_MERGE requires CTR_NATIVE_OT_DEPTH=ON")
     endif()
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_DRAW_MERGE=1)
+endif()
+
+# Render worker thread on core 2 (New3DS-only core; core 1 is the audio
+# worker's). DrawOTag becomes the async post the game's PS1 GPU protocol
+# already expects (bool_DrawOTag_InProgress / DrawSyncCallback / double-
+# buffered OT+primMem), so the OT walk, the C3D frame bracket's GPU wait, and
+# frame end/swap all leave the game thread; everything else the facade exposes
+# posts synchronously in issue order. Behavior-preserving by construction
+# (same jobs, same order, one frame in flight, gated by the game's own
+# DrawSync fence) -- ON is the default and the A/B lives at runtime: dumpreq
+# 'renderthread'. Falls back to today's synchronous path on old 3DS, core-2
+# refusal, or GTE-capture builds (single-buffered capture table). PC builds
+# compile none of this. Design: docs/RENDER_THREAD_DESIGN.md.
+option(CTR_NATIVE_RENDER_THREAD
+    "3DS: render pipeline on a core-2 worker thread (runtime A/B: dumpreq renderthread)"
+    ON)
+if(NINTENDO_3DS AND CTR_NATIVE_RENDER_THREAD)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_RENDER_THREAD=1)
 endif()
 
 # Log every growth/reset of the decoded-voice PCM arena in the audio mixer.

@@ -10,6 +10,9 @@
 // [len:8][link:24]. Under CTR_NATIVE the 24-bit link is a token into
 // registered host ranges, not a truncated host pointer.
 void NativeGpuLinks_Reset(void);
+// Promote the ranges registered since Reset to the table token resolution
+// reads. No-op when nothing moved; fences the render worker when it did.
+void NativeGpuLinks_Commit(void);
 uint32_t NativeGpuLinks_FromHostPointer(const void *hostPtr);
 void *NativeGpuLinks_ToHostPointer(uint32_t token);
 int NativeGpuLinks_IsTerminator(uint32_t token);

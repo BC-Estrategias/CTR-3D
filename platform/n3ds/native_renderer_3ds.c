@@ -38,6 +38,7 @@
 
 #include <macros.h>
 #include <platform/native_perf.h>
+#include <platform/native_render_queue.h>
 #include <platform/native_renderer.h>
 
 #include "n3ds_backend.h"
@@ -3294,6 +3295,12 @@ void NativeRenderer_ClearVRAM(int x, int y, int w, int h, u8 r, u8 g, u8 b)
 {
 	const u16 colour = NativeRenderer3DS_PackBGR555(r, g, b);
 	int row;
+
+	/* Called directly from game code (MM_Scrapbook) as well as from ClearImage
+	 * jobs on the worker; the fence no-ops on the worker and when the queue is
+	 * inactive, so only a game-thread caller pays it -- and must, or it races
+	 * the in-flight walk's VRAM reads. */
+	NativeRenderQueue_Fence();
 
 	if ((w <= 0) || (h <= 0) || (x < 0) || (y < 0))
 	{

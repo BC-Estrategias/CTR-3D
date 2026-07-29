@@ -1042,6 +1042,8 @@ unsigned int N3DS_ReadButtons(void)
 	 *   textureless -- toggle g_dbg_texturelessMode
 	 *   triscopes   -- toggle g_dbg_perfTriScopes (per-triangle perf split; taxed)
 	 *   drawmerge   -- toggle g_dbg_drawMerge (CTR_NATIVE_DRAW_MERGE builds only)
+	 *   renderthread -- toggle g_dbg_renderThread (core-2 render worker routing;
+	 *                  OFF falls back to synchronous main-thread rendering)
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -1104,6 +1106,18 @@ unsigned int N3DS_ReadButtons(void)
 					                              : "[CTR-3DS] draw merge: off (immediate runs)");
 				}
 #endif
+				else if (strncmp(word, "renderthread", 12) == 0)
+				{
+					extern int g_dbg_renderThread;
+
+					/* Checked at post time on the game thread; the OFF
+					 * transition fences the worker before the first direct
+					 * call (NativeRenderQueue_Route), so the flip is safe
+					 * mid-race. This is the feature's A/B instrument. */
+					g_dbg_renderThread ^= 1;
+					N3DS_DebugLog(g_dbg_renderThread ? "[CTR-3DS] render worker routing: ON"
+					                                 : "[CTR-3DS] render worker routing: OFF (sync on main thread)");
+				}
 				else if (strncmp(word, "atlasview", 9) == 0)
 				{
 					extern int g_dbg_atlasView;
