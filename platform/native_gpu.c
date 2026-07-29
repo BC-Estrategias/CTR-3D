@@ -105,6 +105,11 @@ typedef struct
 
 #define MAX_DRAW_SPLITS 4096
 
+/* v2 bucket->ordinal table capacity: 4P swapchain OTs run (numPlyr<<10)|6 =
+ * up to 4102 slots (MainFrame.c); headroom on top, and slots past the
+ * window are simply not recorded. */
+#define OTZ_TABLE_SLOTS 4224
+
 typedef struct
 {
 	const char *currentSplitDebugText;
@@ -146,21 +151,48 @@ typedef struct
 	 * line so OTZ_K is chosen from measurement, not guessed.
 	 */
 	u32 otSlotsCrossed;
-	u32 intraBucket;
-	u32 walkZBase;
 	u32 lastStampedZ;
-	u32 otzIntraClampHits;
-	u32 otzIntraMaxSeen;
-	u32 otzCrossMaxSeen;
-} NativeGpuState;
 
-/* 6 bits of intra-bucket ordinal: 1P OTs are 0x400 slots + a few, so
- * 1030 << 6 tops out inside u16 with room; intra beyond 63 clamps to a
- * depth tie, resolved by draw order exactly like today's 0xFFFF ordinal
- * clamp. [OTZ] occupancy counters exist to revisit this constant from
- * measurement. Runtime A/B: dumpreq 'otz' (3DS); PC ignores z entirely. */
-#define OTZ_K 6
-#define OTZ_INTRA_MAX ((1u << OTZ_K) - 1u)
+	/*
+	 * v2 bucket->ordinal table (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12).
+	 * v1's widened STAMP was falsified by its own [OTZ] occupancy line
+	 * (intraMax 81-168 vs a 6-bit cap; ~1500 "crossings" because len-0
+	 * PACKETS are not OT slots; z saturating 65535 mid-walk) -- so v2
+	 * leaves stamps untouched and only RECORDS: an OT slot is a walked
+	 * node whose address sits in the aligned window descending from the
+	 * walk head (the DrawOTag argument IS the head; ClearOTagR links slots
+	 * in address-descending order), and the table remembers the first
+	 * emit ordinal at each slot. Track draws later compose per leaf by
+	 * table lookup on the CPU. The address window is what rejects the
+	 * len-0 filler packets that polluted v1's crossing count -- they live
+	 * in primMem, far from the OT array.
+	 */
+	uintptr_t otHead;
+	u32 otSlotsDetected;
+	u32 otSpuriousLen0;
+	u32 otMaxSlotIdx;
+	u16 otBucketOrdinal[OTZ_TABLE_SLOTS];
+
+	/*
+	 * Exact OT bounds, straight from the game's own ClearOTag/ClearOTagR
+	 * calls (native_libgpu.c) -- the address-window heuristic failed
+	 * because primMem sits contiguous with the OT arena ([OTZ2] measured
+	 * spurious=0, maxSlot=4107 on a ~1030-slot OT). A small ring, deduped
+	 * by base: the same OTs are re-cleared every frame. The walk resolves
+	 * the range containing its head once per walk; slotIdx is then the
+	 * plain array index (addr - base)/4 == the retail otIndex that
+	 * GetProjectedOtIndex computes from depth -- exactly the axis the
+	 * track compose needs.
+	 */
+	struct
+	{
+		uintptr_t base;
+		u32 count;
+	} otRanges[8];
+	u32 otRangeCursor;
+	uintptr_t walkOtBase;
+	u32 walkOtCount;
+} NativeGpuState;
 
 int g_dbg_otzWiden = 0;
 
@@ -800,48 +832,38 @@ int NativeGpu_HasPendingSplits(void)
  * the >65535-prims tail to equal depth, where LEQUAL/GEQUAL-with-equal-pass
  * still resolves by draw order -- i.e. degrades to painter, never inverts.
  */
-/* The single source of the depth stamp for BOTH stampers (parse path below,
- * direct emit in native_direct_emit.c). Legacy scheme: bare sequence
- * ordinal. Widened scheme: walkZBase + (crossings << OTZ_K | intra). */
-internal u16 NativeGpu_NextDepthStamp(void)
+/* Called by ClearOTag/ClearOTagR (native_libgpu.c): remember this OT's
+ * exact bounds for the walk's slot detection. Deduped by base -- the same
+ * OTs are cleared once per frame, forever. */
+void NativeGpu_RegisterOTRange(uint32_t *ot, int n)
 {
-	if (g_dbg_otzWiden)
+	if ((ot == NULL) || (n <= 0))
 	{
-		u32 intra = s_gpu.intraBucket;
-
-		if (intra > OTZ_INTRA_MAX)
-		{
-			intra = OTZ_INTRA_MAX;
-			s_gpu.otzIntraClampHits++;
-		}
-
-		if (s_gpu.intraBucket > s_gpu.otzIntraMaxSeen)
-		{
-			s_gpu.otzIntraMaxSeen = s_gpu.intraBucket;
-		}
-
-		s_gpu.intraBucket++;
-
-		u32 z = s_gpu.walkZBase + ((s_gpu.otSlotsCrossed << OTZ_K) | intra);
-
-		if (z > 0xFFFFu)
-		{
-			z = 0xFFFFu;
-		}
-
-		if (z < s_gpu.lastStampedZ)
-		{
-			/* Cannot happen by construction (both terms are nondecreasing
-			 * within a walk and walkZBase re-bases between walks) -- but a
-			 * depth INVERSION is the one failure mode worse than a tie, so
-			 * saturate to monotone rather than trust the proof. */
-			z = s_gpu.lastStampedZ;
-		}
-
-		s_gpu.lastStampedZ = z;
-		return (u16)z;
+		return;
 	}
 
+	for (u32 i = 0; i < 8; i++)
+	{
+		if (s_gpu.otRanges[i].base == (uintptr_t)ot)
+		{
+			s_gpu.otRanges[i].count = (u32)n;
+			return;
+		}
+	}
+
+	s_gpu.otRanges[s_gpu.otRangeCursor & 7].base = (uintptr_t)ot;
+	s_gpu.otRanges[s_gpu.otRangeCursor & 7].count = (u32)n;
+	s_gpu.otRangeCursor++;
+}
+
+/* The single source of the depth stamp for BOTH stampers (parse path below,
+ * direct emit in native_direct_emit.c). Bare sequence ordinal -- v1's
+ * widened stamp was deleted after its own [OTZ] occupancy instrument
+ * falsified the encoding (see the v2 table comment in NativeGpuState);
+ * v2 records instead of restamping, so this stays byte-identical to the
+ * pre-rung-1 behavior. */
+internal u16 NativeGpu_NextDepthStamp(void)
+{
 	const u16 ordinal = (u16)(s_gpu.emitOrdinal < 0xFFFFu ? s_gpu.emitOrdinal : 0xFFFFu);
 
 	s_gpu.lastStampedZ = ordinal;
@@ -871,29 +893,25 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
  */
 void NativeGpu_ResetEmitOrdinal(void)
 {
-	/* [OTZ] occupancy line: sizes OTZ_K from measurement (every 256 depth
-	 * clears while widening is on). intraMax > 63 means clamped depth ties
-	 * inside a bucket; crossMax is the deepest OT position walked. */
+	/* [OTZ2] table-validation line (every 256 depth clears while the
+	 * recorder is on): slots should track the OT size (~1030 for 1P),
+	 * spurious counts the len-0 filler packets the address window rejects,
+	 * and slots+spurious should equal cross. Numbers are from the LAST walk
+	 * before this clear (later walks overwrite -- normal frames have one). */
 	if (g_dbg_otzWiden)
 	{
 		static u32 s_otzFrames;
 
 		if (++s_otzFrames >= 256)
 		{
-			Platform_Log("[OTZ] frames=%lu intraMax=%lu clampHits=%lu crossMax=%lu lastZ=%lu\n", (unsigned long)s_otzFrames,
-			             (unsigned long)s_gpu.otzIntraMaxSeen, (unsigned long)s_gpu.otzIntraClampHits, (unsigned long)s_gpu.otzCrossMaxSeen,
-			             (unsigned long)s_gpu.lastStampedZ);
+			Platform_Log("[OTZ2] frames=%lu slots=%lu spurious=%lu cross=%lu maxSlot=%lu lastOrd=%lu\n", (unsigned long)s_otzFrames,
+			             (unsigned long)s_gpu.otSlotsDetected, (unsigned long)s_gpu.otSpuriousLen0, (unsigned long)s_gpu.otSlotsCrossed,
+			             (unsigned long)s_gpu.otMaxSlotIdx, (unsigned long)s_gpu.lastStampedZ);
 			s_otzFrames = 0;
-			s_gpu.otzIntraMaxSeen = 0;
-			s_gpu.otzIntraClampHits = 0;
-			s_gpu.otzCrossMaxSeen = 0;
 		}
 	}
 
 	s_gpu.emitOrdinal = 0;
-	s_gpu.otSlotsCrossed = 0;
-	s_gpu.intraBucket = 0;
-	s_gpu.walkZBase = 0;
 	s_gpu.lastStampedZ = 0;
 }
 
@@ -2035,13 +2053,36 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 		 */
 		u32 otWalkIterations = 0;
 
-		/* Ordinal widening: new walk -> bucket counters restart, and the
-		 * stamp base moves past everything already stamped this depth-clear
-		 * so multi-pass frames keep later passes in front (see the
-		 * NativeGpuState field comment). */
+		/* v2 recorder: resolve which registered OT this walk belongs to
+		 * (the head must lie inside a ClearOTag'd range) and restart the
+		 * per-walk counters. The table itself is only cleared while the
+		 * instrument is on -- recording costs one compare per zero-length
+		 * node otherwise. */
+		s_gpu.otHead = (uintptr_t)p;
 		s_gpu.otSlotsCrossed = 0;
-		s_gpu.intraBucket = 0;
-		s_gpu.walkZBase = (s_gpu.emitOrdinal != 0) ? (s_gpu.lastStampedZ + 1u) : 0u;
+		s_gpu.otSlotsDetected = 0;
+		s_gpu.otSpuriousLen0 = 0;
+		s_gpu.otMaxSlotIdx = 0;
+		s_gpu.walkOtBase = 0;
+		s_gpu.walkOtCount = 0;
+
+		for (u32 rangeIdx = 0; rangeIdx < 8; rangeIdx++)
+		{
+			uintptr_t base = s_gpu.otRanges[rangeIdx].base;
+			u32 count = s_gpu.otRanges[rangeIdx].count;
+
+			if ((base != 0) && (s_gpu.otHead >= base) && (s_gpu.otHead < base + (uintptr_t)count * 4u))
+			{
+				s_gpu.walkOtBase = base;
+				s_gpu.walkOtCount = count;
+				break;
+			}
+		}
+
+		if (g_dbg_otzWiden)
+		{
+			memset(s_gpu.otBucketOrdinal, 0, sizeof(s_gpu.otBucketOrdinal));
+		}
 
 		while (true)
 		{
@@ -2132,13 +2173,37 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 			}
 			else
 			{
-				/* Zero-length node = an OT slot traversed: next bucket. */
+				/* Zero-length node: either an OT slot or a len-0 filler
+				 * packet (v1 conflated them; primMem sits contiguous with
+				 * the OT arena, so only the game's own ClearOTag bounds
+				 * discriminate -- measured, [OTZ2] s27). slotIdx = plain
+				 * array index = the retail otIndex GetProjectedOtIndex
+				 * computes from depth. */
 				s_gpu.otSlotsCrossed++;
-				s_gpu.intraBucket = 0;
 
-				if (s_gpu.otSlotsCrossed > s_gpu.otzCrossMaxSeen)
+				if (g_dbg_otzWiden)
 				{
-					s_gpu.otzCrossMaxSeen = s_gpu.otSlotsCrossed;
+					uintptr_t addr = (uintptr_t)basePacket;
+
+					if ((s_gpu.walkOtBase != 0) && (addr >= s_gpu.walkOtBase) && (addr < s_gpu.walkOtBase + (uintptr_t)s_gpu.walkOtCount * 4u))
+					{
+						u32 slotIdx = (u32)((addr - s_gpu.walkOtBase) >> 2);
+
+						if (slotIdx < OTZ_TABLE_SLOTS)
+						{
+							s_gpu.otBucketOrdinal[slotIdx] = (u16)(s_gpu.emitOrdinal < 0xFFFFu ? s_gpu.emitOrdinal : 0xFFFFu);
+							s_gpu.otSlotsDetected++;
+
+							if (slotIdx > s_gpu.otMaxSlotIdx)
+							{
+								s_gpu.otMaxSlotIdx = slotIdx;
+							}
+						}
+					}
+					else
+					{
+						s_gpu.otSpuriousLen0++;
+					}
 				}
 			}
 

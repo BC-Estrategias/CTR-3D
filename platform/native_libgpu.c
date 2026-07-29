@@ -253,6 +253,13 @@ uint32_t *ClearOTag(uint32_t *ot, int n)
 		return NULL;
 	}
 
+	/* Track-renderer depth compose: the walk needs exact OT bounds to tell
+	 * real slots from len-0 filler packets (native_gpu.c, [OTZ2]). */
+	{
+		extern void NativeGpu_RegisterOTRange(uint32_t *ot, int n);
+		NativeGpu_RegisterOTRange(ot, n);
+	}
+
 	ptag_list = (OT_TAG *)ot;
 
 	termPrim(&ptag_list[n - 1]);
@@ -274,6 +281,12 @@ uint32_t *ClearOTagR(uint32_t *ot, int n)
 	if (n == 0)
 	{
 		return NULL;
+	}
+
+	/* Same bounds registration as ClearOTag above. */
+	{
+		extern void NativeGpu_RegisterOTRange(uint32_t *ot, int n);
+		NativeGpu_RegisterOTRange(ot, n);
 	}
 
 	ptag_list = (OT_TAG *)ot;
