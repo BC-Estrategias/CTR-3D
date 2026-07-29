@@ -170,6 +170,15 @@ typedef struct
 	u32 frameMHashCount;
 	u32 frameMHashes[OTPROF_MAX_HASHES];
 	u32 frameMNoModel;
+	/* Matrix-class probe (s26, full-form open Q1): among nodes that got an
+	 * mshape hash, how many were projected under ONE matrix state, and
+	 * which id. 64 = GTE_CAPTURE_MTX_IDS (native_gte_capture.c). The
+	 * per-hash id array lets the fold count the intersection that actually
+	 * sizes full-form v1: mshape-REUSED and single-matrix-dominant. 255 =
+	 * mixed-matrix node. */
+	u8 frameMHashMtxId[OTPROF_MAX_HASHES];
+	u32 frameMSingleById[64];
+	u32 frameMMulti;
 	u32 keySet[OTPROF_KEY_SET_SIZE];
 
 	/* previous frame's packet hashes, open-addressed (0 = empty) */
@@ -194,6 +203,12 @@ typedef struct
 	u32 winMHashed;
 	u32 winMReused;
 	u32 winMNoModel;
+	u32 winMSingle;
+	u32 winMSingleDom;
+	u32 winMMulti;
+	u32 winMReusedDom;
+	u32 winMtxDomShare; /* sum of per-frame dominant-store shares (avg = /frames) */
+	u32 winMtxIds;      /* sum of per-frame distinct matrix counts */
 	u32 winTruncated;
 	u32 winDryMismatch;
 } OTWalkProfileState;
@@ -404,6 +419,8 @@ internal void OTProf_RecordNodeShape(const u8 *packet, u32 tagLength)
 	{
 		u32 mwords[96];
 		u32 mcount = 0;
+		u8 nodeMtxId = 0;
+		int mtxSame = 1;
 
 		for (u32 i = 0; i < tagLength; i++)
 		{
@@ -413,17 +430,35 @@ internal void OTProf_RecordNodeShape(const u8 *packet, u32 tagLength)
 		{
 			const u32 xy = words[xyIdx[i]];
 			s16 v[3];
+			u8 mtxId;
 
-			if (!GTECapture_LookupModel((s16)(xy & 0xFFFFu), (s16)(xy >> 16), v))
+			if (!GTECapture_LookupModelEx((s16)(xy & 0xFFFFu), (s16)(xy >> 16), v, &mtxId))
 			{
 				s_otprof.frameMNoModel++;
 				return;
 			}
+			if (i == 0)
+			{
+				nodeMtxId = mtxId;
+			}
+			else if (mtxId != nodeMtxId)
+			{
+				mtxSame = 0;
+			}
 			mwords[mcount++] = ((u32)(u16)v[1] << 16) | (u32)(u16)v[0];
 			mwords[mcount++] = (u32)(u16)v[2];
 		}
+		if (mtxSame && (xyCount > 0))
+		{
+			s_otprof.frameMSingleById[nodeMtxId]++;
+		}
+		else
+		{
+			s_otprof.frameMMulti++;
+		}
 		if (s_otprof.frameMHashCount < OTPROF_MAX_HASHES)
 		{
+			s_otprof.frameMHashMtxId[s_otprof.frameMHashCount] = (mtxSame && (xyCount > 0)) ? nodeMtxId : 255;
 			s_otprof.frameMHashes[s_otprof.frameMHashCount++] = OTProf_HashWords(mwords, mcount);
 		}
 	}
@@ -535,6 +570,12 @@ internal void OTProf_FoldFrame(void)
 	}
 
 	u32 mReused = 0;
+	u32 mReusedDom = 0;
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	u8 foldDomId = 0;
+	u32 foldIdsUsed = 0;
+	const u32 foldDomShare = GTECapture_ReadMatrixCensus(&foldDomId, &foldIdsUsed);
+#endif
 	for (u32 i = 0; i < s_otprof.frameMHashCount; i++)
 	{
 		const u32 h = s_otprof.frameMHashes[i];
@@ -544,6 +585,14 @@ internal void OTProf_FoldFrame(void)
 			if (s_otprof.prevMSet[slot] == h)
 			{
 				mReused++;
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+				/* The full-form v1 planning number: stable AND projected
+				 * under this frame's dominant (camera) matrix. */
+				if (s_otprof.frameMHashMtxId[i] == foldDomId)
+				{
+					mReusedDom++;
+				}
+#endif
 				break;
 			}
 			slot = (slot + 1) & (OTPROF_PREV_SET_SIZE - 1);
@@ -581,6 +630,22 @@ internal void OTProf_FoldFrame(void)
 	s_otprof.winMHashed += s_otprof.frameMHashCount;
 	s_otprof.winMReused += mReused;
 	s_otprof.winMNoModel += s_otprof.frameMNoModel;
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	{
+		/* Matrix-class fold: this frame's dominant matrix (census already
+		 * read above, before the reuse loop needed it) vs where the
+		 * mshape-hashed nodes actually sat. */
+		for (int i = 0; i < 64; i++)
+		{
+			s_otprof.winMSingle += s_otprof.frameMSingleById[i];
+		}
+		s_otprof.winMSingleDom += s_otprof.frameMSingleById[foldDomId];
+		s_otprof.winMMulti += s_otprof.frameMMulti;
+		s_otprof.winMtxDomShare += foldDomShare;
+		s_otprof.winMtxIds += foldIdsUsed;
+	}
+#endif
+	s_otprof.winMReusedDom += mReusedDom;
 	if (s_otprof.frameHashCount >= OTPROF_MAX_HASHES)
 	{
 		s_otprof.winTruncated++;
@@ -604,6 +669,8 @@ internal void OTProf_FoldFrame(void)
 	s_otprof.frameShapeSkip = 0;
 	s_otprof.frameMHashCount = 0;
 	s_otprof.frameMNoModel = 0;
+	memset(s_otprof.frameMSingleById, 0, sizeof(s_otprof.frameMSingleById));
+	s_otprof.frameMMulti = 0;
 	memset(s_otprof.keySet, 0, sizeof(s_otprof.keySet));
 
 	if (s_otprof.winFrames < OTPROF_WINDOW_FRAMES)
@@ -629,6 +696,23 @@ internal void OTProf_FoldFrame(void)
 		             (unsigned long)(s_otprof.winShapeReused * 100u / sh), (unsigned long)(s_otprof.winShapeHashed / f), (unsigned long)s_otprof.winShapeSkip,
 		             (unsigned long)(s_otprof.winMReused * 100u / mh), (unsigned long)(s_otprof.winMHashed / f), (unsigned long)(s_otprof.winMNoModel / f));
 	}
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	{
+		/* Full-form open Q1 instrument: singleDom% is the v1 coverage cap --
+		 * the share of model-identified nodes whose every vertex projected
+		 * under the frame's dominant (camera) matrix. */
+		const u32 mn = (s_otprof.winMSingle + s_otprof.winMMulti) ? (s_otprof.winMSingle + s_otprof.winMMulti) : 1;
+
+		/* stableDom% (base: mshape-hashed nodes) is THE full-form v1
+		 * coverage number: frame-over-frame stable AND camera-class. */
+		const u32 mh2 = s_otprof.winMHashed ? s_otprof.winMHashed : 1;
+
+		Platform_Log("[OTPROF] mtx: single=%lu%% singleDom=%lu%% multi=%lu%% stableDom=%lu%% | ids/f=%lu domStores=%lu%%\n",
+		             (unsigned long)(s_otprof.winMSingle * 100u / mn), (unsigned long)(s_otprof.winMSingleDom * 100u / mn),
+		             (unsigned long)(s_otprof.winMMulti * 100u / mn), (unsigned long)(s_otprof.winMReusedDom * 100u / mh2),
+		             (unsigned long)(s_otprof.winMtxIds / f), (unsigned long)(s_otprof.winMtxDomShare / f));
+	}
+#endif
 
 	s_otprof.winFrames = 0;
 	s_otprof.winNodes = 0;
@@ -646,6 +730,12 @@ internal void OTProf_FoldFrame(void)
 	s_otprof.winMHashed = 0;
 	s_otprof.winMReused = 0;
 	s_otprof.winMNoModel = 0;
+	s_otprof.winMSingle = 0;
+	s_otprof.winMSingleDom = 0;
+	s_otprof.winMMulti = 0;
+	s_otprof.winMReusedDom = 0;
+	s_otprof.winMtxDomShare = 0;
+	s_otprof.winMtxIds = 0;
 	s_otprof.winTruncated = 0;
 	s_otprof.winDryMismatch = 0;
 }

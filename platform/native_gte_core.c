@@ -309,6 +309,11 @@ internal int GTE_RotTransPers(int idx, int lm)
 	int h_over_sz3;
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 	s64 sxFull, syFull;
+
+	// Matrix-class probe: R11..R33 + TRX/Y/Z are CP2C words 0..7, contiguous
+	// (gtereg.h). One memcmp per projected vertex tags this frame's Stores
+	// with which matrix state produced them.
+	GTECapture_NoteMatrix(&gteRegs.CP2C.p[0]);
 #endif
 
 	C2_MAC1 = A1(/*int44*/ (s64)((s64)C2_TRX << 12) + (C2_R11 * VX(idx)) + (C2_R12 * VY(idx)) + (C2_R13 * VZ(idx)));

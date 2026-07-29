@@ -16,6 +16,13 @@ int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8);
 // OTWALK_PROFILE retainability instrument; the retained-geometry play proper
 // will grow its own keyed-by-content variant.
 int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3]);
+// Model vector plus the frame-scoped matrix-state id the projection ran
+// under (s26 matrix-class probe; the retained full form's matrix classes).
+int GTECapture_LookupModelEx(s16 sx, s16 sy, s16 outV[3], u8 *outMtxId);
+// Per projected vertex, from the GTE: the 8 contiguous CP2C words (R+TR).
+void GTECapture_NoteMatrix(const void *words8);
+// Read-buffer census: returns dominant-id Store share in percent.
+u32 GTECapture_ReadMatrixCensus(u8 *outDomId, u32 *outIdsUsed);
 void GTECapture_Clear(void);
 // Double-buffer publish (s26): called by the DrawOTag facade on the game
 // thread, before the walk is posted (3DS worker) or run (PC sync) -- the walk

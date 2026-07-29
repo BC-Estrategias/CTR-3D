@@ -47,8 +47,18 @@ typedef struct
 	u16 sz3;      // reserved for stereo (unused by vertex de-snapping)
 	s32 hOverSz3; // reserved for perspective-correct UV (unused by vertex de-snapping)
 	s16 vx, vy, vz; // model-space input vector (retainability rendezvous)
-	s16 _pad;
+	u8 mtxId; // frame-scoped matrix-state id this projection ran under (s26 matrix-class probe / full-form matrix classes)
+	u8 _pad;
 } GTECaptureEntry;
+
+// Matrix-state ids: which distinct GTE R+TR state a Store's projection ran
+// under, numbered 0.. in order of first appearance within the frame. The
+// full retained form needs to know whether a stable node was projected
+// under the frame's dominant (camera) matrix or a per-object one -- that
+// decides its v1 coverage (docs/RETAINED_GEOMETRY_FULL_DESIGN.md, open Q1).
+// Ids above the cap collapse into the last slot; a frame with >63 real
+// matrix states would make "dominant share" mushy, not wrong.
+#define GTE_CAPTURE_MTX_IDS 64
 
 typedef struct
 {
@@ -59,6 +69,10 @@ typedef struct
 	// behind the game thread's current SetUIBand call.
 	const void *bandStart;
 	const void *bandEnd;
+	// Per-frame matrix census (reset by Clear): Store count per matrix id,
+	// and how many ids this frame actually used.
+	u32 mtxStores[GTE_CAPTURE_MTX_IDS];
+	u32 mtxUsed;
 } GTECaptureBuffer;
 
 global_variable GTECaptureBuffer s_gteCaptureBuf[2] = {{{{0}}, 1, NULL, NULL}, {{{0}}, 1, NULL, NULL}};
@@ -82,6 +96,13 @@ internal u32 GTECapture_Hash(u32 key)
 	return (key * 0x9E3779B1u) >> (32u - GTE_CAPTURE_TABLE_BITS);
 }
 
+// Matrix-change detector state: game-thread only, continuity across the
+// buffer flip is irrelevant (ids are frame-scoped; the first projection of a
+// frame always starts id 0).
+global_variable u32 s_gteMtxShadow[8];
+global_variable int s_gteMtxShadowValid;
+global_variable u32 s_gteMtxCurId;
+
 void GTECapture_Clear(void)
 {
 	GTECaptureBuffer *buf;
@@ -97,6 +118,39 @@ void GTECapture_Clear(void)
 	{
 		memset(buf->entries, 0, sizeof(buf->entries));
 		buf->generation = 1;
+	}
+
+	memset(buf->mtxStores, 0, sizeof(buf->mtxStores));
+	buf->mtxUsed = 0;
+	s_gteMtxShadowValid = 0;
+	s_gteMtxCurId = 0;
+}
+
+// Called by GTE_RotTransPers with the 8 contiguous CP2C words holding
+// R11..R33 and TRX/Y/Z -- one memcmp per projected vertex detects the
+// game switching matrices (camera -> instance -> ...).
+void GTECapture_NoteMatrix(const void *words8)
+{
+	GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureWriteIdx];
+
+	if (s_gteMtxShadowValid && (memcmp(s_gteMtxShadow, words8, sizeof(s_gteMtxShadow)) == 0))
+	{
+		return;
+	}
+
+	memcpy(s_gteMtxShadow, words8, sizeof(s_gteMtxShadow));
+	if (!s_gteMtxShadowValid)
+	{
+		s_gteMtxShadowValid = 1;
+		s_gteMtxCurId = 0;
+	}
+	else if (s_gteMtxCurId < (GTE_CAPTURE_MTX_IDS - 1))
+	{
+		s_gteMtxCurId++;
+	}
+	if ((s_gteMtxCurId + 1) > buf->mtxUsed)
+	{
+		buf->mtxUsed = s_gteMtxCurId + 1;
 	}
 }
 
@@ -120,6 +174,8 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 	entry->vx = vx;
 	entry->vy = vy;
 	entry->vz = vz;
+	entry->mtxId = (u8)s_gteMtxCurId;
+	buf->mtxStores[s_gteMtxCurId]++;
 }
 
 int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8)
@@ -153,6 +209,47 @@ int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3])
 	outV[1] = entry->vy;
 	outV[2] = entry->vz;
 	return 1;
+}
+
+int GTECapture_LookupModelEx(s16 sx, s16 sy, s16 outV[3], u8 *outMtxId)
+{
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
+	u32 key = GTECapture_PackKey(sx, sy);
+	const GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
+
+	if ((entry->generation != buf->generation) || (entry->key != key))
+	{
+		return 0;
+	}
+
+	outV[0] = entry->vx;
+	outV[1] = entry->vy;
+	outV[2] = entry->vz;
+	*outMtxId = entry->mtxId;
+	return 1;
+}
+
+// Read-buffer matrix census for the walk: dominant id (most Stores -- in
+// race content, the camera), its share in percent of all Stores, and how
+// many distinct ids the frame used. Share 0 means the frame stored nothing.
+u32 GTECapture_ReadMatrixCensus(u8 *outDomId, u32 *outIdsUsed)
+{
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
+	u32 total = 0, best = 0, bestId = 0, i;
+
+	for (i = 0; i < GTE_CAPTURE_MTX_IDS; i++)
+	{
+		total += buf->mtxStores[i];
+		if (buf->mtxStores[i] > best)
+		{
+			best = buf->mtxStores[i];
+			bestId = i;
+		}
+	}
+
+	*outDomId = (u8)bestId;
+	*outIdsUsed = buf->mtxUsed;
+	return total ? (best * 100u) / total : 0;
 }
 
 // Walk-thread state: BeginOTWalk/MarkOTNode/LookupSuppressed all run on
