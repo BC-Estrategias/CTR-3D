@@ -216,9 +216,10 @@ endif()
 # posts synchronously in issue order. Behavior-preserving by construction
 # (same jobs, same order, one frame in flight, gated by the game's own
 # DrawSync fence) -- ON is the default and the A/B lives at runtime: dumpreq
-# 'renderthread'. Falls back to today's synchronous path on old 3DS, core-2
-# refusal, or GTE-capture builds (single-buffered capture table). PC builds
-# compile none of this. Design: docs/RENDER_THREAD_DESIGN.md.
+# 'renderthread'. Falls back to today's synchronous path on old 3DS or core-2
+# refusal. (GTE-capture builds ran sync until s26 double-buffered the capture
+# table -- native_gte_capture.c -- so capture and the worker now coexist.)
+# PC builds compile none of this. Design: docs/RENDER_THREAD_DESIGN.md.
 option(CTR_NATIVE_RENDER_THREAD
     "3DS: render pipeline on a core-2 worker thread (runtime A/B: dumpreq renderthread)"
     ON)

@@ -477,6 +477,12 @@ void CtrGpu_ExecDrawOTag(void *p)
 
 void DrawOTag(void *p)
 {
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	// Hand the walk the capture buffer this frame just wrote -- game thread,
+	// before the post, so the queue's own lock orders it for the worker.
+	GTECapture_PublishForWalk();
+#endif
+
 	if (NativeRenderQueue_Route())
 	{
 		struct NativeRenderJob job;

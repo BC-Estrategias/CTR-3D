@@ -12,28 +12,62 @@
 // Direct-mapped, verify-by-stored-key side table (docs/GTE_CAPTURE_DESIGN.md).
 // A collision or a stale (last frame's) entry is always a miss, never a wrong
 // value -- callers fall back to today's exact snapped behavior on a miss.
-// Sized generously (2^18 entries, 4 MiB) because eviction misses are not free
-// visually: on a STATIC scene (menus), a vertex that hits most frames but is
-// evicted on some frames pops by up to 1px on exactly those frames. Larger
-// table -> rarer evictions -> calmer static scenes. PC-only sizing; the 3DS
-// gets its own renderer and does not inherit this table.
+//
+// DOUBLE-BUFFERED (s26, the render-thread prerequisite): the game thread
+// writes frame N+1's captures while the core-2 worker may still be walking
+// frame N and reading its table. Two buffers; MainFrame_ResetDB's
+// GTECapture_Clear() is the flip point (it already sits exactly at the DB
+// swap), and DrawOTag publishes the write buffer as the walk's read buffer at
+// post time. One walk in flight ever (the game's own DrawSync fence), so by
+// the time ResetDB flips back to a buffer, no walk can still hold it. The
+// publish->worker-read ordering rides the render queue's own lock/signal
+// pair; no extra synchronization exists or is needed. PC's synchronous walk
+// reads the buffer it just wrote (publish makes read==write), byte-identical
+// to the single-buffered behavior.
+//
+// Sizing: eviction misses are not free visually -- on a STATIC scene (menus),
+// a vertex that hits most frames but is evicted on some frames pops by up to
+// 1px on exactly those frames. PC stays at 2^18 entries (4 MiB/buffer). The
+// 3DS -- which consumes this table for the retained-geometry full form, not
+// desnap -- takes 2^16 (1.5 MiB/buffer): there an eviction only downgrades a
+// prim from retained to walked for a frame, invisible by construction.
+#ifdef __3DS__
+#define GTE_CAPTURE_TABLE_BITS 16
+#else
 #define GTE_CAPTURE_TABLE_BITS 18
+#endif
 #define GTE_CAPTURE_TABLE_SIZE (1u << GTE_CAPTURE_TABLE_BITS)
 
 typedef struct
 {
 	u32 key;        // (u16)sy << 16 | (u16)sx -- same halves as the real C2_SXYn register (gtereg.h)
-	u32 generation; // stamped from s_gteCaptureGeneration; 0 = never written, always a miss
+	u32 generation; // stamped from the owning buffer's generation; 0 = never written, always a miss
 	u8 fracX8;      // top 8 of the 16 discarded fractional bits, i.e. 1/256px resolution
 	u8 fracY8;
 	u16 sz3;      // reserved for stereo (unused by vertex de-snapping)
 	s32 hOverSz3; // reserved for perspective-correct UV (unused by vertex de-snapping)
-	s16 vx, vy, vz; // model-space input vector (retainability instrument)
+	s16 vx, vy, vz; // model-space input vector (retainability rendezvous)
 	s16 _pad;
 } GTECaptureEntry;
 
-global_variable GTECaptureEntry s_gteCaptureTable[GTE_CAPTURE_TABLE_SIZE];
-global_variable u32 s_gteCaptureGeneration = 1;
+typedef struct
+{
+	GTECaptureEntry entries[GTE_CAPTURE_TABLE_SIZE];
+	u32 generation;
+	// UI band travels with the buffer: the band pointers describe the frame
+	// whose captures live here, and the walk that reads them may run a frame
+	// behind the game thread's current SetUIBand call.
+	const void *bandStart;
+	const void *bandEnd;
+} GTECaptureBuffer;
+
+global_variable GTECaptureBuffer s_gteCaptureBuf[2] = {{{{0}}, 1, NULL, NULL}, {{{0}}, 1, NULL, NULL}};
+// Game-thread cursor: which buffer Store/SetUIBand/Clear touch.
+global_variable int s_gteCaptureWriteIdx;
+// Walk cursor: which buffer Lookup*/MarkOTNode read. Written only by
+// GTECapture_PublishForWalk on the game thread at DrawOTag time, before the
+// walk job is posted (or before the synchronous walk runs).
+global_variable int s_gteCaptureReadIdx;
 
 internal u32 GTECapture_PackKey(s16 sx, s16 sy)
 {
@@ -50,21 +84,35 @@ internal u32 GTECapture_Hash(u32 key)
 
 void GTECapture_Clear(void)
 {
-	s_gteCaptureGeneration++;
-	if (s_gteCaptureGeneration == 0) // wrapped after ~2^32 frames (2+ years continuous at 60fps)
+	GTECaptureBuffer *buf;
+
+	// Flip first, then invalidate the NEW write buffer by generation bump.
+	// The buffer being abandoned may still be read by an in-flight walk; it
+	// is left untouched.
+	s_gteCaptureWriteIdx ^= 1;
+	buf = &s_gteCaptureBuf[s_gteCaptureWriteIdx];
+
+	buf->generation++;
+	if (buf->generation == 0) // wrapped after ~2^32 frames (2+ years continuous at 60fps)
 	{
-		memset(s_gteCaptureTable, 0, sizeof(s_gteCaptureTable));
-		s_gteCaptureGeneration = 1;
+		memset(buf->entries, 0, sizeof(buf->entries));
+		buf->generation = 1;
 	}
+}
+
+void GTECapture_PublishForWalk(void)
+{
+	s_gteCaptureReadIdx = s_gteCaptureWriteIdx;
 }
 
 void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3, s16 vx, s16 vy, s16 vz)
 {
+	GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureWriteIdx];
 	u32 key = GTECapture_PackKey(sx, sy);
-	GTECaptureEntry *entry = &s_gteCaptureTable[GTECapture_Hash(key)];
+	GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
 
 	entry->key = key;
-	entry->generation = s_gteCaptureGeneration;
+	entry->generation = buf->generation;
 	entry->fracX8 = (u8)((sxFull & 0xFFFF) >> 8);
 	entry->fracY8 = (u8)((syFull & 0xFFFF) >> 8);
 	entry->sz3 = sz3;
@@ -76,10 +124,11 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 
 int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8)
 {
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
 	u32 key = GTECapture_PackKey(sx, sy);
-	const GTECaptureEntry *entry = &s_gteCaptureTable[GTECapture_Hash(key)];
+	const GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
 
-	if ((entry->generation != s_gteCaptureGeneration) || (entry->key != key))
+	if ((entry->generation != buf->generation) || (entry->key != key))
 	{
 		return 0;
 	}
@@ -91,10 +140,11 @@ int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8)
 
 int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3])
 {
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
 	u32 key = GTECapture_PackKey(sx, sy);
-	const GTECaptureEntry *entry = &s_gteCaptureTable[GTECapture_Hash(key)];
+	const GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
 
-	if ((entry->generation != s_gteCaptureGeneration) || (entry->key != key))
+	if ((entry->generation != buf->generation) || (entry->key != key))
 	{
 		return 0;
 	}
@@ -105,14 +155,17 @@ int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3])
 	return 1;
 }
 
-global_variable const void *s_gteCaptureUIBandStart;
-global_variable const void *s_gteCaptureUIBandEnd;
+// Walk-thread state: BeginOTWalk/MarkOTNode/LookupSuppressed all run on
+// whichever thread owns the walk (worker on 3DS, main on PC) -- one walk in
+// flight, so a single flag needs no buffering.
 global_variable int s_gteCaptureSuppress;
 
 void GTECapture_SetUIBand(const void *start, const void *end)
 {
-	s_gteCaptureUIBandStart = start;
-	s_gteCaptureUIBandEnd = end;
+	GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureWriteIdx];
+
+	buf->bandStart = start;
+	buf->bandEnd = end;
 }
 
 void GTECapture_BeginOTWalk(void)
@@ -122,9 +175,11 @@ void GTECapture_BeginOTWalk(void)
 
 void GTECapture_MarkOTNode(const void *node)
 {
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
+
 	// Sticky: the UI band sits at the tail of the reversed OT walk, so once
 	// entered, every later packet this walk is UI. Reset by BeginOTWalk.
-	if ((node >= s_gteCaptureUIBandStart) && (node < s_gteCaptureUIBandEnd))
+	if ((node >= buf->bandStart) && (node < buf->bandEnd))
 	{
 		s_gteCaptureSuppress = 1;
 	}

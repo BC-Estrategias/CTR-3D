@@ -17,6 +17,11 @@ int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8);
 // will grow its own keyed-by-content variant.
 int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3]);
 void GTECapture_Clear(void);
+// Double-buffer publish (s26): called by the DrawOTag facade on the game
+// thread, before the walk is posted (3DS worker) or run (PC sync) -- the walk
+// then reads the buffer the frame just finished writing, while ResetDB's
+// Clear() flips subsequent Stores to the other one.
+void GTECapture_PublishForWalk(void);
 
 // UI suppression. The frame's single DrawOTag walk renders world geometry
 // first, then crosses into the swapchain OT's low six entries (the

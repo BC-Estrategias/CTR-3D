@@ -237,15 +237,11 @@ int NativeRenderQueue_Route(void)
 
 void NativeRenderQueue_Init(void)
 {
-#if CTR_NATIVE_GTE_CAPTURE
-	/* The GTE capture table is single-buffered and cleared by ResetDB(N+1)
-	 * while an async walk would still be reading it for frame N. Capture
-	 * builds are experiments (desnap/stereo); they run synchronously until
-	 * the table is double-buffered. */
-	N3DS_DebugLog("[CTR-3DS] render worker: NO (GTE-capture build; single-buffered capture table) -- sync fallback");
-#else
+	/* GTE-capture builds no longer force the sync fallback: the capture
+	 * table is double-buffered (s26, native_gte_capture.c) -- ResetDB's
+	 * Clear() flips the write buffer while the in-flight walk keeps reading
+	 * the one DrawOTag published for it. */
 	s_workerUp = N3DS_RenderWorkerStart(NativeRenderQueue_WorkerMain);
-#endif
 }
 
 void NativeRenderQueue_Shutdown(void)
