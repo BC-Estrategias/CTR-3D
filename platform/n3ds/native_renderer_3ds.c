@@ -312,6 +312,36 @@ int g_dbg_disableSubPage = 0;
  * capture set's CPU-side atlas dumps. */
 int g_dbg_atlasView = 0;
 
+/*
+ * Per-triangle resolve memo (s26). The triscopes hardware decomposition put
+ * draw_triangles_resolve at ~25-28ms of a ~59-70ms Labs-class frame -- ~90%
+ * of the whole draw stage -- while convert/append/flush never charted.
+ * Consecutive triangles overwhelmingly ask the same question (same page,
+ * clut, format, view, and sub-page tile), so one remembered answer short-
+ * circuits the hash-probe chain that costs ~2700 ARM11 cycles a call.
+ *
+ * Correctness: the memo is exactly as fresh as the decode caches' own
+ * invariants. Guard stamp = evictions(sum) + s_vramDirtyBumps; any eviction
+ * re-keys cells (coords may now belong to other content) and any VRAM write
+ * bumps cell generations (FindOrDecode would re-decode where the memo would
+ * not) -- either bumps the stamp and kills the memo. VRAM mutators fence the
+ * render worker before writing (see NativeRenderer_UpdateVRAM), so the stamp
+ * cannot move mid-walk under the memo's feet. LRU impact: lastUsedFrame is
+ * frame-granular, so skipping repeat touches within a frame changes nothing.
+ * Stats impact: tier hit counters advance on memo hits (routing counters
+ * stay honest); the caches' own hit counters undercount by design.
+ * Runtime A/B: dumpreq 'resolvememo'.
+ */
+int g_dbg_resolveMemo = 1;
+global_variable int s_rmemoValid = 0;
+global_variable u8 s_rmemoTier; /* 1 = sub-page, 2 = full-page */
+global_variable s16 s_rmemoPage, s_rmemoClut;
+global_variable u8 s_rmemoFormat, s_rmemoView;
+global_variable s16 s_rmemoTileX, s_rmemoTileY;
+global_variable int s_rmemoAtlas, s_rmemoPbU, s_rmemoPbV;
+global_variable u32 s_rmemoStamp;
+global_variable u32 s_resolveMemoHits = 0;
+
 /* ABLATION A (2026-07-21, session 14): boot-splash present submits clear +
  * display transfer but no draw calls. Used to prove the real-hardware boot
  * hang lived in the draw path, not clear/transfer -- which led to the
@@ -2238,6 +2268,20 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 	if (!g_dbg_disableSubPage && (tileX0 == tileX1) && (tileY0 == tileY1))
 	{
 		int atlasIdx, physCellX, physCellY, subX, subY;
+		const u32 stamp = s_decodeCacheEvictions + s_subPageCacheEvictions + s_vramDirtyBumps;
+
+		if (g_dbg_resolveMemo && s_rmemoValid && (s_rmemoTier == 1) && (s_rmemoStamp == stamp) && (s_rmemoPage == texPage) && (s_rmemoClut == clut) &&
+		    (s_rmemoFormat == (u8)format) && (s_rmemoView == (u8)view) && (s_rmemoTileX == (s16)tileX0) && (s_rmemoTileY == (s16)tileY0))
+		{
+			*outAtlasIdx = s_rmemoAtlas;
+			*outPixelBaseU = s_rmemoPbU;
+			*outPixelBaseV = s_rmemoPbV;
+			*outOriginU = tileX0 * N3DS_SUBPAGE_DIM;
+			*outOriginV = tileY0 * N3DS_SUBPAGE_DIM;
+			s_resolveMemoHits++;
+			s_trianglesRoutedSubPage++;
+			return 1;
+		}
 
 		N3DS_SubCellIndexToAtlasCoord(N3DS_FindOrDecodeSubPageTexture(texPage, clut, format, view, tileX0, tileY0),
 		                               &atlasIdx, &physCellX, &physCellY, &subX, &subY);
@@ -2247,11 +2291,41 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 		*outOriginU = tileX0 * N3DS_SUBPAGE_DIM;
 		*outOriginV = tileY0 * N3DS_SUBPAGE_DIM;
 		s_trianglesRoutedSubPage++;
+
+		/* Stamp AFTER the decode: FindOrDecode may itself have evicted,
+		 * which moves the sum -- a memo stored with the pre-decode stamp
+		 * would die on its first probe. */
+		s_rmemoValid = 1;
+		s_rmemoTier = 1;
+		s_rmemoPage = texPage;
+		s_rmemoClut = clut;
+		s_rmemoFormat = (u8)format;
+		s_rmemoView = (u8)view;
+		s_rmemoTileX = (s16)tileX0;
+		s_rmemoTileY = (s16)tileY0;
+		s_rmemoAtlas = *outAtlasIdx;
+		s_rmemoPbU = *outPixelBaseU;
+		s_rmemoPbV = *outPixelBaseV;
+		s_rmemoStamp = s_decodeCacheEvictions + s_subPageCacheEvictions + s_vramDirtyBumps;
 		return 1;
 	}
 
 	{
 		int atlasIdx, cellX, cellY;
+		const u32 stamp = s_decodeCacheEvictions + s_subPageCacheEvictions + s_vramDirtyBumps;
+
+		if (g_dbg_resolveMemo && s_rmemoValid && (s_rmemoTier == 2) && (s_rmemoStamp == stamp) && (s_rmemoPage == texPage) && (s_rmemoClut == clut) &&
+		    (s_rmemoFormat == (u8)format) && (s_rmemoView == (u8)view))
+		{
+			*outAtlasIdx = s_rmemoAtlas;
+			*outPixelBaseU = s_rmemoPbU;
+			*outPixelBaseV = s_rmemoPbV;
+			*outOriginU = 0;
+			*outOriginV = 0;
+			s_resolveMemoHits++;
+			s_trianglesRoutedFullPage++;
+			return 0;
+		}
 
 		N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(texPage, clut, format, view), &atlasIdx, &cellX, &cellY);
 		*outAtlasIdx = atlasIdx;
@@ -2260,6 +2334,17 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 		*outOriginU = 0;
 		*outOriginV = 0;
 		s_trianglesRoutedFullPage++;
+
+		s_rmemoValid = 1;
+		s_rmemoTier = 2;
+		s_rmemoPage = texPage;
+		s_rmemoClut = clut;
+		s_rmemoFormat = (u8)format;
+		s_rmemoView = (u8)view;
+		s_rmemoAtlas = atlasIdx;
+		s_rmemoPbU = *outPixelBaseU;
+		s_rmemoPbV = *outPixelBaseV;
+		s_rmemoStamp = s_decodeCacheEvictions + s_subPageCacheEvictions + s_vramDirtyBumps;
 		return 0;
 	}
 }
@@ -2844,6 +2929,9 @@ void NativeRenderer_SwapWindow(void)
 				         "[CTR-3DS] subpage cache hits=%lu misses=%lu missesWindow=%lu evictions=%lu evictionsWindow=%lu",
 				         (unsigned long)s_subPageCacheHits, (unsigned long)s_subPageCacheMisses, subMissesWindow,
 				         (unsigned long)s_subPageCacheEvictions, subEvictionsWindow);
+				N3DS_DebugLog(cacheLine);
+
+				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] rmemo on=%d hits=%lu", g_dbg_resolveMemo, (unsigned long)s_resolveMemoHits);
 				N3DS_DebugLog(cacheLine);
 
 				snprintf(cacheLine, sizeof(cacheLine),

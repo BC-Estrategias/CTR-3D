@@ -1130,6 +1130,13 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_directEmit ? "[CTR-3DS] direct emit: ON" : "[CTR-3DS] direct emit: OFF");
 				}
 #endif
+				else if (strncmp(word, "resolvememo", 11) == 0)
+				{
+					extern int g_dbg_resolveMemo;
+
+					g_dbg_resolveMemo ^= 1;
+					N3DS_DebugLog(g_dbg_resolveMemo ? "[CTR-3DS] resolve memo: ON" : "[CTR-3DS] resolve memo: OFF");
+				}
 				else if (strncmp(word, "atlasview", 9) == 0)
 				{
 					extern int g_dbg_atlasView;
@@ -1197,6 +1204,16 @@ unsigned int N3DS_ReadButtons(void)
 		N3DS_DebugLog(g_dbg_directEmit ? "[CTR-3DS] direct emit: ON" : "[CTR-3DS] direct emit: OFF");
 	}
 #endif
+
+	/* SELECT held + ZL: resolve-memo A/B (s26; the d-pad slots are full).
+	 * Same mid-run bracketing rationale as the d-pad family. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZL))
+	{
+		extern int g_dbg_resolveMemo;
+
+		g_dbg_resolveMemo ^= 1;
+		N3DS_DebugLog(g_dbg_resolveMemo ? "[CTR-3DS] resolve memo: ON" : "[CTR-3DS] resolve memo: OFF");
+	}
 #endif
 
 	if (held & KEY_A)
