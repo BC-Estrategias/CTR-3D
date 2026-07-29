@@ -1144,11 +1144,28 @@ unsigned int N3DS_ReadButtons(void)
 		}
 	}
 
-	/* SELECT, not ZL: ZL already changes camera angle in CTR's own controls
-	 * (2026-07-20). SELECT still also feeds N3DS_BTN_SELECT below for the
-	 * game as normal; requested this pairing anyway. Mirrors PC's F2
-	 * (native_platform.c:198). */
-	if (hidKeysDown() & KEY_SELECT)
+	/* SELECT held + D-pad DOWN: toggle render-worker routing mid-run, same
+	 * bracketing rationale as SELECT+DUP above. dumpreq 'renderthread' covers
+	 * Azahar (host-writable SD folder), but on hardware nothing can place
+	 * that file while the game runs -- FTP and the game are one-app-at-a-time
+	 * -- so without a combo the feature's own hardware A/B would be
+	 * cross-run, exactly the confound the mid-run flips exist to kill. The
+	 * OFF transition is safe mid-race by construction: Route() fences the
+	 * worker before the first direct call (native_render_queue.c). */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DDOWN))
+	{
+		extern int g_dbg_renderThread;
+
+		g_dbg_renderThread ^= 1;
+		N3DS_DebugLog(g_dbg_renderThread ? "[CTR-3DS] render worker routing: ON" : "[CTR-3DS] render worker routing: OFF (sync on main thread)");
+	}
+
+	/* SELECT held + D-pad RIGHT: textureless. Was bare SELECT (2026-07-20,
+	 * mirroring PC's F2), but once UP/DOWN joined the family every stray
+	 * SELECT tap was silently flipping textures too -- owner moved it onto
+	 * the same held-SELECT d-pad convention as the rest (2026-07-29).
+	 * SELECT still feeds N3DS_BTN_SELECT below for the game as normal. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DRIGHT))
 	{
 		g_dbg_texturelessMode ^= 1;
 		N3DS_DebugLog(g_dbg_texturelessMode ? "[CTR-3DS] textureless mode: 1" : "[CTR-3DS] textureless mode: 0");
