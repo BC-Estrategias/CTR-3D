@@ -229,11 +229,12 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 					activeDrawEnv.tpage = rawTPage;
 				}
 
-				/* One ordinal per prim, unconditionally -- the normal
-				 * path's StampEmitOrdinal advances even for the null-FT3
-				 * DR_TPAGE hack (it stamps zero vertices, then
-				 * increments). Clamp semantics identical. */
-				ordinal = (u16)(s_gpu.emitOrdinal < 0xFFFFu ? s_gpu.emitOrdinal : 0xFFFFu);
+				/* One stamp per prim, unconditionally -- the normal path's
+				 * StampEmitOrdinal advances even for the null-FT3 DR_TPAGE
+				 * hack (it stamps zero vertices, then increments). Same
+				 * shared stamp source as the parse path, so the ordinal
+				 * widening scheme (dumpreq 'otz') covers direct emit too. */
+				ordinal = NativeGpu_NextDepthStamp();
 				s_gpu.emitOrdinal++;
 				z = (s16)((int)ordinal - 32768);
 
