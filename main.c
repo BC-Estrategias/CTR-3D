@@ -92,6 +92,9 @@
 #else
 #include "platform/native_renderer.c"
 #endif
+// After native_gpu.c and the renderer: the direct-emit fast path reads their
+// file-scope state on 3DS, and is count-only on PC (see its header comment).
+#include "platform/native_direct_emit.c"
 #include "platform/native_savestate.c"
 #include "platform/native_state.c"
 #include "platform/native_str.c"

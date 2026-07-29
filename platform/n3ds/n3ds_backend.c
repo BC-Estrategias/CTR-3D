@@ -1118,6 +1118,18 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_renderThread ? "[CTR-3DS] render worker routing: ON"
 					                                 : "[CTR-3DS] render worker routing: OFF (sync on main thread)");
 				}
+#ifdef CTR_NATIVE_DIRECT_EMIT
+				else if (strncmp(word, "directemit", 10) == 0)
+				{
+					extern int g_dbg_directEmit;
+
+					/* Both legs produce byte-identical bins, so unlike
+					 * 'drawmerge' this needs no BeginScene latch -- see
+					 * native_direct_emit.c. */
+					g_dbg_directEmit ^= 1;
+					N3DS_DebugLog(g_dbg_directEmit ? "[CTR-3DS] direct emit: ON" : "[CTR-3DS] direct emit: OFF");
+				}
+#endif
 				else if (strncmp(word, "atlasview", 9) == 0)
 				{
 					extern int g_dbg_atlasView;
@@ -1170,6 +1182,21 @@ unsigned int N3DS_ReadButtons(void)
 		g_dbg_texturelessMode ^= 1;
 		N3DS_DebugLog(g_dbg_texturelessMode ? "[CTR-3DS] textureless mode: 1" : "[CTR-3DS] textureless mode: 0");
 	}
+
+#ifdef CTR_NATIVE_DIRECT_EMIT
+	/* SELECT held + D-pad LEFT: direct-emit fast path A/B, completing the
+	 * held-SELECT d-pad family (UP=single-texture, DOWN=render worker,
+	 * RIGHT=textureless). Same rationale as the others: hardware cannot
+	 * place a dumpreq file mid-race, and only a mid-run flip brackets
+	 * [PERF] windows on identical content. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DLEFT))
+	{
+		extern int g_dbg_directEmit;
+
+		g_dbg_directEmit ^= 1;
+		N3DS_DebugLog(g_dbg_directEmit ? "[CTR-3DS] direct emit: ON" : "[CTR-3DS] direct emit: OFF");
+	}
+#endif
 #endif
 
 	if (held & KEY_A)

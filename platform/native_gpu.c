@@ -32,6 +32,16 @@ extern int g_dbg_polygonSelected;
 #define NATIVE_GPU_LOG(fmt, ...)   Platform_Log("[CTR GPU] " fmt, ##__VA_ARGS__)
 #define NATIVE_GPU_ERROR(fmt, ...) Platform_LogError("[CTR GPU] [%s] - " fmt, __func__, ##__VA_ARGS__)
 
+#ifndef CTR_NATIVE_DIRECT_EMIT
+#define CTR_NATIVE_DIRECT_EMIT 0
+#endif
+#if defined(CTR_NATIVE) && CTR_NATIVE_DIRECT_EMIT
+// Defined in platform/native_direct_emit.c, included later in this TU (it
+// needs this file's and the 3DS renderer's file-scope state in view).
+internal int NativeDirectEmit_TryNode(const u8 *packet, u32 tagLength);
+internal void DirectEmit_FoldFrame(void);
+#endif
+
 // NOTE(aalhendi): Little-endian tag `CTRG` = CTR native GPU snapshot.
 #define NATIVE_GPU_STATE_MAGIC     0x47525443
 #define NATIVE_GPU_STATE_VERSION   1
@@ -696,6 +706,9 @@ void ClearSplits(void)
 {
 #ifdef CTR_NATIVE_OTWALK_PROFILE
 	OTProf_FoldFrame();
+#endif
+#if defined(CTR_NATIVE) && CTR_NATIVE_DIRECT_EMIT
+	DirectEmit_FoldFrame();
 #endif
 	// NOTE: the GTE capture table (native_gte_capture.c) is deliberately NOT
 	// cleared here -- this runs per-OT-draw, after this frame's captures and
@@ -1871,33 +1884,47 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 					break;
 				}
 
-				u8 *currentPacket = basePacket;
-				u8 *endPacket = basePacket + (tagLength + P_LEN) * sizeof(u32);
-				int primLength = 0;
-				int firstVertex = s_gpu.vertexIndex;
-				if (currentPacket < endPacket)
+#if defined(CTR_NATIVE) && CTR_NATIVE_DIRECT_EMIT
+				// Fast path: an all-opaque-poly node goes packet -> merge bin
+				// directly (3DS; PC builds only count and always parse). A
+				// handled node emitted its triangles and advanced the emit
+				// ordinals itself, so the parse loop must not see it. See
+				// native_direct_emit.c.
+				if (NativeDirectEmit_TryNode(basePacket, (u32)tagLength))
 				{
-					primLength = ParsePrimitive((P_TAG *)currentPacket);
-					currentPacket += (primLength + P_LEN) * sizeof(u32);
-					NativeGpu_StampEmitOrdinal(firstVertex);
+					// handled: nothing to parse
 				}
-
-				while (currentPacket < endPacket)
+				else
+#endif
 				{
-					firstVertex = s_gpu.vertexIndex;
-					primLength = ParseTaglessPrimitive((u32 *)currentPacket);
-					currentPacket += primLength * sizeof(u32);
-					NativeGpu_StampEmitOrdinal(firstVertex);
-				}
+					u8 *currentPacket = basePacket;
+					u8 *endPacket = basePacket + (tagLength + P_LEN) * sizeof(u32);
+					int primLength = 0;
+					int firstVertex = s_gpu.vertexIndex;
+					if (currentPacket < endPacket)
+					{
+						primLength = ParsePrimitive((P_TAG *)currentPacket);
+						currentPacket += (primLength + P_LEN) * sizeof(u32);
+						NativeGpu_StampEmitOrdinal(firstVertex);
+					}
 
-				if (currentPacket != endPacket)
-				{
-					char packetRegion[64];
-					NativeGpu_FormatPointerRegion(packetRegion, sizeof(packetRegion), (uintptr_t)basePacket);
-					NATIVE_GPU_ERROR("did not output valid primitive or ptag length is not valid (diff=%d packet=%p region=%s words=%08x %08x %08x %08x)\n",
-					                 endPacket - currentPacket, (void *)basePacket, packetRegion, NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 0),
-					                 NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 1), NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 2),
-					                 NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 3));
+					while (currentPacket < endPacket)
+					{
+						firstVertex = s_gpu.vertexIndex;
+						primLength = ParseTaglessPrimitive((u32 *)currentPacket);
+						currentPacket += primLength * sizeof(u32);
+						NativeGpu_StampEmitOrdinal(firstVertex);
+					}
+
+					if (currentPacket != endPacket)
+					{
+						char packetRegion[64];
+						NativeGpu_FormatPointerRegion(packetRegion, sizeof(packetRegion), (uintptr_t)basePacket);
+						NATIVE_GPU_ERROR("did not output valid primitive or ptag length is not valid (diff=%d packet=%p region=%s words=%08x %08x %08x %08x)\n",
+						                 endPacket - currentPacket, (void *)basePacket, packetRegion, NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 0),
+						                 NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 1), NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 2),
+						                 NativeGpu_ReadPacketWordForLog((uintptr_t)basePacket, 3));
+					}
 				}
 			}
 

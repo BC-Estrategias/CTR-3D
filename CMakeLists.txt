@@ -226,6 +226,32 @@ if(NINTENDO_3DS AND CTR_NATIVE_RENDER_THREAD)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_RENDER_THREAD=1)
 endif()
 
+# Direct-emit fast path (retained-geometry campaign, transitional form --
+# docs/RETAINED_GEOMETRY_V2_DESIGN.md, session 26). OT nodes whose payload is
+# purely opaque poly prims go packet -> merge bin on the 3DS walk directly,
+# skipping the GrVertex intermediate, the split machinery, and the scratch
+# copies -- the translate/convert half the core-2 profile showed as the
+# render worker's tax. Requires DRAW_MERGE (bins) + OT_DEPTH (order freedom);
+# byte-equivalent bins by construction, runtime A/B: SELECT+D-LEFT on
+# hardware, dumpreq 'directemit' in Azahar. On PC builds the gate compiles a
+# count-only scanner ([DEMIT] window line = the eligibility ceiling; runtime
+# default 0 on PC, flip g_dbg_directEmit in source to measure) and never
+# changes PC output. Hardware-accepted 2026-07-28 (owner A/B, Labs arcade:
+# visually identical, ~1.7ms median frame win -- the deleted GrVertex/split
+# machinery, NOT the per-triangle emit work, which just moved buckets:
+# draw_all_splits 42.1->27.6ms but draw_otag_parse 2.7->15.5ms) and promoted
+# to default ON the same night. The per-triangle work itself is the full
+# retained form's target (docs/RETAINED_GEOMETRY_V2_DESIGN.md).
+option(CTR_NATIVE_DIRECT_EMIT
+    "Direct packet->bin emit for all-opaque-poly OT nodes (3DS fast path; PC counts only)"
+    ON)
+if(CTR_NATIVE_DIRECT_EMIT)
+    if(NINTENDO_3DS AND NOT CTR_NATIVE_DRAW_MERGE)
+        message(FATAL_ERROR "CTR_NATIVE_DIRECT_EMIT requires CTR_NATIVE_DRAW_MERGE on 3DS (it emits into the merge bins)")
+    endif()
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_DIRECT_EMIT=1)
+endif()
+
 # Log every growth/reset of the decoded-voice PCM arena in the audio mixer.
 option(CTR_NATIVE_AUDIO_ARENA_LOG
     "Log decoded-voice PCM arena growth and resets"
