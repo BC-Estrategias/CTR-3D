@@ -133,6 +133,10 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
      * is already a candidate -- letting it win "dominant" would double-report
      * the same traversal. */
     {"draw_otag_drywalk_ms", 0},
+    /* dominantCandidate 0: a sub-slice of draw_otag_parse_ms (see the
+     * bucket's header comment) -- letting it win "dominant" would
+     * double-report the same time. */
+    {"direct_emit_ms", 0},
 };
 
 global_variable FILE *s_csvFile;

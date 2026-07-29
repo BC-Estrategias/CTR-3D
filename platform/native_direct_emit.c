@@ -396,6 +396,19 @@ internal int NativeDirectEmit_TryNode(const u8 *packet, u32 tagLength)
 		return 0;
 	}
 
+#ifdef __3DS__
+	/* One scope per handled node (~1-1.5k/frame in a race) under the same
+	 * runtime flag as the other per-call scopes: splits the moved emit work
+	 * out of draw_otag_parse_ms (the s26 finding this bucket exists for). */
+	if (g_dbg_perfTriScopes)
+	{
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DIRECT_EMIT);
+		DirectEmit_WalkNode(words, tagLength, 1);
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_DIRECT_EMIT);
+		return 1;
+	}
+#endif
+
 	DirectEmit_WalkNode(words, tagLength, 1);
 	return 1;
 }

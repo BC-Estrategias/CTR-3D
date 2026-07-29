@@ -82,6 +82,15 @@ enum NativePerfBucket
 	 * cost. Appended, never inserted: s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_DRAW_OTAG_DRYWALK,
+	/*
+	 * Direct-emit fast path (CTR_NATIVE_DIRECT_EMIT): the emit pass of
+	 * NativeDirectEmit_TryNode, i.e. the per-triangle resolve + bin-write
+	 * work running INSIDE the walk. Behind g_dbg_perfTriScopes (one scope
+	 * per handled node, ~1-1.5k/frame in a race) because the s26 hardware
+	 * sitting showed this work is what grew draw_otag_parse_ms when the
+	 * fast path went ON -- this bucket splits true parse from moved emit.
+	 */
+	NATIVE_PERF_BUCKET_DIRECT_EMIT,
 	NATIVE_PERF_BUCKET_COUNT
 };
 
