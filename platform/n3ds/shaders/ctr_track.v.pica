@@ -1,0 +1,216 @@
+; CTR-Native PICA200 vertex shader -- native track renderer, rung 3a STEP 2.
+; docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b.
+;
+; Projects model-space track vertices (NativeTrackVert, via the GPU-side
+; N3DS_TrackVertex mirror -- n3ds_backend.h) with a REAL perspective camera,
+; unlike the packet path's ctr.v.pica, which only remaps already-CPU-projected
+; screen-pixel positions through an orthographic matrix. Derivation (verified
+; against platform/native_gte_core.c's GTE_RotTransPers, not assumed):
+;
+;   view.x = (R00*vx + R01*vy + R02*vz)/4096 + TRX   (same shape for y/z)
+;   screenX = OFX + H * view.x / view.z
+;   screenY = OFY + H * view.y / view.z
+;
+; A straight port of that would need a real divide per vertex and a SECOND
+; matrix multiply to reach the packet path's shared ortho depth axis. Instead:
+; qx/qy/qw (uniforms, composed on the CPU once per frame in
+; platform/native_track_frame.c from the double-buffered camera snapshot) are
+; built so that w = view.z/H falls out of a plain dp4 against raw model-space
+; (vx,vy,vz,1), and a*=w*screenX, b*=w*screenY fall out the same way:
+;
+;   qx = [ R00/4096 + (OFX/H)*R20/4096, ..., TRX + (OFX/H)*TRZ ]
+;   qy = [ R10/4096 + (OFY/H)*R20/4096, ..., TRY + (OFY/H)*TRZ ]
+;   qw = [ R20/(4096*H), R21/(4096*H), R22/(4096*H), TRZ/H ]
+;
+; Feeding S=(a,b,w*zOrd,w) through the packet path's OWN ortho matrix
+; (n3ds_backend.c's s_projection, passed here as a second uniform of THIS
+; program) then yields outpos = (screenX, screenY, zOrd, 1) after the GPU's
+; own perspective divide -- exactly the packet path's own mapping, because
+; Mtx_OrthoTilt's row3 is (0,0,0,1): Mtx_Ortho builds it that way by
+; construction (it never writes anything else into the last row) and the
+; 3DS-panel "tilt" on top of it is a pure rotation, which cannot introduce a
+; w/translation term into a row that started at (0,0,0,1) -- checked by that
+; matrix-algebra argument, NOT by reading citro3d's own Mtx_OrthoTilt source,
+; which is not present locally (only headers ship with this devkitPro
+; install; libcitro3d.a is prebuilt). So outpos.w comes out equal to S.w = w
+; here (not the packet path's constant 1) -- exactly what a real perspective
+; divide needs. Stronger evidence than the matrix algebra alone: the PACKET
+; path already depends on this exact same property, today, on real hardware
+; -- ctr.v.pica sets r0.w = 1 and computes outpos.w = projection[3]-dot-r0
+; through the SAME s_projection this shader reuses. If row 3 were anything
+; other than (0,0,0,1), every packet-drawn frame would already be
+; perspective-distorted, and it is not: the game renders correctly on
+; hardware today. The algebraic argument says row 3 CAN'T be anything else;
+; this says it ISN'T, empirically, every frame this renderer has ever drawn.
+;
+; zOrd (depth compose, design 4.3/12b -- the walk's own bucket->ordinal table,
+; rung 1, NOT the abandoned "ordinal widening" v1 design section 12 describes
+; as falsified): per LEAF, platform/native_track_frame.c projects the leaf's
+; static BSP bbox through the SAME view.z axis (no H term) and converts both
+; ends to an OT bucket index with retail's own formula
+; (DrawLevelOvr1P_GetProjectedOtIndex, game/226/226_00_DrawLevelOvr1P.c:1950-1976:
+; otIndex = clamp((maxDepth>>6) + drawOrder, 0, 1020) -- maxDepth being
+; retail's SZ3 register, which native_gte_core.c:319-328 confirms IS this
+; same view.z axis, clamped to an unsigned 16-bit range, NOT a reciprocal
+; depth), looks up each end's emit ordinal via the rung-1 bucket table
+; (NativeGpu_GetOtBucketOrdinal), and passes the leaf's own
+; (otIndexLo, ordinalLo, ordinalSpan, invIndexSpan) here as a per-draw
+; uniform (N3DS_TrackDraw_Leaf). This shader computes its OWN per-vertex
+; otIndex (viewZ/64 + this vertex's drawOrder) and lerps it into that leaf's
+; ordinal range.
+;
+; REVIEW FIX (FIX 1 -- the CPU-side range this lerps into is no longer
+; box-geometry alone; platform/native_track_frame.c now widens it by this
+; leaf's own [drawOrderMin, drawOrderMax] before it ever reaches this
+; uniform, specifically so no in-range vertex needs to extrapolate outside
+; [0,1] here -- see that file's NativeTrackDraw_ComputeLeafDepthRange for the
+; full fix). What used to sit here was WRONG: a comment calling
+; out-of-[otIndexLo, otIndexLo+span] extrapolation "the same harmless
+; residual the design doc calls out for within-bucket ties" -- it is not a
+; tie-break at all. A valid ordinal (0..65535) already saturates this
+; shader's vertex-z clip range end to end (zOrdBias below maps it to
+; [-32768, 32767], exactly the depth range N3DS_C3DSetProjection's ortho
+; matrix clips against); an EXTRAPOLATED ordinal from a wide lerp
+; (invIndexSpan is large exactly when a leaf's box-derived range was
+; narrow -- one or two OT buckets) pushes outpos.z/outpos.w outside the clip
+; volume, and the GPU DISCARDS those triangles outright. The failure mode is
+; geometry vanishing off screen, not a coplanar tie resolving the wrong way.
+; The fraction clamp just below is belt-and-braces on top of the CPU-side
+; range fix, not a substitute for it: if a future change to the range math
+; ever narrows it again, clamping here still stops a wide lerp from reaching
+; the clip volume, at the cost of flattening depth at the leaf's own
+; extremes instead of deleting geometry.
+;
+; PICA200 has no SUB opcode (verified against picasso's own mnemonic list),
+; so every subtraction below is an ADD against a pre-negated constant:
+; drawOrderDebias is -128 (undoes the CPU-side +128 bias in
+; N3DS_TrackVertex.drawOrder) and depthRange.x arrives PRE-NEGATED from
+; N3DS_TrackDraw_Leaf (see that function's own comment for why the negation
+; lives there, not in platform/native_track_frame.c).
+;
+; PICA200 vertex shaders are float24 (~16-bit mantissa, so integers up to
+; roughly 131072 round-trip exactly). Ordinals reach 65535 -- checked against
+; that bound, not assumed: 65535 < 131072, so every ordinal value this shader
+; ever sees is exactly representable, no precision loss from the float
+; register file itself.
+
+; Uniforms
+.fvec qx           ; composed camera row: dp4(qx, v1) = w*screenX
+.fvec qy           ; composed camera row: dp4(qy, v1) = w*screenY
+.fvec qw           ; composed camera row: dp4(qw, v1) = w = view.z/H
+.fvec projection[4] ; SAME ortho matrix the packet path's ctr.v.pica uses
+.fvec hParam        ; x = H (distanceToScreen_PREV); yzw unused
+.fvec depthRange     ; (-otIndexLo, ordinalLo, ordinalSpan, invIndexSpan) -- per leaf
+
+; Constants
+.constf constants(0.0, 1.0, -1.0, 0.0)
+.alias  zeros constants.xxxx
+.alias  ones  constants.yyyy
+
+; x = -128 (drawOrder debias, additive -- see the header comment on the
+; missing SUB opcode), y = 1/64 (viewZ->otIndex quantizer, matches retail's
+; >>6), z = 1/255 (color rescale, same convention as ctr.v.pica's
+; colorScale), w = -32768 (ordinal->biased-z, matches N3DS_Vertex's own
+; z=ordinal-32768 scheme in n3ds_backend.h so both geometry sources share the
+; same signed-s16 depth-substrate axis).
+.constf trackConst(-128.0, 0.015625, 0.0039215686, -32768.0)
+.alias  drawOrderDebias trackConst.xxxx
+.alias  otIndexScale    trackConst.yyyy
+.alias  colorScale      trackConst.zzzz
+.alias  zOrdBias        trackConst.wwww
+
+; Outputs
+.out outpos position
+.out outtc0 texcoord0
+.out outclr color
+
+; Inputs (regId order must match N3DS_C3DInit's s_trackAttrInfo setup,
+; n3ds_backend.c)
+.alias inpos v0 ; x, y, z -- model space, raw GTE units (NOT rescaled: qx/qy/qw
+                 ; already fold the /4096 R scale, unlike ctr.v.pica's
+                 ; already-screen-space input)
+.alias intc  v1 ; u, v -- page-space texel coords, unused until rung 3b
+.alias inclr v2 ; r, g, b, drawOrder (biased +128; un-biased below)
+
+.proc main
+	; v1 = (vx, vy, vz, 1) -- raw model-space position, homogeneous.
+	mov r0.xyz, inpos.xyz
+	mov r0.w, ones
+
+	; a = w*screenX, b = w*screenY, w = view.z/H. Constant operand first
+	; (src1), input/temp register second (src2) -- PICA200's src2 cannot
+	; address the constant/uniform bank (verified empirically for ctr.v.pica;
+	; same restriction applies here).
+	dp4 r1.x, qx, r0
+	dp4 r1.y, qy, r0
+	dp4 r1.z, qw, r0
+
+	; viewZ = w * H -- recovers retail's own SZ3/maxDepth axis directly (see
+	; the header comment; this is R2.v/4096+TRZ, NOT a reciprocal).
+	mul r2.x, hParam, r1.z
+
+	; per-vertex otIndex = floor(viewZ/64) + (drawOrder-128), matching
+	; DrawLevelOvr1P_GetProjectedOtIndex's own (maxDepth>>6)+drawOrder shape.
+	mul r2.y, otIndexScale, r2.x
+	flr r2.y, r2.y
+	add r2.z, drawOrderDebias, inclr.w
+	add r2.w, r2.y, r2.z                ; otIndex_v (both operands temp regs -- order-free)
+
+	; fraction = (otIndex_v - otIndexLo) * invIndexSpan;
+	; ordinal = ordinalLo + fraction*ordinalSpan; zOrd = ordinal - 32768.
+	; depthRange.x arrives pre-negated (N3DS_TrackDraw_Leaf), so this first
+	; add IS the subtraction.
+	add r3.x, depthRange.xxxx, r2.w     ; otIndex_v - otIndexLo
+	mul r3.y, depthRange.wwww, r3.x     ; fraction
+
+	; REVIEW FIX (FIX 1b, belt-and-braces): clamp fraction to [0,1] before it
+	; scales ordinalSpan. The CPU-side range fix (header comment above) is
+	; what actually closes the geometry-deletion bug -- every real vertex's
+	; otIndex_v now falls inside [otIndexLo, otIndexLo+span] by construction
+	; -- but this clamp stays regardless so a future change to the CPU-side
+	; range math can never silently re-open it: an out-of-range fraction
+	; here degrades to a flattened depth at the leaf's own extreme (clipped
+	; to the valid ordinal range) instead of an extrapolated ordinal outside
+	; it (clipped away by the GPU). Zero-span leaves are unaffected: when
+	; invIndexSpan (depthRange.w) is 0, fraction is already exactly 0 before
+	; either clamp, and max(0,0)/min(1,0) both leave it at 0 -- the existing
+	; per-leaf CONSTANT-ordinal fallback is preserved exactly. Constant
+	; operand first (src1) in both instructions -- same PICA200 restriction
+	; as every dp4/mul above.
+	max r3.y, zeros, r3.y               ; fraction >= 0
+	min r3.y, ones, r3.y                ; fraction <= 1
+
+	mul r3.z, depthRange.zzzz, r3.y     ; fraction * ordinalSpan
+	add r3.w, depthRange.yyyy, r3.z     ; ordinal
+	add r4.x, zOrdBias, r3.w            ; zOrd = ordinal - 32768
+
+	; S = (a, b, w*zOrd, w) -- assembled component-by-component: a single mov
+	; can only read ONE source register (with swizzle), so gathering four
+	; components from three different temp registers takes four movs, not one.
+	mul r4.y, r1.z, r4.x                ; w*zOrd (both temp regs, order-free)
+	mov r5.x, r1.x                      ; a
+	mov r5.y, r1.y                      ; b
+	mov r5.z, r4.y                      ; w*zOrd
+	mov r5.w, r1.z                      ; w
+
+	; outpos = s_projection * S -- the SAME ortho matrix + row3 argument the
+	; header comment makes: outpos.w comes out equal to S.w = w, not 1.
+	dp4 outpos.x, projection[0], r5
+	dp4 outpos.y, projection[1], r5
+	dp4 outpos.z, projection[2], r5
+	dp4 outpos.w, projection[3], r5
+
+	; outtc0 unused in 3a (untextured) -- rung 3b samples the track atlas
+	; here. Every declared output component must still be written regardless
+	; (the s14 hardware boot hang; Azahar does not enforce this) -- one mov
+	; covers all four components since the whole vector is zero.
+	mov outtc0, zeros
+
+	; outclr: colorScale rescales the raw GPU_UNSIGNED_BYTE fetch back to
+	; 0..1 (same convention as ctr.v.pica). Alpha is a constant 1.0 -- inclr.w
+	; is NOT alpha here, it already fed drawOrder above.
+	mul outclr.xyz, colorScale, inclr.xyz
+	mov outclr.w, ones
+
+	end
+.end

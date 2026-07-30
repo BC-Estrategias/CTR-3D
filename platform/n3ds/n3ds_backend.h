@@ -396,6 +396,68 @@ void N3DS_TrackAtlas_UploadRect(int unit, int dstX, int dstY, int wTexels, int h
 /* For rung 3 (drawing). Same bind pattern as N3DS_C3DBindAtlas. */
 void N3DS_TrackAtlas_Bind(int unit);
 
+/* -------------------------------------------------- native track draw --- */
+/* Rung 3a step 2 (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b): the
+ * resident-mesh draw path, a SECOND vertex format/shader/attribute layout
+ * living alongside the packet path's N3DS_Vertex/ctr.v.pica above. Plain
+ * scalars only, same TU-boundary rule as everything else in this header.
+ *
+ * N3DS_TrackVertex mirrors platform/native_track_mesh.c's struct
+ * NativeTrackVert (16B, carries texRef/faceFlags the GPU does not need) into
+ * a 14-byte GPU-side layout: model-space position, page-space UV (unused
+ * until rung 3b's textured draws), and color + the signed per-face draw-order
+ * byte BIASED BY +128 so it can ride in an UNSIGNED byte group without
+ * clashing with r/g/b's own 0..255 range (a signed GPU_BYTE group would read
+ * 255 as -1 for every color channel too -- see n3ds_backend.h's own
+ * N3DS_Vertex comment on why integer attribute formats are never normalized
+ * by the vertex fetch). Every s16 field lands on an even offset and the
+ * struct's own size is even, same alignment rule N3DS_Vertex's trailing pad
+ * byte exists for (n3ds_backend.h's own comment on that struct explains why
+ * this is a hardware-only, Azahar-invisible risk class). */
+typedef struct
+{
+	s16 x, y, z; /* offset 0 -- model space, straight from LevVertex */
+	s16 u, v;    /* offset 6 -- page-space texel coords (rung 3b) */
+	u8 r, g, b;  /* offset 10 -- color_hi */
+	u8 drawOrder; /* offset 13 -- signed per-face OT byte, biased +128 */
+} N3DS_TrackVertex;
+
+/* Uploads one level's resident mesh: ONE linearAlloc block, vertices at
+ * offset 0, indices placed after them at an 8-byte-aligned offset (a single
+ * block is what makes the index physical address strictly greater than the
+ * C3D_BufInfo base by construction, which is what C3D_DrawElements' index
+ * pointer needs to encode as an offset from that base -- see
+ * N3DS_TrackDraw_Leaf's comment for what could and couldn't be confirmed
+ * about that encoding from the headers installed locally). vertStride is
+ * always sizeof(N3DS_TrackVertex) today; passed explicitly rather than
+ * assumed so a future caller changing the layout can't silently desync the
+ * upload from the struct. Frees any previous allocation first (level
+ * reload, same idiom as N3DS_TrackAtlas_Alloc). Returns 0 on allocation
+ * failure (nothing uploaded, any previous geometry already freed) or when
+ * vertCount/indexCount is degenerate. */
+int N3DS_TrackGeom_Upload(const void *verts, int vertCount, int vertStride, const void *indices, int indexCount);
+/* Called from NativeTrackMesh_Free alongside N3DS_TrackAtlas_Free -- a
+ * level's only teardown path. Safe to call with nothing uploaded. */
+void N3DS_TrackGeom_Free(void);
+
+/* Begin/Leaf/End bracket one frame's resident-track draw batch, called from
+ * NativeRenderer_EndScene (rung 3a step 2) immediately before the packet
+ * path's own merge-bin barrier flush. Begin binds the track program/
+ * attribute layout/vertex+index buffer, uploads the camera compose (qx/qy/qw
+ * -- platform/native_track_frame.c derives these once per frame from the
+ * double-buffered snapshot) and H, and configures the fragment combiner for
+ * vertex-color-only output (3a is untextured). Leaf draws one BSP leaf's
+ * index range with its own per-leaf OT-bucket depth-range uniform (design
+ * 4.3/12b's zOrd compose). End restores EVERY piece of packet-path GPU state
+ * this bracket touched (program, attribute layout, vertex buffer, fragment
+ * combiner) so the packet path's own merge-bin flush, issued right after,
+ * draws correctly -- see N3DS_TrackDraw_End's own comment for the exact
+ * list. No-op (Leaf silently skips its draw) if Upload was never called or
+ * last failed. */
+void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h);
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan);
+void N3DS_TrackDraw_End(void);
+
 /* The top-screen CONTENT region: N3DS_C3DBeginFrame pillarboxes every
  * presented frame to a centred 4:3 (320-wide) viewport, so screen columns
  * 0..39 and 360..399 are always black bars, not picture. Consumers that

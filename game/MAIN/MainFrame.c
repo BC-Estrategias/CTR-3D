@@ -156,6 +156,25 @@ void MainFrame_ResetDB(struct GameTracker *gGT)
 	GTECapture_SetUIBand((const void *)(uintptr_t)otSwapchainDB, (const void *)((uintptr_t)otSwapchainDB + 0x18u));
 #endif
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	// Native track renderer (rung 3a step 1, review fix): invalidate the
+	// snapshot on the SAME reset boundary GTECapture_Clear uses, same idiom,
+	// same reason. NativeTrackFrame_PublishForWalk (platform/native_libgpu.c)
+	// runs from EVERY DrawOTag -- FMV (game/230/MM_Video.c), the error screen
+	// (game/CTR/CTR_Error.c), load-time clears (game/MAIN/MainInit.c) -- not
+	// just the 1P race gate in RenderAllLevelGeometry that calls
+	// NativeTrackFrame_Record. Without an explicit invalidation here, a frame
+	// that publishes without ever recording would keep re-exposing whatever
+	// the LAST race frame recorded as still `valid` forever -- e.g. the
+	// final race snapshot drawn as a frozen track under the results screen,
+	// permanently, since nothing else ever clears it. Implementation:
+	// platform/native_track_frame.c.
+	{
+		extern void NativeTrackFrame_Clear(void);
+		NativeTrackFrame_Clear();
+	}
+#endif
+
 	CTR_EmptyFunc_MainFrame_ResetDB();
 	DecalGlobal_EmptyFunc_MainFrame_ResetDB();
 

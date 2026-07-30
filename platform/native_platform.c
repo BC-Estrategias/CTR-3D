@@ -175,6 +175,50 @@ internal void Platform_TakeScreenshot(void)
 }
 #endif
 
+#if defined(CTR_INTERNAL) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+// Review fix, FIX 1 (highest severity): the PC counterpart of the 3DS
+// dumpreq 'trackrender'/SELECT+ZR toggle, copying NativePlatform_LodBias-
+// ConfigureFromArgs's template exactly. Before this, g_dbg_trackRender had
+// NO PC setter at all -- an enabled build's toggle could never leave 0 on
+// PC, so NativeTrackFrame_Record's `if (g_dbg_trackRender != 0)` gate always
+// bailed and the leaf walk / bspIndex mapping / camera copy had never
+// executed a single time on any platform, on PC or 3DS, despite step 1's own
+// verification claiming otherwise. This is what makes step 1 verifiable at
+// all: without it there is no way to drive the recorder on PC, where the
+// golden/[TRKMESH]/[TRKFRAME] loop actually runs.
+internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[])
+{
+	extern int g_dbg_trackRender;
+	int i;
+
+	for (i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "--track-render") != 0)
+		{
+			continue;
+		}
+
+		if ((i + 1) >= argc)
+		{
+			Platform_LogWarn("[CTR Native] --track-render needs a state (0=off 1=on 2=both)\n");
+			continue;
+		}
+
+		i++;
+		{
+			int n = atoi(argv[i]);
+
+			g_dbg_trackRender = (n < 0) ? 0 : (n > 2) ? 2 : n;
+		}
+	}
+
+	// Always log the resulting state (even the default 0), same as the
+	// dumpreq/button handlers do on 3DS -- this is the line the verification
+	// loop greps for to confirm the flag actually took.
+	Platform_LogWarn("[CTR Native] track render: %d\n", g_dbg_trackRender);
+}
+#endif
+
 internal void Platform_HandleKey(int key, char down)
 {
 	if (down == 0)
@@ -234,6 +278,28 @@ internal void Platform_HandleKey(int key, char down)
 		case SDL_SCANCODE_F8:
 			NativeSaveState_RequestLoad();
 			break;
+#if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+		// Review fix, FIX 1: PC debug key for the native track renderer's
+		// runtime toggle, --track-render N's mid-run companion (same
+		// rationale as the LOD-bias keys just above). F1-F12 are all already
+		// spoken for in this switch (wireframe/textureless/filtering/LOD/
+		// savestate/replay/screenshot) or intercepted earlier in the event
+		// loop before Platform_HandleKey ever runs (F4/F6 controller-cycling,
+		// F11 fullscreen -- see Platform_PollHostEvents) -- F13 is the one
+		// scancode in the extended function-key range nothing else in this
+		// file touches. It's a convenience for a PC dev without a launch
+		// script handy; --track-render on the command line is the interface
+		// the verification loop actually depends on, since most keyboards
+		// don't have a physical F13 key at all.
+		case SDL_SCANCODE_F13:
+		{
+			extern int g_dbg_trackRender;
+
+			g_dbg_trackRender = (g_dbg_trackRender + 1) % 3;
+			Platform_LogWarn("[CTR Native] track render: %d\n", g_dbg_trackRender);
+			break;
+		}
+#endif
 		}
 	}
 #endif

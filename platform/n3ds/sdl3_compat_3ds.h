@@ -138,6 +138,14 @@ typedef enum SDL_Scancode
 	SDL_SCANCODE_F11 = 68,
 	SDL_SCANCODE_F12 = 69,
 
+	// F13 (value matches real SDL3's SDL_scancode.h) -- the 3DS has no
+	// physical keyboard, so this scancode is never actually produced by any
+	// input path here; it exists only so shared unity-TU code (native_platform.c's
+	// Platform_HandleKey switch, e.g. the native track renderer's PC debug
+	// key) can reference SDL_SCANCODE_F13 without a platform #ifdef and
+	// still compile on 3DS, even though the case can never fire there.
+	SDL_SCANCODE_F13 = 104,
+
 	SDL_SCANCODE_RIGHT = 79,
 	SDL_SCANCODE_LEFT = 80,
 	SDL_SCANCODE_DOWN = 81,

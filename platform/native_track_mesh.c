@@ -17,26 +17,28 @@
  * not widening the exclusion.
  */
 
+/* Included unconditionally (review fix, FIX 5): the accessor stubs in the
+ * #else branch far below need struct NativeTrackVert's real definition too
+ * (it's a complete type in the header regardless of the gate), and pulling
+ * the include out from inside the #if is what lets the SAME header serve
+ * both the real builder below and the stubs, rather than each half seeing a
+ * different implicit tag for the same struct name. */
+#include "platform/native_track_mesh.h"
+
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 
-/* 16 bytes, matches the design's budget. Positions are model-space straight
- * from LevVertex; colors are the near set (color_hi); u/v are page-space
- * texel bytes from the near-variant TextureLayout corner assigned to this
- * grid vertex (atlas translation happens at upload, not here); texRef
- * indexes the per-level layout table below; drawOrder is the signed
- * per-face OT byte folded into depth by the shader (GetProjectedOtIndex's
- * own formula, 226:1956). */
-struct NativeTrackVert
-{
-	s16 x, y, z;
-	s8 drawOrder;
-	u8 faceFlags; /* bit0 doubleSided; bits 1-3 faceMode/rotation scratch */
-	u8 r, g, b, a;
-	u8 u, v;
-	u16 texRef;
-};
-
-CTR_STATIC_ASSERT(sizeof(struct NativeTrackVert) == 16);
+/* struct NativeTrackVert itself now lives in the header above (rung 3a step
+ * 1) -- the read-only accessor surface at the end of this file hands a
+ * draw side a typed `const struct NativeTrackVert *`, and a 3DS re-packer
+ * needs the real field layout to do that, so the definition moved out of
+ * this file's private section rather than being duplicated. Everything
+ * about it is unchanged: 16 bytes, matches the design's budget. Positions
+ * are model-space straight from LevVertex; colors are the near set
+ * (color_hi); u/v are page-space texel bytes from the near-variant
+ * TextureLayout corner assigned to this grid vertex (atlas translation
+ * happens at upload, not here); texRef indexes the per-level layout table
+ * below; drawOrder is the signed per-face OT byte folded into depth by the
+ * shader (GetProjectedOtIndex's own formula, 226:1956). */
 
 struct NativeTrackLeafRange
 {
@@ -44,7 +46,35 @@ struct NativeTrackLeafRange
 	u16 atlasBin;    /* reserved: draws are binned per (leaf x atlas) */
 	u32 firstIndex;  /* into s_trackIndices */
 	u32 indexCount;
+	/* Rung 3a step 2: copied from mesh->bspRoot[bspIndex].box at BUILD time
+	 * (NOT re-read from the BSP tree per frame) so the draw side's per-leaf
+	 * depth-range compose (platform/native_track_frame.c, design 4.3/12b)
+	 * never has to dereference a raw mesh_info/BSP pointer on the worker --
+	 * this flat copy enjoys the same build-or-nothing validity contract every
+	 * other field in this struct already does. */
+	s16 boxMin[3], boxMax[3];
+	/* Review fix (FIX 1a): running min/max of the signed per-face drawOrder
+	 * byte over every face THIS leaf actually emits (same loop that already
+	 * reads block->draw_order_high per face below -- tracked alongside it,
+	 * not re-derived). The box alone bounds where a leaf's geometry SITS;
+	 * it says nothing about how far a face's own drawOrder can additionally
+	 * push that leaf's vertices along the OT axis in the shader. Widening
+	 * the draw-side range by [drawOrderMin, drawOrderMax] before it reaches
+	 * the shader is what stops a vertex from extrapolating past a valid
+	 * ordinal and being clipped away -- see native_track_mesh.h's accessor
+	 * comment for the full failure mode. Sentinel-initialized to
+	 * [127, -128] (the widest-possible empty range) before the emit loop; a
+	 * leaf that ends up with indexCount == 0 never has these read. */
+	s8 drawOrderMin, drawOrderMax;
 };
+
+/* Grew this session (FIX 1a added drawOrderMin/drawOrderMax): 24B -> 28B
+ * (2 bytes of struct-alignment padding after the two s8 fields, since a u32
+ * member forces 4-byte alignment). Tripwire so the next field added here
+ * doesn't silently drift the size assumed by every allocation/log line that
+ * sizes off this struct without anyone noticing, the same reasoning
+ * NativeTrackVert's own assert (native_track_mesh.h) already applies. */
+CTR_STATIC_ASSERT(sizeof(struct NativeTrackLeafRange) == 28);
 
 /*
  * Rung 2a: track atlas LAYOUT (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12).
@@ -105,6 +135,27 @@ struct NativeTrackMeshState
 	u32 indexCount;
 	struct NativeTrackLeafRange *leafRanges;
 	u32 leafCount;
+
+	/* Reverse lookup, bspIndex -> leafRanges index (rung 3a step 1,
+	 * include/platform/native_track_mesh.h's NativeTrackMesh_LeafIndexForBsp):
+	 * numBspNodes entries, -1 = no resident range for that BSP index (an
+	 * excluded leaf per design 4.4, or simply not a leaf). Built once per
+	 * mesh build alongside leafRanges itself, NOT per frame -- the frame
+	 * recorder's visibility walk maps the game's own per-frame BSP-index
+	 * lists through this table, which is what keeps that walk O(visible
+	 * leaves) instead of O(leaves x ranges). */
+	s32 *bspToLeafIndex;
+
+	/* bspToLeafIndex's allocated element count, latched at the SAME time as
+	 * the allocation itself (review fix: NativeTrackMesh_LeafIndexForBsp used
+	 * to bound bspIndex against builtFor->numBspNodes read LIVE at call time,
+	 * but that can silently drift from what this table was actually sized
+	 * for -- a level reloading into the same mesh_info arena slot with equal
+	 * quad/vertex counts but a different bsp node count would read past the
+	 * allocation before the rebuild latch above ever catches it. Bound
+	 * against THIS field instead, which only ever changes alongside the
+	 * allocation it describes. */
+	u32 bspNodeCount;
 
 	/* Per-level table of near-variant TextureLayout pointers; texRef fields
 	 * index it. AnimTex faces record the AnimTex instead (low bit set,
@@ -215,12 +266,17 @@ static void NativeTrackMesh_Free(void)
 	/* Release the dedicated atlas pool's linear-heap textures too (review
 	 * finding #8) -- this is the only teardown path a level currently has
 	 * (called both on rebuild and on allocation-failure unwind below), so
-	 * it's also the only place leaving a track can release that memory. */
+	 * it's also the only place leaving a track can release that memory.
+	 * Rung 3a step 2: the resident geometry buffer (N3DS_TrackGeom_Upload)
+	 * is the SAME per-level linear-heap allocation shape, freed here for
+	 * exactly the same reason. */
 	N3DS_TrackAtlas_Free();
+	N3DS_TrackGeom_Free();
 #endif
 	free(s_trackMesh.verts);
 	free(s_trackMesh.indices);
 	free(s_trackMesh.leafRanges);
+	free(s_trackMesh.bspToLeafIndex);
 	free(s_trackMesh.texTable);
 	memset(&s_trackMesh, 0, sizeof(s_trackMesh));
 }
@@ -565,6 +621,119 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 	s_retryCount = 0;
 	return 1;
 }
+
+/*
+ * Rung 3a step 2: repack + upload the resident mesh's GPU-visible geometry.
+ * struct NativeTrackVert (this file's own 16B build-time layout, above) still
+ * carries texRef/faceFlags the GPU never reads; N3DS_TrackVertex
+ * (n3ds_backend.h, 14B) is the plain-scalar mirror N3DS_C3DInit's
+ * s_trackAttrInfo actually consumes. One-time-per-level repack into a
+ * transient malloc'd staging buffer -- N3DS_TrackGeom_Upload memcpies it
+ * into its own linearAlloc block immediately, so nothing here needs to
+ * outlive this call.
+ *
+ * GIVEUP (review fix, FIX 3 -- mirrors NativeTrackAtlas_UploadToBackend's own
+ * mechanism above, same reasoning): a persistently full linear heap makes a
+ * bare "return 0 on failure" retry FOREVER, since nothing frees the heap
+ * between frames on its own -- every one of those retries reruns the WHOLE
+ * build this function is only the tail of (weld pass, per-face emit over up
+ * to 20000 quadblocks, atlas repack, atlas decode+upload), not just this
+ * upload. Same fingerprint (mesh/numQuadBlock/numVertex, reset when the level
+ * changes), same 4-attempt ceiling, same distinct GIVEUP log tag. Unlike the
+ * atlas's giveup, there is no partial win to latch here -- N3DS_TrackGeom_Upload
+ * either fully succeeds or fully fails -- so giving up means latching this
+ * level with NO resident geometry rather than a stale one:
+ * N3DS_TrackGeom_Free() is called explicitly on that path (on top of every
+ * failing call already leaving s_trackGeomReady at 0 via N3DS_TrackGeom_Upload's
+ * own Free-first), so N3DS_TrackDraw_Begin's s_trackGeomReady check is
+ * guaranteed to see "not ready" and draw nothing, rather than this function's
+ * contract depending on a reader tracing into n3ds_backend.c to confirm it.
+ */
+static int NativeTrackGeom_UploadToBackend(struct mesh_info *mesh, int numQuadBlock, int numVertex)
+{
+	static struct mesh_info *s_retryMesh = NULL;
+	static int s_retryQb = -1, s_retryVtx = -1;
+	static int s_retryCount = 0;
+	N3DS_TrackVertex *staging;
+	int ok;
+	u32 i;
+
+	if ((mesh != s_retryMesh) || (numQuadBlock != s_retryQb) || (numVertex != s_retryVtx))
+	{
+		s_retryMesh = mesh;
+		s_retryQb = numQuadBlock;
+		s_retryVtx = numVertex;
+		s_retryCount = 0;
+	}
+
+	if ((s_trackMesh.vertCount == 0) || (s_trackMesh.indexCount == 0))
+	{
+		/* An empty resident mesh (every leaf excluded, or nothing textured)
+		 * is not a failure -- nothing to upload, nothing to draw. Free any
+		 * PRIOR level's geometry so a stale buffer never survives into a
+		 * level that builds none of its own, and reset the retry counter so
+		 * a LATER level that genuinely fails doesn't inherit an empty
+		 * level's count. */
+		N3DS_TrackGeom_Free();
+		s_retryCount = 0;
+		return 1;
+	}
+
+	staging = (N3DS_TrackVertex *)malloc((size_t)s_trackMesh.vertCount * sizeof(N3DS_TrackVertex));
+
+	if (staging != NULL)
+	{
+		for (i = 0; i < s_trackMesh.vertCount; i++)
+		{
+			const struct NativeTrackVert *src = &s_trackMesh.verts[i];
+			N3DS_TrackVertex *dst = &staging[i];
+
+			dst->x = src->x;
+			dst->y = src->y;
+			dst->z = src->z;
+			dst->u = src->u; /* u8 -> s16 widen, page-space texel coord (rung 3b) */
+			dst->v = src->v;
+			dst->r = src->r;
+			dst->g = src->g;
+			dst->b = src->b;
+			/* Bias +128 -- see N3DS_TrackVertex's own comment (n3ds_backend.h)
+			 * for why an UNSIGNED byte group (shared with r/g/b) can't carry a
+			 * raw signed value without corrupting r/g/b=255 into -1. */
+			dst->drawOrder = (u8)((int)src->drawOrder + 128);
+		}
+
+		ok = N3DS_TrackGeom_Upload(staging, (int)s_trackMesh.vertCount, (int)sizeof(N3DS_TrackVertex), s_trackMesh.indices, (int)s_trackMesh.indexCount);
+
+		free(staging);
+	}
+	else
+	{
+		/* Staging malloc failure is the same "couldn't get memory" signal as
+		 * a linearAlloc failure inside N3DS_TrackGeom_Upload -- count it
+		 * toward the same retry ceiling rather than returning early. */
+		ok = 0;
+	}
+
+	if (ok)
+	{
+		s_retryCount = 0;
+		Platform_Log("[TRKGEOM3DS] verts=%u idx=%u KB=%u\n", s_trackMesh.vertCount, s_trackMesh.indexCount,
+		             (u32)((s_trackMesh.vertCount * sizeof(N3DS_TrackVertex) + s_trackMesh.indexCount * sizeof(u16)) / 1024));
+		return 1;
+	}
+
+	s_retryCount++;
+
+	if (s_retryCount >= 4)
+	{
+		Platform_Log("[TRKGEOM3DS] GIVEUP after %d tries -- latching level with NO resident geometry\n", s_retryCount);
+		s_retryCount = 0;
+		N3DS_TrackGeom_Free();
+		return 1;
+	}
+
+	return 0;
+}
 #endif /* __3DS__ */
 
 static u16 NativeTrackMesh_InternTexture(uintptr_t texPtr)
@@ -617,15 +786,35 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * s27 review finding), and it is only recorded on SUCCESSFUL builds; the
 	 * cheap-validation and calloc-failure paths below return unlatched so a
 	 * transient failure retries next frame instead of pinning an empty mesh
-	 * to that level forever. */
-	static int s_builtQb = -1, s_builtVtx = -1;
+	 * to that level forever. numBspNodes joined the fingerprint after a
+	 * review finding: a level reloading into the same arena address with
+	 * equal quad/vertex counts but a DIFFERENT bsp node count would otherwise
+	 * pass this check while bspToLeafIndex (sized from the OLD numBspNodes)
+	 * is still allocated at the old size -- see NativeTrackMesh_LeafIndexForBsp's
+	 * bound, which now checks bspNodeCount as latched at build time, not
+	 * mesh->numBspNodes read live (which could have already changed under
+	 * a stale-but-pointer-equal mesh). */
+	static int s_builtQb = -1, s_builtVtx = -1, s_builtBspNodes = -1;
 
 	if ((level == NULL) || (mesh == NULL))
 	{
 		return;
 	}
 
-	if ((mesh == s_trackMesh.builtFor) && (mesh->numQuadBlock == s_builtQb) && (mesh->numVertex == s_builtVtx))
+	/*
+	 * Review fix (FIX 7, comment only): this closes the specific
+	 * arena-address-reuse bug it was written for (a stale mesh at the SAME
+	 * pointer with a DIFFERENT shape), but it is still a heuristic, not a
+	 * guarantee -- two DIFFERENT levels sharing all three counts (quad,
+	 * vertex, bsp-node) AND landing at the same reused arena address would
+	 * pass this check and skip the rebuild, drawing a stale mesh. Low
+	 * probability across the ~20-track roster, and a real content hash isn't
+	 * worth the extra build-time cost to close it -- but that is a residual
+	 * risk being accepted, not something this check actually rules out, so a
+	 * later reader shouldn't mistake three matching counts for proof it's the
+	 * same level.
+	 */
+	if ((mesh == s_trackMesh.builtFor) && (mesh->numQuadBlock == s_builtQb) && (mesh->numVertex == s_builtVtx) && (mesh->numBspNodes == s_builtBspNodes))
 	{
 		return;
 	}
@@ -686,14 +875,21 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	s_trackMesh.verts = (struct NativeTrackVert *)malloc(maxVerts * sizeof(struct NativeTrackVert));
 	s_trackMesh.indices = (u16 *)malloc(maxIndices * sizeof(u16));
 	s_trackMesh.leafRanges = (struct NativeTrackLeafRange *)malloc((size_t)mesh->numBspNodes * sizeof(struct NativeTrackLeafRange));
+	s_trackMesh.bspToLeafIndex = (s32 *)malloc((size_t)mesh->numBspNodes * sizeof(s32));
 	s_trackMesh.texTable = (uintptr_t *)malloc(1024 * sizeof(uintptr_t));
 
-	if ((s_trackMesh.verts == NULL) || (s_trackMesh.indices == NULL) || (s_trackMesh.leafRanges == NULL) || (s_trackMesh.texTable == NULL))
+	if ((s_trackMesh.verts == NULL) || (s_trackMesh.indices == NULL) || (s_trackMesh.leafRanges == NULL) || (s_trackMesh.bspToLeafIndex == NULL) ||
+	    (s_trackMesh.texTable == NULL))
 	{
 		NativeTrackMesh_Free();
 		free(animMark);
 		return;
 	}
+
+	/* -1 = no resident range. Set once here rather than defaulted per-entry
+	 * below, since most BSP node indices are branches (never visited by this
+	 * leaf-only loop) and would otherwise read as stale/uninitialized. */
+	memset(s_trackMesh.bspToLeafIndex, 0xff, (size_t)mesh->numBspNodes * sizeof(s32));
 
 	/* Weld pre-pass: canonical mid per matched edge, over ALL quadblocks so
 	 * the choice is stable regardless of which leaves end up resident. */
@@ -772,6 +968,18 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		leafRange->bspIndex = (u16)n;
 		leafRange->atlasBin = 0;
 		leafRange->firstIndex = s_trackMesh.indexCount;
+		leafRange->boxMin[0] = bsp->box.min.x;
+		leafRange->boxMin[1] = bsp->box.min.y;
+		leafRange->boxMin[2] = bsp->box.min.z;
+		leafRange->boxMax[0] = bsp->box.max.x;
+		leafRange->boxMax[1] = bsp->box.max.y;
+		leafRange->boxMax[2] = bsp->box.max.z;
+		/* Widest-possible empty range (FIX 1a) -- narrows as real emitted
+		 * faces' drawOrder bytes are seen below. Only ever read back when
+		 * indexCount > 0 (i.e. at least one face narrowed it), same
+		 * build-or-nothing contract as the rest of this struct. */
+		leafRange->drawOrderMin = 127;
+		leafRange->drawOrderMax = -128;
 
 		for (int q = 0; q < numQuads; q++)
 		{
@@ -861,6 +1069,18 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				s8 drawOrder = (s8)((const u8 *)&block->draw_order_high)[face];
 				u32 baseVert = s_trackMesh.vertCount;
 
+				/* FIX 1a: widen this leaf's drawOrder range to cover every
+				 * face actually emitted into it (not just this one) -- see
+				 * the struct comment on drawOrderMin/drawOrderMax. */
+				if (drawOrder < leafRange->drawOrderMin)
+				{
+					leafRange->drawOrderMin = drawOrder;
+				}
+				if (drawOrder > leafRange->drawOrderMax)
+				{
+					leafRange->drawOrderMax = drawOrder;
+				}
+
 				/* Per-face rotation/flip: corner c takes UV index
 				 * sTrackUvPerm[rot][c] (see the table's derivation note). */
 				u32 faceBits = (drawOrderLow >> (8 + 5 * face)) & 0x1f;
@@ -936,6 +1156,10 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 		if (leafRange->indexCount > 0)
 		{
+			/* leafRange sits at s_trackMesh.leafRanges[s_trackMesh.leafCount]
+			 * (allocated above, before this count is known) -- record the
+			 * reverse mapping at that same index before advancing it. */
+			s_trackMesh.bspToLeafIndex[n] = (s32)s_trackMesh.leafCount;
 			s_trackMesh.leafCount++;
 		}
 	}
@@ -1008,6 +1232,12 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 #if defined(__3DS__)
 	int trackAtlasOk = NativeTrackAtlas_UploadToBackend(mesh, numQuadBlock, numVertex);
+	/* Rung 3a step 2: geometry upload shares the atlas's own withhold-latch-
+	 * on-failure contract (below) -- a transient linearAlloc shortfall
+	 * retries the WHOLE build next frame, same as the atlas's documented
+	 * linear-heap pressure case, rather than latching a level with no
+	 * resident geometry uploaded. */
+	int trackGeomOk = NativeTrackGeom_UploadToBackend(mesh, numQuadBlock, numVertex);
 #endif
 
 	/* Latch only now, on success -- see the fingerprint comment up top. On
@@ -1017,12 +1247,14 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * calloc-failure paths above; permanent per-rect skips (oversize,
 	 * unresolved unit) do not withhold it (review finding #4). */
 #if defined(__3DS__)
-	if (trackAtlasOk)
+	if (trackAtlasOk && trackGeomOk)
 #endif
 	{
 		s_trackMesh.builtFor = mesh;
 		s_builtQb = numQuadBlock;
 		s_builtVtx = numVertex;
+		s_builtBspNodes = mesh->numBspNodes;
+		s_trackMesh.bspNodeCount = (u32)mesh->numBspNodes;
 	}
 
 #if !defined(__3DS__)
@@ -1075,6 +1307,200 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	Platform_Log("[TRKATLAS] rects=%d units=%d/%d fill=%d%% texelKB=%u animFrames=%d dropped=%d\n", s_trackMesh.atlas.rectCount, s_trackMesh.atlas.unitsUsed,
 	             TRACK_ATLAS_MAX_UNITS, s_trackMesh.atlas.unitsUsed ? (int)((s_trackMesh.atlas.packedTexels * 100u) / ((u32)s_trackMesh.atlas.unitsUsed * TRACK_ATLAS_DIM * TRACK_ATLAS_DIM)) : 0,
 	             (s_trackMesh.atlas.packedTexels * 2u) / 1024u, atlasAnimFrames, s_trackMesh.atlas.rectsDropped);
+}
+
+/*
+ * Read-only accessor surface (include/platform/native_track_mesh.h), rung 3a
+ * step 1. Everything below is a plain read of state NativeTrackMesh_Frame
+ * above already owns and validates -- no new invariants, no new failure
+ * modes. This is the only part of this file another translation unit (the
+ * frame recorder, platform/native_track_frame.c) is meant to touch; every
+ * other symbol here stays static.
+ */
+
+int NativeTrackMesh_IsBuilt(void)
+{
+	return s_trackMesh.builtFor != NULL;
+}
+
+int NativeTrackMesh_IsBuiltFor(const struct mesh_info *mesh)
+{
+	return (mesh != NULL) && (s_trackMesh.builtFor == mesh);
+}
+
+unsigned NativeTrackMesh_LeafCount(void)
+{
+	return (unsigned)s_trackMesh.leafCount;
+}
+
+int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirstIndex, unsigned *outIndexCount)
+{
+	if (i >= s_trackMesh.leafCount)
+	{
+		return 0;
+	}
+
+	*outBspIndex = s_trackMesh.leafRanges[i].bspIndex;
+	*outFirstIndex = s_trackMesh.leafRanges[i].firstIndex;
+	*outIndexCount = s_trackMesh.leafRanges[i].indexCount;
+	return 1;
+}
+
+int NativeTrackMesh_LeafBox(unsigned i, s16 outMin[3], s16 outMax[3])
+{
+	if (i >= s_trackMesh.leafCount)
+	{
+		return 0;
+	}
+
+	outMin[0] = s_trackMesh.leafRanges[i].boxMin[0];
+	outMin[1] = s_trackMesh.leafRanges[i].boxMin[1];
+	outMin[2] = s_trackMesh.leafRanges[i].boxMin[2];
+	outMax[0] = s_trackMesh.leafRanges[i].boxMax[0];
+	outMax[1] = s_trackMesh.leafRanges[i].boxMax[1];
+	outMax[2] = s_trackMesh.leafRanges[i].boxMax[2];
+	return 1;
+}
+
+int NativeTrackMesh_LeafDrawOrderRange(unsigned i, s8 *outMin, s8 *outMax)
+{
+	if (i >= s_trackMesh.leafCount)
+	{
+		return 0;
+	}
+
+	*outMin = s_trackMesh.leafRanges[i].drawOrderMin;
+	*outMax = s_trackMesh.leafRanges[i].drawOrderMax;
+	return 1;
+}
+
+int NativeTrackMesh_LeafIndexForBsp(unsigned bspIndex)
+{
+	if ((s_trackMesh.bspToLeafIndex == NULL) || (s_trackMesh.builtFor == NULL))
+	{
+		return -1;
+	}
+
+	/* bspIndex arrives from the game's own per-frame render-list traversal
+	 * (a BSP node index), not something this file bounds itself -- check it
+	 * against bspNodeCount, the element count THIS ALLOCATION was actually
+	 * sized for at build time (review fix: builtFor->numBspNodes read live
+	 * here could silently drift from what bspToLeafIndex was sized for if a
+	 * level reloads into the same mesh_info arena slot with a different bsp
+	 * node count -- bspNodeCount only ever changes alongside the allocation
+	 * it describes, so it can't drift out from under it that way). Unsigned
+	 * compare against an unsigned field -- no (int) cast on bspIndex: casting
+	 * an unsigned value to int before comparing would let any bspIndex >=
+	 * 0x80000000 read as negative and slip past this bound entirely. */
+	if (bspIndex >= s_trackMesh.bspNodeCount)
+	{
+		return -1;
+	}
+
+	return (int)s_trackMesh.bspToLeafIndex[bspIndex];
+}
+
+const struct NativeTrackVert *NativeTrackMesh_Verts(void)
+{
+	return s_trackMesh.verts;
+}
+
+unsigned NativeTrackMesh_VertCount(void)
+{
+	return s_trackMesh.vertCount;
+}
+
+const u16 *NativeTrackMesh_Indices(void)
+{
+	return s_trackMesh.indices;
+}
+
+unsigned NativeTrackMesh_IndexCount(void)
+{
+	return s_trackMesh.indexCount;
+}
+
+#else /* !(CTR_NATIVE && CTR_NATIVE_TRACK_RENDERER) */
+
+/*
+ * Review fix (FIX 5): include/platform/native_track_mesh.h promises every
+ * accessor is a no-op/zero-returning stub when the gate is off, so a caller
+ * never needs its own #ifdef -- that promise was previously just a comment;
+ * nothing defined these symbols on the off path, they only existed because
+ * the whole file (mesh builder AND accessors together) sat inside one big
+ * #if block above. That matters concretely because a gate-OFF 3DS build is
+ * the DEFAULT configuration this whole tree builds (CTR_NATIVE_TRACK_RENDERER
+ * defaults OFF in CMakeLists.txt), and step 2's 3DS draw path
+ * (platform/n3ds/native_renderer_3ds.c) is meant to call these unconditionally
+ * and see "nothing built" rather than fail to link. These stubs are what
+ * makes that true.
+ */
+
+int NativeTrackMesh_IsBuilt(void)
+{
+	return 0;
+}
+
+int NativeTrackMesh_IsBuiltFor(const struct mesh_info *mesh)
+{
+	(void)mesh;
+	return 0;
+}
+
+unsigned NativeTrackMesh_LeafCount(void)
+{
+	return 0;
+}
+
+int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirstIndex, unsigned *outIndexCount)
+{
+	(void)i;
+	(void)outBspIndex;
+	(void)outFirstIndex;
+	(void)outIndexCount;
+	return 0;
+}
+
+int NativeTrackMesh_LeafBox(unsigned i, s16 outMin[3], s16 outMax[3])
+{
+	(void)i;
+	(void)outMin;
+	(void)outMax;
+	return 0;
+}
+
+int NativeTrackMesh_LeafDrawOrderRange(unsigned i, s8 *outMin, s8 *outMax)
+{
+	(void)i;
+	(void)outMin;
+	(void)outMax;
+	return 0;
+}
+
+int NativeTrackMesh_LeafIndexForBsp(unsigned bspIndex)
+{
+	(void)bspIndex;
+	return -1;
+}
+
+const struct NativeTrackVert *NativeTrackMesh_Verts(void)
+{
+	return NULL;
+}
+
+unsigned NativeTrackMesh_VertCount(void)
+{
+	return 0;
+}
+
+const u16 *NativeTrackMesh_Indices(void)
+{
+	return NULL;
+}
+
+unsigned NativeTrackMesh_IndexCount(void)
+{
+	return 0;
 }
 
 #endif /* CTR_NATIVE_TRACK_RENDERER */

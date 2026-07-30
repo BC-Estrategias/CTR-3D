@@ -208,6 +208,47 @@ if(CTR_NATIVE_DRAW_MERGE)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_DRAW_MERGE=1)
 endif()
 
+# Track censuses for the native track renderer (s27) -- one [TRKCENSUS] log
+# block per level load: vertex-pool edge sharing (the no-crack premise),
+# water/animated-vertex exclusion share, AnimTex inventory, and texture
+# working set per LOD variant. Read-only over game structs; golden unchanged.
+# Design + what each number decides: docs/NATIVE_TRACK_RENDERER_DESIGN.md 7.
+option(CTR_NATIVE_TRACK_CENSUS
+    "[TRKCENSUS] level-geometry censuses for the native track renderer"
+    OFF)
+if(CTR_NATIVE_TRACK_CENSUS)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_TRACK_CENSUS=1)
+endif()
+
+# Native track renderer (s27+, docs/NATIVE_TRACK_RENDERER_DESIGN.md). Current
+# state: ladder step 1 -- load-time resident-mesh builder, count-only ([TRKMESH]
+# line per level), draws nothing on any platform yet. The 3DS draw side lands
+# behind this same gate.
+option(CTR_NATIVE_TRACK_RENDERER
+    "Native track renderer: resident track meshes from level data (in progress)"
+    OFF)
+if(CTR_NATIVE_TRACK_RENDERER)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_TRACK_RENDERER=1)
+
+    # On 3DS the whole depth compose (design 4.3) is the OT_DEPTH substrate --
+    # track fragments and packets meet in one depth buffer only because that
+    # gate legalizes comparing a real depth test against emit-ordinal z -- and
+    # rung 3a issues its draws at the DRAW_MERGE barrier (N3DS_FlushRun's
+    # caller). Neither dependency is optional the way CTR_NATIVE_DIRECT_EMIT's
+    # is; catch a mismatched config at configure time rather than a silent
+    # black track or a merge-barrier that never runs on hardware. PC is
+    # count-only at this ladder step (no drawing at all), so it carries no
+    # such requirement.
+    if(NINTENDO_3DS)
+        if(NOT CTR_NATIVE_OT_DEPTH)
+            message(FATAL_ERROR "CTR_NATIVE_TRACK_RENDERER requires CTR_NATIVE_OT_DEPTH=ON on 3DS (the depth compose is the OT_DEPTH substrate)")
+        endif()
+        if(NOT CTR_NATIVE_DRAW_MERGE)
+            message(FATAL_ERROR "CTR_NATIVE_TRACK_RENDERER requires CTR_NATIVE_DRAW_MERGE=ON on 3DS (draws are issued at the merge-bin barrier)")
+        endif()
+    endif()
+endif()
+
 # Render worker thread on core 2 (New3DS-only core; core 1 is the audio
 # worker's). DrawOTag becomes the async post the game's PS1 GPU protocol
 # already expects (bool_DrawOTag_InProgress / DrawSyncCallback / double-
@@ -375,6 +416,41 @@ if(NINTENDO_3DS)
 
     target_sources(ctr_native PRIVATE "${CTR_N3DS_SHADER_GEN}/ctr_shbin.S")
     target_include_directories(ctr_native PRIVATE "${CTR_N3DS_SHADER_GEN}")
+
+    # Native track renderer (rung 3a): sibling shader for the resident track
+    # draw path, same picasso -> bin2s -> embedded .S/.h pipeline as ctr.v.pica
+    # above. Guarded by CTR_NATIVE_TRACK_RENDERER -- step 1 only ships a
+    # minimal placeholder .pica (see the file's own header) that assembles and
+    # writes every declared output, so a plain 3DS build with the gate OFF
+    # never even looks for it and a build with the gate ON doesn't break
+    # before step 2 (a later task) writes the real shader body.
+    if(CTR_NATIVE_TRACK_RENDERER)
+        set(CTR_N3DS_TRACK_SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/platform/n3ds/shaders/ctr_track.v.pica")
+        set(CTR_N3DS_TRACK_SHADER_SHBIN "${CTR_N3DS_SHADER_GEN}/ctr_track.shbin")
+
+        add_custom_command(
+            OUTPUT "${CTR_N3DS_TRACK_SHADER_SHBIN}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CTR_N3DS_SHADER_GEN}"
+            COMMAND ${CTR_PICASSO_EXE} -o "${CTR_N3DS_TRACK_SHADER_SHBIN}" "${CTR_N3DS_TRACK_SHADER_SRC}"
+            DEPENDS "${CTR_N3DS_TRACK_SHADER_SRC}"
+            COMMENT "picasso: ctr_track.v.pica -> ctr_track.shbin"
+        )
+        add_custom_command(
+            OUTPUT "${CTR_N3DS_SHADER_GEN}/ctr_track_shbin.S" "${CTR_N3DS_SHADER_GEN}/ctr_track_shbin.h"
+            COMMAND ${DKP_BIN2S} -a ${DKP_BIN2S_ALIGNMENT} -H "${CTR_N3DS_SHADER_GEN}/ctr_track_shbin.h"
+                    "${CTR_N3DS_TRACK_SHADER_SHBIN}" > "${CTR_N3DS_SHADER_GEN}/ctr_track_shbin.S"
+            DEPENDS "${CTR_N3DS_TRACK_SHADER_SHBIN}"
+            COMMENT "bin2s: embedding ctr_track.shbin"
+        )
+        # ASM language + the ctr_shbin.S source-file-properties override above
+        # already ran unconditionally for the first shader in this same
+        # if(NINTENDO_3DS) scope, so both apply here too; only the new output
+        # needs its own PROPERTIES call.
+        set_source_files_properties("${CTR_N3DS_SHADER_GEN}/ctr_track_shbin.S"
+            PROPERTIES LANGUAGE ASM)
+
+        target_sources(ctr_native PRIVATE "${CTR_N3DS_SHADER_GEN}/ctr_track_shbin.S")
+    endif()
 
     # citro3d before ctru: the linker resolves left to right and citro3d pulls
     # symbols out of ctru.

@@ -110,6 +110,28 @@ typedef struct
  * window are simply not recorded. */
 #define OTZ_TABLE_SLOTS 4224
 
+/* Review fix (FIX 4): "never crossed" sentinel for otBucketOrdinal entries.
+ * The table used to be memset to 0 every clear, which is indistinguishable
+ * from a real recorded ordinal of 0 (the first prim of a walk legitimately
+ * stamps at ordinal 0) -- NativeGpu_GetOtBucketOrdinal could not tell "this
+ * slot was crossed at the very start of the walk" from "this slot was never
+ * crossed at all" and would hand step 2 a plausible-looking zero either way.
+ * 0xFFFF is a real value NativeGpu_NextDepthStamp can produce (its own clamp,
+ * once s_gpu.emitOrdinal reaches the u16 max), so this sentinel is not
+ * airtight in principle -- but that requires 65535+ prims stamped in ONE
+ * walk, versus this design doc's own measured content (~1000-1200 prims/f on
+ * the heaviest tracks), so in practice the one ordinal value this trades
+ * away is unreachable. Documented rather than silently assumed, same
+ * disclosure style native_gte_capture.c uses for its GTE_CAPTURE_MTX_IDS cap. */
+#define NATIVE_GPU_OTZ_SENTINEL 0xFFFFu
+
+/* Sentinel for otCurrentSlotIdx / minContentBucket (both u32): "no bucket
+ * recorded yet". Same idea as NATIVE_GPU_OTZ_SENTINEL just above (0 is a
+ * real bucket index -- the walk's very last crossing is bucket 0 -- so it
+ * cannot double as "never set"), kept as its own constant because these two
+ * fields are a different width/scale than the u16 ordinal table entries. */
+#define NATIVE_GPU_NO_CONTENT_BUCKET 0xFFFFFFFFu
+
 typedef struct
 {
 	const char *currentSplitDebugText;
@@ -192,9 +214,72 @@ typedef struct
 	u32 otRangeCursor;
 	uintptr_t walkOtBase;
 	u32 walkOtCount;
+
+	/*
+	 * Review fix (FIX 7): whether the bucket->ordinal recorder is active for
+	 * THIS walk, latched exactly once at the top of the walk (where the
+	 * clear below runs) rather than re-evaluated at every zero-length node.
+	 * Without this, the walk runs on the worker thread while the game thread
+	 * can flip g_dbg_trackRender (button/dumpreq handler) at any time; a
+	 * press landing between the clear and the walk's first zero-length node
+	 * would make `g_dbg_otzWiden || NATIVE_GPU_TRACK_RENDER_ACTIVE` read
+	 * false at the clear (table left stale from the PREVIOUS walk) but true
+	 * moments later at the first record site -- a walk that records into a
+	 * table it never cleared, exactly the stale-ordinal bug the clear-must-
+	 * match-record comment already warns about, just reintroduced through a
+	 * mid-walk toggle flip instead of a code mismatch. Precedent: s_mergeActive
+	 * is latched at BeginScene for the identical reason (platform/n3ds/
+	 * n3ds_backend.c, native_renderer_3ds.c's matching comment).
+	 */
+	int otRecorderActive;
+
+	/*
+	 * rung 3a depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3,
+	 * measured bug 2026-07-30, N. Gin Labs): otBucketOrdinal above records
+	 * EVERY slot the walk crosses, including buckets nearer than any real
+	 * primitive this frame emitted -- the camera sits ON the track, so the
+	 * leaf under the kart reaches bucket 0, which retail never puts content
+	 * in. Because markers are crossed in descending index order, an empty
+	 * near bucket's recorded ordinal is just whatever the emit counter had
+	 * reached by the END of the walk -- past every real primitive, i.e.
+	 * "nearer than everything in the frame" (measured: otIdxMin=0 recorded
+	 * ordinal 931 vs finalOrdinal 930). otCurrentSlotIdx/minContentBucket
+	 * close that hole: otCurrentSlotIdx tracks which bucket the walk is
+	 * PASSING THROUGH right now (set at the same marker-crossing site that
+	 * fills otBucketOrdinal); minContentBucket is stamped from it only when
+	 * real primitive content actually advances the emit ordinal (see
+	 * NativeGpu_RecordContentAdvance), so by the time the walk ends it holds
+	 * the LOWEST bucket that ever had real content, not just the lowest
+	 * bucket the walk merely visited. native_track_frame.c's depth-range
+	 * compose clamps a leaf's bucket range up to this floor before trusting
+	 * otBucketOrdinal for either end.
+	 */
+	u32 otCurrentSlotIdx;
+	u32 minContentBucket;
 } NativeGpuState;
 
 int g_dbg_otzWiden = 0;
+
+/*
+ * Rung 3a step 1: the bucket->ordinal recorder above was built for the
+ * standalone 'otz' instrument (g_dbg_otzWiden), but the track renderer's
+ * depth compose (design 4.3) needs the exact same table -- so recording
+ * must also run whenever the track renderer is actually active, not just
+ * when the otz instrument is separately toggled on. g_dbg_trackRender is
+ * defined in platform/native_track_frame.c, which is only compiled (and
+ * only then does that symbol exist) when CTR_NATIVE_TRACK_RENDERER is on;
+ * this file has no such gate of its own, so the extern -- and every use of
+ * it below -- is wrapped in the same #if, collapsing to a plain 0 when the
+ * track renderer isn't built at all. This keeps a PC build (or a 3DS build)
+ * with the gate OFF exactly as before: no extern reference to a symbol that
+ * doesn't exist, no behavior change.
+ */
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+extern int g_dbg_trackRender;
+#define NATIVE_GPU_TRACK_RENDER_ACTIVE (g_dbg_trackRender != 0)
+#else
+#define NATIVE_GPU_TRACK_RENDER_ACTIVE 0
+#endif
 
 global_variable NativeGpuState s_gpu;
 
@@ -879,6 +964,54 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 		s_gpu.vertexBuffer[i].emitOrdinal = stamp;
 	}
 	s_gpu.emitOrdinal++;
+}
+
+/*
+ * rung 3a depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3): call
+ * at every point real primitive content actually advances the emit ordinal --
+ * the parse loop's two NativeGpu_StampEmitOrdinal call sites below (tagged
+ * first primitive, tagless primitives loop) and the direct-emit fast path's
+ * own manual advance (native_direct_emit.c, which stamps through
+ * NativeGpu_NextDepthStamp directly rather than through
+ * NativeGpu_StampEmitOrdinal -- it has no vertexBuffer range to backfill).
+ *
+ * Deliberately NOT folded into NativeGpu_NextDepthStamp itself, even though
+ * that function's own comment already calls it "the single source of the
+ * depth stamp for BOTH stampers": NextDepthStamp is ALSO called from the
+ * singlePrimitive (DrawPrim, non-walk) branch of ParsePrimitivesLinkedList
+ * below, which runs with no OT walk in progress at all. At that call site
+ * otCurrentSlotIdx is leftover state from whichever real walk last ran --
+ * typically bucket 0, the walk's final crossing -- and has no relationship
+ * to the single primitive being stamped. Hooking NextDepthStamp itself would
+ * let an unrelated DrawPrim (e.g. a HUD element drawn after the frame's main
+ * DrawOTag) silently reassign minContentBucket down to that stale near-
+ * bucket value -- exactly the corruption this fix exists to prevent, just
+ * reintroduced one level up. Calling this explicitly only from the walk's
+ * own content-emitting sites keeps it scoped to actual OT-bucket-attributed
+ * content.
+ */
+internal void NativeGpu_RecordContentAdvance(void)
+{
+	if (!s_gpu.otRecorderActive)
+	{
+		return;
+	}
+
+	if (s_gpu.otCurrentSlotIdx == NATIVE_GPU_NO_CONTENT_BUCKET)
+	{
+		/* Content emitted before the walk crossed its first marker node --
+		 * not expected in practice (the walk head is itself the farthest
+		 * bucket's marker node, so real content only ever follows an
+		 * already-recorded crossing), but there is no bucket to attribute
+		 * this to, so don't fabricate one. */
+		return;
+	}
+
+	/* Slots are visited in strictly descending index order for the whole
+	 * walk, so the LAST call here before the walk ends naturally holds the
+	 * MINIMUM bucket that ever had real content -- a plain assignment on
+	 * every advance is sufficient; no running-min compare needed. */
+	s_gpu.minContentBucket = s_gpu.otCurrentSlotIdx;
 }
 
 /*
@@ -2079,9 +2212,41 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 			}
 		}
 
-		if (g_dbg_otzWiden)
+		/* Recording (not just the standalone 'otz' instrument) also runs when
+		 * the track renderer is active -- the depth compose (design 4.3)
+		 * consumes this same table. Latch the condition ONCE here, at the top
+		 * of the walk, into otRecorderActive rather than re-evaluating the OR
+		 * expression at the clear and again at every zero-length node (review
+		 * fix, FIX 7): this walk can run on the worker thread while the game
+		 * thread flips g_dbg_trackRender from a button/dumpreq handler at any
+		 * time, and re-reading the live globals at two different points in
+		 * the same walk let a toggle flip land BETWEEN them -- clear skipped
+		 * (condition false), then recording ON moments later at the first
+		 * node (condition now true), which fills a table that was never
+		 * cleared this walk. That is the exact stale-ordinal failure mode
+		 * the clear-must-match-record comment already warns about, just
+		 * reintroduced through a mid-walk toggle flip instead of a code
+		 * mismatch. A single latch read at one instant closes that window.
+		 * [OTZ2] below stays tied to g_dbg_otzWiden alone -- that log line is
+		 * the standalone instrument's own validation output, and turning the
+		 * track renderer on should not start spamming it. */
+		s_gpu.otRecorderActive = (g_dbg_otzWiden || NATIVE_GPU_TRACK_RENDER_ACTIVE) ? 1 : 0;
+
+		if (s_gpu.otRecorderActive)
 		{
-			memset(s_gpu.otBucketOrdinal, 0, sizeof(s_gpu.otBucketOrdinal));
+			/* Fill with the sentinel, not 0 (review fix, FIX 4) -- see
+			 * NATIVE_GPU_OTZ_SENTINEL's comment for why 0 is ambiguous with a
+			 * real recorded ordinal. memset's byte value 0xFF replicated
+			 * across both bytes of every u16 entry gives exactly 0xFFFF. */
+			memset(s_gpu.otBucketOrdinal, 0xFF, sizeof(s_gpu.otBucketOrdinal));
+
+			/* Per-walk reset for the depth-compose fix -- "no bucket crossed
+			 * yet" / "no content seen yet this walk". See the field
+			 * comments on NativeGpuState. Gated on otRecorderActive same as
+			 * the memset above, so a build/toggle with the feature off pays
+			 * nothing. */
+			s_gpu.otCurrentSlotIdx = NATIVE_GPU_NO_CONTENT_BUCKET;
+			s_gpu.minContentBucket = NATIVE_GPU_NO_CONTENT_BUCKET;
 		}
 
 		while (true)
@@ -2150,6 +2315,7 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 						primLength = ParsePrimitive((P_TAG *)currentPacket);
 						currentPacket += (primLength + P_LEN) * sizeof(u32);
 						NativeGpu_StampEmitOrdinal(firstVertex);
+						NativeGpu_RecordContentAdvance();
 					}
 
 					while (currentPacket < endPacket)
@@ -2158,6 +2324,7 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 						primLength = ParseTaglessPrimitive((u32 *)currentPacket);
 						currentPacket += primLength * sizeof(u32);
 						NativeGpu_StampEmitOrdinal(firstVertex);
+						NativeGpu_RecordContentAdvance();
 					}
 
 					if (currentPacket != endPacket)
@@ -2181,7 +2348,11 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 				 * computes from depth. */
 				s_gpu.otSlotsCrossed++;
 
-				if (g_dbg_otzWiden)
+				/* Read the SAME latched value the clear above used (review
+				 * fix, FIX 7) -- never re-evaluate g_dbg_otzWiden /
+				 * NATIVE_GPU_TRACK_RENDER_ACTIVE live here, see
+				 * otRecorderActive's field comment for why. */
+				if (s_gpu.otRecorderActive)
 				{
 					uintptr_t addr = (uintptr_t)basePacket;
 
@@ -2193,6 +2364,16 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 						{
 							s_gpu.otBucketOrdinal[slotIdx] = (u16)(s_gpu.emitOrdinal < 0xFFFFu ? s_gpu.emitOrdinal : 0xFFFFu);
 							s_gpu.otSlotsDetected++;
+
+							/* Depth-compose fix: remember which bucket the
+							 * walk is passing through right now, so a later
+							 * content advance (NativeGpu_RecordContentAdvance)
+							 * knows which bucket to attribute itself to.
+							 * Slots are visited in descending order, so
+							 * whichever bucket was crossed most recently is
+							 * simply the current one -- no comparison needed
+							 * here, only at the point that reads it. */
+							s_gpu.otCurrentSlotIdx = slotIdx;
 
 							if (slotIdx > s_gpu.otMaxSlotIdx)
 							{
@@ -2234,6 +2415,98 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 	}
 
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_OTAG_PARSE);
+}
+
+/*
+ * Track-renderer accessor (rung 3a step 1, design 12/12b): per-draw CPU-side
+ * lookup of the bucket->ordinal table the walk above records into
+ * s_gpu.otBucketOrdinal. Step 2's draw side looks up a leaf's OT bucket ONCE
+ * PER DRAW (not per fragment) to compose its depth against the packet path's
+ * ordinals, so this stays a narrow read accessor, not a bulk copy.
+ *
+ * Returns 0 (nothing written to the outputs, contract review fix FIX 4) when
+ * the table has nothing trustworthy for this slot:
+ *   - the recorder was not latched active for the LAST walk (otRecorderActive
+ *     false) -- previously this accessor ignored that entirely and reported
+ *     success reading whatever garbage/stale table contents happened to be
+ *     sitting in otBucketOrdinal, since walkOtBase/walkOtCount are resolved
+ *     on EVERY walk regardless of the recorder condition (they're just OT
+ *     bounds lookup, unconditional); now checked explicitly;
+ *   - no walk has run yet this depth-clear (walkOtCount == 0), or slotIdx is
+ *     outside the walk's own OT size;
+ *   - the slot still holds NATIVE_GPU_OTZ_SENTINEL, i.e. it was never
+ *     crossed this walk -- previously a cleared-to-zero table made "crossed
+ *     at ordinal 0" and "never crossed" both read back as 0, silently hand-
+ *     ing step 2's depth compose a plausible but meaningless bucket depth
+ *     for content that was never actually on this frame's OT.
+ * Returns 1 otherwise, with *outOrdinal holding the recorded emit ordinal for
+ * that slot and *outWalkOtCount holding the walk's total slot count (so a
+ * caller can sanity-check its own otIndex range against the same OT the
+ * recorder saw).
+ */
+int NativeGpu_GetOtBucketOrdinal(u32 slotIdx, u16 *outOrdinal, u32 *outWalkOtCount)
+{
+	if (!s_gpu.otRecorderActive)
+	{
+		return 0;
+	}
+
+	if ((s_gpu.walkOtCount == 0) || (slotIdx >= s_gpu.walkOtCount) || (slotIdx >= OTZ_TABLE_SLOTS))
+	{
+		return 0;
+	}
+
+	if (s_gpu.otBucketOrdinal[slotIdx] == (u16)NATIVE_GPU_OTZ_SENTINEL)
+	{
+		return 0;
+	}
+
+	*outOrdinal = s_gpu.otBucketOrdinal[slotIdx];
+	*outWalkOtCount = s_gpu.walkOtCount;
+	return 1;
+}
+
+/*
+ * Track-renderer accessor (rung 3a depth-compose fix, docs/
+ * NATIVE_TRACK_RENDERER_DESIGN.md 4.3): the lowest OT bucket index that held
+ * real primitive content during the last walk the recorder ran for -- see
+ * minContentBucket's field comment on NativeGpuState for why
+ * otBucketOrdinal alone (which records every crossed bucket, content or not)
+ * is not sufficient for this. Same failure contract as
+ * NativeGpu_GetOtBucketOrdinal: returns 0 (nothing written to
+ * *outMinContentBucket) when the recorder was not latched active for the
+ * last walk, or no content-advance was ever recorded this walk (a genuinely
+ * empty walk, or still holding NATIVE_GPU_NO_CONTENT_BUCKET). Returns 1
+ * otherwise with *outMinContentBucket valid.
+ */
+int NativeGpu_GetMinContentBucket(u32 *outMinContentBucket)
+{
+	if (!s_gpu.otRecorderActive)
+	{
+		return 0;
+	}
+
+	if (s_gpu.minContentBucket == NATIVE_GPU_NO_CONTENT_BUCKET)
+	{
+		return 0;
+	}
+
+	*outMinContentBucket = s_gpu.minContentBucket;
+	return 1;
+}
+
+/*
+ * DIAGNOSTIC ONLY (uncommitted rung 3a occlusion investigation, no behavior
+ * change) -- see the header comment (include/platform/native_gpu.h) for the
+ * full contract. emitOrdinal is the NEXT ordinal NativeGpu_StampEmitOrdinal
+ * will hand out, so the highest ordinal actually STAMPED this frame is one
+ * less; guard against underflow on a frame that stamped nothing (emitOrdinal
+ * still 0 after NativeGpu_ResetEmitOrdinal, e.g. a menu frame with no OT
+ * walk at all).
+ */
+u32 NativeGpu_GetFrameEmitOrdinal(void)
+{
+	return (s_gpu.emitOrdinal > 0) ? (s_gpu.emitOrdinal - 1) : 0;
 }
 
 internal inline int IsNull(POLY_FT3 *poly)

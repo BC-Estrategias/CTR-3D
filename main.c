@@ -95,6 +95,15 @@
 // After native_gpu.c and the renderer: the direct-emit fast path reads their
 // file-scope state on 3DS, and is count-only on PC (see its header comment).
 #include "platform/native_direct_emit.c"
+// Track censuses + resident mesh builder for the native-track-renderer
+// campaign (s27). Both read game level structs, so they must come after
+// game_unity.h like everything here.
+#include "platform/native_track_census.c"
+#include "platform/native_track_mesh.c"
+// Per-frame camera/visibility snapshot recorder (rung 3a step 1) -- after
+// native_track_mesh.c so it can call the mesh accessors (NativeTrackMesh_*)
+// directly, same include-order reasoning as the line above.
+#include "platform/native_track_frame.c"
 #include "platform/native_savestate.c"
 #include "platform/native_state.c"
 #include "platform/native_str.c"
@@ -277,6 +286,14 @@ int main(int argc, char *argv[])
 	// --offscreen-capture arms the dfe=0 split inventory + golden stream
 	// (docs/OFFSCREEN_RENDER_VRAM_DESIGN.md Phase 0/1). No-op stub on 3DS.
 	NativeOffscreenCapture_ConfigureFromArgs(argc, argv);
+
+#if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	// --track-render N (0/1/2) is the PC surface for the native track
+	// renderer's runtime toggle (review fix, FIX 1) -- see
+	// NativePlatform_TrackRenderConfigureFromArgs for why this is what makes
+	// rung 3a step 1 verifiable at all. F13 steps the same toggle mid-run.
+	NativePlatform_TrackRenderConfigureFromArgs(argc, argv);
+#endif
 #endif
 
 	Platform_InitScratchpad();

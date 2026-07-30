@@ -12,6 +12,7 @@
 #include <platform/native_gpu.h>
 #include <platform/native_perf.h>
 #include <platform/native_render_queue.h>
+#include <platform/native_track_frame.h>
 #include <gpu.h>
 #include <platform.h>
 
@@ -494,6 +495,14 @@ void DrawOTag(void *p)
 	// Hand the walk the capture buffer this frame just wrote -- game thread,
 	// before the post, so the queue's own lock orders it for the worker.
 	GTECapture_PublishForWalk();
+#endif
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	// Same reasoning as the GTE capture publish just above: hand the walk
+	// this frame's camera/visibility snapshot -- game thread, before the
+	// post, so the render queue's own lock/signal orders it for whichever
+	// thread ends up walking (worker on 3DS render-thread builds).
+	NativeTrackFrame_PublishForWalk();
 #endif
 
 	if (NativeRenderQueue_Route())

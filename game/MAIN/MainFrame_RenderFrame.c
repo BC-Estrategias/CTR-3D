@@ -936,6 +936,26 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 		return;
 	}
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_CENSUS) && CTR_NATIVE_TRACK_CENSUS
+	// Native-track-renderer censuses (s27): once per level, read-only, logs a
+	// [TRKCENSUS] block. Same instrument-in-game-code precedent as [LODPROBE]
+	// below. Implementation: platform/native_track_census.c.
+	{
+		extern void NativeTrackCensus_Frame(struct Level *level, struct mesh_info *mesh);
+		NativeTrackCensus_Frame(level1, ptr_mesh_info);
+	}
+#endif
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	// Native track renderer (s27+): rebuilds the resident track mesh when the
+	// level changes. Count-only at ladder step 1 -- draws nothing yet.
+	// Implementation: platform/native_track_mesh.c.
+	{
+		extern void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh);
+		NativeTrackMesh_Frame(level1, ptr_mesh_info);
+	}
+#endif
+
 	numPlyrCurrGame = gGT->numPlyrCurrGame;
 
 	if (numPlyrCurrGame == 1)
@@ -1004,9 +1024,56 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 		gGT->bspLeafsDrawn += RenderLists_Init1P2P(ptr_mesh_info->bspRoot, gGT->visMem1->visLeafList[0], pushBuffer, (u32)&gGT->LevRenderLists[0],
 		                                           gGT->visMem1->bspList[0], numPlyrCurrGame);
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+		// Native track renderer (rung 3a step 1): per-frame camera + visibility
+		// snapshot, recorded from the SAME render-list traversal DrawLevelOvr1P
+		// is about to consume below -- gGT->LevRenderLists[0] is only valid
+		// after RenderLists_Init1P2P just above has populated it. Count-only at
+		// this ladder step -- nothing is drawn from this snapshot yet.
+		// Implementation: platform/native_track_frame.c.
+		{
+			extern void NativeTrackFrame_Record(struct GameTracker *gGT, struct mesh_info *mesh, struct DrawLevelOvr1PRenderList *renderList,
+			                                     struct PushBuffer *pushBuffer);
+			// gGT->LevRenderLists[0] is declared as an anonymous struct in
+			// namespace_Main.h (identical layout: list[5] of {ptrQuadBlocksRendered,
+			// bspListStart} + bspListStart_FullDynamic/ptrQuadBlocksRendered_FullDynamic
+			// -- see namespace_DrawLevel.h), so the cast is layout-safe, not a
+			// reinterpretation of different data. Routed through (void *) first,
+			// same idiom as game/DecalMP.c and game/Vehicle/VehPhysCrash.c, so
+			// the compiler doesn't flag a direct incompatible-pointer-type cast
+			// as a strict-aliasing hazard for what is actually the same object
+			// DrawLevelOvr1P below already reads through its own void* parameter.
+			NativeTrackFrame_Record(gGT, ptr_mesh_info, (struct DrawLevelOvr1PRenderList *)(void *)&gGT->LevRenderLists[0], pushBuffer);
+		}
+#endif
+
 		// 226-229
-		DrawLevelOvr1P(&gGT->LevRenderLists[0], pushBuffer, (struct BSP *)ptr_mesh_info, &gGT->backBuffer->primMem, gGT->visMem1->visFaceList[0],
-		               level1->ptr_tex_waterEnvMap); // waterEnvMap?
+		//
+		// Rung 3a step 2's gate (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b):
+		// toggle state 1 (resident) REPLACES this retail draw -- the resident
+		// path (platform/native_track_frame.c's NativeTrackDraw_IssueForWalk,
+		// called later from NativeRenderer_EndScene) draws the track instead.
+		// State 2 (both) leaves this call in place as the projection
+		// diagnostic overlay's retail baseline. skipRetailTrackDraw is a
+		// compile-time-const 0 in every OTHER configuration (state 0, or the
+		// gate compiled out entirely), so the compiler folds `if (!0)` away
+		// and DrawLevelOvr1P is called exactly as it is today -- ONE call
+		// site rather than two copies that could drift apart.
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+		int skipRetailTrackDraw;
+		{
+			extern int g_dbg_trackRender;
+			skipRetailTrackDraw = (g_dbg_trackRender == 1);
+		}
+#else
+		const int skipRetailTrackDraw = 0;
+#endif
+
+		if (!skipRetailTrackDraw)
+		{
+			DrawLevelOvr1P(&gGT->LevRenderLists[0], pushBuffer, (struct BSP *)ptr_mesh_info, &gGT->backBuffer->primMem, gGT->visMem1->visFaceList[0],
+			               level1->ptr_tex_waterEnvMap); // waterEnvMap?
+		}
 
 		DrawSky_Full(level1->ptr_skybox, pushBuffer, &gGT->backBuffer->primMem);
 

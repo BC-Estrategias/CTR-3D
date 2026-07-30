@@ -2590,6 +2590,45 @@ void NativeRenderer_EndScene(void)
 		return;
 	}
 
+#if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	/*
+	 * Rung 3a step 2 (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b): resident
+	 * track draws, issued IMMEDIATELY BEFORE the merge-bin barrier below.
+	 * MergeFlush emits opaque bins/segments first and blend segments last,
+	 * so track geometry submitted just before it is opaque-with-opaque
+	 * (order-free under the CTR_NATIVE_OT_DEPTH test) and still lands UNDER
+	 * every blended packet -- which is what surface-riding content (shadows,
+	 * skids) draws over the surface it rides needs. Forward-declared here,
+	 * defined later (platform/native_track_frame.c) -- same idiom
+	 * game/MAIN/MainFrame_RenderFrame.c already uses for
+	 * NativeTrackFrame_Record, needed because main.c's unity chain includes
+	 * this file before that one.
+	 */
+	{
+		extern void NativeTrackDraw_IssueForWalk(void);
+		NativeTrackDraw_IssueForWalk();
+
+		/* NativeTrackDraw_IssueForWalk's own N3DS_TrackDraw_End (called once
+		 * per leaf-draw bracket, even when zero leaves drew) already restored
+		 * the packet path's program/attrInfo/bufInfo/texture-combiner state
+		 * via N3DS_BindPacketDrawState -- required before MergeFlush below,
+		 * whose draws assume that exact state. TEV doubling doesn't strictly
+		 * need this reset too (N3DS_MergeFlush's own lastDoubling=-1 always
+		 * reasserts it before its first emit), but reset the frame-scope
+		 * tracker anyway so ANY other consumer between here and the next
+		 * BeginScene sees the same "unknown, please reassert" signal the
+		 * atlas inspector/PresentVRAMRect already leave behind after their
+		 * own foreign draws -- review fix (FIX 5): that reset now happens
+		 * INSIDE NativeTrackDraw_IssueForWalk itself, gated behind its own
+		 * toggle-0 early return, rather than unconditionally here every
+		 * frame this build option is compiled in. Toggle 0 is the A/B
+		 * baseline every fps number gets measured against, and it must cost
+		 * nothing beyond retail -- a stray reset of state nothing here even
+		 * touched at toggle 0 broke that (the effect was near-nil per the
+		 * comment above, but near-nil isn't the same as compiled-out). */
+	}
+#endif
+
 	/* Last flush point of the frame: whatever the final splits left
 	 * deferred (merge bins/segments, or just the pending run) has to be
 	 * recorded before C3D_FrameEnd submits the frame. */

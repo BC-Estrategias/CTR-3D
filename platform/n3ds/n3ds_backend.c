@@ -14,6 +14,12 @@
 
 #include "n3ds_backend.h"
 #include "ctr_shbin.h"
+#ifdef CTR_NATIVE_TRACK_RENDERER
+/* Rung 3a step 2's sibling shader, built by the exact same picasso -> bin2s
+ * pipeline as ctr_shbin.h above (CMakeLists.txt, guarded by the same
+ * CTR_NATIVE_TRACK_RENDERER option) -- see platform/n3ds/shaders/ctr_track.v.pica. */
+#include "ctr_track_shbin.h"
+#endif
 
 /*
  * Diagnostics go to two places because neither alone is sufficient:
@@ -392,6 +398,37 @@ static C3D_Tex s_vramDisplayTex[N3DS_VRAM_DISPLAY_TEX_COUNT];
 static C3D_Tex s_trackAtlasTextures[N3DS_TRACK_ATLAS_MAX_UNITS];
 static int s_trackAtlasUnitsAllocated = 0;
 
+#ifdef CTR_NATIVE_TRACK_RENDERER
+/*
+ * Rung 3a step 2: the resident-mesh draw path's own program/attribute
+ * layout/vertex+index buffer -- a second, independent set of the SAME kind
+ * of state N3DS_C3DInit builds for the packet path above, since track draws
+ * use a completely different vertex format (model-space N3DS_TrackVertex,
+ * not screen-space N3DS_Vertex) and shader (ctr_track.v.pica's perspective
+ * projection, not ctr.v.pica's orthographic passthrough).
+ */
+static DVLB_s *s_trackShaderDvlb = NULL;
+static shaderProgram_s s_trackShaderProgram;
+static int s_trackULocQx = -1, s_trackULocQy = -1, s_trackULocQw = -1;
+static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange = -1;
+static C3D_AttrInfo s_trackAttrInfo;
+static C3D_BufInfo s_trackBufInfo;
+
+/* One linearAlloc block per level (N3DS_TrackGeom_Upload's header comment):
+ * verts at offset 0, indices at an 8-byte-aligned offset after them.
+ * s_trackGeomReady is false until a successful upload, and N3DS_TrackDraw_Begin
+ * checks it so a level whose upload failed (or hasn't happened yet, e.g. the
+ * toggle flipped on before any level finished loading) draws nothing instead
+ * of binding a stale/absent buffer. */
+static void *s_trackGeomMem = NULL;
+static const void *s_trackIndexPtr = NULL;
+static int s_trackGeomReady = 0;
+/* Set by Begin only when geometry is actually ready; End always clears it
+ * and always restores packet state regardless (cheap, and foolproof against
+ * any Begin/Leaf/End call-order mistake upstream). */
+static int s_trackDrawActive = 0;
+#endif /* CTR_NATIVE_TRACK_RENDERER */
+
 void N3DS_C3DSetProjection(float left, float right, float bottom)
 {
 	/*
@@ -417,12 +454,53 @@ void N3DS_C3DSetProjection(float left, float right, float bottom)
 	Mtx_OrthoTilt(&s_projection, left, right, bottom, 0.0f, -32769.0f, 32769.0f, true);
 }
 
-int N3DS_C3DInit(void)
+/*
+ * Rebinds the packet path's program + attribute layout + vertex buffer +
+ * texture-modulate combiner. Split out of N3DS_C3DInit (which calls it once,
+ * right after the one-time DVLB parse/shader-program-init/linear-vertex-
+ * buffer-allocation steps below) so N3DS_TrackDraw_End (rung 3a step 2) can
+ * call the SAME code to restore this state after the track draw bracket
+ * switches program/attrInfo/bufInfo/env0 away from it for its own untextured
+ * draws -- see that function's comment for why every piece of this has to
+ * come back before the packet path's merge-bin flush runs. Redundant to call
+ * during N3DS_C3DInit's own one-time setup (nothing has changed yet); cheap
+ * either way, and having exactly one place that knows the packet path's full
+ * GPU-state shape is worth the one extra call at boot.
+ */
+static void N3DS_BindPacketDrawState(void)
 {
 	C3D_AttrInfo *attrInfo;
 	C3D_BufInfo *bufInfo;
 	C3D_TexEnv *env;
 
+	C3D_BindProgram(&s_shaderProgram);
+
+	attrInfo = C3D_GetAttrInfo();
+	AttrInfo_Init(attrInfo);
+	AttrInfo_AddLoader(attrInfo, 0, GPU_SHORT, 3);         /* v0 = position (x, y, z=emit-ordinal depth) */
+	AttrInfo_AddLoader(attrInfo, 1, GPU_SHORT, 2);         /* v1 = texcoord (u, v) */
+	AttrInfo_AddLoader(attrInfo, 2, GPU_UNSIGNED_BYTE, 3); /* v2 = color (r, g, b) -- alpha is a shader constant now, not fetched */
+
+	bufInfo = C3D_GetBufInfo();
+	BufInfo_Init(bufInfo);
+	BufInfo_Add(bufInfo, s_vertexBufferMem, sizeof(N3DS_Vertex), 3, 0x210);
+
+	/*
+	 * Texture0 modulated by vertex color -- the CPU decode cache (design doc
+	 * section 1) resolves page/CLUT/palette on the CPU, so by the time a
+	 * texture reaches the GPU it is an ordinary RGBA8 image; the vertex color
+	 * multiply reproduces the PC shader's v_color * texel behaviour (bright
+	 * baked into vertex color CPU-side -- see native_renderer_3ds.c).
+	 */
+	env = C3D_GetTexEnv(0);
+	C3D_TexEnvInit(env);
+	C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+	C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+	C3D_DirtyTexEnv(env);
+}
+
+int N3DS_C3DInit(void)
+{
 	/* 4x citro3d's 256KB default. Both hardware crashes to date
 	 * (crash_dump_00000007, s18 build; crash_dump_00000008, s19 build) were
 	 * the SAME deliberate panic: prefetch abort, IFSR=debug event, svcBreak
@@ -460,33 +538,17 @@ int N3DS_C3DInit(void)
 	 */
 	N3DS_C3DSetProjection(0.0f, 400.0f, 240.0f);
 
-	attrInfo = C3D_GetAttrInfo();
-	AttrInfo_Init(attrInfo);
-	AttrInfo_AddLoader(attrInfo, 0, GPU_SHORT, 3);         /* v0 = position (x, y, z=emit-ordinal depth) */
-	AttrInfo_AddLoader(attrInfo, 1, GPU_SHORT, 2);         /* v1 = texcoord (u, v) */
-	AttrInfo_AddLoader(attrInfo, 2, GPU_UNSIGNED_BYTE, 3); /* v2 = color (r, g, b) -- alpha is a shader constant now, not fetched */
-
 	s_vertexBufferMem = linearAlloc((size_t)N3DS_MAX_FRAME_VERTICES * sizeof(N3DS_Vertex));
 	if (s_vertexBufferMem == NULL)
 	{
 		return 0;
 	}
 
-	bufInfo = C3D_GetBufInfo();
-	BufInfo_Init(bufInfo);
-	BufInfo_Add(bufInfo, s_vertexBufferMem, sizeof(N3DS_Vertex), 3, 0x210);
-
-	/*
-	 * Texture0 modulated by vertex color -- the CPU decode cache (design doc
-	 * section 1) resolves page/CLUT/palette on the CPU, so by the time a
-	 * texture reaches the GPU it is an ordinary RGBA8 image; the vertex color
-	 * multiply reproduces the PC shader's v_color * texel behaviour (bright
-	 * baked into vertex color CPU-side -- see native_renderer_3ds.c).
-	 */
-	env = C3D_GetTexEnv(0);
-	C3D_TexEnvInit(env);
-	C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
-	C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+	/* Program + attribute layout + vertex buffer + texture-modulate combiner
+	 * -- see N3DS_BindPacketDrawState's own comment for why this is a
+	 * reusable function rather than inlined here (rung 3a step 2 needs to
+	 * restore this exact state after the track draw bracket). */
+	N3DS_BindPacketDrawState();
 
 	/*
 	 * Visibility sentinel. The decode cache encodes alpha as a single bit,
@@ -580,12 +642,57 @@ int N3DS_C3DInit(void)
 		}
 	}
 
+#ifdef CTR_NATIVE_TRACK_RENDERER
+	/* Rung 3a step 2's sibling shader/program -- a SECOND program object, not
+	 * a second vertex shader in the same one, since the packet and track
+	 * paths need to switch attribute layout and uniform sets independently
+	 * (N3DS_TrackDraw_Begin/End bind whichever one is active). Failure here
+	 * is fatal to init, same as the packet shader above: a track-renderer
+	 * build with no track shader would silently draw nothing once the
+	 * toggle is flipped on, which is worse than failing loudly at boot. */
+	s_trackShaderDvlb = DVLB_ParseFile((u32 *)ctr_track_shbin, ctr_track_shbin_size);
+	if (s_trackShaderDvlb == NULL)
+	{
+		return 0;
+	}
+	shaderProgramInit(&s_trackShaderProgram);
+	shaderProgramSetVsh(&s_trackShaderProgram, &s_trackShaderDvlb->DVLE[0]);
+	s_trackULocQx = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "qx");
+	s_trackULocQy = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "qy");
+	s_trackULocQw = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "qw");
+	s_trackULocProjection = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "projection");
+	s_trackULocH = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "hParam");
+	s_trackULocDepthRange = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "depthRange");
+
+	/* Fixed attribute layout for N3DS_TrackVertex -- does not depend on any
+	 * per-level allocation (unlike s_trackBufInfo, built in
+	 * N3DS_TrackGeom_Upload once a level's vertex buffer address is known),
+	 * so it is safe to build once here. v2's count is 4, not 3 like the
+	 * packet path's color loader -- drawOrder rides as the 4th fetched byte
+	 * (see N3DS_TrackVertex's own comment for why it can't be a signed
+	 * GPU_BYTE group instead). */
+	AttrInfo_Init(&s_trackAttrInfo);
+	AttrInfo_AddLoader(&s_trackAttrInfo, 0, GPU_SHORT, 3);         /* v0 = position (x, y, z) */
+	AttrInfo_AddLoader(&s_trackAttrInfo, 1, GPU_SHORT, 2);         /* v1 = texcoord (u, v) -- unused in 3a */
+	AttrInfo_AddLoader(&s_trackAttrInfo, 2, GPU_UNSIGNED_BYTE, 4); /* v2 = color + biased drawOrder */
+#endif /* CTR_NATIVE_TRACK_RENDERER */
+
 	return 1;
 }
 
 void N3DS_C3DExit(void)
 {
 	int i;
+
+#ifdef CTR_NATIVE_TRACK_RENDERER
+	N3DS_TrackGeom_Free();
+	shaderProgramFree(&s_trackShaderProgram);
+	if (s_trackShaderDvlb != NULL)
+	{
+		DVLB_Free(s_trackShaderDvlb);
+		s_trackShaderDvlb = NULL;
+	}
+#endif
 
 	for (i = 0; i < N3DS_VRAM_DISPLAY_TEX_COUNT; i++)
 	{
@@ -1017,6 +1124,230 @@ void N3DS_TrackAtlas_Bind(int unit)
 	C3D_TexBind(0, &s_trackAtlasTextures[unit]);
 }
 
+/* ------------------------------------------------ native track draw --- */
+/* Rung 3a step 2. See the header comment (n3ds_backend.h) for the bracket
+ * contract. #else below provides no-op/failing stubs so the unconditional
+ * declarations in n3ds_backend.h always link, the same promise
+ * native_track_mesh.h makes for ITS accessors -- these functions have a real
+ * compile-time dependency the atlas pool above does not (the generated
+ * ctr_track_shbin.h only exists when CTR_NATIVE_TRACK_RENDERER is on), so
+ * unlike N3DS_TrackAtlas_*, the real bodies have to be gated. */
+#ifdef CTR_NATIVE_TRACK_RENDERER
+
+int N3DS_TrackGeom_Upload(const void *verts, int vertCount, int vertStride, const void *indices, int indexCount)
+{
+	size_t vertBytes;
+	size_t indexOffset;
+	size_t totalBytes;
+	u8 *block;
+
+	N3DS_TrackGeom_Free();
+
+	if ((verts == NULL) || (vertCount <= 0) || (vertStride <= 0) || (indices == NULL) || (indexCount <= 0))
+	{
+		return 0;
+	}
+
+	vertBytes = (size_t)vertCount * (size_t)vertStride;
+	indexOffset = (vertBytes + 7u) & ~(size_t)7u; /* 8-byte align, see the header comment */
+	totalBytes = indexOffset + ((size_t)indexCount * sizeof(u16));
+
+	block = (u8 *)linearAlloc(totalBytes);
+	if (block == NULL)
+	{
+		char msg[128];
+
+		snprintf(msg, sizeof(msg), "[CTR-3DS] track geom upload FAILED: %u bytes, linear free %lu KiB", (unsigned)totalBytes,
+		         (unsigned long)(linearSpaceFree() / 1024));
+		N3DS_DebugLog(msg);
+		return 0;
+	}
+
+	memcpy(block, verts, vertBytes);
+	memcpy(block + indexOffset, indices, (size_t)indexCount * sizeof(u16));
+
+	s_trackGeomMem = block;
+	s_trackIndexPtr = block + indexOffset;
+
+	/* Rebuilt every upload (not just once): base_paddr depends on THIS
+	 * level's linearAlloc address, which N3DS_TrackAtlas_Alloc-style level
+	 * reloads change every time. s_trackAttrInfo is NOT rebuilt here -- its
+	 * layout is fixed and already built once in N3DS_C3DInit. */
+	BufInfo_Init(&s_trackBufInfo);
+	BufInfo_Add(&s_trackBufInfo, s_trackGeomMem, vertStride, 3, 0x210);
+
+	s_trackGeomReady = 1;
+	return 1;
+}
+
+void N3DS_TrackGeom_Free(void)
+{
+	if (s_trackGeomMem != NULL)
+	{
+		linearFree(s_trackGeomMem);
+		s_trackGeomMem = NULL;
+	}
+	s_trackIndexPtr = NULL;
+	s_trackGeomReady = 0;
+}
+
+void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h)
+{
+	C3D_TexEnv *env;
+
+	s_trackDrawActive = 0;
+
+	if (!s_trackGeomReady)
+	{
+		return;
+	}
+
+	C3D_BindProgram(&s_trackShaderProgram);
+	C3D_SetAttrInfo(&s_trackAttrInfo);
+	C3D_SetBufInfo(&s_trackBufInfo);
+
+	/*
+	 * Review fix (FIX 2): assert opaque blending explicitly rather than
+	 * inheriting whatever the LAST packet draw left set. N3DS_C3DSetBlendMode
+	 * memoizes through a static `lastMode` (below in this file) and this
+	 * function never called it before, so track draws silently picked up
+	 * additive/subtractive blend state on any frame containing sparks,
+	 * shadows, or transparency, and plain opaque on frames without -- an
+	 * intermittent, content-dependent bug that is exactly the worst kind for
+	 * an A/B fps measurement (same toggle setting, different blend state,
+	 * different-looking or differently-costed frame depending on what else
+	 * was on screen a moment ago). Mode 0 is BM_NONE/opaque, matching this
+	 * pass's actual content (untextured vertex-lit track geometry, rung 3a --
+	 * see N3DS_TrackDraw_Begin's own header comment; rung 3b's textured
+	 * draws stay opaque too, design 4.4's exclusions keep semi-trans faces on
+	 * the packet path). No restore in N3DS_TrackDraw_End is needed for this:
+	 * every packet emit re-asserts its OWN mode through this same memoized
+	 * setter before it draws anything, so whatever N3DS_TrackDraw_Begin set
+	 * here is always overwritten before it could affect packet content --
+	 * don't "fix" this by adding a redundant restore.
+	 */
+	N3DS_C3DSetBlendMode(0);
+
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQx, qx[0], qx[1], qx[2], qx[3]);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQy, qy[0], qy[1], qy[2], qy[3]);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQw, qw[0], qw[1], qw[2], qw[3]);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, 0.0f, 0.0f, 0.0f);
+	/* SAME ortho matrix the packet path uses (n3ds_backend.c's s_projection,
+	 * computed by N3DS_C3DSetProjection) -- this is what puts track content
+	 * and packet content on one shared depth axis (see the shader's own
+	 * header comment for the row3/outpos.w reasoning this depends on). */
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_trackULocProjection, &s_projection);
+
+	/*
+	 * Vertex-color-only output: 3a is untextured (color_hi is already baked
+	 * per vertex -- the familiar "textureless mode" look). Deliberately NOT
+	 * a rebind of the packet path's own reserved white decode-cache cell
+	 * (N3DS_MERGE_UNTEX_BIN/N3DS_WHITE_ATLAS, native_renderer_3ds.c) even
+	 * though that is this renderer's existing precedent for "untextured":
+	 * that cell is addressed by a plain atlas-index constant defined in a
+	 * DIFFERENT translation unit (the unity build), and hardcoding the same
+	 * index here would be an unenforced cross-TU coupling this project's own
+	 * TU/ABI boundary rule argues against -- if that index ever changed on
+	 * the unity side, this file would silently sample the wrong atlas with
+	 * no compile-time signal. GPU_REPLACE from GPU_PRIMARY_COLOR reaches the
+	 * identical pixel result (texture0 is never sampled at all) without that
+	 * coupling. N3DS_TrackDraw_End restores GPU_MODULATE.
+	 */
+	env = C3D_GetTexEnv(0);
+	C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, 0);
+	C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+	C3D_DirtyTexEnv(env);
+
+	/* No PS1 2x "bright" modulate for untextured Gouraud content -- matches
+	 * N3DS_MERGE_UNTEX_BIN's own choice of doubling=0 for the packet path's
+	 * untextured bin. Rung 3b's textured draws are where the PS1 2x texel*
+	 * color modulate belongs (design 12b), not here. */
+	N3DS_C3DSetColorDoubling(0);
+
+	s_trackDrawActive = 1;
+}
+
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan)
+{
+	const u16 *indexBase;
+
+	if (!s_trackDrawActive || (indexCount <= 0) || (firstIndex < 0))
+	{
+		return;
+	}
+
+	/*
+	 * Negate otIndexLo here, not on the caller's side: PICA200 has no SUB
+	 * opcode (verified against picasso's own mnemonic list -- see the
+	 * shader's header comment), so the shader computes "otIndex_v -
+	 * otIndexLo" as an ADD against a pre-negated constant. Keeping that
+	 * encoding choice inside this GPU-facing function, rather than pushing a
+	 * pre-negated otIndexLo out through the plain-scalar API, is what keeps
+	 * platform/native_track_frame.c's math a direct, literal reading of the
+	 * design doc's formulas.
+	 */
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocDepthRange, -otIndexLo, ordinalLo, ordinalSpan, invIndexSpan);
+
+	indexBase = (const u16 *)s_trackIndexPtr + firstIndex;
+	C3D_DrawElements(GPU_TRIANGLES, indexCount, C3D_UNSIGNED_SHORT, indexBase);
+}
+
+void N3DS_TrackDraw_End(void)
+{
+	/* Program + attribute layout + vertex buffer + texture-modulate combiner
+	 * -- N3DS_BindPacketDrawState's own body covers all four (it is the same
+	 * function N3DS_C3DInit uses to build this state the first time), which
+	 * is the full list of GPU state N3DS_TrackDraw_Begin changed away from
+	 * the packet path's own shape. Unconditional: even if Begin no-op'd
+	 * (geometry not ready, s_trackDrawActive never went true), restoring
+	 * packet state here is always safe and cheap, and guarantees the packet
+	 * path's merge-bin flush right after this call is never left pointed at
+	 * track state by a call-order mistake upstream. */
+	N3DS_BindPacketDrawState();
+
+	s_trackDrawActive = 0;
+}
+
+#else /* !CTR_NATIVE_TRACK_RENDERER */
+
+int N3DS_TrackGeom_Upload(const void *verts, int vertCount, int vertStride, const void *indices, int indexCount)
+{
+	(void)verts;
+	(void)vertCount;
+	(void)vertStride;
+	(void)indices;
+	(void)indexCount;
+	return 0;
+}
+
+void N3DS_TrackGeom_Free(void)
+{
+}
+
+void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h)
+{
+	(void)qx;
+	(void)qy;
+	(void)qw;
+	(void)h;
+}
+
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan)
+{
+	(void)firstIndex;
+	(void)indexCount;
+	(void)otIndexLo;
+	(void)ordinalLo;
+	(void)ordinalSpan;
+	(void)invIndexSpan;
+}
+
+void N3DS_TrackDraw_End(void)
+{
+}
+
+#endif /* CTR_NATIVE_TRACK_RENDERER */
+
 /*
  * PS1 semi-transparency (the four ABR modes) via PICA's fixed-function blend
  * unit -- the same equation/factor mapping PC uses in GL
@@ -1161,6 +1492,12 @@ unsigned int N3DS_ReadButtons(void)
 	 *   drawmerge   -- toggle g_dbg_drawMerge (CTR_NATIVE_DRAW_MERGE builds only)
 	 *   renderthread -- toggle g_dbg_renderThread (core-2 render worker routing;
 	 *                  OFF falls back to synchronous main-thread rendering)
+	 *   trackrender [N] -- native track renderer state (CTR_NATIVE_TRACK_RENDERER
+	 *                  builds only): 0=off(retail) 1=on(resident replaces retail)
+	 *                  2=both(diagnostic overlay). Bare token cycles 0->1->2->0;
+	 *                  'trackrender N' sets a specific state. Also reachable on
+	 *                  hardware via SELECT+ZR (a dumpreq file can't be placed
+	 *                  mid-race there -- see the button handler below).
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -1272,6 +1609,30 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] atlas view: %d", g_dbg_atlasView - 1);
 					N3DS_DebugLog(g_dbg_atlasView ? msg : "[CTR-3DS] atlas view: off");
 				}
+#ifdef CTR_NATIVE_TRACK_RENDERER
+				else if (strncmp(word, "trackrender", 11) == 0)
+				{
+					extern int g_dbg_trackRender;
+					static const char *const names[3] = {"OFF (retail)", "ON (resident replaces retail)", "BOTH (resident + retail overlay)"};
+					char msg[64];
+
+					/* 'trackrender N' sets a specific state (clamped 0-2);
+					 * bare 'trackrender' cycles 0->1->2->0 -- same idiom as
+					 * 'atlasview' above. */
+					if (word[11] == ' ')
+					{
+						int n = atoi(&word[12]);
+
+						g_dbg_trackRender = (n < 0) ? 0 : (n > 2) ? 2 : n;
+					}
+					else
+					{
+						g_dbg_trackRender = (g_dbg_trackRender + 1) % 3;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
+					N3DS_DebugLog(msg);
+				}
+#endif
 				else
 				{
 					N3DS_DebugCaptureAll();
@@ -1280,14 +1641,15 @@ unsigned int N3DS_ReadButtons(void)
 		}
 	}
 
-	/* SELECT held + D-pad DOWN: toggle render-worker routing mid-run, same
-	 * bracketing rationale as SELECT+DUP above. dumpreq 'renderthread' covers
-	 * Azahar (host-writable SD folder), but on hardware nothing can place
-	 * that file while the game runs -- FTP and the game are one-app-at-a-time
-	 * -- so without a combo the feature's own hardware A/B would be
-	 * cross-run, exactly the confound the mid-run flips exist to kill. The
-	 * OFF transition is safe mid-race by construction: Route() fences the
-	 * worker before the first direct call (native_render_queue.c). */
+	/* SELECT held + D-pad DOWN: toggle render-worker routing mid-run (mid-run
+	 * flips bracket [PERF] windows by state, killing the cross-run content
+	 * confound the same way textureless's combo does below). dumpreq
+	 * 'renderthread' covers Azahar (host-writable SD folder), but on
+	 * hardware nothing can place that file while the game runs -- FTP and
+	 * the game are one-app-at-a-time -- so without a combo the feature's own
+	 * hardware A/B would be cross-run. The OFF transition is safe mid-race
+	 * by construction: Route() fences the worker before the first direct
+	 * call (native_render_queue.c). */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DDOWN))
 	{
 		extern int g_dbg_renderThread;
@@ -1296,11 +1658,11 @@ unsigned int N3DS_ReadButtons(void)
 		N3DS_DebugLog(g_dbg_renderThread ? "[CTR-3DS] render worker routing: ON" : "[CTR-3DS] render worker routing: OFF (sync on main thread)");
 	}
 
-	/* SELECT held + D-pad RIGHT: textureless. Was bare SELECT (2026-07-20,
-	 * mirroring PC's F2), but once UP/DOWN joined the family every stray
-	 * SELECT tap was silently flipping textures too -- owner moved it onto
-	 * the same held-SELECT d-pad convention as the rest (2026-07-29).
-	 * SELECT still feeds N3DS_BTN_SELECT below for the game as normal. */
+	/* SELECT held + D-pad RIGHT: textureless. Was bare SELECT (2026-07-20),
+	 * mirroring PC's F2, but once other held-SELECT combos joined the family
+	 * every stray SELECT tap was silently flipping textures too -- owner
+	 * moved it onto the same held-SELECT d-pad convention as the rest
+	 * (2026-07-29). SELECT still feeds N3DS_BTN_SELECT below as normal. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DRIGHT))
 	{
 		g_dbg_texturelessMode ^= 1;
@@ -1308,11 +1670,11 @@ unsigned int N3DS_ReadButtons(void)
 	}
 
 #ifdef CTR_NATIVE_DIRECT_EMIT
-	/* SELECT held + D-pad LEFT: direct-emit fast path A/B, completing the
-	 * held-SELECT d-pad family (UP=single-texture, DOWN=render worker,
-	 * RIGHT=textureless). Same rationale as the others: hardware cannot
-	 * place a dumpreq file mid-race, and only a mid-run flip brackets
-	 * [PERF] windows on identical content. */
+	/* SELECT held + D-pad LEFT: direct-emit fast path A/B, part of the
+	 * held-SELECT d-pad family (DOWN=render worker, RIGHT=textureless).
+	 * Same rationale as the others: hardware cannot place a dumpreq file
+	 * mid-race, and only a mid-run flip brackets [PERF] windows on
+	 * identical content. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DLEFT))
 	{
 		extern int g_dbg_directEmit;
@@ -1322,15 +1684,28 @@ unsigned int N3DS_ReadButtons(void)
 	}
 #endif
 
-	/* SELECT held + ZL: resolve-memo A/B (s26; the d-pad slots are full).
-	 * Same mid-run bracketing rationale as the d-pad family. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZL))
+#ifdef CTR_NATIVE_TRACK_RENDERER
+	/* SELECT held + ZR: native track renderer state cycle 0->1->2->0 (rung
+	 * 3a). Reassigned from the s27 fbtest probe (design doc 12b: fbtest's
+	 * question is closed/null) -- ZR was fbtest's combo, not resolve-memo's;
+	 * the s26 resolve-memo combo lived on SELECT+ZL, which this pass simply
+	 * frees (its dumpreq token 'resolvememo' stays reachable in Azahar, it
+	 * just has no hardware button anymore). Both 'fbtest' and 'resolvememo'
+	 * dumpreq tokens stay reachable in Azahar either way -- only the
+	 * hardware BUTTON combos are freed here, because a mid-race hardware A/B
+	 * needs a BUTTON (dumpreq is unplaceable while the game holds the SD
+	 * card) and trackrender is now the toggle that matters for that. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZR))
 	{
-		extern int g_dbg_resolveMemo;
+		extern int g_dbg_trackRender;
+		static const char *const names[3] = {"OFF (retail)", "ON (resident replaces retail)", "BOTH (resident + retail overlay)"};
+		char msg[64];
 
-		g_dbg_resolveMemo ^= 1;
-		N3DS_DebugLog(g_dbg_resolveMemo ? "[CTR-3DS] resolve memo: ON" : "[CTR-3DS] resolve memo: OFF");
+		g_dbg_trackRender = (g_dbg_trackRender + 1) % 3;
+		snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
+		N3DS_DebugLog(msg);
 	}
+#endif
 #endif
 
 	if (held & KEY_A)

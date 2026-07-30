@@ -236,6 +236,15 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				 * widening scheme (dumpreq 'otz') covers direct emit too. */
 				ordinal = NativeGpu_NextDepthStamp();
 				s_gpu.emitOrdinal++;
+				/* Depth-compose fix (native_gpu.c's NativeGpu_RecordContentAdvance
+				 * comment): this fast path advances the emit ordinal exactly
+				 * like the normal parse path's two NativeGpu_StampEmitOrdinal
+				 * call sites, so it must feed minContentBucket the same way --
+				 * otherwise every direct-emitted node (most of a heavy track's
+				 * opaque content) would be invisible to the depth-compose
+				 * floor, and the fix would only work when direct emit happens
+				 * to be off. */
+				NativeGpu_RecordContentAdvance();
 				z = (s16)((int)ordinal - 32768);
 
 				if (!isNullFT3)
