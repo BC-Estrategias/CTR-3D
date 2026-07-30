@@ -58,18 +58,32 @@ struct NativeTrackLeafRange
  */
 #define TRKMESH_MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define TRKMESH_MAX(a, b) (((a) > (b)) ? (a) : (b))
+#define TRKMESH_ROUND8(a) (((a) + 7) & ~7)
 
 #define TRACK_ATLAS_DIM 512
 #define TRACK_ATLAS_MAX_UNITS 8
 #define TRACK_ATLAS_MAX_RECTS 512
 #define TRACK_ATLAS_PAD 1 /* texel border per rect against bleed */
+#define TRACK_ATLAS_UNIT_INVALID 0xff
 
 struct NativeTrackAtlasRect
 {
 	u16 tpage, clut;
-	u8 minU, minV, maxU, maxV; /* page-space texel bbox (inclusive) */
-	u8 atlasUnit;
-	u16 atlasX, atlasY; /* placement of (minU,minV) inside the unit */
+	u8 minU, minV, maxU, maxV; /* TRUE page-space texel bbox (inclusive) -- UV translation reads these, never allocW/allocH */
+	u8 srcU, srcV;              /* page-relative decode origin actually passed to N3DS_DecodeAndTilePage. srcU is always minU
+	                              * (a horizontal decode overrun wraps in-bounds -- PS1 VRAM row addressing, harmless). srcV is
+	                              * pulled UP from minV whenever minV+allocH would overrun the page half: N3DS_DecodeAndTilePage
+	                              * wraps the COLUMN but not the ROW (native_renderer_3ds.c ~:1151), so decoding from minV with
+	                              * a tall allocH can read vram[] past the end of the page half (review finding #1). Rung 3's UV
+	                              * translation must read THESE fields, never minU/minV: atlasU = atlasX + (u - srcU),
+	                              * atlasV = atlasY + (v - srcV). */
+	u8 atlasUnit;                /* TRACK_ATLAS_UNIT_INVALID until placed by NativeTrackAtlas_Pack, or if the backend
+	                               * couldn't/didn't upload this rect (NativeTrackAtlas_UploadToBackend resets it on every
+	                               * skip path) -- rung 3 must never bind a unit for a rect carrying this sentinel. */
+	u16 atlasX, atlasY; /* placement of (srcU,srcV) inside the unit -- always a multiple of 8, see NativeTrackAtlas_Pack */
+	u16 allocW, allocH; /* (maxU-minU+1)/(maxV-minV+1) rounded UP to multiples of 8 and capped at 256 (one PSX page) -- the
+	                      * shelf-packed/uploaded size, distinct from the true bbox above (rung 2b, upload needs 8x8-tile-
+	                      * aligned rects) */
 };
 
 struct NativeTrackAtlasLayout
@@ -197,6 +211,13 @@ static int NativeTrackMesh_WeldSlot(struct NativeTrackWeldTable *table, u64 key)
 
 static void NativeTrackMesh_Free(void)
 {
+#if defined(__3DS__)
+	/* Release the dedicated atlas pool's linear-heap textures too (review
+	 * finding #8) -- this is the only teardown path a level currently has
+	 * (called both on rebuild and on allocation-failure unwind below), so
+	 * it's also the only place leaving a track can release that memory. */
+	N3DS_TrackAtlas_Free();
+#endif
 	free(s_trackMesh.verts);
 	free(s_trackMesh.indices);
 	free(s_trackMesh.leafRanges);
@@ -271,7 +292,7 @@ static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *
 	rect->minV = minV;
 	rect->maxU = maxU;
 	rect->maxV = maxV;
-	rect->atlasUnit = 0xff;
+	rect->atlasUnit = TRACK_ATLAS_UNIT_INVALID;
 
 	if (outRectIndex != NULL)
 	{
@@ -281,8 +302,40 @@ static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *
 	atlas->rectCount++;
 }
 
-/* Shelf-pack the gathered rects into 512x512 units. Census-sized: ~120
- * pairs, ~0.5-1.2MB of near-variant texels -- a plain shelf is plenty. */
+/*
+ * Shelf-pack the gathered rects into 512x512 units. Census-sized: ~120
+ * pairs, ~0.5-1.2MB of near-variant texels -- a plain shelf is plenty.
+ *
+ * 8-texel alignment (rung 2b): the 3DS upload path writes whole 8x8
+ * PICA200 tile blocks (N3DS_TrackAtlas_UploadRect), so both the allocated
+ * SIZE of each rect and its PLACEMENT must be multiples of 8 -- an
+ * unaligned destination offset would address the wrong tile entirely, not
+ * just look slightly off.
+ *
+ * w/h below are the true bbox rounded UP to a multiple of 8 (with
+ * TRACK_ATLAS_PAD folded into the rounding rather than added as a separate
+ * texel offset -- see the struct comment on allocW/allocH). Because w and h
+ * are always multiples of 8 and both cursors start at 0, cursorX/cursorY
+ * stay multiples of 8 by construction as they accumulate whole w/h steps;
+ * TRKMESH_ROUND8 is applied anyway at the point they're stored, so this
+ * invariant is enforced rather than merely relied upon. The true bbox
+ * (minU/minV/maxU/maxV) is untouched -- UV translation always reads that,
+ * never allocW/allocH -- so the rounding only affects how much atlas space
+ * a rect reserves and how many texels the decoder produces, not addressing.
+ *
+ * Two review fixes (post rung-2b-first-cut) folded in here:
+ *   - allocW/allocH are capped at 256 after rounding. Uncapped, a
+ *     near-full-page union (trueW/trueH up to 256, the likeliest-large rect
+ *     shape) rounds to 264 and would otherwise trip the TRACK_ATLAS_DIM
+ *     check below and get dropped outright, uploading nothing. The cap
+ *     sacrifices the bleed pad for these rects, which is fine under
+ *     GPU_NEAREST with exact UVs -- there's no filtering to bleed into. With
+ *     the cap in place w/h can never exceed 256 < TRACK_ATLAS_DIM (512), so
+ *     that check is now unreachable; left as-is (defensive dead code).
+ *   - srcU/srcV (the actual decode origin, distinct from minU/minV) are
+ *     computed here per rect -- see the struct comment on those fields for
+ *     why plain minV isn't safe to decode from directly.
+ */
 static void NativeTrackAtlas_Pack(void)
 {
 	struct NativeTrackAtlasLayout *atlas = &s_trackMesh.atlas;
@@ -292,8 +345,20 @@ static void NativeTrackAtlas_Pack(void)
 	for (int i = 0; i < atlas->rectCount; i++)
 	{
 		struct NativeTrackAtlasRect *rect = &atlas->rects[i];
-		int w = (rect->maxU - rect->minU + 1) + 2 * TRACK_ATLAS_PAD;
-		int h = (rect->maxV - rect->minV + 1) + 2 * TRACK_ATLAS_PAD;
+		int trueW = rect->maxU - rect->minU + 1;
+		int trueH = rect->maxV - rect->minV + 1;
+		int w = TRKMESH_ROUND8(trueW + 2 * TRACK_ATLAS_PAD);
+		int h = TRKMESH_ROUND8(trueH + 2 * TRACK_ATLAS_PAD);
+		int srcV;
+
+		if (w > 256)
+		{
+			w = 256;
+		}
+		if (h > 256)
+		{
+			h = 256;
+		}
 
 		if ((w > TRACK_ATLAS_DIM) || (h > TRACK_ATLAS_DIM))
 		{
@@ -322,16 +387,185 @@ static void NativeTrackAtlas_Pack(void)
 			}
 		}
 
+		/* Decode origin (review finding #1): pull srcV up from minV just far
+		 * enough that the whole h-tall decode window stays inside the page
+		 * half (pageOriginY + srcV + h <= pageOriginY + 256), never past the
+		 * end of vram[]. srcU never needs this treatment -- see the struct
+		 * comment. */
+		srcV = TRKMESH_MIN((int)rect->minV, 256 - h);
+		if (srcV < 0)
+		{
+			srcV = 0;
+		}
+		rect->srcU = rect->minU;
+		rect->srcV = (u8)srcV;
+
 		rect->atlasUnit = (u8)unit;
-		rect->atlasX = (u16)(cursorX + TRACK_ATLAS_PAD);
-		rect->atlasY = (u16)(cursorY + TRACK_ATLAS_PAD);
+		rect->atlasX = (u16)TRKMESH_ROUND8(cursorX);
+		rect->atlasY = (u16)TRKMESH_ROUND8(cursorY);
+		rect->allocW = (u16)w;
+		rect->allocH = (u16)h;
 		cursorX += w;
 		shelfH = TRKMESH_MAX(shelfH, h);
 		atlas->packedTexels += (u32)(w * h);
 	}
 
-	atlas->unitsUsed = (atlas->rectCount > 0) ? (unit + 1) : 0;
+	/* unit can reach TRACK_ATLAS_MAX_UNITS exactly at the overflow break
+	 * above (review finding #7) -- clamp rather than report one more unit
+	 * than the pool actually has. */
+	atlas->unitsUsed = (atlas->rectCount > 0) ? TRKMESH_MIN(unit + 1, TRACK_ATLAS_MAX_UNITS) : 0;
 }
+
+#if defined(__3DS__)
+/*
+ * Rung 2b: decode + upload driver. Reuses N3DS_DecodeAndTilePage
+ * (native_renderer_3ds.c, included earlier in this unity TU -- see main.c's
+ * include order) for CLUT resolution and per-texel visibility, so the track
+ * atlas's texel results are IDENTICAL to the decode cache's, not a
+ * reimplementation of the same rules. N3DS_TEXVIEW_OPAQUE (any non-zero
+ * texel visible, punch-through alpha) is the only view baked here: nothing
+ * samples these atlases yet (rung 3 draws), and which of the decode cache's
+ * three STP views a track triangle would need is a per-draw blend-mode
+ * question, not something a one-time load-time upload can predict.
+ *
+ * One-time per level load, called right after NativeTrackAtlas_Pack from
+ * NativeTrackMesh_Frame. The static staging buffer is sized to one PSX page
+ * (256x256 texels) -- NativeTrackAtlas_Pack caps allocW/allocH at 256 itself
+ * (review finding #2), so the >256 guard in the loop below is defensive,
+ * not reachable.
+ */
+
+/* Cross-TU constant check (review finding #5): the packer's own
+ * TRACK_ATLAS_DIM/MAX_UNITS and the backend pool's N3DS_TRACK_ATLAS_DIM/
+ * MAX_UNITS (n3ds_backend.h) must agree -- both size the SAME pool from
+ * opposite sides of the plain-scalar boundary, so a drift between them
+ * would silently place rects outside what the backend actually allocated.
+ * Caught at compile time rather than trusted by inspection. */
+CTR_STATIC_ASSERT(TRACK_ATLAS_DIM == N3DS_TRACK_ATLAS_DIM);
+CTR_STATIC_ASSERT(TRACK_ATLAS_MAX_UNITS == N3DS_TRACK_ATLAS_MAX_UNITS);
+
+static u16 s_trackAtlasStaging[256 * 256]; /* one PSX page, RGBA5551 tiled -- 128KB, no malloc */
+
+/*
+ * Returns 0 only when N3DS_TrackAtlas_Alloc returned fewer units than this
+ * level's pack needs -- linear-heap pressure. The caller withholds
+ * NativeTrackMesh_Frame's rebuild latch on a 0 so the WHOLE build (mesh AND
+ * atlas, not just the upload) retries next frame, the same contract the
+ * calloc-failure paths earlier in this file already use. Returns 1
+ * otherwise: per-rect skips (oversize, unresolved unit) are permanent for
+ * this content -- withholding the latch over those would rebuild forever
+ * without ever latching.
+ *
+ * GIVEUP (Azahar validation, post review round): the alloc shortfall above
+ * is NOT reliably transient -- nothing frees the linear heap between
+ * frames on its own, so an unconditional "withhold the latch and retry"
+ * can retry forever, rerunning the entire census+mesh+pack+decode+upload
+ * (~50ms observed) every single frame. mesh/numQuadBlock/numVertex
+ * fingerprint THIS level (reset the attempt counter when it changes, same
+ * fingerprint the outer latch uses) so repeated genuine failures on the
+ * same content are distinguishable from a fresh level's first attempt.
+ * After 4 failed attempts on the same level, latch anyway with whatever
+ * partial atlas is currently uploaded (better than a permanently pegged
+ * frame time) and log a distinct GIVEUP line so the condition shows up in
+ * any log harvest, not just as a wall of repeated normal lines.
+ */
+static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadBlock, int numVertex)
+{
+	static struct mesh_info *s_retryMesh = NULL;
+	static int s_retryQb = -1, s_retryVtx = -1;
+	static int s_retryCount = 0;
+	struct NativeTrackAtlasLayout *atlas = &s_trackMesh.atlas;
+	unsigned long long freq = N3DS_GetTickFrequency();
+	unsigned long long tStart;
+	int allocated;
+	int rectsUploaded = 0, skipOversize = 0, skipNoUnit = 0;
+	u32 texelsDecoded = 0;
+	long long elapsedUs;
+	unsigned int freeKiB;
+
+	if ((mesh != s_retryMesh) || (numQuadBlock != s_retryQb) || (numVertex != s_retryVtx))
+	{
+		s_retryMesh = mesh;
+		s_retryQb = numQuadBlock;
+		s_retryVtx = numVertex;
+		s_retryCount = 0;
+	}
+
+	if (atlas->unitsUsed <= 0)
+	{
+		return 1;
+	}
+
+	tStart = N3DS_GetTickCount();
+	allocated = N3DS_TrackAtlas_Alloc(atlas->unitsUsed);
+
+	for (int i = 0; i < atlas->rectCount; i++)
+	{
+		struct NativeTrackAtlasRect *rect = &atlas->rects[i];
+		TexFormat format;
+
+		/* Unplaced (dropped by the packer) or in a unit the pool failed to
+		 * allocate -- never a partial/garbage upload. Reset the sentinel
+		 * explicitly (review finding #3): a rect the packer DID place still
+		 * carries a real-looking unit index here if its unit's allocation
+		 * failed, and rung 3 must never bind that. */
+		if ((rect->atlasUnit == TRACK_ATLAS_UNIT_INVALID) || ((int)rect->atlasUnit >= allocated))
+		{
+			rect->atlasUnit = TRACK_ATLAS_UNIT_INVALID;
+			skipNoUnit++;
+			continue;
+		}
+
+		/* Defensive only -- see the function comment; NativeTrackAtlas_Pack
+		 * caps allocW/allocH at 256, so this can't currently trigger. */
+		if (((int)rect->allocW > 256) || ((int)rect->allocH > 256))
+		{
+			rect->atlasUnit = TRACK_ATLAS_UNIT_INVALID;
+			skipOversize++;
+			continue;
+		}
+
+		format = GetTPageFormat(rect->tpage);
+
+		/* srcU/srcV, NOT minU/minV -- see the struct comment on
+		 * NativeTrackAtlasRect (review finding #1: minV can put the decode
+		 * window past the end of vram[] for a bottom-half page). */
+		N3DS_DecodeAndTilePage((s16)rect->tpage, (s16)rect->clut, format, N3DS_TEXVIEW_OPAQUE, rect->srcU, rect->srcV, rect->allocW, rect->allocH,
+		                       rect->allocW / 8, s_trackAtlasStaging);
+		N3DS_TrackAtlas_UploadRect(rect->atlasUnit, rect->atlasX, rect->atlasY, rect->allocW, rect->allocH, s_trackAtlasStaging);
+
+		texelsDecoded += (u32)rect->allocW * (u32)rect->allocH;
+		rectsUploaded++;
+	}
+
+	/* us, not ms (review finding #9): an ms-rounded field silently prints 0
+	 * for a light level's upload, and hardware has since shown the heavy
+	 * end (57 rects / 330KB decoded) running ~50ms -- us reads correctly at
+	 * either extreme instead of rounding one of them away. */
+	elapsedUs = (long long)(((N3DS_GetTickCount() - tStart) * 1000000ull) / (freq ? freq : 1ull));
+	freeKiB = (unsigned int)(N3DS_LinearFreeBytes() / 1024ul);
+
+	Platform_Log("[TRKATLAS3DS] units=%d/%d rects=%d/%d skipOversize=%d skipNoUnit=%d texels=%u KB=%u us=%d freeKiB=%u\n", allocated, atlas->unitsUsed,
+	             rectsUploaded, atlas->rectCount, skipOversize, skipNoUnit, texelsDecoded, (texelsDecoded * 2u) / 1024u, (int)elapsedUs, freeKiB);
+
+	if (allocated < atlas->unitsUsed)
+	{
+		s_retryCount++;
+
+		if (s_retryCount >= 4)
+		{
+			Platform_Log("[TRKATLAS3DS] GIVEUP units=%d/%d after %d tries -- latching with partial atlas\n", allocated, atlas->unitsUsed, s_retryCount);
+			s_retryCount = 0;
+			return 1;
+		}
+
+		return 0;
+	}
+
+	s_retryCount = 0;
+	return 1;
+}
+#endif /* __3DS__ */
 
 static u16 NativeTrackMesh_InternTexture(uintptr_t texPtr)
 {
@@ -772,10 +1006,24 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 	NativeTrackAtlas_Pack();
 
-	/* Latch only now, on success -- see the fingerprint comment up top. */
-	s_trackMesh.builtFor = mesh;
-	s_builtQb = numQuadBlock;
-	s_builtVtx = numVertex;
+#if defined(__3DS__)
+	int trackAtlasOk = NativeTrackAtlas_UploadToBackend(mesh, numQuadBlock, numVertex);
+#endif
+
+	/* Latch only now, on success -- see the fingerprint comment up top. On
+	 * 3DS, a transient track-atlas allocation shortfall (linear-heap
+	 * pressure) also withholds the latch so the WHOLE build -- mesh and
+	 * atlas together -- retries next frame, same contract as the
+	 * calloc-failure paths above; permanent per-rect skips (oversize,
+	 * unresolved unit) do not withhold it (review finding #4). */
+#if defined(__3DS__)
+	if (trackAtlasOk)
+#endif
+	{
+		s_trackMesh.builtFor = mesh;
+		s_builtQb = numQuadBlock;
+		s_builtVtx = numVertex;
+	}
 
 #if !defined(__3DS__)
 	/* Geometry/UV audit artifact: one OBJ per level into the gitignored

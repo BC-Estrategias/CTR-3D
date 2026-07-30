@@ -277,8 +277,25 @@ int N3DS_C3DFrameVertexHighWater(void);
  * 63/63 working set with ~45 capacity misses per frame and 2052 evictions of
  * cells that a queued draw still pointed at. Cell count was the binding
  * constraint on both the corruption and the decode cost.
- */
+ *
+ * 11, not 12, when the native track renderer is compiled in (rung 2b
+ * hardening, post-Azahar validation): the dedicated track-atlas pool
+ * (N3DS_TrackAtlas_Alloc, below) competes with these 12x1024x1024 atlases
+ * (24MB) for the SAME linear heap, and 12 of them leaves under 1MB free --
+ * observed live as `[TRKATLAS3DS] units=1/2 ... freeKiB=463`, one 512KB
+ * track unit allocated with no room for the second a typical level's pack
+ * needs. Every number in the CAPACITY comment above was measured WITHOUT
+ * the track renderer compiled in. Dropping to 11 gives back 2MB (four
+ * 512KB track units), comfortably covering the measured 1-2 units/level
+ * (worst case 2 so far). This is a net win, not just a trade: once rung 3
+ * draws track geometry natively, track content stops flowing through this
+ * decode cache at all, so the cache needs LESS capacity under the track
+ * renderer, not the same amount minus one. */
+#ifdef CTR_NATIVE_TRACK_RENDERER
+#define N3DS_ATLAS_COUNT           11
+#else
 #define N3DS_ATLAS_COUNT           12
+#endif
 #define N3DS_ATLAS_DIM             1024
 #define N3DS_ATLAS_CELLS_PER_ROW   (N3DS_ATLAS_DIM / N3DS_DECODE_TEXTURE_DIM)
 #define N3DS_ATLAS_CELLS_PER_ATLAS (N3DS_ATLAS_CELLS_PER_ROW * N3DS_ATLAS_CELLS_PER_ROW)
@@ -331,6 +348,53 @@ void N3DS_C3DSetBlendMode(int blendMode);
 #define N3DS_VRAM_DISPLAY_TEX_COUNT 4
 void N3DS_C3DUploadVramDisplayChunk(int slotIndex, const void *tiled256);
 void N3DS_C3DBindVramDisplayTex(int slotIndex);
+
+/* -------------------------------------------------- native track atlas --- */
+/* Dedicated pool for the native track renderer's atlas layout
+ * (platform/native_track_mesh.c, docs/NATIVE_TRACK_RENDERER_DESIGN.md
+ * section 12, rung 2b). Separate from the decode-cache atlases above --
+ * smaller units (512x512 vs 1024x1024), matching the packer's own
+ * TRACK_ATLAS_DIM -- and (re)allocated per level load rather than once at
+ * boot, since the packed layout itself is computed per level from that
+ * level's own texture working set. Same format/filter/wrap as the decode
+ * cache (GPU_RGBA5551, GPU_NEAREST, clamp-to-edge) and the same manual
+ * tiled-upload path (no sub-rect C3D_TexUpload -- see the decode-cache
+ * section's header comment above for why).
+ *
+ * N3DS_TRACK_ATLAS_DIM/MAX_UNITS live HERE, not in n3ds_backend.c, because
+ * native_track_mesh.c's packer (TRACK_ATLAS_DIM/MAX_UNITS, its own file-
+ * local macros) sizes the SAME pool from the other side of the plain-scalar
+ * boundary and must never drift from these -- native_track_mesh.c carries a
+ * compile-time check (CTR_STATIC_ASSERT) against these two exact macros
+ * (review finding #5). Plain integer macros, so exposing them here is
+ * ABI-safe -- no libctru type crosses the boundary. */
+#define N3DS_TRACK_ATLAS_DIM       512
+#define N3DS_TRACK_ATLAS_MAX_UNITS 8
+
+/* Lazily (re)allocates unitCount textures (clamped to N3DS_TRACK_ATLAS_MAX_UNITS
+ * above). Frees any previously allocated pool first (level reload) -- the
+ * pool is sized per level, not per game session. Logs linear free KiB
+ * before allocating and, on failure, which unit index failed and the free
+ * KiB remaining at that point -- same idiom as the decode-cache atlas init
+ * in N3DS_C3DBackend_InitialisePSX. Returns the number of units actually
+ * allocated (< unitCount only on an allocation failure). */
+int N3DS_TrackAtlas_Alloc(int unitCount);
+void N3DS_TrackAtlas_Free(void);
+/* Writes an 8x8-tile-aligned rect into unit's backing memory, via the same
+ * shared tile-block writer the decode cache's N3DS_C3DUploadDecodedCell/
+ * N3DS_C3DUploadDecodedSubCell use. dstX, dstY, wTexels, and hTexels MUST
+ * all be multiples of 8 -- PICA200 tile addressing, the same constraint
+ * the decode cache's cellX/cellY/subX/subY satisfy implicitly by
+ * construction -- AND the rect must fit inside N3DS_TRACK_ATLAS_DIM; both
+ * are validated and rejected (logged, no-op) rather than trusted, since a
+ * violation here would silently corrupt neighbouring tile memory instead of
+ * just this rect's content (review finding #6). tiledRGBA5551 must already
+ * be Z-order tiled with stride wTexels/8 tiles (exactly what
+ * N3DS_DecodeAndTilePage produces when called with destStrideTiles =
+ * wTexels/8). */
+void N3DS_TrackAtlas_UploadRect(int unit, int dstX, int dstY, int wTexels, int hTexels, const void *tiledRGBA5551);
+/* For rung 3 (drawing). Same bind pattern as N3DS_C3DBindAtlas. */
+void N3DS_TrackAtlas_Bind(int unit);
 
 /* The top-screen CONTENT region: N3DS_C3DBeginFrame pillarboxes every
  * presented frame to a centred 4:3 (320-wide) viewport, so screen columns

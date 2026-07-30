@@ -381,6 +381,17 @@ static int s_vertexHighWater = 0;
 static C3D_Tex s_atlasTextures[N3DS_ATLAS_COUNT];
 static C3D_Tex s_vramDisplayTex[N3DS_VRAM_DISPLAY_TEX_COUNT];
 
+/* Native track renderer's dedicated atlas pool (rung 2b) -- see the header
+ * comment on N3DS_TrackAtlas_Alloc. N3DS_TRACK_ATLAS_DIM/MAX_UNITS live in
+ * n3ds_backend.h, not here (review finding #5) -- native_track_mesh.c's
+ * packer checks its own constants against those exact macros at compile
+ * time. Sized to the pool's own max unit count, NOT allocated up front;
+ * s_trackAtlasUnitsAllocated tracks how many of these are actually live
+ * textures right now (0 until the first level load calls
+ * N3DS_TrackAtlas_Alloc). */
+static C3D_Tex s_trackAtlasTextures[N3DS_TRACK_ATLAS_MAX_UNITS];
+static int s_trackAtlasUnitsAllocated = 0;
+
 void N3DS_C3DSetProjection(float left, float right, float bottom)
 {
 	/*
@@ -749,41 +760,43 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
  * row-major order across a texture's FULL width (verified against
  * tex3ds's reference swizzle, see native_renderer_3ds.c). A tile block is a
  * tilesWide x tilesHigh square positioned at tile offset (baseTileCol,
- * baseTileRow) within the atlas's 128x128-tile grid (1024/8); each of its
- * tile-rows is tilesWide CONSECUTIVE tiles, which -- because tile-column is
- * the fastest-varying index in row-major order -- are contiguous in the
- * atlas's memory too, so one memcpy per tile-row is exact and correct, not
- * an approximation.
+ * baseTileRow) within the destination texture's own tile grid
+ * (tilesPerRow x tilesPerRow); each of its tile-rows is tilesWide
+ * CONSECUTIVE tiles, which -- because tile-column is the fastest-varying
+ * index in row-major order -- are contiguous in the texture's memory too,
+ * so one memcpy per tile-row is exact and correct, not an approximation.
  *
- * Shared by the whole-cell (32x32-tile) and sub-cell (8x8-tile) upload
- * wrappers below (docs/SUBPAGE_DECODE_CACHE_DESIGN.md) -- both are the same
- * blit, just a different tile-block size and origin. tilesWide/tilesHigh
- * must be used for ALL FOUR of the base-tile calc (the caller's job here,
- * via baseTileCol/baseTileRow), the loop bound, the srcRow stride, and the
- * memcpy width -- getting only the loop bound right and leaving srcRow/
- * memcpy at a stale hardcoded stride was caught in review before this
- * shipped (correct only for a 32-wide caller, silently wrong for an 8-wide
- * one).
+ * Shared by the whole-cell (32x32-tile) and sub-cell (8x8-tile) decode-cache
+ * upload wrappers below (docs/SUBPAGE_DECODE_CACHE_DESIGN.md), AND by the
+ * native track renderer's dedicated atlas pool (N3DS_TrackAtlas_UploadRect,
+ * rung 2b) -- generalized 2026-07-29 from a hardcoded s_atlasTextures[]/
+ * N3DS_ATLAS_DIM to an explicit destination texture + tiles-per-row so both
+ * pools can share one blit implementation rather than duplicating it.
+ * tilesWide/tilesHigh must be used for ALL FOUR of the base-tile calc (the
+ * caller's job here, via baseTileCol/baseTileRow), the loop bound, the
+ * srcRow stride, and the memcpy width -- getting only the loop bound right
+ * and leaving srcRow/memcpy at a stale hardcoded stride was caught in review
+ * before this shipped (correct only for a 32-wide caller, silently wrong for
+ * an 8-wide one).
  */
-static void N3DS_C3DUploadTileBlock(int atlasIndex, int baseTileCol, int baseTileRow, int tilesWide, int tilesHigh,
-                                     const void *tiled)
+static void N3DS_C3DUploadTileBlock(C3D_Tex *tex, int tilesPerRow, int baseTileCol, int baseTileRow, int tilesWide,
+                                     int tilesHigh, const void *tiled)
 {
-	const int atlasTilesPerRow = N3DS_ATLAS_DIM / 8;
 	const u8 *src = (const u8 *)tiled;
-	u8 *atlasData;
+	u8 *texData;
 	int localTileRow;
 
-	if ((atlasIndex < 0) || (atlasIndex >= N3DS_ATLAS_COUNT))
+	if (tex == NULL)
 	{
 		return;
 	}
 
-	atlasData = (u8 *)s_atlasTextures[atlasIndex].data;
+	texData = (u8 *)tex->data;
 
 	for (localTileRow = 0; localTileRow < tilesHigh; localTileRow++)
 	{
-		const int atlasTileRow = baseTileRow + localTileRow;
-		u8 *dstRow = atlasData + (size_t)((atlasTileRow * atlasTilesPerRow) + baseTileCol) * N3DS_TILE_BYTES;
+		const int dstTileRow = baseTileRow + localTileRow;
+		u8 *dstRow = texData + (size_t)((dstTileRow * tilesPerRow) + baseTileCol) * N3DS_TILE_BYTES;
 		const u8 *srcRow = src + (size_t)localTileRow * tilesWide * N3DS_TILE_BYTES;
 
 		memcpy(dstRow, srcRow, (size_t)tilesWide * N3DS_TILE_BYTES);
@@ -792,18 +805,18 @@ static void N3DS_C3DUploadTileBlock(int atlasIndex, int baseTileCol, int baseTil
 	/*
 	 * Flush the just-written region to physical RAM. Without this the GPU (and,
 	 * critically, Azahar's/Citra's host-side texture cache) never learns the
-	 * atlas cell changed: after a cell is evicted and re-decoded for a new
-	 * texture, the emulator keeps serving the cell's PREVIOUS occupant, which is
-	 * exactly the "recognizable textures showing up in the wrong places on the
+	 * texture's content changed: after a cell is evicted and re-decoded for a
+	 * new texture, the emulator keeps serving the cell's PREVIOUS occupant, which
+	 * is exactly the "recognizable textures showing up in the wrong places on the
 	 * track" corruption. This is the missing counterpart to a C3D_TexUpload that
 	 * the raw-memcpy upload path above never had. Flush the bounding range of
 	 * the rows written (over-flushing the inter-row gaps is harmless -- the data
 	 * there is already correct, and a slightly larger invalidation just re-reads
-	 * a little more of the atlas). GSPGPU_FlushDataCache rounds to cache lines
+	 * a little more of the texture). GSPGPU_FlushDataCache rounds to cache lines
 	 * internally, so an unaligned start/size is fine. */
 	{
-		u8 *flushStart = atlasData + (size_t)((baseTileRow * atlasTilesPerRow) + baseTileCol) * N3DS_TILE_BYTES;
-		size_t flushBytes = (size_t)(((tilesHigh - 1) * atlasTilesPerRow) + tilesWide) * N3DS_TILE_BYTES;
+		u8 *flushStart = texData + (size_t)((baseTileRow * tilesPerRow) + baseTileCol) * N3DS_TILE_BYTES;
+		size_t flushBytes = (size_t)(((tilesHigh - 1) * tilesPerRow) + tilesWide) * N3DS_TILE_BYTES;
 
 		GSPGPU_FlushDataCache(flushStart, (u32)flushBytes);
 	}
@@ -811,12 +824,21 @@ static void N3DS_C3DUploadTileBlock(int atlasIndex, int baseTileCol, int baseTil
 
 void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256)
 {
-	N3DS_C3DUploadTileBlock(atlasIndex, cellX * 32, cellY * 32, 32, 32, tiled256); /* unchanged behavior */
+	if ((atlasIndex < 0) || (atlasIndex >= N3DS_ATLAS_COUNT))
+	{
+		return;
+	}
+	N3DS_C3DUploadTileBlock(&s_atlasTextures[atlasIndex], N3DS_ATLAS_DIM / 8, cellX * 32, cellY * 32, 32, 32, tiled256); /* unchanged behavior */
 }
 
 void N3DS_C3DUploadDecodedSubCell(int atlasIndex, int physCellX, int physCellY, int subX, int subY, const void *tiled64)
 {
-	N3DS_C3DUploadTileBlock(atlasIndex, (physCellX * 32) + (subX * 8), (physCellY * 32) + (subY * 8), 8, 8, tiled64);
+	if ((atlasIndex < 0) || (atlasIndex >= N3DS_ATLAS_COUNT))
+	{
+		return;
+	}
+	N3DS_C3DUploadTileBlock(&s_atlasTextures[atlasIndex], N3DS_ATLAS_DIM / 8, (physCellX * 32) + (subX * 8), (physCellY * 32) + (subY * 8), 8, 8,
+	                         tiled64);
 }
 
 #ifdef CTR_INTERNAL
@@ -898,6 +920,101 @@ void N3DS_C3DBindAtlas(int atlasIndex)
 	}
 
 	C3D_TexBind(0, &s_atlasTextures[atlasIndex]);
+}
+
+/* ------------------------------------------------ native track atlas --- */
+/* See the header comment (n3ds_backend.h) for the pool's rationale. */
+
+void N3DS_TrackAtlas_Free(void)
+{
+	int i;
+
+	for (i = 0; i < s_trackAtlasUnitsAllocated; i++)
+	{
+		C3D_TexDelete(&s_trackAtlasTextures[i]);
+	}
+	s_trackAtlasUnitsAllocated = 0;
+}
+
+int N3DS_TrackAtlas_Alloc(int unitCount)
+{
+	char msg[128];
+	int i;
+
+	if (unitCount > N3DS_TRACK_ATLAS_MAX_UNITS)
+	{
+		unitCount = N3DS_TRACK_ATLAS_MAX_UNITS;
+	}
+	if (unitCount < 0)
+	{
+		unitCount = 0;
+	}
+
+	/* Level reload: free any previous pool before allocating the new one --
+	 * same idiom as NativeTrackMesh_Free on the game side. */
+	N3DS_TrackAtlas_Free();
+
+	snprintf(msg, sizeof(msg), "[CTR-3DS] linear free before track atlas: %lu KiB (want %d x %d KiB)",
+	         (unsigned long)(linearSpaceFree() / 1024), unitCount, (N3DS_TRACK_ATLAS_DIM * N3DS_TRACK_ATLAS_DIM * 2) / 1024);
+	N3DS_DebugLog(msg);
+
+	for (i = 0; i < unitCount; i++)
+	{
+		if (!C3D_TexInit(&s_trackAtlasTextures[i], N3DS_TRACK_ATLAS_DIM, N3DS_TRACK_ATLAS_DIM, GPU_RGBA5551))
+		{
+			snprintf(msg, sizeof(msg), "[CTR-3DS] track atlas unit %d of %d FAILED to allocate; linear free %lu KiB", i, unitCount,
+			         (unsigned long)(linearSpaceFree() / 1024));
+			N3DS_DebugLog(msg);
+			/* Units [0, i) allocated fine -- keep them live and usable rather
+			 * than tearing the whole pool down over a partial failure. */
+			s_trackAtlasUnitsAllocated = i;
+			return i;
+		}
+		C3D_TexSetFilter(&s_trackAtlasTextures[i], GPU_NEAREST, GPU_NEAREST);
+		C3D_TexSetWrap(&s_trackAtlasTextures[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+	}
+
+	s_trackAtlasUnitsAllocated = unitCount;
+	return unitCount;
+}
+
+void N3DS_TrackAtlas_UploadRect(int unit, int dstX, int dstY, int wTexels, int hTexels, const void *tiledRGBA5551)
+{
+	if ((unit < 0) || (unit >= s_trackAtlasUnitsAllocated))
+	{
+		return;
+	}
+
+	/* Preconditions (see the header comment): dstX/dstY/wTexels/hTexels are
+	 * all multiples of 8, and the rect must fit inside the unit's own
+	 * N3DS_TRACK_ATLAS_DIM bounds. A violation here is a caller bug, not
+	 * routine content variation (the packer's own invariants guarantee this
+	 * in practice) -- reject and log it instead of silently writing into the
+	 * wrong tile or past the texture's backing memory (review finding #6). */
+	if (((dstX & 7) != 0) || ((dstY & 7) != 0) || ((wTexels & 7) != 0) || ((hTexels & 7) != 0) || ((dstX + wTexels) > N3DS_TRACK_ATLAS_DIM) ||
+	    ((dstY + hTexels) > N3DS_TRACK_ATLAS_DIM))
+	{
+		char msg[128];
+
+		snprintf(msg, sizeof(msg), "[CTR-3DS] track atlas upload REJECTED: unit=%d dst=(%d,%d) size=%dx%d (unaligned or out of bounds)", unit, dstX,
+		         dstY, wTexels, hTexels);
+		N3DS_DebugLog(msg);
+		return;
+	}
+
+	/* Dividing by 8 here converts to the tile-space units
+	 * N3DS_C3DUploadTileBlock actually addresses in. */
+	N3DS_C3DUploadTileBlock(&s_trackAtlasTextures[unit], N3DS_TRACK_ATLAS_DIM / 8, dstX / 8, dstY / 8, wTexels / 8, hTexels / 8, tiledRGBA5551);
+}
+
+void N3DS_TrackAtlas_Bind(int unit)
+{
+	if ((unit < 0) || (unit >= s_trackAtlasUnitsAllocated))
+	{
+		return;
+	}
+
+	C3D_TexBind(0, &s_trackAtlasTextures[unit]);
 }
 
 /*
