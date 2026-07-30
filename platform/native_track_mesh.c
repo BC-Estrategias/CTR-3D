@@ -46,6 +46,41 @@ struct NativeTrackLeafRange
 	u32 indexCount;
 };
 
+/*
+ * Rung 2a: track atlas LAYOUT (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12).
+ * Platform-neutral half of the dedicated track atlas: per-(tpage,clut)
+ * union UV rectangles gathered from the resident verts, shelf-packed into
+ * 512x512 atlas units, with a translation entry per rect so upload (rung
+ * 2b, 3DS) can rewrite baked page-space UVs into atlas coordinates. The
+ * census bound the working set (<=120 pairs, ~0.5-1.2MB near-variant
+ * decoded), so fixed-size tables suffice; overflow logs and truncates
+ * rather than growing.
+ */
+#define TRKMESH_MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define TRKMESH_MAX(a, b) (((a) > (b)) ? (a) : (b))
+
+#define TRACK_ATLAS_DIM 512
+#define TRACK_ATLAS_MAX_UNITS 8
+#define TRACK_ATLAS_MAX_RECTS 512
+#define TRACK_ATLAS_PAD 1 /* texel border per rect against bleed */
+
+struct NativeTrackAtlasRect
+{
+	u16 tpage, clut;
+	u8 minU, minV, maxU, maxV; /* page-space texel bbox (inclusive) */
+	u8 atlasUnit;
+	u16 atlasX, atlasY; /* placement of (minU,minV) inside the unit */
+};
+
+struct NativeTrackAtlasLayout
+{
+	struct NativeTrackAtlasRect rects[TRACK_ATLAS_MAX_RECTS];
+	int rectCount;
+	int unitsUsed;
+	int rectsDropped;
+	u32 packedTexels;
+};
+
 struct NativeTrackMeshState
 {
 	struct mesh_info *builtFor; /* rebuild latch, same idiom as the census */
@@ -63,6 +98,10 @@ struct NativeTrackMeshState
 	 * the live frame. */
 	uintptr_t *texTable;
 	u32 texCount;
+
+	/* texRef -> rect index into the atlas layout (-1 = unplaced). */
+	s16 texRectIndex[1024];
+	struct NativeTrackAtlasLayout atlas;
 };
 
 global_variable struct NativeTrackMeshState s_trackMesh;
@@ -163,6 +202,135 @@ static void NativeTrackMesh_Free(void)
 	free(s_trackMesh.leafRanges);
 	free(s_trackMesh.texTable);
 	memset(&s_trackMesh, 0, sizeof(s_trackMesh));
+}
+
+/* Merge one TextureLayout's corner bbox into the per-(tpage,clut) rect
+ * map. Layout corners ARE the face's texel footprint (vert UVs are just
+ * permutations of them), so no vertex pass is needed. */
+static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *outRectIndex)
+{
+	struct NativeTrackAtlasLayout *atlas = &s_trackMesh.atlas;
+	u16 tpage = CTR_ReadU16LE(&layout->tpage);
+	u16 clut = CTR_ReadU16LE(&layout->clut);
+	u8 minU = layout->u0, maxU = layout->u0, minV = layout->v0, maxV = layout->v0;
+	static const u8 cornerOfs[3] = {4, 8, 10}; /* u1, u2, u3 byte offsets */
+
+	for (int c = 0; c < 3; c++)
+	{
+		u8 u = (&layout->u0)[cornerOfs[c]];
+		u8 v = (&layout->u0)[cornerOfs[c] + 1];
+
+		if (u < minU)
+		{
+			minU = u;
+		}
+		if (u > maxU)
+		{
+			maxU = u;
+		}
+		if (v < minV)
+		{
+			minV = v;
+		}
+		if (v > maxV)
+		{
+			maxV = v;
+		}
+	}
+
+	for (int i = 0; i < atlas->rectCount; i++)
+	{
+		if ((atlas->rects[i].tpage == tpage) && (atlas->rects[i].clut == clut))
+		{
+			struct NativeTrackAtlasRect *rect = &atlas->rects[i];
+
+			rect->minU = TRKMESH_MIN(rect->minU, minU);
+			rect->minV = TRKMESH_MIN(rect->minV, minV);
+			rect->maxU = TRKMESH_MAX(rect->maxU, maxU);
+			rect->maxV = TRKMESH_MAX(rect->maxV, maxV);
+
+			if (outRectIndex != NULL)
+			{
+				*outRectIndex = (s16)i;
+			}
+			return;
+		}
+	}
+
+	if (atlas->rectCount >= TRACK_ATLAS_MAX_RECTS)
+	{
+		atlas->rectsDropped++;
+		return;
+	}
+
+	struct NativeTrackAtlasRect *rect = &atlas->rects[atlas->rectCount];
+
+	rect->tpage = tpage;
+	rect->clut = clut;
+	rect->minU = minU;
+	rect->minV = minV;
+	rect->maxU = maxU;
+	rect->maxV = maxV;
+	rect->atlasUnit = 0xff;
+
+	if (outRectIndex != NULL)
+	{
+		*outRectIndex = (s16)atlas->rectCount;
+	}
+
+	atlas->rectCount++;
+}
+
+/* Shelf-pack the gathered rects into 512x512 units. Census-sized: ~120
+ * pairs, ~0.5-1.2MB of near-variant texels -- a plain shelf is plenty. */
+static void NativeTrackAtlas_Pack(void)
+{
+	struct NativeTrackAtlasLayout *atlas = &s_trackMesh.atlas;
+	int unit = 0;
+	int cursorX = 0, cursorY = 0, shelfH = 0;
+
+	for (int i = 0; i < atlas->rectCount; i++)
+	{
+		struct NativeTrackAtlasRect *rect = &atlas->rects[i];
+		int w = (rect->maxU - rect->minU + 1) + 2 * TRACK_ATLAS_PAD;
+		int h = (rect->maxV - rect->minV + 1) + 2 * TRACK_ATLAS_PAD;
+
+		if ((w > TRACK_ATLAS_DIM) || (h > TRACK_ATLAS_DIM))
+		{
+			atlas->rectsDropped++;
+			continue;
+		}
+
+		if (cursorX + w > TRACK_ATLAS_DIM)
+		{
+			cursorX = 0;
+			cursorY += shelfH;
+			shelfH = 0;
+		}
+
+		if (cursorY + h > TRACK_ATLAS_DIM)
+		{
+			unit++;
+			cursorX = 0;
+			cursorY = 0;
+			shelfH = 0;
+
+			if (unit >= TRACK_ATLAS_MAX_UNITS)
+			{
+				atlas->rectsDropped += atlas->rectCount - i;
+				break;
+			}
+		}
+
+		rect->atlasUnit = (u8)unit;
+		rect->atlasX = (u16)(cursorX + TRACK_ATLAS_PAD);
+		rect->atlasY = (u16)(cursorY + TRACK_ATLAS_PAD);
+		cursorX += w;
+		shelfH = TRKMESH_MAX(shelfH, h);
+		atlas->packedTexels += (u32)(w * h);
+	}
+
+	atlas->unitsUsed = (atlas->rectCount > 0) ? (unit + 1) : 0;
 }
 
 static u16 NativeTrackMesh_InternTexture(uintptr_t texPtr)
@@ -541,6 +709,69 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	free(animMark);
 	free(weldTable);
 
+	/* Rung 2a: atlas layout over the interned texture table. Plain refs
+	 * contribute their near layout; AnimTex refs contribute EVERY frame's
+	 * near layout (all frames live in the atlas -- design 4.1), with the
+	 * texRef translation pointing at the active frame's rect. */
+	for (u32 t = 0; t < 1024; t++)
+	{
+		s_trackMesh.texRectIndex[t] = -1;
+	}
+
+	int atlasAnimFrames = 0;
+
+	for (u32 t = 0; t < s_trackMesh.texCount; t++)
+	{
+		uintptr_t texPtr = s_trackMesh.texTable[t];
+
+		if ((texPtr & 1) != 0)
+		{
+			const struct AnimTex *anim = (const struct AnimTex *)(texPtr - 1);
+
+			if ((anim->numFrames > 0) && (anim->numFrames <= 256))
+			{
+				struct IconGroup4 **frames = ANIMTEX_GETARRAY((struct AnimTex *)anim);
+
+				for (int f = 0; f < anim->numFrames; f++)
+				{
+					if (frames[f] == NULL)
+					{
+						continue;
+					}
+
+					const struct TextureLayout *frameLayout = (const struct TextureLayout *)frames[f] + 2; /* near */
+
+					if ((CTR_ReadU16LE(&frameLayout->tpage) & 0xfe00) != 0)
+					{
+						continue;
+					}
+
+					atlasAnimFrames++;
+
+					if ((uintptr_t)frames[f] == (uintptr_t)anim->ptrActiveTex)
+					{
+						NativeTrackAtlas_AddLayout(frameLayout, &s_trackMesh.texRectIndex[t]);
+					}
+					else
+					{
+						NativeTrackAtlas_AddLayout(frameLayout, NULL);
+					}
+				}
+			}
+		}
+		else
+		{
+			const struct TextureLayout *layout = (const struct TextureLayout *)texPtr + 2; /* near */
+
+			if ((CTR_ReadU16LE(&layout->tpage) & 0xfe00) == 0)
+			{
+				NativeTrackAtlas_AddLayout(layout, &s_trackMesh.texRectIndex[t]);
+			}
+		}
+	}
+
+	NativeTrackAtlas_Pack();
+
 	/* Latch only now, on success -- see the fingerprint comment up top. */
 	s_trackMesh.builtFor = mesh;
 	s_builtQb = numQuadBlock;
@@ -592,6 +823,10 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		Platform_Log("[TRKMESH] notex: null=%d animNull=%d badWord=%d sample0=%08x sample1=%08x\n", notexNull, notexAnimNull, notexBadWord, notexSample[0],
 		             notexSample[1]);
 	}
+
+	Platform_Log("[TRKATLAS] rects=%d units=%d/%d fill=%d%% texelKB=%u animFrames=%d dropped=%d\n", s_trackMesh.atlas.rectCount, s_trackMesh.atlas.unitsUsed,
+	             TRACK_ATLAS_MAX_UNITS, s_trackMesh.atlas.unitsUsed ? (int)((s_trackMesh.atlas.packedTexels * 100u) / ((u32)s_trackMesh.atlas.unitsUsed * TRACK_ATLAS_DIM * TRACK_ATLAS_DIM)) : 0,
+	             (s_trackMesh.atlas.packedTexels * 2u) / 1024u, atlasAnimFrames, s_trackMesh.atlas.rectsDropped);
 }
 
 #endif /* CTR_NATIVE_TRACK_RENDERER */
