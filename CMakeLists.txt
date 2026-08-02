@@ -272,6 +272,23 @@ if(CTR_NATIVE_TRACK_RENDERER)
     endif()
 endif()
 
+# PICA-native model renderer (s30, docs/HANDOFF_s30_pica_native.md). Current
+# state: rung 0 -- load-time per-ModelHeader topology scan ([MODELMESH] and
+# [MODELGATE] per level) plus a per-frame instance sampler ([MODELFRAME] per
+# 64 content frames). Count-only on every platform; draws nothing, changes no
+# game state, and the two hooks in game/ compile to empty calls with this off.
+#
+# Deliberately carries NO 3DS prerequisites yet, unlike the track renderer
+# above: nothing here reaches the GPU, so requiring OT_DEPTH/DRAW_MERGE would
+# only stop the measurement from running in configs where it is perfectly
+# valid. The draw side will add them when it lands.
+option(CTR_NATIVE_MODEL_RENDERER
+    "PICA-native model renderer: instance topology + per-frame census (in progress)"
+    OFF)
+if(CTR_NATIVE_MODEL_RENDERER)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_MODEL_RENDERER=1)
+endif()
+
 # Render worker thread on core 2 (New3DS-only core; core 1 is the audio
 # worker's). DrawOTag becomes the async post the game's PS1 GPU protocol
 # already expects (bool_DrawOTag_InProgress / DrawSyncCallback / double-

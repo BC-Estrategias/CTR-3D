@@ -813,6 +813,20 @@ void RenderBucket_QueueAllInstances(struct GameTracker *gGT)
 
 	// null terminator at end of list
 	*RBI = 0;
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	// PICA-native model renderer (s30 rung 0): frame edge for the per-instance
+	// sampler above. This function is the ONE place per frame that queues every
+	// instance for every player (MainFrame_RenderFrame:166), so its tail is the
+	// frame boundary -- folding anywhere per-player would double-count split
+	// screen, and folding from the level-geometry path would miss frames that
+	// draw instances without drawing track.
+	// Implementation: platform/native_model_frame.c.
+	{
+		extern void NativeModelFrame_EndFrame(void);
+		NativeModelFrame_EndFrame();
+	}
+#endif
 }
 
 void RenderAllNormalParticles(struct GameTracker *gGT)

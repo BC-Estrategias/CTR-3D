@@ -1,5 +1,21 @@
 #include <common.h>
 
+/*
+ * s30 rung 0 instrument, same shape as the MAINFRAME_PERF_* pair in
+ * game/MAIN/MainFrame_RenderFrame.c:3-10 -- a macro that compiles to nothing
+ * unless the instrument build asked for it, so no platform #ifdef spreads into
+ * the walk itself. Gated on CTR_NATIVE_MODEL_RENDERER as well as CTR_INTERNAL
+ * because this scope fires once per instance per player (~10-150 times a
+ * frame) and belongs only in the build that is asking the question.
+ */
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+#include <platform/native_perf.h>
+#define RB_MODEL_PERF_BEGIN(bucket) NativePerf_BeginScope(bucket)
+#define RB_MODEL_PERF_END(bucket)   NativePerf_EndScope(bucket)
+#else
+#define RB_MODEL_PERF_BEGIN(bucket) ((void)0)
+#define RB_MODEL_PERF_END(bucket)   ((void)0)
+#endif
 
 struct RenderBucketEntry
 {
@@ -2015,6 +2031,7 @@ static struct RenderBucketEntry *RenderBucket_QueueDraw(struct Instance *inst, s
 	int lastFrameAdvance;
 	int lodIndex;
 	int lodExhausted;
+	int depthRangeOk;
 	int normalDepthBias;
 	int secondaryDepthBias;
 	int viewDepth;
@@ -2121,8 +2138,16 @@ static struct RenderBucketEntry *RenderBucket_QueueDraw(struct Instance *inst, s
 	RenderBucket_StoreMatrixWords(&idpp->m3x3, matrixState.m0, matrixState.m1, matrixState.m2, matrixState.m3, matrixState.m4);
 	split = RenderBucket_BuildSplitState(inst, mh, frame, nextFrame, pb, idpp, viewDepth, &queuedFlags, &matrixState, &projectionMvp);
 
-	if (RenderBucket_BuildDepthRange(inst, frame, nextFrame, pb, idpp, queueState, viewDepth, normalDepthBias, secondaryDepthBias, &queuedFlags, &split,
-	                                 &projectionMvp) == 0)
+	// Split out of the `if` only so the scope closes on BOTH exits: the reject
+	// path is where the bbox projection is at its purest cost -- an instance
+	// that pays nine GTE projections and then draws nothing -- and it is
+	// exactly the population the per-instance sampler below never sees.
+	RB_MODEL_PERF_BEGIN(NATIVE_PERF_BUCKET_MODEL_DEPTH_RANGE);
+	depthRangeOk = RenderBucket_BuildDepthRange(inst, frame, nextFrame, pb, idpp, queueState, viewDepth, normalDepthBias, secondaryDepthBias, &queuedFlags,
+	                                            &split, &projectionMvp);
+	RB_MODEL_PERF_END(NATIVE_PERF_BUCKET_MODEL_DEPTH_RANGE);
+
+	if (depthRangeOk == 0)
 	{
 		idpp->instFlags = queuedFlags;
 		return rbi;
@@ -2139,6 +2164,19 @@ static struct RenderBucketEntry *RenderBucket_QueueDraw(struct Instance *inst, s
 	idpp->ptrTexLayout = mh->ptrTexLayout;
 	idpp->ptrColorLayout = (u32)mh->ptrColors;
 	idpp->instFlags = queuedFlags;
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	// PICA-native model renderer (s30 rung 0): per-instance sample, taken HERE
+	// -- past every early-out above, with the LOD rung chosen and the draw
+	// committed -- so the count is instances the frame actually draws rather
+	// than instances it considered. Count-only; nothing below reads it.
+	// Implementation: platform/native_model_frame.c.
+	{
+		extern void NativeModelFrame_Sample(const struct Instance *inst, const struct ModelHeader *mh, int lodIndex);
+		NativeModelFrame_Sample(inst, mh, lodIndex);
+	}
+#endif
+
 	return rbi + 1;
 }
 

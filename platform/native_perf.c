@@ -137,6 +137,10 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
      * bucket's header comment) -- letting it win "dominant" would
      * double-report the same time. */
     {"direct_emit_ms", 0},
+    /* dominantCandidate 0: nests inside mainframe_queue_instances_ms, which is
+     * already a candidate -- letting a sub-slice win "dominant" would
+     * double-report the same time. */
+    {"model_depth_range_ms", 0},
 };
 
 global_variable FILE *s_csvFile;

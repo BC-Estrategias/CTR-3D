@@ -91,6 +91,20 @@ enum NativePerfBucket
 	 * fast path went ON -- this bucket splits true parse from moved emit.
 	 */
 	NATIVE_PERF_BUCKET_DIRECT_EMIT,
+	/*
+	 * Per-instance bounding-box projection + OT range allocation
+	 * (RenderBucket_BuildDepthRange), nested inside
+	 * mainframe_queue_instances_ms. Exists to answer one question s30 turns on:
+	 * of the per-object setup cost, how much SURVIVES a PICA-native model path?
+	 * This slice does not -- the bbox's OT-bucket-range purpose is erased by a
+	 * depth buffer, and its off-screen reject becomes two dot products on the
+	 * GPU instead of nine projections through our software-emulated GTE. What
+	 * stays (matrix compose, LOD pick, anim-frame pick) is the remainder of the
+	 * parent bucket. Reading the parent alone would price work we intend to
+	 * delete as work we have to keep. Appended, never inserted: s_bucketInfo is
+	 * indexed by this enum.
+	 */
+	NATIVE_PERF_BUCKET_MODEL_DEPTH_RANGE,
 	NATIVE_PERF_BUCKET_COUNT
 };
 

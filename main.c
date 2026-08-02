@@ -105,7 +105,15 @@
 // instead of an estimate. Called from MainFrame_RenderFrame, NOT from the
 // track mesh builder -- it must run on a plain PC build, where
 // CTR_NATIVE_TRACK_RENDERER is off.
+// Model topology scan + per-frame instance sampler for the PICA-native model
+// renderer (s30, docs/HANDOFF_s30_pica_native.md). The scanner comes FIRST so
+// the census below can fold each header's triangle counts into the same walk
+// that already has the deduped model population; the frame sampler comes after
+// both because it looks scans up rather than producing them. Both are
+// count-only and stubbed out when CTR_NATIVE_MODEL_RENDERER is off.
+#include "platform/native_model_mesh.c"
 #include "platform/native_model_census.c"
+#include "platform/native_model_frame.c"
 #include "platform/native_track_mesh.c"
 // Per-frame camera/visibility snapshot recorder (rung 3a step 1) -- after
 // native_track_mesh.c so it can call the mesh accessors (NativeTrackMesh_*)

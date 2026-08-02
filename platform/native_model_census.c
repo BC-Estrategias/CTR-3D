@@ -33,6 +33,11 @@
  * Counts only -- reads model metadata, allocates nothing, changes nothing.
  */
 
+/* Included unconditionally: the accessors are stubs when
+ * CTR_NATIVE_MODEL_RENDERER is off, so the topology half of this census
+ * degrades to zeros rather than needing its own #ifdef at every use. */
+#include "platform/native_model_mesh.h"
+
 #if defined(CTR_INTERNAL)
 
 /*
@@ -46,6 +51,22 @@
  */
 #define MODELCENSUS_FRAME_HEADER 0x1C
 #define MODELCENSUS_COMP_VERTEX  3
+
+/*
+ * LOD rungs reported separately (s30 rung 0). RenderBucket_SelectModelHeader
+ * (game/RenderBucket/RenderBucket_QueueExecute.c:1264) walks model->headers[]
+ * in order and takes the first whose maxDistanceLOD exceeds the projected
+ * distance, so header index IS the rung; InstDrawPerPlayer's own comment calls
+ * lodIndex "(0,1,2,3)". Anything past that is bucketed rather than dropped, so
+ * a model with more rungs than expected shows up as a number instead of
+ * silently skewing rung 3.
+ */
+#define MODELCENSUS_MAX_RUNGS 4
+
+/* Named scenery gated out of higher player counts, listed rather than just
+ * counted -- the whole point of the gating report is the list. Capped so a
+ * pathological level cannot flood the SD log on 3DS. */
+#define MODELCENSUS_MAX_GATED_NAMES 24
 
 struct NativeModelCensusTotals
 {
@@ -77,9 +98,71 @@ struct NativeModelCensusTotals
 	unsigned headersVertsUnknown;
 	unsigned framesVertsUnknown;
 	unsigned suspectFrameSizes;
+
+	/*
+	 * s30 rung 0 -- topology, from platform/native_model_mesh.c. Separate from
+	 * everything above: those fields are about whether ANIMATION DATA fits in
+	 * memory (the question the morph-target plan turned on), these are about
+	 * how much GEOMETRY a frame draws (the question the PICA-native plan turns
+	 * on). They are counted in the same walk only because it already has the
+	 * deduped model population.
+	 */
+	unsigned meshStatic;
+	unsigned meshAnimated;
+	unsigned meshMismatch;
+	unsigned meshNoCommands;
+	unsigned meshCapped;
+	unsigned meshTexOverflow;
+	unsigned meshNoTexTable;
+	unsigned meshMaxLayouts;
+	unsigned meshMaxPages;
+	unsigned rungHeaders[MODELCENSUS_MAX_RUNGS];
+	unsigned rungVerts[MODELCENSUS_MAX_RUNGS];
+	unsigned rungTris[MODELCENSUS_MAX_RUNGS];
+	unsigned rungBeyond;
 };
 
 static struct Level *s_censusLastLevel = NULL;
+
+/*
+ * Content fingerprint, latched alongside the pointer. Two bugs made this
+ * necessary and neither is hypothetical -- both were caught in attract runs
+ * while building the s30 topology report on top of this census.
+ *
+ * 1. The Level allocation is REUSED across loads, so a pointer-only latch
+ *    reported the first level of a session and then went quiet for every level
+ *    after it. A 5.5-minute run produced exactly one census block while
+ *    [MODELFRAME] plainly showed the game moving between levels. For the byte
+ *    census that only cost coverage; for the topology table it is a
+ *    correctness problem, because NativeModelMesh_Reset runs off this same
+ *    latch and a missed level change leaves ModelHeader pointers from the
+ *    PREVIOUS level cached for any address the allocator reuses.
+ *
+ * 2. Adding the level ID to the latch fixed that and introduced a worse
+ *    failure: the ID changes a frame BEFORE the Level struct is repopulated,
+ *    so every level was reported twice -- once with the previous level's data
+ *    under the new level's ID. Mislabelled data is worse than missing data,
+ *    and this project has lost whole sessions to exactly that shape of error.
+ *
+ * So the latch is the level's own CONTENT, the same answer native_track_mesh.c
+ * reached for the same reason (pointer + numQuadBlock/numVertex fingerprint,
+ * s27 review finding). The ID is read at report time and only tags the output;
+ * it never decides whether to report, so it cannot lead the data it labels.
+ */
+struct NativeModelCensusFingerprint
+{
+	const void *instDefs;
+	const void *modelArray;
+	u32 numInstances;
+	u32 numModels;
+};
+
+static struct NativeModelCensusFingerprint s_censusLastPrint;
+
+static int NativeModelCensus_SameFingerprint(const struct NativeModelCensusFingerprint *a, const struct NativeModelCensusFingerprint *b)
+{
+	return (a->instDefs == b->instDefs) && (a->modelArray == b->modelArray) && (a->numInstances == b->numInstances) && (a->numModels == b->numModels);
+}
 
 /*
  * Dedupe set. The level's model array and the global library are NOT disjoint
@@ -216,9 +299,80 @@ static unsigned NativeModelCensus_HeaderVerts(const struct ModelHeader *mh, unsi
 	return 0;
 }
 
-static void NativeModelCensus_Header(const struct ModelHeader *mh, struct NativeModelCensusTotals *t)
+/*
+ * Topology half (s30 rung 0). Folds one header's command-list scan into the
+ * per-rung totals. `rung` is the header's index within its Model, which is
+ * exactly the lodIndex RenderBucket_SelectModelHeader would assign it.
+ */
+static void NativeModelCensus_HeaderMesh(const struct ModelHeader *mh, s16 rung, struct NativeModelCensusTotals *t)
+{
+	const struct NativeModelHeaderScan *scan = NativeModelMesh_Scan(mh);
+
+	if (scan == NULL)
+	{
+		return;
+	}
+
+	if ((scan->flags & NATIVE_MODEL_SCAN_STATIC) != 0)
+	{
+		t->meshStatic++;
+	}
+	else
+	{
+		t->meshAnimated++;
+	}
+
+	if ((scan->flags & NATIVE_MODEL_SCAN_FRAME_MISMATCH) != 0)
+	{
+		t->meshMismatch++;
+	}
+
+	if ((scan->flags & NATIVE_MODEL_SCAN_NO_COMMANDS) != 0)
+	{
+		t->meshNoCommands++;
+	}
+
+	if ((scan->flags & NATIVE_MODEL_SCAN_WALK_CAPPED) != 0)
+	{
+		t->meshCapped++;
+	}
+
+	if ((scan->flags & NATIVE_MODEL_SCAN_TEX_OVERFLOW) != 0)
+	{
+		t->meshTexOverflow++;
+	}
+
+	if ((scan->flags & NATIVE_MODEL_SCAN_NO_TEXTABLE) != 0)
+	{
+		t->meshNoTexTable++;
+	}
+
+	if ((unsigned)scan->texLayouts > t->meshMaxLayouts)
+	{
+		t->meshMaxLayouts = scan->texLayouts;
+	}
+
+	if ((unsigned)scan->texPages > t->meshMaxPages)
+	{
+		t->meshMaxPages = scan->texPages;
+	}
+
+	if ((rung < 0) || (rung >= MODELCENSUS_MAX_RUNGS))
+	{
+		t->rungBeyond++;
+		return;
+	}
+
+	t->rungHeaders[rung]++;
+	t->rungVerts[rung] += scan->verts;
+	t->rungTris[rung] += scan->tris;
+}
+
+static void NativeModelCensus_Header(const struct ModelHeader *mh, s16 rung, struct NativeModelCensusTotals *t)
 {
 	unsigned verts = NativeModelCensus_HeaderVerts(mh, &t->suspectFrameSizes);
+
+	NativeModelCensus_HeaderMesh(mh, rung, t);
 
 	t->headers++;
 
@@ -302,19 +456,170 @@ static void NativeModelCensus_Model(const struct Model *model, struct NativeMode
 
 	for (s16 h = 0; h < model->numHeaders; h++)
 	{
-		NativeModelCensus_Header(&model->headers[h], t);
+		NativeModelCensus_Header(&model->headers[h], h, t);
 	}
 }
 
-static void NativeModelCensus_Print(const char *tag, const struct NativeModelCensusTotals *t)
+static void NativeModelCensus_Print(const char *tag, int levelID, const struct NativeModelCensusTotals *t)
 {
 	unsigned storedKiB = (t->storedPlainBytes + t->storedCompressedBytes) / 1024u;
 	unsigned gpuKiB = (t->gpuPlainBytes + t->gpuCompBytes) / 1024u;
 
-	Platform_Log("[MODELCENSUS] %s models=%u headers=%u anims=%u(plain %u) frames=%u verts=%u\n", tag, t->models, t->headers, t->anims, t->animsPlain,
-	             t->frames, t->plainVerts + t->compVerts);
-	Platform_Log("[MODELCENSUS] %s storedKiB=%u gpuKiB=%u ratio=%u%%  unresolved: headers=%u frames=%u suspect=%u\n", tag, storedKiB, gpuKiB,
+	/* lvl= on every line for the same reason [TRKMESH] gained it in s29: these
+	 * blocks now print once per level rather than once per session, and an
+	 * untagged number in a rotation log is a number nobody can attribute. */
+	Platform_Log("[MODELCENSUS] lvl=%d %s models=%u headers=%u anims=%u(plain %u) frames=%u verts=%u\n", levelID, tag, t->models, t->headers, t->anims,
+	             t->animsPlain, t->frames, t->plainVerts + t->compVerts);
+	Platform_Log("[MODELCENSUS] lvl=%d %s storedKiB=%u gpuKiB=%u ratio=%u%%  unresolved: headers=%u frames=%u suspect=%u\n", levelID, tag, storedKiB, gpuKiB,
 	             (storedKiB > 0) ? ((gpuKiB * 100u) / storedKiB) : 0u, t->headersVertsUnknown, t->framesVertsUnknown, t->suspectFrameSizes);
+}
+
+/*
+ * s30 rung 0 topology report. Split out from the byte report above because the
+ * two answer different questions and mixing them is how the first version of
+ * this file produced a doubled memory figure nobody could interpret.
+ *
+ * Read the rung columns as the price list for "racers use their multiplayer
+ * models": rung 0 is what a close instance draws today, rung 1 what it would
+ * draw one step down. The per-frame [MODELFRAME] line is what says how many
+ * instances are actually sitting on each rung -- these totals are the whole
+ * population, drawn or not.
+ */
+static void NativeModelCensus_PrintMesh(const char *tag, int levelID, const struct NativeModelCensusTotals *t)
+{
+	Platform_Log("[MODELMESH] lvl=%d %s static=%u anim=%u maxLayouts=%u maxPages=%u  suspect: mismatch=%u noCmd=%u capped=%u texOver=%u noTexTable=%u "
+	             "beyondRung%u=%u%s\n",
+	             levelID, tag, t->meshStatic, t->meshAnimated, t->meshMaxLayouts, t->meshMaxPages, t->meshMismatch, t->meshNoCommands, t->meshCapped,
+	             t->meshTexOverflow, t->meshNoTexTable, MODELCENSUS_MAX_RUNGS, t->rungBeyond, NativeModelMesh_Overflowed() ? " TABLE-FULL(partial)" : "");
+
+	for (unsigned r = 0; r < MODELCENSUS_MAX_RUNGS; r++)
+	{
+		if (t->rungHeaders[r] == 0)
+		{
+			continue;
+		}
+
+		Platform_Log("[MODELMESH] lvl=%d %s rung%u headers=%u verts=%u tris=%u\n", levelID, tag, r, t->rungHeaders[r], t->rungVerts[r], t->rungTris[r]);
+	}
+}
+
+/*
+ * Player-count gating (s30 rung 0, owner-requested).
+ *
+ * Bits 0-3 of Instance.flags are a per-instance visibility set indexed by
+ * player count, not the "collision?" the decomp's comment guesses at:
+ * RenderBucket_QueueDraw tests `inst->flags & lodMask` and returns early when
+ * it is clear (RenderBucket_QueueExecute.c:2053), where lodMask is
+ * sdata->LOD[] = {1,2,4,4,8,8,8,8} indexed by player count, or by
+ * (players | 4) for Time Trial and Relic Race (regionsEXE.h:3209). So:
+ *
+ *   bit 0 = drawn in 1P    bit 1 = drawn in 2P
+ *   bit 2 = drawn in 3P/4P bit 3 = drawn in Time Trial / Relic Race
+ *
+ * This is the mechanism behind the observation that started this report --
+ * Polar Pass's frozen polar bear is absent in multiplayer. `droppedAt4P` below
+ * is therefore the price list for the reverse trade: running 1P with the 4P
+ * mask would drop exactly these instances, and their triangle count is what
+ * that would buy.
+ *
+ * First measured examples, for what the population actually looks like:
+ * Roo's Tubes drops 17 mushrooms (flags 0x0b -- present in 1P, 2P and Time
+ * Trial, absent only at 3P/4P) for 933 triangles; Tiger Temple drops 10
+ * torches for 428; Crash Cove drops nothing but the three CTR letter tokens
+ * (flags 0x09), which are gameplay pickups and not a candidate for removal.
+ * So the lever is real, it is decorative scenery, and it is track-dependent.
+ *
+ * Read from InstDef rather than the live Instance deliberately: INSTANCE_
+ * LevInitAll copies InstDef bytes [0,0x20) plus three more words to
+ * Instance+8, which lands InstDef.flags (0x20) exactly on Instance.flags
+ * (0x28), so these ARE the flags QueueDraw tests -- and the InstDef array is
+ * walkable at level load without depending on instance-pool allocation having
+ * succeeded.
+ */
+static void NativeModelCensus_ReportGating(struct Level *level, int levelID)
+{
+	unsigned total = 0;
+	unsigned drawn1P = 0;
+	unsigned drawn2P = 0;
+	unsigned drawn4P = 0;
+	unsigned drawnTT = 0;
+	unsigned droppedAt4P = 0;
+	unsigned droppedAt4PTris = 0;
+	unsigned named = 0;
+
+	if ((level->ptrInstDefs == NULL) || (level->numInstances == 0) || (level->numInstances > 8192))
+	{
+		return;
+	}
+
+	for (u32 i = 0; i < level->numInstances; i++)
+	{
+		const struct InstDef *def = &level->ptrInstDefs[i];
+		u32 flags = def->flags;
+
+		total++;
+
+		if ((flags & 1) != 0)
+		{
+			drawn1P++;
+		}
+		if ((flags & 2) != 0)
+		{
+			drawn2P++;
+		}
+		if ((flags & 4) != 0)
+		{
+			drawn4P++;
+		}
+		if ((flags & 8) != 0)
+		{
+			drawnTT++;
+		}
+
+		/* Drawn in 1P, dropped at 3P/4P -- the population a 1P build could
+		 * shed by adopting the 4P mask.
+		 *
+		 * NOT "1P-only", which is what this was first called and what the
+		 * first run's output claimed: measured flags are 0x0b on Roo's Tubes
+		 * mushrooms (1P + 2P + Time Trial, absent only at 3P/4P) and 0x09 on
+		 * the CTR letter tokens. Naming the set after a property it does not
+		 * have is the same class of mistake as tagging a report with the next
+		 * level's ID. */
+		if (((flags & 1) == 0) || ((flags & 4) != 0))
+		{
+			continue;
+		}
+
+		droppedAt4P++;
+
+		/* Rung 0 is the right rung to price it at: this instance is being
+		 * counted precisely because it is drawn, and a drawn instance close
+		 * enough to matter is on rung 0. Models with no headers contribute
+		 * nothing rather than being skipped from the count. */
+		if ((def->model != NULL) && (def->model->headers != NULL) && (def->model->numHeaders > 0))
+		{
+			const struct NativeModelHeaderScan *scan = NativeModelMesh_Scan(&def->model->headers[0]);
+
+			if (scan != NULL)
+			{
+				droppedAt4PTris += scan->tris;
+			}
+		}
+
+		if (named < MODELCENSUS_MAX_GATED_NAMES)
+		{
+			named++;
+			/* modelID as well as the name, because the names in LEV InstDefs
+			 * are terse (a first run printed single letters) and an ID maps
+			 * straight onto the STATIC_* enum in namespace_Instance.h, which
+			 * is how anyone would actually identify the object. */
+			Platform_Log("[MODELGATE] lvl=%d   no4P: '%.16s' model='%.16s' id=%d flags=%08x\n", levelID, def->name,
+			             (def->model != NULL) ? def->model->name : "<none>", (def->model != NULL) ? (int)def->model->id : -1, (unsigned)flags);
+		}
+	}
+
+	Platform_Log("[MODELGATE] lvl=%d instances=%u drawn: 1P=%u 2P=%u 4P=%u TT=%u | droppedAt4P=%u (tris=%u, listed %u)\n", levelID, total, drawn1P, drawn2P,
+	             drawn4P, drawnTT, droppedAt4P, droppedAt4PTris, named);
 }
 
 void NativeModelCensus_Report(struct GameTracker *gGT, struct Level *level)
@@ -322,15 +627,37 @@ void NativeModelCensus_Report(struct GameTracker *gGT, struct Level *level)
 	struct NativeModelCensusTotals lvlTotals;
 	struct NativeModelCensusTotals libTotals;
 
-	if ((gGT == NULL) || (level == NULL) || (level == s_censusLastLevel))
+	int levelID;
+	struct NativeModelCensusFingerprint print;
+
+	if ((gGT == NULL) || (level == NULL))
 	{
 		return;
 	}
+
+	print.instDefs = (const void *)level->ptrInstDefs;
+	print.modelArray = (const void *)level->ptrModelsPtrArray;
+	print.numInstances = level->numInstances;
+	print.numModels = level->numModels;
+
+	if ((level == s_censusLastLevel) && NativeModelCensus_SameFingerprint(&print, &s_censusLastPrint))
+	{
+		return;
+	}
+
 	s_censusLastLevel = level;
+	s_censusLastPrint = print;
+	levelID = NativePerf_CurrentLevelID();
 
 	memset(&lvlTotals, 0, sizeof(lvlTotals));
 	memset(&libTotals, 0, sizeof(libTotals));
 	s_censusSeenCount = 0;
+
+	/* ModelHeader pointers are into level/library allocations and do not
+	 * survive a load, so the topology cache is per-level by construction. This
+	 * is also what makes the per-frame sampler's pointer lookups safe: nothing
+	 * in the table can outlive the level it was scanned from. */
+	NativeModelMesh_Reset();
 
 	/*
 	 * TWO populations, and conflating them was the first version's mistake.
@@ -366,8 +693,11 @@ void NativeModelCensus_Report(struct GameTracker *gGT, struct Level *level)
 		}
 	}
 
-	NativeModelCensus_Print("lvl ", &lvlTotals);
-	NativeModelCensus_Print("lib+", &libTotals);
+	NativeModelCensus_Print("lvl ", levelID, &lvlTotals);
+	NativeModelCensus_Print("lib+", levelID, &libTotals);
+	NativeModelCensus_PrintMesh("lvl ", levelID, &lvlTotals);
+	NativeModelCensus_PrintMesh("lib+", levelID, &libTotals);
+	NativeModelCensus_ReportGating(level, levelID);
 	Platform_Log("[MODELCENSUS] TOTAL uniqueModels=%u gpuKiB=%u (lvl %u + lib+ %u)\n", s_censusSeenCount,
 	             (lvlTotals.gpuPlainBytes + lvlTotals.gpuCompBytes + libTotals.gpuPlainBytes + libTotals.gpuCompBytes) / 1024u,
 	             (lvlTotals.gpuPlainBytes + lvlTotals.gpuCompBytes) / 1024u, (libTotals.gpuPlainBytes + libTotals.gpuCompBytes) / 1024u);
