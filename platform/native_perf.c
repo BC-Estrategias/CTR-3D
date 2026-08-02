@@ -717,8 +717,27 @@ void NativePerf_Shutdown(void)
 #endif
 }
 
+int NativePerf_CurrentLevelID(void)
+{
+	return (int)s_frameBeginInfo.levelID;
+}
+
 void NativePerf_BeginFrame(const struct NativePerfFrameInfo *info)
 {
+	/*
+	 * levelID is latched BEFORE the enabled check, because
+	 * NativePerf_CurrentLevelID is now the single source every instrument tags
+	 * from -- including instruments that run in builds with the frame profiler
+	 * switched off. Behind the guard it reported a confident 0 (Dingo Canyon)
+	 * for every track on PC, which is the same lookalike-level-field trap that
+	 * made [SWEEP] print 39 for a race that was demonstrably N. Gin Labs, only
+	 * harder to notice because 0 is a real level.
+	 */
+	if (info != NULL)
+	{
+		s_frameBeginInfo.levelID = info->levelID;
+	}
+
 	if (!s_enabled || (info == NULL))
 	{
 		return;

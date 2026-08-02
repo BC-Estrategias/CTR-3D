@@ -208,6 +208,29 @@ if(CTR_NATIVE_DRAW_MERGE)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_DRAW_MERGE=1)
 endif()
 
+# Runtime percentage on CTR's own track/texture LOD switch distances, seeded
+# once per frame in RenderAllLevelGeometry, plus the [LODPROBE] counters that
+# say where BSP leaves actually landed. Built 2026-07-28 to test whether pulling
+# the draw distance in would shorten the OT walk.
+#
+# IT DOES NOT -- measured, PC attract race: at 50% the leaves move out of the
+# subdivided lists into FULL_DYNAMIC exactly as intended, and prims/f does not
+# follow (1092 retail vs 1215 at 50%, same track). FULL_DYNAMIC is a different
+# drawing style, not a lower-density one. Keep this OFF; it is retained as the
+# instrument that produced that answer and can re-test it in one run, not as an
+# fps lever. The texture half is untested and expected to be worth little
+# regardless -- hardware put the entire texture pipeline at ~2ms of a 37ms frame.
+#
+# Both scales start at retail 100% even when compiled in, so an enabled build is
+# byte-identical until something moves them. Runtime: dumpreq 'lodgeo N' /
+# 'lodtex N' on 3DS, F4/F6 or --lod-geo/--lod-tex on PC. 1P only.
+option(CTR_NATIVE_LOD_BIAS
+    "LOD distance scaling + [LODPROBE] slot counters (1P; measured: no fps win)"
+    OFF)
+if(CTR_NATIVE_LOD_BIAS)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_LOD_BIAS=1)
+endif()
+
 # Track censuses for the native track renderer (s27) -- one [TRKCENSUS] log
 # block per level load: vertex-pool edge sharing (the no-crack premise),
 # water/animated-vertex exclusion share, AnimTex inventory, and texture

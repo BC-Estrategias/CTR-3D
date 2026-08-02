@@ -947,17 +947,404 @@ void NativeGpu_RegisterOTRange(uint32_t *ot, int n)
  * falsified the encoding (see the v2 table comment in NativeGpuState);
  * v2 records instead of restamping, so this stays byte-identical to the
  * pre-rung-1 behavior. */
+/* Escape detector for the depth model (docs/PACKET_DEPTH_DESIGN.md 3.4b).
+ * NextDepthStamp is the single stamp source for BOTH emit paths, so counting
+ * here gives the true number of stamped primitives per frame. [PKTDEPTH]
+ * compares it against the number the resolver actually saw: if any emit path
+ * writes a stamp without going through PacketDepth_ResolveXY, that path is
+ * still on the ordinal axis and the two numbers diverge.
+ *
+ * This exists because exactly that happened and a screenshot did not reveal it:
+ * native_direct_emit.c carries most of a heavy track's opaque content and was
+ * silently bypassing the resolver. Counting is how a third emit path gets
+ * caught without waiting for someone to notice geometry through a wall. */
+global_variable u32 s_pktDepthStamps;
+
 internal u16 NativeGpu_NextDepthStamp(void)
 {
 	const u16 ordinal = (u16)(s_gpu.emitOrdinal < 0xFFFFu ? s_gpu.emitOrdinal : 0xFFFFu);
 
+	s_pktDepthStamps++;
 	s_gpu.lastStampedZ = ordinal;
 	return ordinal;
 }
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+/* Packet depth from GTE sz3 -- docs/PACKET_DEPTH_DESIGN.md.
+ *
+ * OFF by default and inert until enabled: with g_dbg_packetDepth == 0 nothing
+ * here runs and NativeGpu_StampEmitOrdinal writes exactly what it writes today.
+ * The visual half cannot be validated on PC (PC runs no depth test), so it
+ * stays off until Azahar and hardware have looked at it.
+ *
+ * Per-primitive, never per-vertex (design 3.2): one missing vertex disqualifies
+ * the whole primitive, because splitting a face across two depth axes puts a
+ * seam in the middle of it -- the failure class s28 spent a session chasing.
+ * Measured cost of the whole-primitive rule: 97.09% of primitives covered.
+ *
+ * max(), not average, because that is what retail does: both
+ * DrawLevelOvr1P_GetProjected*Depth helpers (226_00_DrawLevelOvr1P.c:1922-1947)
+ * run a plain running maximum over the primitive's vertices and feed it to
+ * GetProjectedOtIndex as maxDepth. Matching it keeps the real value and the
+ * otIndex<<6 fallback on the same footing.
+ *
+ * SENSE INVERSION -- the one thing here reasoned rather than measured, and the
+ * first thing to check if this looks wrong in Azahar. sz3 INCREASES with
+ * distance (it is view.z). Emit ordinals INCREASE with proximity: the OT walk
+ * descends, so later emissions are nearer, which is why s28 saw a leaf's
+ * ordinals run 225 -> 166 as it receded. The axes run opposite ways, and the
+ * depth test's sense is already fixed by the ordinal convention, so the lookup
+ * is flipped to match the test rather than the other way round.
+ *
+ * Declared here, above NativeGpu_StampEmitOrdinal, because that is the consumer.
+ */
+int g_dbg_packetDepth = 0;
+
+/* ONE AXIS, FOUR CASES. Every stamp below is "nearer = larger", and every one
+ * of them must land on the SAME numeric scale, because the depth test cannot
+ * tell an ordinal from a depth -- it just compares u16s.
+ *
+ * Getting this wrong is not subtle and it is not theoretical: the first Azahar
+ * run with the feature on drew N. Gin Labs' animated waterfalls over the entire
+ * scene INCLUDING the HUD. Those are AnimateWater vertices, mutated per frame,
+ * so they are never GTE-projected and always miss the lookup -- and the miss
+ * path was leaving them on the raw emit ordinal, a small integer on a scale
+ * that has nothing to do with 0..65535 view depth. Design 3.3 says exactly this
+ * ("NOT the ordinal axis. That would reintroduce two axes"); the implementation
+ * did it anyway.
+ *
+ *   world, covered  : 0xFFFF - maxSz3                (true view depth)
+ *   world, miss     : 0xFFFF - (otIndex << 6)        (same axis, bucket-coarse;
+ *                                                     inverts retail's >>6)
+ *   2D / UI         : PKTDEPTH_UI_BASE + ordinal     (reserved near band)
+ *   feature off     : the emit ordinal, exactly as before
+ *
+ * The near band is reserved off the TOP of the range, so world content is
+ * clamped to PKTDEPTH_WORLD_MAX. That costs the nearest 256 units of view.z,
+ * which sit inside the near clip plane anyway -- geometry that close is already
+ * not drawn. ctr_track.v.pica applies the identical clamp; if one side is
+ * changed without the other, the two sources stop sharing the axis. */
+enum
+{
+	PKTDEPTH_UI_BAND = 256,
+	PKTDEPTH_UI_BASE = 0xFFFF - PKTDEPTH_UI_BAND + 1, /* 0xFF00 */
+	PKTDEPTH_WORLD_MAX = PKTDEPTH_UI_BASE - 1,        /* 0xFEFF */
+	PKTDEPTH_OT_SHIFT = 6                             /* retail's maxDepth >> 6 */
+};
+
+global_variable u16 s_pendingDepth;
+global_variable int s_pendingDepthValid;
+/*
+ * s29 PER-VERTEX depth. The flat stamp above is the primitive's FARTHEST
+ * vertex (maxSz3, retail's own maxDepth convention -- correct for choosing an
+ * OT bucket, wrong for a z-buffer). Against the resident track renderer, which
+ * gives every vertex real depth and lets the GPU interpolate it across the
+ * surface, a flat-at-its-far-corner kart polygon loses to the road it is
+ * sitting on -- owner-visible as "the ground keeps getting drawn over Crash",
+ * and structural in a racing game, where the ground runs near-parallel to the
+ * view for most of the screen most of the time.
+ *
+ * The per-vertex depths were already being looked up and then discarded by the
+ * max. These keep them. Max 4: every caller's xs/ys arrays are [4] (tri, quad,
+ * line, point), which PacketDepth_ResolveXY now enforces rather than assumes.
+ */
+global_variable u16 s_pendingDepthPerVert[4];
+global_variable int s_pendingDepthCount;
+
+/* s29 per-vertex-vs-flat accounting -- see NativeGpu_StampEmitOrdinal. */
+global_variable u32 s_pktDepthPerVertHits;
+global_variable u32 s_pktDepthFlatFallback;
+global_variable int s_pktDepthLastAppended;
+global_variable int s_pktDepthLastResolved;
+
+/*
+ * s29 owner-requested depth bias, in view.z units (stamp units are the same
+ * scale: stamp = 0xFFFF - sz3, so +1 stamp == 1 unit NEARER the camera).
+ *
+ * Applies to WORLD packet content only -- this is the single funnel every
+ * world stamp passes through, and the 2D/UI band is resolved before it, so UI
+ * is untouched. Because it shifts every world packet by the same amount,
+ * packet-vs-packet ordering is bit-for-bit unchanged; the only relationship it
+ * moves is packet-vs-TRACK, which is exactly the complaint ("racers sinking
+ * into the ground").
+ *
+ * A HACK, deliberately, and it trades one artefact against another: too small
+ * and racers still sink, too large and they show through walls, and on a track
+ * with thin geometry there may be no value that is clean everywhere. The real
+ * fix is the track side -- the near-plane clamp (ctr_track.v.pica's
+ * depthMinWorld) and behind-camera leaves, both still open. Default 0 so this
+ * costs nothing and changes nothing until it is asked for.
+ */
+int g_dbg_pktDepthBias = 0;
+
+internal u16 PacketDepth_ClampWorld(u32 stamp)
+{
+	int biased = (int)stamp + g_dbg_pktDepthBias;
+
+	/* Signed intermediate on purpose: a negative bias must saturate at 0
+	 * rather than wrap through 0xFFFF into "nearest", which is the exact
+	 * failure this whole session started with. */
+	if (biased < 0)
+	{
+		biased = 0;
+	}
+	if (biased > (int)PKTDEPTH_WORLD_MAX)
+	{
+		biased = (int)PKTDEPTH_WORLD_MAX;
+	}
+	return (u16)biased;
+}
+
+/* Live fallback rate (design 4). Distinct from [SZPROBE], which is a PC
+ * instrument behind its own switch: this one counts whenever the feature is on,
+ * including on hardware, because "97.09% of primitives" was measured on PC
+ * content and hardware content is allowed to disagree. If it does, that must
+ * arrive as a number, not as an owner noticing something looks wrong. */
+global_variable struct
+{
+	u32 real, fellBack, suppressed2d, frames;
+	/* Actual stamp EXTENTS per class. The counts above say how often each path
+	 * fired; these say WHERE on the axis it landed, which is the only thing
+	 * that explains content vanishing. Larger stamp = nearer (n3ds_backend.c's
+	 * empirically-settled polarity: Mtx_OrthoTilt maps larger vertex z to
+	 * smaller stored depth, LEQUAL, clear-to-max). Compare against the track's
+	 * own zOrd range in [TRKDEPTH0]: if the two do not overlap, one source is
+	 * simply in front of the other everywhere and no amount of per-primitive
+	 * correctness will help. */
+	u16 realMin, realMax;
+	u16 backMin, backMax;
+	u16 uiMin, uiMax;
+} s_pktDepth;
+
+internal void PacketDepth_NoteExtent(u16 stamp, u16 *lo, u16 *hi)
+{
+	if ((*lo == 0) && (*hi == 0))
+	{
+		*lo = stamp;
+		*hi = stamp;
+		return;
+	}
+	if (stamp < *lo)
+	{
+		*lo = stamp;
+	}
+	if (stamp > *hi)
+	{
+		*hi = stamp;
+	}
+}
+
+/* Shared core. BOTH emit paths must call this: the parse loop's MakeVertex*
+ * sites AND native_direct_emit.c, which stamps its own z and handles most of a
+ * heavy track's opaque content on 3DS. If only one of them resolves depth, the
+ * two populations sit on different axes -- the same defect as the waterfalls,
+ * just split by code path instead of by content type, and therefore much harder
+ * to see in a screenshot.
+ *
+ * Returns 1 and writes *out whenever the feature is on (covered, miss and 2D
+ * all produce a stamp); returns 0 only when the feature is off, which is the
+ * caller's signal to keep its existing ordinal. */
+internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out, u16 *perVert)
+{
+	u16 sz3s[4];
+	u16 maxSz3 = 0;
+	int i;
+
+	if (!g_dbg_packetDepth)
+	{
+		return 0;
+	}
+
+	/* perVert is only meaningful for the vertex counts the emit paths actually
+	 * append one-for-one; anything else falls back to the flat stamp rather
+	 * than writing past sz3s[]. */
+	if (n > 4)
+	{
+		perVert = NULL;
+	}
+
+	if (GTECapture_LookupSuppressed())
+	{
+		/* 2D in the UI band: no depth exists, and it must stay on top of every
+		 * world stamp. Ordinal ordering is preserved WITHIN the band so UI
+		 * layers among itself exactly as it does today. */
+		*out = (u16)(PKTDEPTH_UI_BASE + (s_gpu.emitOrdinal & (PKTDEPTH_UI_BAND - 1)));
+		PacketDepth_NoteExtent(*out, &s_pktDepth.uiMin, &s_pktDepth.uiMax);
+		s_pktDepth.suppressed2d++;
+		/* 2D has no per-vertex depth by definition -- flat is correct here. */
+		if (perVert)
+		{
+			for (i = 0; i < n; i++)
+			{
+				perVert[i] = *out;
+			}
+		}
+		return 1;
+	}
+
+	for (i = 0; i < n; i++)
+	{
+		u16 sz3;
+
+		if (!GTECapture_LookupDepth(xs[i], ys[i], &sz3))
+		{
+			/* Whole primitive falls back (design 3.2) -- but onto the SAME
+			 * axis (design 3.3), never onto the ordinal. The OT bucket the
+			 * walk is currently parsing IS a quantisation of this same view
+			 * depth (retail builds it as maxDepth >> 6), so shifting it back
+			 * up recovers a coarse but correctly-scaled depth. Without this
+			 * the miss population lands at an arbitrary point on the scale --
+			 * which is what put the waterfalls through the HUD. */
+			s_pktDepth.fellBack++;
+			if (s_gpu.otCurrentSlotIdx == NATIVE_GPU_NO_CONTENT_BUCKET)
+			{
+				/* No bucket to derive from (outside a walk). Keeping the
+				 * caller's ordinal is the lesser evil: it is at least the
+				 * behaviour this content had before the feature existed. */
+				return 0;
+			}
+			*out = PacketDepth_ClampWorld(0xFFFFu - (s_gpu.otCurrentSlotIdx << PKTDEPTH_OT_SHIFT));
+			PacketDepth_NoteExtent(*out, &s_pktDepth.backMin, &s_pktDepth.backMax);
+			/* Bucket-derived depth is primitive-wide -- there is no per-vertex
+			 * information to recover, so the whole primitive stays flat. */
+			if (perVert)
+			{
+				int k;
+
+				for (k = 0; k < n; k++)
+				{
+					perVert[k] = *out;
+				}
+			}
+			return 1;
+		}
+
+		if (perVert)
+		{
+			sz3s[i] = sz3;
+		}
+		if (sz3 > maxSz3)
+		{
+			maxSz3 = sz3;
+		}
+	}
+
+	*out = PacketDepth_ClampWorld(0xFFFFu - maxSz3); /* see SENSE INVERSION above */
+	PacketDepth_NoteExtent(*out, &s_pktDepth.realMin, &s_pktDepth.realMax);
+	s_pktDepth.real++;
+	/*
+	 * The whole point (s29): every vertex keeps its OWN depth instead of
+	 * inheriting the primitive's farthest corner, so the GPU interpolates
+	 * across the polygon exactly as it already does for resident track
+	 * geometry. *out stays the flat max so callers that cannot carry
+	 * per-vertex depth (and the [PKTDEPTHZ] extents) are unchanged.
+	 */
+	if (perVert)
+	{
+		for (i = 0; i < n; i++)
+		{
+			perVert[i] = PacketDepth_ClampWorld(0xFFFFu - sz3s[i]);
+		}
+	}
+	return 1;
+}
+
+/* Parse-path wrapper: stashes the result for NativeGpu_StampEmitOrdinal, which
+ * is where that path's stamp is actually written. */
+internal void PacketDepth_ResolvePrim(VERTTYPE **srcs, int n)
+{
+	s16 xs[4], ys[4];
+	int i;
+
+	for (i = 0; i < n; i++)
+	{
+		xs[i] = (s16)srcs[i][0];
+		ys[i] = (s16)srcs[i][1];
+	}
+
+	s_pendingDepthValid = PacketDepth_ResolveXY(xs, ys, n, &s_pendingDepth, s_pendingDepthPerVert);
+	s_pendingDepthCount = s_pendingDepthValid ? n : 0;
+}
+
+/* Direct-emit wrapper: that path has packed XY words and writes its own z, so
+ * it takes the stamp back directly instead of going through the pending slot. */
+internal int PacketDepth_ResolvePacked(const u32 *xyPacked, int n, u16 *out, u16 *perVert)
+{
+	s16 xs[4], ys[4];
+	int i;
+
+	for (i = 0; i < n; i++)
+	{
+		xs[i] = (s16)(xyPacked[i] & 0xFFFFu);
+		ys[i] = (s16)(xyPacked[i] >> 16);
+	}
+
+	return PacketDepth_ResolveXY(xs, ys, n, out, perVert);
+}
+#endif
+
 internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 {
-	const u16 stamp = NativeGpu_NextDepthStamp();
+	u16 stamp = NativeGpu_NextDepthStamp();
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* Consume-and-clear: the resolution belongs to the primitive the parse loop
+	 * just appended, and must never leak to the next one. NextDepthStamp is
+	 * still called unconditionally above so the emit ordinal keeps advancing at
+	 * exactly the same rate whether or not a primitive took real depth -- the
+	 * bucket->ordinal recorder and the miss fallback both depend on that
+	 * sequence being undisturbed. */
+	if (s_pendingDepthValid)
+	{
+		stamp = s_pendingDepth;
+		s_pendingDepthValid = 0;
+
+		/*
+		 * s29 per-vertex depth. Only when the parse loop appended EXACTLY one
+		 * vertex per resolved source vertex, in order -- checked here rather
+		 * than assumed, because a path that appends a different count (or
+		 * reorders) would otherwise pair each vertex with a stranger's depth,
+		 * which looks like subtle z-fighting rather than an obvious break.
+		 * Any mismatch silently keeps today's flat stamp below.
+		 */
+		if ((s_pendingDepthCount > 0) && ((s_gpu.vertexIndex - firstVertex) == s_pendingDepthCount))
+		{
+			int k;
+
+			for (k = 0; k < s_pendingDepthCount; k++)
+			{
+				s_gpu.vertexBuffer[firstVertex + k].emitOrdinal = s_pendingDepthPerVert[k];
+			}
+			s_pendingDepthCount = 0;
+			s_pktDepthPerVertHits++;
+			s_gpu.emitOrdinal++;
+			return;
+		}
+
+		/*
+		 * s29 INSTRUMENT. The guard above is silent by design, and silence is
+		 * how it hid: falling back writes ONE depth for the whole primitive,
+		 * and that depth is the running MAXIMUM over its vertices (retail's
+		 * rule, correct for choosing an OT bucket, wrong for a depth buffer).
+		 * A primitive stamped at its farthest corner sits as far away as its
+		 * own back edge, so a kart made of them reads several of its own
+		 * lengths too distant and loses the depth test to the ground it is
+		 * standing on -- which is the reported sinking, and which the owner
+		 * confirmed on hardware by driving visually INTO a wall before the
+		 * game agreed he had reached it.
+		 *
+		 * Suspected trigger: a 4-sided face resolves 4 vertices but is drawn
+		 * as two triangles = 6 appended, so 6 != 4 and every quad silently
+		 * takes the flat maximum. Triangles match and are fine. PS1 models are
+		 * mostly quads. Counted rather than asserted, and the sample pair is
+		 * carried so the ratio is readable instead of inferred.
+		 */
+		s_pktDepthFlatFallback++;
+		s_pktDepthLastAppended = s_gpu.vertexIndex - firstVertex;
+		s_pktDepthLastResolved = s_pendingDepthCount;
+		s_pendingDepthCount = 0;
+	}
+#endif
 
 	for (int i = firstVertex; i < s_gpu.vertexIndex; i++)
 	{
@@ -1014,6 +1401,94 @@ internal void NativeGpu_RecordContentAdvance(void)
 	s_gpu.minContentBucket = s_gpu.otCurrentSlotIdx;
 }
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+/* [SZPROBE] -- stamp-time depth-source probe (s29, PC-first; content counts
+ * transfer, so this never needs to run on a device).
+ *
+ * The s28 handoff proposes giving the packet path real depth by looking up the
+ * GTE's sz3 at stamp time, keyed by the screen XY already in the packet. That
+ * plan rests on a hit rate NOBODY HAS MEASURED: the 60%/47% figures in the
+ * session notes are for the s24 model-space SHAPE hash, a different lookup with
+ * a different key over a different population. Measure the real one before the
+ * design commits to it.
+ *
+ * The counting sites are MakeVertexTriangle/Quad/Rect, further down: they
+ * receive p0..p3, pointers to the packet's own XY words, which are exactly what
+ * GTE_RotTransPers truncated and keyed the table with. The vertexBuffer copies
+ * those functions build have already had DrawEnvOffset added and would key a
+ * shifted, always-missing coordinate.
+ *
+ * Classification matters as much as the rate. A miss on world geometry is a
+ * depth fallback; a miss on a HUD glyph is correct behavior, since 2D content
+ * has no depth and must keep ordinal treatment in a near band. So 2D is
+ * counted separately, using the parallelogram discriminator MakeVertexQuad
+ * already relies on -- which is itself a candidate answer to the handoff's open
+ * question about how to classify 2D content.
+ *
+ * Declared up here rather than beside those sites because the [SZPROBE] report
+ * lives in NativeGpu_ResetEmitOrdinal immediately below -- the one hook that
+ * fires exactly once per presented frame.
+ *
+ * Read-only and off by default: it counts, it never writes a vertex. */
+int g_dbg_szProbe = 0;
+
+global_variable struct
+{
+	u32 tri3dHit, tri3dMiss;
+	u32 quad3dHit, quad3dMiss;
+	u32 quad2d, rect2d; /* vertices classified 2D, never looked up */
+	u32 suppressed;     /* vertices inside the UI band */
+	/* Per-PRIMITIVE coverage, which is what the fallback policy actually keys
+	 * on: a primitive with one missing vertex cannot take real depth for two
+	 * corners and ordinal depth for the third, so it falls back whole. The
+	 * vertex rate overstates usable coverage and must not be quoted for this
+	 * decision -- and the two can't be derived from each other, since misses
+	 * cluster within a primitive (a partly off-screen face loses several
+	 * corners at once) rather than landing independently. */
+	u32 primFull, primPartial;
+	u32 frames;
+} s_szProbe;
+
+internal void SzProbe_CountVerts(VERTTYPE **srcs, int n, u32 *hit, u32 *miss)
+{
+	int i;
+	int missed = 0;
+
+	if (GTECapture_LookupSuppressed())
+	{
+		s_szProbe.suppressed += (u32)n;
+		return;
+	}
+
+	for (i = 0; i < n; i++)
+	{
+		u8 fracX8, fracY8;
+
+		/* Same key and same generation/collision test the depth lookup would
+		 * use -- only the payload read differs, so hit/miss counts here are
+		 * the hit/miss counts an sz3 lookup would see. */
+		if (GTECapture_Lookup(srcs[i][0], srcs[i][1], &fracX8, &fracY8))
+		{
+			(*hit)++;
+		}
+		else
+		{
+			(*miss)++;
+			missed = 1;
+		}
+	}
+
+	if (missed)
+	{
+		s_szProbe.primPartial++;
+	}
+	else
+	{
+		s_szProbe.primFull++;
+	}
+}
+#endif
+
 /*
  * Reset the emission ordinal. Called by the platform renderer when the DEPTH
  * BUFFER clears (once per presented frame), NOT from ClearSplits: ClearSplits
@@ -1043,6 +1518,74 @@ void NativeGpu_ResetEmitOrdinal(void)
 			s_otzFrames = 0;
 		}
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* [SZPROBE] every 256 presented frames. hit3d% is THE number the depth
+	 * design turns on: the share of world-geometry vertices that would find a
+	 * real sz3 at stamp time. flat2d/rect/supp size the near band that keeps
+	 * ordinal treatment. Reported here because this is the one hook that fires
+	 * exactly once per presented frame (see the comment above). */
+	/* [PKTDEPTH] every 256 presented frames while the depth model is on.
+	 * realPct is the hardware counterpart of [SZPROBE]'s primFullPct: if the
+	 * two disagree, PC content was not representative and the design's 97.09%
+	 * needs re-deriving on the platform that matters. */
+	if (!g_dbg_packetDepth)
+	{
+		/* Keep the stamp counter zeroed while the feature is off, so the FIRST
+		 * window after enabling reports a real 'escaped' instead of counting
+		 * stamps issued before the resolver was ever consulted. A misleading
+		 * first reading is worse than no reading -- it is the one most likely
+		 * to be acted on. */
+		s_pktDepthStamps = 0;
+	}
+	else
+	{
+		const u32 prims = s_pktDepth.real + s_pktDepth.fellBack;
+
+		s_pktDepth.frames++;
+		if (s_pktDepth.frames >= 256)
+		{
+			/* stamps vs seen: stamps counts every primitive that got a depth
+			 * stamp from either emit path; seen counts the ones the resolver
+			 * was actually offered. escaped != 0 means some path is writing
+			 * stamps on the ordinal axis while the rest of the frame is on the
+			 * true-depth axis -- the defect class that put waterfalls through
+			 * the HUD. It should be 0. */
+			const u32 seen = prims + s_pktDepth.suppressed2d;
+
+			Platform_Log("[PKTDEPTHZ] realZ=%u..%u backZ=%u..%u uiZ=%u..%u (larger = nearer)\n", s_pktDepth.realMin, s_pktDepth.realMax,
+			             s_pktDepth.backMin, s_pktDepth.backMax, s_pktDepth.uiMin, s_pktDepth.uiMax);
+			Platform_Log("[PKTDEPTH] frames=%lu prims=%lu real=%lu fellBack=%lu realPct=%lu ui2d=%lu stamps=%lu escaped=%ld\n",
+			             (unsigned long)s_pktDepth.frames, (unsigned long)prims, (unsigned long)s_pktDepth.real,
+			             (unsigned long)s_pktDepth.fellBack, (unsigned long)(prims ? ((s_pktDepth.real * 100u) / prims) : 0u),
+			             (unsigned long)s_pktDepth.suppressed2d, (unsigned long)s_pktDepthStamps, (long)((long)s_pktDepthStamps - (long)seen));
+			memset(&s_pktDepth, 0, sizeof(s_pktDepth));
+			s_pktDepthStamps = 0;
+		}
+	}
+
+	if (g_dbg_szProbe)
+	{
+		s_szProbe.frames++;
+		if (s_szProbe.frames >= 256)
+		{
+			const u32 hit3d = s_szProbe.tri3dHit + s_szProbe.quad3dHit;
+			const u32 miss3d = s_szProbe.tri3dMiss + s_szProbe.quad3dMiss;
+			const u32 look3d = hit3d + miss3d;
+
+			const u32 prims = s_szProbe.primFull + s_szProbe.primPartial;
+
+			Platform_Log("[SZPROBE] frames=%lu 3dverts=%lu hit=%lu miss=%lu hit3dPct=%lu prims=%lu primFull=%lu primFullPct=%lu tri=%lu/%lu quad=%lu/%lu flat2d=%lu rect=%lu supp=%lu\n",
+			             (unsigned long)s_szProbe.frames, (unsigned long)look3d, (unsigned long)hit3d, (unsigned long)miss3d,
+			             (unsigned long)(look3d ? ((hit3d * 100u) / look3d) : 0u), (unsigned long)prims, (unsigned long)s_szProbe.primFull,
+			             (unsigned long)(prims ? ((s_szProbe.primFull * 100u) / prims) : 0u), (unsigned long)s_szProbe.tri3dHit,
+			             (unsigned long)(s_szProbe.tri3dHit + s_szProbe.tri3dMiss), (unsigned long)s_szProbe.quad3dHit,
+			             (unsigned long)(s_szProbe.quad3dHit + s_szProbe.quad3dMiss), (unsigned long)s_szProbe.quad2d,
+			             (unsigned long)s_szProbe.rect2d, (unsigned long)s_szProbe.suppressed);
+			memset(&s_szProbe, 0, sizeof(s_szProbe));
+		}
+	}
+#endif
 
 	s_gpu.emitOrdinal = 0;
 	s_gpu.lastStampedZ = 0;
@@ -1223,6 +1766,21 @@ void MakeLineArray(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1)
 		vertex[3].x = vertex[0].x + 1;
 		vertex[3].y = vertex[0].y;
 	} // TODO diagonal line alignment
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* Fourth and last geometry builder. Lines are the same story as rects:
+	 * screen-space by the time they get here, but their endpoints may or may
+	 * not have come from the GTE, and the lookup is what decides. Wired for the
+	 * same reason -- an unresolved builder is a slice of the frame on the wrong
+	 * depth axis, and [PKTDEPTH]'s 'escaped' counts it. */
+	{
+		s16 xs[2] = {(s16)p0[0], (s16)p1[0]};
+		s16 ys[2] = {(s16)p0[1], (s16)p1[1]};
+
+		s_pendingDepthValid = PacketDepth_ResolveXY(xs, ys, 2, &s_pendingDepth, s_pendingDepthPerVert);
+		s_pendingDepthCount = s_pendingDepthValid ? 2 : 0;
+	}
+#endif
 }
 
 // Draws geometry at its true GTE sub-pixel position instead of snapping to
@@ -1269,6 +1827,20 @@ void MakeVertexTriangle(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *
 				vertex[i]._p1 = (s8)fracY8;
 			}
 		}
+	}
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* Triangles carry no 2D discriminator the way quads do, but the game emits
+	 * them almost exclusively for world geometry, so they count as 3D. */
+	{
+		VERTTYPE *srcs[3] = {p0, p1, p2};
+
+		if (g_dbg_szProbe)
+		{
+			SzProbe_CountVerts(srcs, 3, &s_szProbe.tri3dHit, &s_szProbe.tri3dMiss);
+		}
+		PacketDepth_ResolvePrim(srcs, 3);
 	}
 #endif
 }
@@ -1327,6 +1899,42 @@ void MakeVertexQuad(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, 
 		}
 	}
 #endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	{
+		/* Recomputed rather than shared with the desnap block above, which
+		 * compiles out in a capture-only build -- this has to stand on its
+		 * own. Same discriminator, same reasoning (see that comment).
+		 *
+		 * The discriminator classifies for the [SZPROBE] counters only. It must
+		 * NOT gate the depth resolve, which an earlier version did: a
+		 * parallelogram is not reliably 2D (a screen-parallel WORLD quad forms
+		 * one too, and those need real depth), and skipping the resolver left
+		 * genuine UI on the raw ordinal instead of in its reserved near band --
+		 * an escape in both directions at once.
+		 *
+		 * Every quad goes to the resolver, which already distinguishes these
+		 * correctly and by evidence rather than by geometry: UI is caught by
+		 * band suppression, world quads hit the capture table, and anything
+		 * else takes the bucket fallback. */
+		int parallelogram = ((p1[0] - p0[0]) == (p3[0] - p2[0])) && ((p1[1] - p0[1]) == (p3[1] - p2[1]));
+		VERTTYPE *srcs[4] = {p0, p1, p2, p3};
+
+		if (g_dbg_szProbe)
+		{
+			if (parallelogram)
+			{
+				s_szProbe.quad2d += 4;
+			}
+			else
+			{
+				SzProbe_CountVerts(srcs, 4, &s_szProbe.quad3dHit, &s_szProbe.quad3dMiss);
+			}
+		}
+
+		PacketDepth_ResolvePrim(srcs, 4);
+	}
+#endif
 }
 
 void MakeVertexRect(GrVertex *vertex, VERTTYPE *p0, s16 w, s16 h)
@@ -1349,6 +1957,32 @@ void MakeVertexRect(GrVertex *vertex, VERTTYPE *p0, s16 w, s16 h)
 
 	vertex[3].x = vertex[0].x + w;
 	vertex[3].y = vertex[0].y;
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	if (g_dbg_szProbe)
+	{
+		s_szProbe.rect2d += 4;
+	}
+
+	/* Rects are axis-aligned in SCREEN space, but that does not make them 2D
+	 * content: world sprites (particles, shadows, item boxes) get their origin
+	 * from a projected point, while HUD panels get theirs from game math. The
+	 * capture lookup already tells those apart -- the first hits, the second
+	 * misses or is UI-band suppressed -- so resolve on the origin vertex and
+	 * let the normal rules sort it out.
+	 *
+	 * Leaving these unresolved was an escape: [PKTDEPTH] measured 12-14% of all
+	 * stamps bypassing the resolver with only tris and quads wired up. Only one
+	 * point is available, so a rect's depth is its origin's depth; that is the
+	 * same approximation the PS1 makes by giving a SPRT a single Z. */
+	{
+		s16 x = (s16)p0[0], y = (s16)p0[1];
+
+		/* n == 1: per-vertex and flat are the same value by construction. */
+		s_pendingDepthValid = PacketDepth_ResolveXY(&x, &y, 1, &s_pendingDepth, NULL);
+		s_pendingDepthCount = 0;
+	}
+#endif
 }
 
 void MakeTexcoordQuad(GrVertex *vertex, u8 *uv0, u8 *uv1, u8 *uv2, u8 *uv3, s16 page, s16 clut, u8 dither)
@@ -1987,6 +2621,36 @@ void DrawAllSplits()
 	}
 
 	ClearSplits();
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/*
+	 * s29 per-vertex depth coverage, once every 64 frames. Reports how many
+	 * primitives actually received per-vertex depth versus how many silently
+	 * fell back to the flat per-primitive MAXIMUM, plus the appended/resolved
+	 * vertex counts from the last fallback so the cause is readable rather
+	 * than inferred. Only meaningful with g_dbg_packetDepth on -- with it off
+	 * nothing upstream resolves depth and both counters stay at zero, which is
+	 * correct and not a bug in the instrument.
+	 */
+	{
+		global_variable u32 s_pktDepthLogCountdown;
+
+		if ((s_pktDepthPerVertHits | s_pktDepthFlatFallback) != 0)
+		{
+			if (s_pktDepthLogCountdown == 0)
+			{
+				u32 total = s_pktDepthPerVertHits + s_pktDepthFlatFallback;
+
+				Platform_Log("[PKTDEPTH] perVert=%u flat=%u (%u%% flat) lastFallback appended=%d resolved=%d\n", s_pktDepthPerVertHits,
+				             s_pktDepthFlatFallback, (total > 0) ? ((s_pktDepthFlatFallback * 100u) / total) : 0u, s_pktDepthLastAppended,
+				             s_pktDepthLastResolved);
+				s_pktDepthLogCountdown = 64;
+			}
+			s_pktDepthLogCountdown--;
+		}
+	}
+#endif
+
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_ALL_SPLITS);
 }
 
@@ -2164,7 +2828,13 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 		OTProf_DryWalk(basePacket);
 #endif
 
-#if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		/* Gate widened from VERTEX_DESNAP to GTE_CAPTURE (s29): the UI band
+		 * describes the capture TABLE -- which screen coordinates in it are
+		 * trustworthy -- not the one feature that read it first. Desnap builds
+		 * are unaffected (CMake forces CAPTURE on for them), and any other
+		 * consumer, starting with the stamp-time depth probe below, needs the
+		 * same band or it counts UI packets as world geometry. */
 		GTECapture_BeginOTWalk();
 #endif
 
@@ -2277,8 +2947,8 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 			OTProf_RecordNodeShape(basePacket, (u32)tagLength);
 #endif
 
-#if defined(CTR_NATIVE) && CTR_NATIVE_VERTEX_DESNAP
-			GTECapture_MarkOTNode(basePacket);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+			GTECapture_MarkOTNode(basePacket); /* gate widened with BeginOTWalk above (s29) */
 #endif
 			if (tagLength > 0)
 			{

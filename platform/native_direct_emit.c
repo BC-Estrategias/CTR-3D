@@ -221,6 +221,8 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				    (!gouraud && textured && !quadPrim && (xy[0] == 0xFFFFFFFFu) && (xy[1] == 0xFFFFFFFFu) && (xy[2] == 0xFFFFFFFFu));
 				u16 ordinal;
 				s16 z;
+				s16 zPerVert[4];
+				int zPerVertValid;
 
 				/* Side effect order matches ProcessFlat/GouraudPoly: the
 				 * tpage write happens before anything else, null or not. */
@@ -246,6 +248,44 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				 * to be off. */
 				NativeGpu_RecordContentAdvance();
 				z = (s16)((int)ordinal - 32768);
+				/* Per-vertex depth (s29). Stays invalid -- and every vertex
+				 * keeps the flat z above -- unless the resolver below fills it,
+				 * so the feature-off and fallback paths are byte-unchanged. */
+				zPerVertValid = 0;
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+				/* s29 depth model (docs/PACKET_DEPTH_DESIGN.md 3.4b). This path
+				 * writes its own z and handles most of a heavy track's opaque
+				 * content, so it MUST resolve depth exactly as the parse path
+				 * does -- if only one of the two moves onto the true-depth
+				 * axis, the halves of the same frame end up on different
+				 * scales. Returns 0 with the feature off, leaving the ordinal
+				 * above untouched. */
+				{
+					u16 depthStamp;
+					u16 depthPerVert[4];
+
+					if (PacketDepth_ResolvePacked(xy, numVerts, &depthStamp, depthPerVert))
+					{
+						int v;
+
+						z = (s16)((int)depthStamp - 32768);
+						/* s29 per-vertex depth: keep each corner's own depth so
+						 * the GPU interpolates across the polygon, instead of
+						 * flattening the whole primitive onto its FARTHEST
+						 * corner (retail's OT-bucket convention, which loses to
+						 * the resident track's real interpolated depth wherever
+						 * the two meet -- the road drawing over Crash). Indexed
+						 * by SOURCE vertex below via idx[], so triangulation
+						 * order cannot pair a vertex with a stranger's depth. */
+						for (v = 0; v < numVerts && v < 4; v++)
+						{
+							zPerVert[v] = (s16)((int)depthPerVert[v] - 32768);
+						}
+						zPerVertValid = 1;
+					}
+				}
+#endif
 
 				if (!isNullFT3)
 				{
@@ -304,7 +344,7 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 
 							dst[k].x = (s16)((float)(s16)(xyWord & 0xFFFFu) + ofsX);
 							dst[k].y = (s16)((float)(s16)(xyWord >> 16) + ofsY);
-							dst[k].z = z;
+							dst[k].z = zPerVertValid ? zPerVert[idx[k]] : z;
 							if (textured)
 							{
 								const int srcU = (int)(uvw[idx[k]] & 0xFFu);

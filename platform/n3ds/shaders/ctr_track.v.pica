@@ -99,7 +99,16 @@
 .fvec qy           ; composed camera row: dp4(qy, v1) = w*screenY
 .fvec qw           ; composed camera row: dp4(qw, v1) = w = view.z/H
 .fvec projection[4] ; SAME ortho matrix the packet path's ctr.v.pica uses
-.fvec hParam        ; x = H (distanceToScreen_PREV); yzw unused
+.fvec hParam        ; x = H (distanceToScreen_PREV), y = selTrueDepth,
+                     ; z = selOrdinal (= 1 - y), w unused. y/z are the runtime
+                     ; A/B between the ordinal lerp and the true-depth axis
+                     ; (docs/PACKET_DEPTH_DESIGN.md) -- see the TRUE DEPTH block
+                     ; in main. Both paths are computed and blended rather than
+                     ; branched: PICA200 branching on a uniform would need two
+                     ; shader variants or a real jump, and a handful of extra
+                     ; ALU ops is the cheap way to get a mid-race hardware A/B,
+                     ; which is the only way this gets accepted. Collapse to the
+                     ; winner once the owner has ruled.
 .fvec depthRange     ; (-otIndexLo, ordinalLo, ordinalSpan, invIndexSpan) -- per leaf
 
 ; Constants
@@ -118,6 +127,67 @@
 .alias  otIndexScale    trackConst.yyyy
 .alias  colorScale      trackConst.zzzz
 .alias  zOrdBias        trackConst.wwww
+
+; TRUE-DEPTH path constants (docs/PACKET_DEPTH_DESIGN.md 3.6).
+; x = 1 -- drawOrder tie-break weight, in view.z units. WAS 64 (one OT bucket,
+;     the inverse of retail's >>6) with a comment claiming that gave "FINER
+;     granularity than retail's own quantiser". It gave exactly retail's
+;     granularity, and on an ABSOLUTE depth axis that is a 64-unit shove -- so
+;     a ground face with a negative drawOrder computed as up to several hundred
+;     units NEARER than its true distance and won the depth test against
+;     anything standing on it. On hardware that buried the player kart to the
+;     neck: a coherent plane, constant offset, unchanged with distance, which is
+;     the signature of an additive per-face term the packet path has no
+;     equivalent for. Packets stamp raw sz3 and carry no drawOrder at all
+;     (drawOrder is a QuadBlock field; nothing in Vehicle/ has one), so ANY
+;     nonzero weight here puts the two sources on parallel-but-offset axes --
+;     the exact failure this file's own comment on zOrdFromDepth warns about,
+;     four lines down.
+;
+;     Design 3.6 specifies no tie-break term whatsoever. 1.0 is kept rather than
+;     0.0 because the term's real job is ordering coplanar decals against the
+;     surface they sit on, and 1 unit still breaks that tie in retail's
+;     direction while being far too small to outrank a kart. If road markings
+;     shimmer, this is the number to take to 0 -- the owner's call is that
+;     shimmer beats hats poking out of the ground.
+; y = 65535 -- SZ3's clamp ceiling (native_gte_core.c's Lm_D), applied here so
+;     track depth saturates exactly where the packet path's sz3 saturates.
+; z = 32767 -- zOrd = 32767 - depth. Derivation: the packet side stamps
+;     (0xFFFF - maxSz3) and N3DS_Vertex maps z = value - 32768, so a packet at
+;     depth d lands at (65535 - d) - 32768 = 32767 - d. The track must use the
+;     identical expression or the two sources sit on parallel-but-offset axes,
+;     which looks correct while parked and wrong in motion.
+; w = -1 -- negation for the two subtractions (no SUB opcode).
+.constf depthConst(1.0, 65535.0, 32767.0, -1.0)
+.alias  bucketToDepth  depthConst.xxxx
+.alias  depthMax       depthConst.yyyy
+.alias  zOrdFromDepth  depthConst.zzzz
+.alias  negOne         depthConst.wwww
+
+; Near-band floor. native_gpu.c reserves the top 256 stamps (0xFF00..0xFFFF)
+; for 2D/UI content, which has no depth and must sit in front of every world
+; stamp, and clamps world content to 0xFEFF. The track is world content, so it
+; takes the identical clamp: 0xFEFF - 32768 = 32511 is the nearest zOrd it may
+; produce, i.e. depth may not fall below 256. That costs the nearest 256 units
+; of view.z, which are inside the near clip plane and never drawn anyway.
+; If PKTDEPTH_UI_BAND changes in native_gpu.c, this MUST change with it --
+; the two sides only share an axis while these agree.
+; z = 0.0 disables the near-plane reject below (owner ruling, see the REVERTED
+; block in main). 1000.0 re-enables it.
+.constf depthConst2(256.0, 0.0009765625, 0.0, 0.0)
+.alias  depthMinWorld depthConst2.xxxx
+; Near-plane reject kick (s29). Any positive multiple large enough that a
+; violation of ONE view.z unit already pushes zOrd past the clip volume's
+; 32767 end: 1 * 1000 does, and the deepest possible violation (viewZ = 0,
+; i.e. exactly at the eye) gives 256 * 1000 = 256000, which is still finite
+; and exactly representable in float24, so this can never produce a NaN that
+; would poison the whole primitive rather than discard it.
+.alias  nearKick      depthConst2.zzzz
+; 1/1024 = 1/(2 * N3DS_TRACK_ATLAS_DIM). The 2x is not a typo: UVs arrive in
+; the packet path's own atlas convention -- 2x fixed point, +1 for the texel
+; centre, V pre-flipped -- so the divisor is twice the atlas dimension. See
+; native_track_mesh.c's encode comment. Change one, change the other.
+.alias  atlasScale    depthConst2.yyyy
 
 ; Outputs
 .out outpos position
@@ -182,7 +252,86 @@
 
 	mul r3.z, depthRange.zzzz, r3.y     ; fraction * ordinalSpan
 	add r3.w, depthRange.yyyy, r3.z     ; ordinal
-	add r4.x, zOrdBias, r3.w            ; zOrd = ordinal - 32768
+	add r6.x, zOrdBias, r3.w            ; zOrd_ordinal = ordinal - 32768
+
+	; ---- TRUE DEPTH path (docs/PACKET_DEPTH_DESIGN.md) --------------------
+	; Everything above maps this vertex's real depth onto the packet path's
+	; QUANTISED ordinal axis, per leaf, by lerping between two recorded
+	; ordinals. s28 measured why that cannot be made seam-stable: the true
+	; bucket->ordinal curve is not linear, so neighbouring leaves disagree about
+	; a shared edge and the disagreement moves with camera micro-motion.
+	;
+	; This path goes the other way -- it keeps viewZ and lets the PACKETS come
+	; to it (they now stamp sz3, which native_gte_core.c confirms is this same
+	; view.z axis). No leaf uniform, no lerp, so there is nothing left to
+	; disagree about at a shared edge: two vertices at the same world position
+	; get the same depth regardless of which leaf drew them. That is a
+	; structural property, not a tuning improvement.
+	;
+	; depth = viewZ + (drawOrder-128)*64, clamped to [0, 65535].
+	; r2.z already holds (drawOrder - 128) from the otIndex math above.
+	mul r4.y, bucketToDepth, r2.z       ; drawOrder in view.z units
+	add r4.z, r2.x, r4.y                ; viewZ + tie-break (both temps, order-free)
+	max r4.z, depthMinWorld, r4.z       ; stay out of the 2D near band
+	min r4.z, depthMax, r4.z
+	mul r4.w, negOne, r4.z              ; -depth (no SUB opcode)
+	add r6.y, zOrdFromDepth, r4.w       ; zOrd_true = 32767 - depth
+
+	; Blend the two by the uniform selector rather than branching (see hParam).
+	; hParam.z is 1-hParam.y, supplied by the CPU so no subtraction is needed.
+	mul r6.z, hParam.yyyy, r6.y
+	mul r6.w, hParam.zzzz, r6.x
+	add r4.x, r6.z, r6.w                ; zOrd
+
+	; ---- NEAR-PLANE REJECT (s29) -- REVERTED, OWNER RULING ----------------
+	; DISABLED (nearKick is 0.0 below, so the four instructions are a no-op
+	; kept only as the record). Owner rejected the trade on sight and was
+	; right to: whole-triangle discard makes track polygons vanish wherever a
+	; triangle straddles the near plane, and in a RACING GAME the ground is
+	; near-parallel to the view constantly, so that case is not an edge case,
+	; it is every frame under the player's own kart. Losing ground under the
+	; kart is worse than the occlusion it was meant to fix.
+	;
+	; PROCESS NOTE: this trade was explained to the owner only AFTER it
+	; shipped. It should have been a decision put to him before a line was
+	; written -- his standing perf-over-parity ruling covers visual downgrades,
+	; NOT holes in the track surface.
+	;
+	; The behind-camera problem it targeted is REAL and still open (measured:
+	; [TRKDEPTH0] reports viewZLo=0 on live frames, so leaves at/behind the eye
+	; are drawn whole and the depthMinWorld clamp maps them to the NEAREST
+	; world depth). The correct fix is a proper near-plane clip or CPU-side
+	; leaf rejection, not a vertex-shader discard. Re-enable only by giving
+	; nearKick a non-zero value, and only after the owner has ruled again.
+	; ----------------------------------------------------------------------
+	; MEASURED, not assumed: [TRKDEPTH0] reports viewZLo=0 on real frames --
+	; leaves whose near edge sits AT OR BEHIND the eye are drawn whole,
+	; because v1 visibility is leaf-granularity and retail's own per-polygon
+	; near-clip ("near-clip records") was deleted for track content. The
+	; depthMinWorld clamp above then maps every one of those vertices onto
+	; 256, i.e. the NEAREST world depth the axis can express -- so geometry
+	; that should not be on screen at all outranks karts that genuinely are.
+	; That was this renderer's last remaining occlusion bug, isolated with
+	; g_dbg_depthTest state 2 (track tests but does not write depth): karts
+	; become permanently visible the moment the track stops writing depth.
+	;
+	; The comment that used to sit on depthMinWorld claimed the clamped range
+	; was "inside the near clip plane and never drawn anyway". The log says
+	; otherwise, so this rejects instead of clamping.
+	;
+	; No SUB opcode and no discard in a PICA vertex shader, so this uses the
+	; mechanism this shader already documents (see the FIX 1 header comment):
+	; z outside the ortho matrix's [-32768, 32767] clip volume makes the GPU
+	; DISCARD the triangle. Whole-triangle discard is cruder than retail's
+	; true clip -- a triangle straddling the plane vanishes rather than being
+	; split -- but it is strictly better than the same triangle covering the
+	; screen at maximum nearness, and it matches the owner's standing
+	; perf/parity ruling. r7 deliberately, NOT r5: r5 is the S vector below.
+	mul r7.x, negOne, r2.x              ; -viewZ
+	add r7.y, depthMinWorld, r7.x       ; 256 - viewZ  (> 0 only when too near)
+	max r7.y, zeros, r7.y               ; in-range vertices contribute exactly 0
+	mul r7.z, nearKick, r7.y
+	add r4.x, r4.x, r7.z                ; in range: unchanged. Too near: clipped away.
 
 	; S = (a, b, w*zOrd, w) -- assembled component-by-component: a single mov
 	; can only read ONE source register (with swizzle), so gathering four
@@ -200,11 +349,22 @@
 	dp4 outpos.z, projection[2], r5
 	dp4 outpos.w, projection[3], r5
 
-	; outtc0 unused in 3a (untextured) -- rung 3b samples the track atlas
-	; here. Every declared output component must still be written regardless
-	; (the s14 hardware boot hang; Azahar does not enforce this) -- one mov
-	; covers all four components since the whole vector is zero.
-	mov outtc0, zeros
+	; Rung 3b: intc arrives already ENCODED in the packet path's atlas
+	; convention -- 2x fixed point, +1 texel-centre bias, V pre-flipped for
+	; PICA's bottom-up T axis -- so all this does is normalise by 1/1024
+	; (= 1/(2*N3DS_TRACK_ATLAS_DIM)). The encode lives in native_track_mesh.c
+	; because that is where the rect placement is known.
+	;
+	; The flip is NOT optional and does NOT live in the upload: an earlier
+	; version of this shader carried a comment claiming it did, skipped it, and
+	; reproduced the ten-session texture-quilt bug -- each rect mirrored
+	; vertically into its neighbours. native_renderer_3ds.c's own UV write says
+	; plainly that the fix is sample-side.
+	;
+	; Every declared output component must still be written (the s14 hardware
+	; boot hang; Azahar does not enforce this), so z/w get explicit zeros.
+	mul outtc0.xy, atlasScale, intc.xy
+	mov outtc0.zw, zeros
 
 	; outclr: colorScale rescales the raw GPU_UNSIGNED_BYTE fetch back to
 	; 0..1 (same convention as ctr.v.pica). Alpha is a constant 1.0 -- inclr.w

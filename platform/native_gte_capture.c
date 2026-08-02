@@ -75,6 +75,16 @@ typedef struct
 	u32 mtxUsed;
 } GTECaptureBuffer;
 
+// Cost ablation (s29). The whole subsystem's per-frame price is two calls per
+// projected vertex in GTE_RotTransPers; this switch removes both without a
+// rebuild, so the "what does capture cost" question can be answered by a
+// mid-race hardware A/B on identical content instead of by two netloads of two
+// binaries racing two different attract tracks. It ablates COST, not the
+// table's contents: stale entries are left alone and simply fail their
+// generation/key check on lookup, which is the same miss path collisions and
+// evictions already take.
+int g_dbg_gteCapture = 1;
+
 global_variable GTECaptureBuffer s_gteCaptureBuf[2] = {{{{0}}, 1, NULL, NULL}, {{{0}}, 1, NULL, NULL}};
 // Game-thread cursor: which buffer Store/SetUIBand/Clear touch.
 global_variable int s_gteCaptureWriteIdx;
@@ -208,6 +218,33 @@ int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3])
 	outV[0] = entry->vx;
 	outV[1] = entry->vy;
 	outV[2] = entry->vz;
+	return 1;
+}
+
+// True view-space depth for a packet's screen coordinate -- the field that has
+// sat here unread since capture was written ("reserved for stereo").
+//
+// This is the SAME axis the track renderer's shader calls view.z and the same
+// axis retail quantises into an OT index: ctr_track.v.pica's header and
+// native_gte_core.c:319-328 (C2_SZ3 = Lm_D(m_mac3, 1), clamped to unsigned
+// 16-bit) establish that SZ3 is a linear view depth, NOT a reciprocal. That is
+// what makes one shared depth axis possible at all -- see
+// docs/PACKET_DEPTH_DESIGN.md.
+//
+// Same key, same generation/collision test, same miss semantics as every other
+// lookup here: a miss is always a miss, never a wrong value.
+int GTECapture_LookupDepth(s16 sx, s16 sy, u16 *outSz3)
+{
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
+	u32 key = GTECapture_PackKey(sx, sy);
+	const GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
+
+	if ((entry->generation != buf->generation) || (entry->key != key))
+	{
+		return 0;
+	}
+
+	*outSz3 = entry->sz3;
 	return 1;
 }
 

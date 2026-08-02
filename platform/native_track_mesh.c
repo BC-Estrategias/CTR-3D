@@ -525,6 +525,174 @@ static u16 s_trackAtlasStaging[256 * 256]; /* one PSX page, RGBA5551 tiled -- 12
  * frame time) and log a distinct GIVEUP line so the condition shows up in
  * any log harvest, not just as a wall of repeated normal lines.
  */
+/*
+ * Which atlas unit a triangle samples, keyed off its first vertex (all three
+ * share a face and therefore a texRef). Returns N3DS_TRACK_ATLAS_MAX_UNITS as a
+ * catch-all "no placed unit" bin -- out-of-range vertex, out-of-range texRef,
+ * unplaced rect, or a rect the backend declined to upload all land there and
+ * draw untextured rather than sampling whatever happens to sit at atlas origin.
+ */
+static u32 NativeTrackMesh_UnitBinForIndex(u16 vertexIndex)
+{
+	const unsigned texRefMax = (unsigned)(sizeof(s_trackMesh.texRectIndex) / sizeof(s_trackMesh.texRectIndex[0]));
+	u16 texRef;
+	s16 rectIdx;
+	u8 unit;
+
+	if ((u32)vertexIndex >= s_trackMesh.vertCount)
+	{
+		return N3DS_TRACK_ATLAS_MAX_UNITS;
+	}
+
+	texRef = s_trackMesh.verts[vertexIndex].texRef;
+	if ((unsigned)texRef >= texRefMax)
+	{
+		return N3DS_TRACK_ATLAS_MAX_UNITS;
+	}
+
+	rectIdx = s_trackMesh.texRectIndex[texRef];
+	if ((rectIdx < 0) || (rectIdx >= s_trackMesh.atlas.rectCount))
+	{
+		return N3DS_TRACK_ATLAS_MAX_UNITS;
+	}
+
+	unit = s_trackMesh.atlas.rects[rectIdx].atlasUnit;
+	return (unit >= N3DS_TRACK_ATLAS_MAX_UNITS) ? (u32)N3DS_TRACK_ATLAS_MAX_UNITS : (u32)unit;
+}
+
+/*
+ * Rung 3b: split each leaf's index range into one sub-range per ATLAS UNIT.
+ *
+ * A draw binds exactly one texture, and a leaf's faces routinely land in
+ * different atlas units, so "one draw per leaf" and "textured" are mutually
+ * exclusive. NativeTrackLeafRange has carried a reserved `atlasBin` field since
+ * rung 2a for exactly this; this is what fills it.
+ *
+ * Why a POST-pass rather than binning inside the emit loop: the rect set is
+ * gathered *by* that loop and only packed afterwards, so no face knows its
+ * atlas unit while it is being emitted. Running after
+ * NativeTrackAtlas_UploadToBackend matters too -- that function resets
+ * atlasUnit to the sentinel on every skip path, so binning any earlier could
+ * bin against placements the backend then declined to upload.
+ *
+ * Triangles whose rect never got placed keep the sentinel bin. They are not
+ * dropped: they still draw, untextured, exactly as rung 3a drew everything.
+ *
+ * Exact sizing, two passes: count the distinct units per leaf to get the final
+ * range count, allocate that, then fill. The old code sized leafRanges at one
+ * per BSP node; binning can only grow that, and guessing a multiplier would
+ * either waste heap the atlas needs or overflow on a track nobody tested.
+ *
+ * Returns 0 on allocation failure, which the caller treats like every other
+ * upload failure here: withhold the latch and retry the whole build next frame
+ * rather than latch a half-binned mesh.
+ */
+static int NativeTrackMesh_BinLeavesByAtlasUnit(void)
+{
+	struct NativeTrackLeafRange *newRanges = NULL;
+	u16 *newIndices = NULL;
+	u32 newRangeCount = 0;
+	u32 newIndexCursor = 0;
+	u32 leaf;
+
+	if ((s_trackMesh.leafCount == 0) || (s_trackMesh.indexCount == 0))
+	{
+		return 1;
+	}
+
+	/* Pass 1 -- how many ranges will there be? */
+	for (leaf = 0; leaf < s_trackMesh.leafCount; leaf++)
+	{
+		const struct NativeTrackLeafRange *range = &s_trackMesh.leafRanges[leaf];
+		u8 seen[N3DS_TRACK_ATLAS_MAX_UNITS + 1];
+		u32 tri;
+
+		memset(seen, 0, sizeof(seen));
+		for (tri = 0; tri + 2 < range->indexCount; tri += 3)
+		{
+			/* A FLAG, deliberately not a count: a u8 counter wraps to 0 at
+			 * exactly 256 triangles in one bin, which real leaves reach, and an
+			 * undercount here under-allocates the array pass 2 then writes
+			 * past. Presence is all this pass needs. */
+			seen[NativeTrackMesh_UnitBinForIndex(s_trackMesh.indices[range->firstIndex + tri])] = 1;
+		}
+		for (u32 b = 0; b < sizeof(seen); b++)
+		{
+			if (seen[b] != 0)
+			{
+				newRangeCount++;
+			}
+		}
+	}
+
+	newRanges = (struct NativeTrackLeafRange *)malloc((size_t)newRangeCount * sizeof(struct NativeTrackLeafRange));
+	newIndices = (u16 *)malloc((size_t)s_trackMesh.indexCount * sizeof(u16));
+
+	if ((newRanges == NULL) || (newIndices == NULL))
+	{
+		free(newRanges);
+		free(newIndices);
+		return 0;
+	}
+
+	/* Pass 2 -- emit, grouped. Bins are walked in ascending order so a leaf's
+	 * sub-ranges stay contiguous AND ordered, which is what lets the frame
+	 * recorder find them all by walking forward while bspIndex matches. */
+	newRangeCount = 0;
+	for (leaf = 0; leaf < s_trackMesh.leafCount; leaf++)
+	{
+		const struct NativeTrackLeafRange *src = &s_trackMesh.leafRanges[leaf];
+		int firstForThisLeaf = 1;
+
+		for (u32 bin = 0; bin <= N3DS_TRACK_ATLAS_MAX_UNITS; bin++)
+		{
+			const u32 rangeStart = newIndexCursor;
+			u32 tri;
+
+			for (tri = 0; tri + 2 < src->indexCount; tri += 3)
+			{
+				const u16 i0 = s_trackMesh.indices[src->firstIndex + tri];
+
+				if (NativeTrackMesh_UnitBinForIndex(i0) != bin)
+				{
+					continue;
+				}
+				newIndices[newIndexCursor++] = i0;
+				newIndices[newIndexCursor++] = s_trackMesh.indices[src->firstIndex + tri + 1];
+				newIndices[newIndexCursor++] = s_trackMesh.indices[src->firstIndex + tri + 2];
+			}
+
+			if (newIndexCursor == rangeStart)
+			{
+				continue;
+			}
+
+			newRanges[newRangeCount] = *src; /* bspIndex, box, drawOrder range all carry over unchanged */
+			newRanges[newRangeCount].atlasBin = (u16)bin;
+			newRanges[newRangeCount].firstIndex = rangeStart;
+			newRanges[newRangeCount].indexCount = newIndexCursor - rangeStart;
+
+			if (firstForThisLeaf)
+			{
+				/* The reverse map points at the FIRST sub-range; the recorder
+				 * walks forward from there. Rewritten rather than left alone
+				 * because range indices have all shifted. */
+				s_trackMesh.bspToLeafIndex[src->bspIndex] = (s32)newRangeCount;
+				firstForThisLeaf = 0;
+			}
+			newRangeCount++;
+		}
+	}
+
+	free(s_trackMesh.leafRanges);
+	free(s_trackMesh.indices);
+	s_trackMesh.leafRanges = newRanges;
+	s_trackMesh.leafCount = newRangeCount;
+	s_trackMesh.indices = newIndices;
+	s_trackMesh.indexCount = newIndexCursor;
+	return 1;
+}
+
 static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadBlock, int numVertex)
 {
 	static struct mesh_info *s_retryMesh = NULL;
@@ -683,6 +851,8 @@ static int NativeTrackGeom_UploadToBackend(struct mesh_info *mesh, int numQuadBl
 
 	if (staging != NULL)
 	{
+		u32 uvChecked = 0, uvOutOfRect = 0, uvOutOfAtlas = 0, uvUnplaced = 0;
+
 		for (i = 0; i < s_trackMesh.vertCount; i++)
 		{
 			const struct NativeTrackVert *src = &s_trackMesh.verts[i];
@@ -691,8 +861,85 @@ static int NativeTrackGeom_UploadToBackend(struct mesh_info *mesh, int numQuadBl
 			dst->x = src->x;
 			dst->y = src->y;
 			dst->z = src->z;
-			dst->u = src->u; /* u8 -> s16 widen, page-space texel coord (rung 3b) */
-			dst->v = src->v;
+
+			/* Rung 3b: rewrite the baked PAGE-space UV into ABSOLUTE ATLAS
+			 * texel coords, which is why the GPU-side field is s16 while the
+			 * resident one is u8 -- a page coordinate is 0..255, an atlas one
+			 * is 0..511 and carries the rect's placement.
+			 *
+			 * The formula and, more importantly, WHICH fields it reads are
+			 * fixed by NativeTrackAtlasRect's own comment: srcU/srcV, never
+			 * minU/minV. They differ whenever the packer had to pull the decode
+			 * origin up to keep a tall rect from overrunning the page half, and
+			 * using minV there would shift every texel in that rect.
+			 *
+			 * Unplaced or unuploaded rects (atlasUnit sentinel) leave the UV at
+			 * 0: the vertex still draws, just sampling the atlas origin. The
+			 * draw side is what must not bind a unit for those -- see the
+			 * per-unit binning below. */
+			{
+				const unsigned texRefMax = (unsigned)(sizeof(s_trackMesh.texRectIndex) / sizeof(s_trackMesh.texRectIndex[0]));
+				const s16 rectIdx = (src->texRef < texRefMax) ? s_trackMesh.texRectIndex[src->texRef] : (s16)-1;
+
+				if ((rectIdx >= 0) && (rectIdx < s_trackMesh.atlas.rectCount) && (s_trackMesh.atlas.rects[rectIdx].atlasUnit != TRACK_ATLAS_UNIT_INVALID))
+				{
+					const struct NativeTrackAtlasRect *rect = &s_trackMesh.atlas.rects[rectIdx];
+					const int atlasU = (int)rect->atlasX + ((int)src->u - (int)rect->srcU);
+					const int atlasV = (int)rect->atlasY + ((int)src->v - (int)rect->srcV);
+
+					/* Store in the SAME convention the packet path's atlas uses
+					 * (native_renderer_3ds.c, the N3DS_Vertex UV write): 2x
+					 * fixed point, +1 for the texel CENTRE, and V FLIPPED --
+					 * PICA reads the atlas bottom-up, so memory row `a` is
+					 * targeted by numerator (2*DIM - 1) - 2a. U is not flipped;
+					 * horizontal order matches.
+					 *
+					 * This is not optional polish. Sampling texel corners
+					 * instead of centres shifts every fetch by half a texel
+					 * under GPU_NEAREST, and omitting the flip mirrors each
+					 * rect vertically INTO ITS NEIGHBOURS -- which is the
+					 * ten-session texture-quilt bug, rediscovered. An earlier
+					 * version of this code did both, on the strength of a
+					 * comment I wrote claiming the flip lived in the upload.
+					 * It does not: the fix is sample-side, and that file says
+					 * so in the comment directly above the code being mirrored
+					 * here.
+					 *
+					 * Denominator is therefore 2*N3DS_TRACK_ATLAS_DIM = 1024,
+					 * which is what ctr_track.v.pica's atlasScale must be. */
+					dst->u = (s16)((atlasU << 1) + 1);
+					dst->v = (s16)(((2 * N3DS_TRACK_ATLAS_DIM) - 1) - (atlasV << 1));
+
+					/* Self-check, because "does it look right" is not available:
+					 * attract never holds a scene long enough for a same-frame
+					 * A/B, and a wrong UV shows up as plausible-looking texture
+					 * rather than as an obvious error. Every translated coord
+					 * must land inside its own rect's allocated box; anything
+					 * outside is sampling a NEIGHBOURING rect's texels, which
+					 * is precisely the s16 quilt failure mode wearing a
+					 * different hat. Counted, not asserted -- one number in
+					 * [TRKUV] beats a crash on a track nobody has loaded yet. */
+					/* Validate the RAW atlas coords, before the 2x/flip encode
+					 * -- checking the encoded values would just be checking the
+					 * encoding against itself. */
+					uvChecked++;
+					if ((atlasU < (int)rect->atlasX) || (atlasU >= (int)(rect->atlasX + rect->allocW)) || (atlasV < (int)rect->atlasY)
+					    || (atlasV >= (int)(rect->atlasY + rect->allocH)))
+					{
+						uvOutOfRect++;
+					}
+					if ((atlasU < 0) || (atlasV < 0) || (atlasU >= N3DS_TRACK_ATLAS_DIM) || (atlasV >= N3DS_TRACK_ATLAS_DIM))
+					{
+						uvOutOfAtlas++;
+					}
+				}
+				else
+				{
+					dst->u = 0;
+					dst->v = 0;
+					uvUnplaced++;
+				}
+			}
 			dst->r = src->r;
 			dst->g = src->g;
 			dst->b = src->b;
@@ -701,6 +948,12 @@ static int NativeTrackGeom_UploadToBackend(struct mesh_info *mesh, int numQuadBl
 			 * raw signed value without corrupting r/g/b=255 into -1. */
 			dst->drawOrder = (u8)((int)src->drawOrder + 128);
 		}
+
+		/* outOfRect/outOfAtlas MUST both be 0. Non-zero outOfRect means verts
+		 * sample a neighbouring rect (the quilt failure mode); outOfAtlas means
+		 * they sample off the texture entirely. unplaced is benign -- those
+		 * draw untextured by design. */
+		Platform_Log("[TRKUV] checked=%u outOfRect=%u outOfAtlas=%u unplaced=%u\n", uvChecked, uvOutOfRect, uvOutOfAtlas, uvUnplaced);
 
 		ok = N3DS_TrackGeom_Upload(staging, (int)s_trackMesh.vertCount, (int)sizeof(N3DS_TrackVertex), s_trackMesh.indices, (int)s_trackMesh.indexCount);
 
@@ -779,6 +1032,38 @@ static int NativeTrackMesh_LeafTouchesAnim(const struct BSP *bsp, const u8 *anim
 
 	return 0;
 }
+
+/*
+ * GAP FILL (s29). The builder drops a WHOLE BSP leaf if it is flagged water or
+ * if any one of its vertices is animated, and with the retail track draw
+ * switched off nothing draws those leaves at all: Polar Pass loses 77 of 526.
+ * The owner reported the missing pieces as ordinary road, which the exclusion
+ * rule permits -- it discards the leaf, not the offending face.
+ *
+ * With this on, the retail path is left running and the render-list builder
+ * simply declines to link any leaf the resident mesh already owns
+ * (RenderLists_LinkBsp). Retail then draws exactly the leaves residency
+ * refused, and the two cover the level between them with no overlap.
+ *
+ * It is also the falsification test for the diagnosis: if the holes persist
+ * with this on, retail is not drawing that geometry either and the cause is
+ * somewhere else entirely. That was worth having as a switch rather than a
+ * silent fix, because "solved" has been claimed for this twice already
+ * without either claim being checked.
+ *
+ * DEFAULT 0 -- BROKEN AS WRITTEN, s29. Filtering in RenderLists_LinkBsp is the
+ * wrong place: NativeTrackFrame_Record derives the RESIDENT renderer's own
+ * visible-leaf set by walking that same render list (see its bspListBase walk),
+ * so withholding resident leaves from the list to prevent double-drawing also
+ * blinds the resident renderer completely. On hardware the result was the exact
+ * negative of the track -- only the 77 excluded chunks drew, nothing else.
+ *
+ * The fix is to prune AFTER the recorder has read the list rather than before
+ * it is built. Record runs at MainFrame_RenderFrame:1262 and the retail draw at
+ * :1290, so a prune pass between them sees a complete list and still hands
+ * DrawLevelOvr1P only the gaps. Not attempted yet.
+ */
+int g_dbg_trackGapFill = 0;
 
 void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 {
@@ -1230,6 +1515,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 	NativeTrackAtlas_Pack();
 
+
 #if defined(__3DS__)
 	int trackAtlasOk = NativeTrackAtlas_UploadToBackend(mesh, numQuadBlock, numVertex);
 	/* Rung 3a step 2: geometry upload shares the atlas's own withhold-latch-
@@ -1237,7 +1523,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * retries the WHOLE build next frame, same as the atlas's documented
 	 * linear-heap pressure case, rather than latching a level with no
 	 * resident geometry uploaded. */
-	int trackGeomOk = NativeTrackGeom_UploadToBackend(mesh, numQuadBlock, numVertex);
+	/* Rung 3b: bin BEFORE the geometry upload, because binning rewrites the
+	 * index buffer (and leafRanges with it) and the upload is what hands that
+	 * buffer to the GPU. It must also come AFTER the atlas upload above, which
+	 * clears atlasUnit on any rect it skipped. Shares the same
+	 * withhold-latch-and-retry contract as its two neighbours. */
+	int trackBinOk = NativeTrackMesh_BinLeavesByAtlasUnit();
+	int trackGeomOk = trackBinOk && NativeTrackGeom_UploadToBackend(mesh, numQuadBlock, numVertex);
 #endif
 
 	/* Latch only now, on success -- see the fingerprint comment up top. On
@@ -1293,8 +1585,18 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	}
 #endif
 
-	Platform_Log("[TRKMESH] lev=%p leaves=%u/%d (excl=%d) verts=%u idx=%u tex=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d | welds=%d\n",
-	             (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, s_trackMesh.vertCount, s_trackMesh.indexCount, s_trackMesh.texCount,
+	/*
+	 * lvl= joins lev= because a heap pointer does not identify a track. The
+	 * open Polar Pass defect (untextured holes in ground and wall) has to be
+	 * matched to the build line for the level it happened on, and reading these
+	 * blocks back meant hand-correlating pointers against a separate log
+	 * stream. Same source [PERF] and [SWEEP] stamp -- see
+	 * NativePerf_CurrentLevelID's comment for why a second level field is not
+	 * an option.
+	 */
+	Platform_Log("[TRKMESH] lvl=%d lev=%p leaves=%u/%d (excl=%d) verts=%u idx=%u tex=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d | welds=%d\n",
+	             NativePerf_CurrentLevelID(), (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, s_trackMesh.vertCount, s_trackMesh.indexCount,
+	             s_trackMesh.texCount,
 	             (u32)(s_trackMesh.vertCount * sizeof(struct NativeTrackVert) / 1024), (u32)(s_trackMesh.indexCount * sizeof(u16) / 1024), facesDoubleSided,
 	             facesAnimTex, facesNoTexture, weldCount);
 
@@ -1304,7 +1606,8 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		             notexSample[1]);
 	}
 
-	Platform_Log("[TRKATLAS] rects=%d units=%d/%d fill=%d%% texelKB=%u animFrames=%d dropped=%d\n", s_trackMesh.atlas.rectCount, s_trackMesh.atlas.unitsUsed,
+	Platform_Log("[TRKATLAS] lvl=%d rects=%d units=%d/%d fill=%d%% texelKB=%u animFrames=%d dropped=%d\n", NativePerf_CurrentLevelID(),
+	             s_trackMesh.atlas.rectCount, s_trackMesh.atlas.unitsUsed,
 	             TRACK_ATLAS_MAX_UNITS, s_trackMesh.atlas.unitsUsed ? (int)((s_trackMesh.atlas.packedTexels * 100u) / ((u32)s_trackMesh.atlas.unitsUsed * TRACK_ATLAS_DIM * TRACK_ATLAS_DIM)) : 0,
 	             (s_trackMesh.atlas.packedTexels * 2u) / 1024u, atlasAnimFrames, s_trackMesh.atlas.rectsDropped);
 }
@@ -1344,6 +1647,14 @@ int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirst
 	*outFirstIndex = s_trackMesh.leafRanges[i].firstIndex;
 	*outIndexCount = s_trackMesh.leafRanges[i].indexCount;
 	return 1;
+}
+
+/* Rung 3b: which atlas unit this range samples. Values at or above the unit
+ * count mean "no placed texture" -- the draw side must leave texturing off for
+ * those rather than binding a stale unit. */
+unsigned NativeTrackMesh_LeafAtlasBin(unsigned i)
+{
+	return (i < s_trackMesh.leafCount) ? (unsigned)s_trackMesh.leafRanges[i].atlasBin : 0xFFFFu;
 }
 
 int NativeTrackMesh_LeafBox(unsigned i, s16 outMin[3], s16 outMax[3])

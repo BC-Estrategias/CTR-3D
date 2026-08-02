@@ -411,6 +411,10 @@ static DVLB_s *s_trackShaderDvlb = NULL;
 static shaderProgram_s s_trackShaderProgram;
 static int s_trackULocQx = -1, s_trackULocQy = -1, s_trackULocQw = -1;
 static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange = -1;
+/* Rung 3b texenv memo -- see N3DS_TrackDraw_SetTextured. Declared up here with
+ * the other track statics because N3DS_TrackDraw_Begin resets it and sits above
+ * the function that uses it. */
+static int s_trackTexturedState = -1;
 static C3D_AttrInfo s_trackAttrInfo;
 static C3D_BufInfo s_trackBufInfo;
 
@@ -497,6 +501,43 @@ static void N3DS_BindPacketDrawState(void)
 	C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
 	C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
 	C3D_DirtyTexEnv(env);
+
+	/*
+	 * s29 ROOT CAUSE of "the resident track renderer hides karts/characters/UI".
+	 *
+	 * PICA200 vertex-shader float uniforms are PHYSICAL REGISTERS shared by
+	 * every program -- a uniform "location" is a register index, not a
+	 * per-program handle. The two shaders' declaration orders collide head-on:
+	 *
+	 *   ctr.v.pica        projection[4]            -> f0 f1 f2 f3
+	 *   ctr_track.v.pica  qx, qy, qw               -> f0 f1 f2
+	 *                     projection[4]            -> f3 f4 f5 f6
+	 *                     hParam, depthRange       -> f7 f8   (matches the
+	 *                       runtime log's own "uLocH=7 uLocDepth=8")
+	 *
+	 * So every N3DS_TrackDraw_Begin writes the track camera's qx/qy/qw over
+	 * the packet shader's projection rows 0-2. That matrix was uploaded ONCE
+	 * for the frame in N3DS_C3DBeginFrame -- BEFORE the track draw -- and
+	 * nothing re-uploaded it, so every packet draw issued AFTER the track
+	 * projected through the track's camera rows and landed nowhere visible.
+	 *
+	 * That is why the symptom tracked SUBMISSION ORDER and nothing else:
+	 * with CTR_NATIVE_DRAW_MERGE off, packet content draws during the walk
+	 * (before the track) and survives; with merge on, essentially all of it
+	 * is deferred to N3DS_MergeFlush (after the track) and died. It also
+	 * explains why the s29 depth model appeared to do nothing -- the content
+	 * it was meant to sort was never on screen to be sorted.
+	 *
+	 * Re-asserting it HERE rather than in N3DS_TrackDraw_End on purpose: this
+	 * function is the single definition of "packet draw state", it is already
+	 * called from every path that returns to packet drawing, and the
+	 * projection is as much packet state as the program or the buffer layout.
+	 * Guarded because C3D_C3DInit calls this before the location is resolved.
+	 */
+	if (s_uLocProjection >= 0)
+	{
+		C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
+	}
 }
 
 int N3DS_C3DInit(void)
@@ -739,6 +780,66 @@ static void N3DS_FrameTrace(const char *msg)
 	}
 }
 
+/*
+ * s29 occlusion split (docs/HANDOFF_s29.md). The resident track renderer hides
+ * karts/characters/skybox/HUD, and four theories for WHY were refuted in one
+ * sitting (extra geometry, GPU state leak between the two paths, a track/HUD
+ * depth tie, and the uiZ=0 "anomaly" -- which turned out to be an instrument
+ * pointed at content that never reaches it, this project's third such miss).
+ * Rather than reason further, this splits the remaining space by construction.
+ * Every state is a VISUAL binary a human settles in one glance -- deliberately
+ * not a counter, for the reason PORT_FEASIBILITY_3DS.md's "How to measure"
+ * section exists:
+ *
+ *   0 NORMAL  -- LEQUAL + depth writes. Today's behaviour, the baseline.
+ *   1 NOTEST  -- GPU_ALWAYS + depth writes: pure submission (painter's) order.
+ *                Content reappears  => the depth TEST is what hides it, so
+ *                                      this is a depth-VALUE bug.
+ *                Content still gone  => depth is irrelevant and the content is
+ *                                      never drawn at all -- look at what
+ *                                      skipping DrawLevelOvr1P took with it
+ *                                      (MainFrame_RenderFrame.c's
+ *                                      skipRetailTrackDraw), starting with the
+ *                                      skybox, which that call does NOT draw
+ *                                      and which is missing anyway.
+ *   2 TRACKRO -- normal test, but the TRACK draws read-only against depth
+ *                (GPU_WRITE_COLOR, applied in N3DS_TrackDraw_Begin). Isolates
+ *                the track's own depth WRITES from every other variable: if
+ *                only this state restores the karts, the track is stamping
+ *                depth that outranks them, and the packet side is fine.
+ *
+ * State 1 vs 2 is the whole point -- 1 asks "is it depth at all", 2 asks "is it
+ * OUR depth". Runtime, because the answer is worth more than a rebuild cycle:
+ * dumpreq `depthtest [N]` in Azahar, SELECT+ZL on hardware (ZL is free since
+ * s27 moved resolve-memo off it; a dumpreq file cannot be placed mid-race).
+ */
+int g_dbg_depthTest = 0;
+
+/*
+ * Preset ladder for the packet depth bias (see g_dbg_pktDepthBias, native_gpu.c).
+ * Values are view.z units pulled toward the camera. Deliberately coarse and
+ * short: this is dialled BY EYE mid-race on hardware, where a fine-grained
+ * control the owner has to press twenty times is useless. 256 is the top rung
+ * because it equals the track's own near-band clamp -- past that, packet
+ * content starts winning against track surfaces it is genuinely behind, which
+ * is the "racers through walls" failure the owner explicitly ruled out.
+ * Shared by the hardware chord and the dumpreq token so the two agree.
+ */
+static int N3DS_NextPktBias(int cur)
+{
+	static const int ladder[5] = {0, 32, 64, 128, 256};
+	int i;
+
+	for (i = 0; i < 5; i++)
+	{
+		if (ladder[i] == cur)
+		{
+			return ladder[(i + 1) % 5];
+		}
+	}
+	return 0; /* off-ladder (set via 'pktbias N') rejoins at the bottom */
+}
+
 void N3DS_C3DBeginFrame(void)
 {
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: enter (SYNCDRAW wait)");
@@ -765,7 +866,16 @@ void N3DS_C3DBeginFrame(void)
 	 * needs re-deriving, use the loading screen's letters as the canary,
 	 * not world layering.
 	 */
-	C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+	/* State 2 (TRACKRO) leaves this at the normal pair -- it only narrows the
+	 * write mask for the track's own draws, inside N3DS_TrackDraw_Begin. */
+	if (g_dbg_depthTest == 1)
+	{
+		C3D_DepthTest(true, GPU_ALWAYS, GPU_WRITE_ALL);
+	}
+	else
+	{
+		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+	}
 #endif
 
 	/*
@@ -1206,6 +1316,19 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	C3D_SetAttrInfo(&s_trackAttrInfo);
 	C3D_SetBufInfo(&s_trackBufInfo);
 
+#ifdef CTR_NATIVE_OT_DEPTH
+	/* State 2 (TRACKRO, see g_dbg_depthTest): the track still TESTS against
+	 * depth -- so it can still be hidden by nearer packet content, which is
+	 * what makes this a fair test rather than a "draw the track first" hack --
+	 * but stops WRITING depth, so nothing the track draws can outrank a kart.
+	 * Restored in N3DS_TrackDraw_End rather than left set: the merge flush
+	 * immediately after assumes the frame-wide pair from N3DS_C3DBeginFrame. */
+	if (g_dbg_depthTest == 2)
+	{
+		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_COLOR);
+	}
+#endif
+
 	/*
 	 * Review fix (FIX 2): assert opaque blending explicitly rather than
 	 * inheriting whatever the LAST packet draw left set. N3DS_C3DSetBlendMode
@@ -1231,7 +1354,49 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQx, qx[0], qx[1], qx[2], qx[3]);
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQy, qy[0], qy[1], qy[2], qy[3]);
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQw, qw[0], qw[1], qw[2], qw[3]);
-	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, 0.0f, 0.0f, 0.0f);
+	{
+		/* hParam.y/z select the track's depth axis, and they are driven by the
+		 * SAME toggle that makes packets stamp sz3 (g_dbg_packetDepth,
+		 * native_gpu.c). One switch on purpose: with only one side flipped the
+		 * two geometry sources sit on different axes and the result is worse
+		 * than either alone, which is exactly the sort of half-state that
+		 * costs an owner hardware sitting to diagnose.
+		 *
+		 * z is supplied as 1-y so the shader needs no subtraction (PICA200 has
+		 * no SUB opcode). Capture-off builds pin this to the ordinal path, so
+		 * they behave exactly as they do today. */
+		float selTrueDepth = 0.0f;
+
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+		{
+			extern int g_dbg_packetDepth;
+
+			selTrueDepth = (g_dbg_packetDepth != 0) ? 1.0f : 0.0f;
+		}
+#endif
+
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, selTrueDepth, 1.0f - selTrueDepth, 0.0f);
+
+		/* Prove the selector actually REACHES the shader. Every depth number
+		 * logged so far is CPU-side arithmetic showing what the value would be,
+		 * which is not evidence the GPU used it -- and "the fix changed almost
+		 * nothing visible" is exactly what an unbound uniform looks like. uLoc
+		 * is included because -1 means shaderInstanceGetUniformLocation never
+		 * found it, in which case every C3D_FVUnifSet above has been writing
+		 * into nowhere. */
+		{
+			static float s_lastSel = -1.0f;
+
+			if (s_lastSel != selTrueDepth)
+			{
+				char msg[96];
+
+				snprintf(msg, sizeof(msg), "[CTR-3DS] track depth sel=%d uLocH=%d uLocDepth=%d", (int)selTrueDepth, s_trackULocH, s_trackULocDepthRange);
+				N3DS_DebugLog(msg);
+				s_lastSel = selTrueDepth;
+			}
+		}
+	}
 	/* SAME ortho matrix the packet path uses (n3ds_backend.c's s_projection,
 	 * computed by N3DS_C3DSetProjection) -- this is what puts track content
 	 * and packet content on one shared depth axis (see the shader's own
@@ -1264,16 +1429,79 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	 * color modulate belongs (design 12b), not here. */
 	N3DS_C3DSetColorDoubling(0);
 
+	/* The packet path owns texenv 0 between track frames, so whatever
+	 * N3DS_TrackDraw_SetTextured last recorded is stale by now. */
+	s_trackTexturedState = 0;
+
 	s_trackDrawActive = 1;
 }
 
-void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan)
+/*
+ * Rung 3b: flip the track program's combiner between textured and untextured.
+ * Memoized -- a track frame issues one draw per (leaf x atlas unit) and most
+ * consecutive draws share a state, so re-emitting the env every draw would be
+ * pure command-buffer traffic on the platform this campaign exists to speed up.
+ * The memo is reset by N3DS_TrackDraw_Begin, since the packet path owns texenv
+ * 0 between frames and will have changed it.
+ *
+ * Colour doubling is part of the state, not incidental: PS1 texel*colour
+ * modulate is 2x (design 12b), which is exactly why rung 3a deliberately left
+ * doubling off for its untextured draws. Textured track content needs it back
+ * or every texture reads half-brightness against retail.
+ */
+static void N3DS_TrackDraw_SetTextured(int textured)
+{
+	C3D_TexEnv *env;
+
+	if (s_trackTexturedState == textured)
+	{
+		return;
+	}
+
+	env = C3D_GetTexEnv(0);
+	if (textured)
+	{
+		C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+		C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+	}
+	else
+	{
+		C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, 0);
+		C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+	}
+	C3D_DirtyTexEnv(env);
+	N3DS_C3DSetColorDoubling(textured ? 1 : 0);
+	s_trackTexturedState = textured;
+}
+
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin)
 {
 	const u16 *indexBase;
 
 	if (!s_trackDrawActive || (indexCount <= 0) || (firstIndex < 0))
 	{
 		return;
+	}
+
+	/*
+	 * Rung 3b: one draw binds one texture, which is the entire reason the mesh
+	 * builder splits a leaf's indices per atlas unit. A bin at or past the
+	 * allocated unit count means "no placed texture for these faces" -- draw
+	 * them untextured rather than binding a stale unit and sampling another
+	 * rect's texels, which would look like garbage welded onto the track.
+	 *
+	 * The texture-enable selector rides hParam.w (see the shader): the vertex
+	 * program cannot branch cheaply, so it always computes the atlas UV and the
+	 * fragment side is what decides whether to sample.
+	 */
+	if ((atlasBin >= 0) && (atlasBin < s_trackAtlasUnitsAllocated))
+	{
+		N3DS_TrackAtlas_Bind(atlasBin);
+		N3DS_TrackDraw_SetTextured(1);
+	}
+	else
+	{
+		N3DS_TrackDraw_SetTextured(0);
 	}
 
 	/*
@@ -1305,6 +1533,17 @@ void N3DS_TrackDraw_End(void)
 	 * track state by a call-order mistake upstream. */
 	N3DS_BindPacketDrawState();
 
+#ifdef CTR_NATIVE_OT_DEPTH
+	/* Undo state 2's read-only depth mask. Unconditional on the state rather
+	 * than mirrored off a flag set in Begin: Begin can return early (geometry
+	 * not ready) having changed nothing, and re-asserting the frame-wide pair
+	 * is idempotent, so this cannot desync the way a paired flag could. */
+	if (g_dbg_depthTest == 2)
+	{
+		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+	}
+#endif
+
 	s_trackDrawActive = 0;
 }
 
@@ -1332,7 +1571,7 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	(void)h;
 }
 
-void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan)
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin)
 {
 	(void)firstIndex;
 	(void)indexCount;
@@ -1340,6 +1579,7 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	(void)ordinalLo;
 	(void)ordinalSpan;
 	(void)invIndexSpan;
+	(void)atlasBin;
 }
 
 void N3DS_TrackDraw_End(void)
@@ -1492,12 +1732,29 @@ unsigned int N3DS_ReadButtons(void)
 	 *   drawmerge   -- toggle g_dbg_drawMerge (CTR_NATIVE_DRAW_MERGE builds only)
 	 *   renderthread -- toggle g_dbg_renderThread (core-2 render worker routing;
 	 *                  OFF falls back to synchronous main-thread rendering)
+	 *   lodgeo [N]  -- track LOD distance, percent of retail (CTR_NATIVE_LOD_BIAS)
+	 *   lodtex [N]  -- texture LOD distance, percent of retail (same gate)
+	 *   fbtest      -- toggle g_dbg_skipFbTriTest (s27 probe: skip resolve's
+	 *                  per-triangle fb-mirror test; freeze frames stale while ON)
+	 *   otz         -- toggle g_dbg_otzWiden (widened depth stamps, track-
+	 *                  renderer rung 1; [OTZ] occupancy line while on)
 	 *   trackrender [N] -- native track renderer state (CTR_NATIVE_TRACK_RENDERER
 	 *                  builds only): 0=off(retail) 1=on(resident replaces retail)
 	 *                  2=both(diagnostic overlay). Bare token cycles 0->1->2->0;
 	 *                  'trackrender N' sets a specific state. Also reachable on
 	 *                  hardware via SELECT+ZR (a dumpreq file can't be placed
 	 *                  mid-race there -- see the button handler below).
+	 *   packetdepth -- toggle g_dbg_packetDepth (s29 depth model): packets stamp
+	 *                  GTE sz3 and the track shader switches to the same
+	 *                  true-depth axis, both at once. Hardware button: SELECT+L.
+	 *   gtecapture [N] -- g_dbg_gteCapture (CTR_NATIVE_GTE_CAPTURE builds):
+	 *                  1=full 2=store-only(no matrix note) 0=ablated, to price
+	 *                  the capture subsystem and its matrix probe separately.
+	 *                  Bare token cycles 1->2->0. Hardware button: SELECT+D-UP.
+	 *   depthtest [N] -- g_dbg_depthTest, the s29 occlusion split: 0=normal
+	 *                  1=no depth test (painter's order) 2=track tests but
+	 *                  does not write depth. Bare token cycles 0->1->2->0.
+	 *                  Hardware button: SELECT+ZL.
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -1560,6 +1817,29 @@ unsigned int N3DS_ReadButtons(void)
 					                              : "[CTR-3DS] draw merge: off (immediate runs)");
 				}
 #endif
+#if defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+				else if (strncmp(word, "lodgeo", 6) == 0 || strncmp(word, "lodtex", 6) == 0)
+				{
+					/* Track detail ('lodgeo') and texture detail ('lodtex') as a
+					 * percentage of retail switch distance -- lower means detail
+					 * drops nearer the camera and the OT walk is handed fewer
+					 * prims. 'lodgeo 50' sets a value; bare 'lodgeo' steps the
+					 * A/B ladder. Read once per frame when RenderAllLevelGeometry
+					 * seeds its thresholds, so a change lands on a frame boundary
+					 * and never mid-walk. */
+					extern int g_ctrLodGeoScale;
+					extern int g_ctrLodTexScale;
+					extern int CTR_LodBias_Clamp(int percent);
+					extern int CTR_LodBias_Step(int percent);
+					int isGeo = (word[3] == 'g');
+					int *scale = isGeo ? &g_ctrLodGeoScale : &g_ctrLodTexScale;
+					char msg[48];
+
+					*scale = (word[6] == ' ') ? CTR_LodBias_Clamp(atoi(&word[7])) : CTR_LodBias_Step(*scale);
+					snprintf(msg, sizeof(msg), "[CTR-3DS] %s LOD scale: %d%%", isGeo ? "level" : "texture", *scale);
+					N3DS_DebugLog(msg);
+				}
+#endif
 				else if (strncmp(word, "renderthread", 12) == 0)
 				{
 					extern int g_dbg_renderThread;
@@ -1591,6 +1871,26 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_resolveMemo ^= 1;
 					N3DS_DebugLog(g_dbg_resolveMemo ? "[CTR-3DS] resolve memo: ON" : "[CTR-3DS] resolve memo: OFF");
 				}
+				else if (strncmp(word, "fbtest", 6) == 0)
+				{
+					extern int g_dbg_skipFbTriTest;
+
+					/* s27 probe: ablate resolve's per-triangle fb-mirror
+					 * overlap test. ON = pause/wipe freeze frames may be
+					 * stale; instrument only, see the declaration comment. */
+					g_dbg_skipFbTriTest ^= 1;
+					N3DS_DebugLog(g_dbg_skipFbTriTest ? "[CTR-3DS] fb tri test: SKIPPED (freeze frames may be stale)" : "[CTR-3DS] fb tri test: on");
+				}
+				else if (strncmp(word, "otz", 3) == 0)
+				{
+					extern int g_dbg_otzWiden;
+
+					/* Track-renderer rung 1 v2: RECORD-ONLY bucket->ordinal
+					 * table (stamps untouched; v1's restamp was falsified by
+					 * its own [OTZ] line). [OTZ2] validation line while on. */
+					g_dbg_otzWiden ^= 1;
+					N3DS_DebugLog(g_dbg_otzWiden ? "[CTR-3DS] otz table: RECORDING (stamps unchanged)" : "[CTR-3DS] otz table: off");
+				}
 				else if (strncmp(word, "atlasview", 9) == 0)
 				{
 					extern int g_dbg_atlasView;
@@ -1608,6 +1908,61 @@ unsigned int N3DS_ReadButtons(void)
 					}
 					snprintf(msg, sizeof(msg), "[CTR-3DS] atlas view: %d", g_dbg_atlasView - 1);
 					N3DS_DebugLog(g_dbg_atlasView ? msg : "[CTR-3DS] atlas view: off");
+				}
+				else if (strncmp(word, "verbose", 7) == 0)
+				{
+					extern int g_dbg_statsVerbose;
+
+					g_dbg_statsVerbose ^= 1;
+					N3DS_DebugLog(g_dbg_statsVerbose ? "[CTR-3DS] stats: VERBOSE" : "[CTR-3DS] stats: quiet");
+				}
+				else if (strncmp(word, "pktbias", 7) == 0)
+				{
+					extern int g_dbg_pktDepthBias;
+					char msg[64];
+
+					/* 'pktbias N' sets an exact value (view.z units nearer);
+					 * bare 'pktbias' steps the same preset ladder the hardware
+					 * chord uses, so the two controls can't disagree. */
+					if (word[7] == ' ')
+					{
+						g_dbg_pktDepthBias = atoi(&word[8]);
+					}
+					else
+					{
+						g_dbg_pktDepthBias = N3DS_NextPktBias(g_dbg_pktDepthBias);
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] packet depth bias: %d (units nearer)", g_dbg_pktDepthBias);
+					N3DS_DebugLog(msg);
+				}
+				else if (strncmp(word, "trackafter", 10) == 0)
+				{
+					extern int g_dbg_trackAfterMerge;
+
+					g_dbg_trackAfterMerge ^= 1;
+					N3DS_DebugLog(g_dbg_trackAfterMerge ? "[CTR-3DS] track draw: AFTER merge flush" : "[CTR-3DS] track draw: before merge flush (default)");
+				}
+				else if (strncmp(word, "depthtest", 9) == 0)
+				{
+					/* No extern: g_dbg_depthTest lives in THIS translation
+					 * unit (see its comment above N3DS_C3DBeginFrame), unlike
+					 * the g_dbg_* below that live in the main.c unity TU. */
+					static const char *const names[3] = {"NORMAL (LEQUAL + writes)", "NOTEST (painter's order)",
+					                                     "TRACKRO (track tests but does not write depth)"};
+					char msg[80];
+
+					if (word[9] == ' ')
+					{
+						int n = atoi(&word[10]);
+
+						g_dbg_depthTest = (n < 0) ? 0 : (n > 2) ? 2 : n;
+					}
+					else
+					{
+						g_dbg_depthTest = (g_dbg_depthTest + 1) % 3;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] depth test: %s", names[g_dbg_depthTest]);
+					N3DS_DebugLog(msg);
 				}
 #ifdef CTR_NATIVE_TRACK_RENDERER
 				else if (strncmp(word, "trackrender", 11) == 0)
@@ -1633,12 +1988,92 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(msg);
 				}
 #endif
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+				else if (strncmp(word, "packetdepth", 11) == 0)
+				{
+					extern int g_dbg_packetDepth;
+
+					g_dbg_packetDepth ^= 1;
+					N3DS_DebugLog(g_dbg_packetDepth ? "[CTR-3DS] packet depth: ON (sz3 true-depth axis)" : "[CTR-3DS] packet depth: off (emit ordinals)");
+				}
+				else if (strncmp(word, "gtecapture", 10) == 0)
+				{
+					extern int g_dbg_gteCapture;
+					static const char *const names[3] = {"OFF (ablated)", "FULL (store + matrix note)", "STORE ONLY (no matrix note)"};
+					char msg[64];
+
+					/* 'gtecapture N' sets a state; bare token cycles 1->2->0. */
+					if (word[10] == ' ')
+					{
+						int n = atoi(&word[11]);
+
+						g_dbg_gteCapture = (n < 0) ? 0 : (n > 2) ? 2 : n;
+					}
+					else
+					{
+						g_dbg_gteCapture = (g_dbg_gteCapture + 1) % 3;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] gte capture: %s", names[g_dbg_gteCapture]);
+					N3DS_DebugLog(msg);
+				}
+#endif
 				else
 				{
 					N3DS_DebugCaptureAll();
 				}
 			}
 		}
+	}
+
+	/* SELECT held + B: automated config sweep. Drive one lap with this on and
+	 * every config gets equal exposure to the same content -- see g_dbg_sweep. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_B))
+	{
+		extern int g_dbg_sweep;
+
+		g_dbg_sweep ^= 1;
+		N3DS_DebugLog(g_dbg_sweep ? "[CTR-3DS] sweep: ON (auto-cycling configs)" : "[CTR-3DS] sweep: off");
+	}
+
+	/* SELECT held + X: bottom-screen verbosity. Default off (s29) -- the stats
+	 * block had grown into a wall the owner couldn't read the live toggles in. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_X))
+	{
+		extern int g_dbg_statsVerbose;
+
+		g_dbg_statsVerbose ^= 1;
+		N3DS_DebugLog(g_dbg_statsVerbose ? "[CTR-3DS] stats: VERBOSE" : "[CTR-3DS] stats: quiet");
+	}
+
+	/* SELECT held + Y: step the packet depth bias 0 -> 32 -> 64 -> 128 -> 256
+	 * -> 0. Owner-dialled mid-race on hardware ("just pull them a little bit
+	 * closer"), which is why it is a button and why the ladder is short: the
+	 * judgement is "do racers still sink" vs "can I see them through a wall",
+	 * and only a human mid-race can make it. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_Y))
+	{
+		extern int g_dbg_pktDepthBias;
+		char msg[64];
+
+		g_dbg_pktDepthBias = N3DS_NextPktBias(g_dbg_pktDepthBias);
+		snprintf(msg, sizeof(msg), "[CTR-3DS] packet depth bias: %d (units nearer)", g_dbg_pktDepthBias);
+		N3DS_DebugLog(msg);
+	}
+
+	/* SELECT held + ZL: depth-test state cycle 0->1->2->0 (see g_dbg_depthTest
+	 * above N3DS_C3DBeginFrame for what each state proves). ZL has been free
+	 * since s27 moved resolve-memo off it. Mid-race by design -- the question
+	 * is "where did the karts go", and the karts only exist mid-race, so a
+	 * cross-run A/B would confound content the way the LOD null did. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZL))
+	{
+		static const char *const names[3] = {"NORMAL (LEQUAL + writes)", "NOTEST (painter's order)",
+		                                     "TRACKRO (track tests but does not write depth)"};
+		char msg[80];
+
+		g_dbg_depthTest = (g_dbg_depthTest + 1) % 3;
+		snprintf(msg, sizeof(msg), "[CTR-3DS] depth test: %s", names[g_dbg_depthTest]);
+		N3DS_DebugLog(msg);
 	}
 
 	/* SELECT held + D-pad DOWN: toggle render-worker routing mid-run (mid-run
@@ -1684,6 +2119,47 @@ unsigned int N3DS_ReadButtons(void)
 	}
 #endif
 
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+	/* SELECT held + D-pad UP: GTE capture cost A/B (s29). The depth model the
+	 * track renderer needs reads per-vertex sz3 out of the capture table, which
+	 * means capture stops being an optional instrument and becomes permanently
+	 * compiled in on the platform with the least frame time to spare -- so its
+	 * price gets measured BEFORE the design commits to it. Completes the
+	 * held-SELECT d-pad family (DOWN=render worker, RIGHT=textureless,
+	 * LEFT=direct emit); same reason as all of them, a hardware A/B needs a
+	 * button because dumpreq is unplaceable while the game holds the SD card.
+	 * Safe to flip mid-race: OFF only stops writing a side table whose readers
+	 * all treat a miss as "use the exact snapped value". */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DUP))
+	{
+		extern int g_dbg_gteCapture;
+		static const char *const names[3] = {"OFF (ablated; lookups all miss)", "FULL (store + matrix note)", "STORE ONLY (no matrix note)"};
+		char msg[80];
+
+		/* Cycles 1 -> 2 -> 0 -> 1 so a sitting walks full -> what the depth
+		 * model would actually pay -> nothing, and each [PERF] window between
+		 * two of these log lines belongs to exactly one state. */
+		g_dbg_gteCapture = (g_dbg_gteCapture + 1) % 3;
+		snprintf(msg, sizeof(msg), "[CTR-3DS] gte capture: %s", names[g_dbg_gteCapture]);
+		N3DS_DebugLog(msg);
+	}
+
+	/* SELECT held + D-pad DOWN is the render worker; SELECT + L is packet depth
+	 * -- the s29 depth model's mid-race A/B. Flips BOTH sides at once (packets
+	 * stamp sz3, track shader switches to the true-depth axis), because either
+	 * alone puts the two geometry sources on different axes. This is the
+	 * toggle the "karts through walls" objection gets tested against, so it
+	 * has to be a button: a dumpreq file cannot be placed mid-race. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_L))
+	{
+		extern int g_dbg_packetDepth;
+
+		g_dbg_packetDepth ^= 1;
+		N3DS_DebugLog(g_dbg_packetDepth ? "[CTR-3DS] packet depth: ON (sz3 true-depth axis, both sources)"
+		                                : "[CTR-3DS] packet depth: off (emit ordinals)");
+	}
+#endif
+
 #ifdef CTR_NATIVE_TRACK_RENDERER
 	/* SELECT held + ZR: native track renderer state cycle 0->1->2->0 (rung
 	 * 3a). Reassigned from the s27 fbtest probe (design doc 12b: fbtest's
@@ -1701,7 +2177,19 @@ unsigned int N3DS_ReadButtons(void)
 		static const char *const names[3] = {"OFF (retail)", "ON (resident replaces retail)", "BOTH (resident + retail overlay)"};
 		char msg[64];
 
-		g_dbg_trackRender = (g_dbg_trackRender + 1) % 3;
+		/*
+		 * TWO states on the button, not three. BOTH is not a way to play -- it
+		 * draws the level twice -- and cycling through it mid-race costs a
+		 * press every time the owner wants to A/B the thing that matters. It
+		 * stays reachable as 'trackrender 2' via dumpreq, because drawing both
+		 * at once is still the fastest visual check for the two renderers
+		 * disagreeing about position or depth: they fight each other on screen
+		 * in one frame instead of having to be inferred from a sunk kart.
+		 *
+		 * From 2 the button drops to 0 rather than sticking, so a dumpreq into
+		 * BOTH can always be escaped from the console.
+		 */
+		g_dbg_trackRender = (g_dbg_trackRender == 0) ? 1 : 0;
 		snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
 		N3DS_DebugLog(msg);
 	}

@@ -11,6 +11,31 @@
 
 #ifdef CTR_INTERNAL
 volatile int gCtrDebugSkipLevelGeometry = 0;
+
+/*
+ * Content-ablation switches (s29). With the resident track renderer on, a Polar
+ * Pass frame is ~55ms of which draw_all_splits (15.3) + draw_otag_parse (12.5)
+ * = ~28ms is packet-path work, and by construction NONE of it is the track any
+ * more -- but nothing said WHICH content it is. Rather than build a
+ * per-primitive tagging side-table and an attribution model to get wrong,
+ * subtract one class at a time and read the frame time: the delta IS that
+ * class's whole cost, game-side build plus GPU submission.
+ *
+ * Driven by the [SWEEP] harness (platform/n3ds/native_renderer_3ds.c) so every
+ * class sees the same lap -- the confounding that made s29's first three perf
+ * readings disagree came from unmatched exposure, not from bad timers.
+ *
+ * Measurement only; never on in a shipping build. Each gate covers additive
+ * draw calls ONLY -- RenderDispEnv_World and PushBuffer_FadeAllWindows sit
+ * inside the same perf scopes but set up state the rest of the frame needs, so
+ * they stay outside the gates.
+ */
+volatile int gCtrDebugSkipInstances = 0;
+volatile int gCtrDebugSkipEffects = 0;
+volatile int gCtrDebugSkipHUD = 0;
+#define CTR_DEBUG_ABLATE(flag) if ((flag) == 0)
+#else
+#define CTR_DEBUG_ABLATE(flag)
 #endif
 
 #ifdef CTR_NATIVE
@@ -99,64 +124,88 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 	MAINFRAME_LOG_CHECKPOINT("EFFECTS_1_weather");
-	RenderAllWeather(gGT);
-	RenderAllConfetti(gGT);
-	// NOTE(aalhendi): ASM-verified NTSC-U 926 subrange 0x800364f8-0x80036538.
-	if (((gGT->renderFlags & RENDER_FLAG_STARS) != 0) && (gGT->stars.numStars != 0))
+	CTR_DEBUG_ABLATE(gCtrDebugSkipEffects)
 	{
-		RenderStars(&gGT->pushBuffer[0], &gGT->backBuffer->primMem, &gGT->stars, gGT->numPlyrCurrGame);
-	}
+		RenderAllWeather(gGT);
+		RenderAllConfetti(gGT);
+		// NOTE(aalhendi): ASM-verified NTSC-U 926 subrange 0x800364f8-0x80036538.
+		if (((gGT->renderFlags & RENDER_FLAG_STARS) != 0) && (gGT->stars.numStars != 0))
+		{
+			RenderStars(&gGT->pushBuffer[0], &gGT->backBuffer->primMem, &gGT->stars, gGT->numPlyrCurrGame);
+		}
 
-	if (((gGT->renderFlags & RENDER_FLAG_MULTIPLAYER_DECALS) != 0) && (gGT->numPlyrCurrGame > 1))
-	{
-		DecalMP_01(gGT);
+		if (((gGT->renderFlags & RENDER_FLAG_MULTIPLAYER_DECALS) != 0) && (gGT->numPlyrCurrGame > 1))
+		{
+			DecalMP_01(gGT);
+		}
 	}
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_HUD);
 	MAINFRAME_LOG_CHECKPOINT("HUD");
-	RenderAllHUD(gGT);
+	CTR_DEBUG_ABLATE(gCtrDebugSkipHUD)
+	{
+		RenderAllHUD(gGT);
+	}
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_HUD);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 	MAINFRAME_LOG_CHECKPOINT("EFFECTS_2_beakerrain");
-	RenderAllBeakerRain(gGT);
+	CTR_DEBUG_ABLATE(gCtrDebugSkipEffects)
+	{
+		RenderAllBeakerRain(gGT);
 
-	RenderAllBoxSceneSplitLines(gGT);
+		RenderAllBoxSceneSplitLines(gGT);
+	}
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_QUEUE_INSTANCES);
 	MAINFRAME_LOG_CHECKPOINT("QUEUE_INSTANCES");
-	RenderBucket_QueueAllInstances(gGT);
+	CTR_DEBUG_ABLATE(gCtrDebugSkipInstances)
+	{
+		RenderBucket_QueueAllInstances(gGT);
+	}
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_QUEUE_INSTANCES);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 	MAINFRAME_LOG_CHECKPOINT("EFFECTS_3_particles");
-	RenderAllNormalParticles(gGT);
+	CTR_DEBUG_ABLATE(gCtrDebugSkipEffects)
+	{
+		RenderAllNormalParticles(gGT);
+	}
 
 	RenderDispEnv_World(gGT); // == RenderDispEnv_World ==
 
-	if (((gGT->renderFlags & RENDER_FLAG_MULTIPLAYER_DECALS) != 0) && (gGT->numPlyrCurrGame > 1))
+	CTR_DEBUG_ABLATE(gCtrDebugSkipEffects)
 	{
-		DecalMP_02(gGT);
-	}
+		if (((gGT->renderFlags & RENDER_FLAG_MULTIPLAYER_DECALS) != 0) && (gGT->numPlyrCurrGame > 1))
+		{
+			DecalMP_02(gGT);
+		}
 
-	RenderAllFlag0x40(gGT); // I need a better name
-	RenderAllTitleDPP(gGT);
+		RenderAllFlag0x40(gGT); // I need a better name
+		RenderAllTitleDPP(gGT);
+	}
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EXECUTE_INSTANCES);
 	MAINFRAME_LOG_CHECKPOINT("EXECUTE_INSTANCES");
-	RenderBucket_ExecuteAllInstances(gGT);
+	CTR_DEBUG_ABLATE(gCtrDebugSkipInstances)
+	{
+		RenderBucket_ExecuteAllInstances(gGT);
+	}
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EXECUTE_INSTANCES);
 
 	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
 	MAINFRAME_LOG_CHECKPOINT("EFFECTS_4_tires");
-	RenderAllTires(gGT);
+	CTR_DEBUG_ABLATE(gCtrDebugSkipEffects)
+	{
+		RenderAllTires(gGT);
 
-	RenderAllShadows(gGT);
+		RenderAllShadows(gGT);
 
-	RenderAllHeatParticles(gGT);
+		RenderAllHeatParticles(gGT);
+	}
 
 	PushBuffer_FadeAllWindows();
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_EFFECTS);
@@ -918,6 +967,135 @@ static s32 RenderAllLevelGeometry_ScaleDistanceShift8(s32 distToScreen, s32 scal
 	return CTR_MipsSra(product, 8);
 }
 
+// Native LOD bias. CTR already switches track detail by distance on its own:
+// RenderLists_Select1P2PSlot (game/RenderLevel/RenderLists.c:137) routes a BSP
+// leaf past bspLodDistanceThreshold into the FULL_DYNAMIC list, which overlay
+// 226 draws at DRAW_LEVEL_OVR1P_LOD_LOW instead of the subdivided 4x4/4x2/
+// dynamic lists, and the two texture thresholds pick a finer texture variant
+// per quadblock (226_00_DrawLevelOvr1P.c:637). Both distances are seeded once
+// per frame from distanceToScreen below, which makes this the single place a
+// native build can move them without touching the decision sites themselves.
+//
+// Why it exists: the 3DS frame is OT-walk-bound and the walk's cost tracks the
+// prim count it is handed (draw_otag 46.9ms of a 70.2ms N. Gin Labs frame,
+// hardware 2026-07-28), so the hope was to scale the input to the expensive
+// part rather than optimize the part itself.
+//
+// MEASURED RESULT, PC attract race, 2026-07-28 -- THE GEOMETRY SCALE DOES NOT
+// SHED PRIMS. At 50% the slot distribution moves exactly as designed (leaves
+// pour out of the subdivided lists into FULL_DYNAMIC; see the [LODPROBE] line
+// below), and prims/f does not fall with it: 1092/f at retail vs 1215/f at 50%
+// on the same track. FULL_DYNAMIC is a different DRAWING STYLE for a quadblock,
+// not a lower-density one -- its bucket even reserves the largest prim block of
+// any list (DRAW_LEVEL_OVR1P_BUCKET_RESERVE_FULL_DYNAMIC). Whatever controls
+// quadblock density in CTR, it is not this threshold, and the OT walk is handed
+// the same work either way.
+//
+// So this is kept as a measuring instrument and a negative result, not as an
+// fps lever: it is the rig that answers "would pulling the draw distance in
+// help?" without rebuilding it from scratch every time someone asks. Before
+// using it for anything else, re-read the [LODPROBE] counters -- the answer so
+// far is no. Owner ruling the same day does put fps ahead of visual parity on
+// 3DS, so a lever like this would have been allowed had it worked.
+//
+// Scales are percentages of the retail distance: 100 = retail, lower = detail
+// drops nearer the camera = less work. At 100 nothing is written at all, so an
+// enabled build with untouched scales is byte-identical to a disabled one.
+// Scope: 1P only. RenderLists uses its own 0x1540 constant when numPlyr != 1,
+// so split-screen stays retail no matter what these say.
+#ifndef CTR_NATIVE_LOD_BIAS
+#define CTR_NATIVE_LOD_BIAS 0
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_LOD_BIAS
+// Runtime A/B, same pattern as dumpreq 'drawmerge': flipping mid-race brackets
+// [PERF]/[OTPROF] windows by state on identical content. Cross-run comparison
+// is not an option here -- this project's fps numbers have confounded on track,
+// game mode and AI count often enough that only a mid-run flip is trusted.
+int g_ctrLodGeoScale = 100;
+int g_ctrLodTexScale = 100;
+
+// Clamping and the A/B ladder live here rather than at the two toggle sites
+// (PC keys, 3DS dumpreq) so the value a toggle logs is always the value the
+// frame will actually use.
+int CTR_LodBias_Clamp(int percent)
+{
+	if (percent < 10)
+	{
+		return 10;
+	}
+
+	if (percent > 200)
+	{
+		return 200;
+	}
+
+	return percent;
+}
+
+// 100 (retail) -> 75 -> 50 -> 35 -> back to retail. Coarse on purpose: the
+// point of a mid-race step is to bracket [PERF] windows far enough apart that
+// the delta clears run-to-run noise, not to find a final number.
+int CTR_LodBias_Step(int percent)
+{
+	if (percent > 75)
+	{
+		return 75;
+	}
+
+	if (percent > 50)
+	{
+		return 50;
+	}
+
+	if (percent > 35)
+	{
+		return 35;
+	}
+
+	return 100;
+}
+
+static s32 RenderAllLevelGeometry_ScaleLodDistance(s32 distance, int percent)
+{
+	// 64-bit intermediate: the race path seeds these as distanceToScreen * 0x1a,
+	// and a scale above 100 is free to overflow s32 on the way back down.
+	return (s32)(((s64)distance * (s64)CTR_LodBias_Clamp(percent)) / 100);
+}
+
+static void RenderAllLevelGeometry_ApplyLodBias(struct MainRenderLevelGeometryScratch *scratch)
+{
+	if (g_ctrLodGeoScale != 100)
+	{
+		scratch->bspLodDistanceThreshold = RenderAllLevelGeometry_ScaleLodDistance(scratch->bspLodDistanceThreshold, g_ctrLodGeoScale);
+
+		// Both retail branches derive the fade start from the threshold. Leaving
+		// it stale would detach the FULL_DYNAMIC fade band (consumed at
+		// 226_00_DrawLevelOvr1P.c:2252) from the list it fades, and distant
+		// geometry would pop in at full brightness instead of fading up.
+		scratch->fullDynamicFadeDepthStart = CTR_MipsAddLo(scratch->bspLodDistanceThreshold, MAIN_RENDER_LEVEL_GEOMETRY_FULL_DYNAMIC_FADE_OFFSET);
+	}
+
+	if (g_ctrLodTexScale != 100)
+	{
+		scratch->textureLodDepthThreshold0 = RenderAllLevelGeometry_ScaleLodDistance(scratch->textureLodDepthThreshold0, g_ctrLodTexScale);
+		scratch->textureLodDepthThreshold1 = RenderAllLevelGeometry_ScaleLodDistance(scratch->textureLodDepthThreshold1, g_ctrLodTexScale);
+	}
+
+	// Deliberate omissions:
+	// - topLevelNearDepthThreshold is a third texture-variant bump
+	//   (226_00_DrawLevelOvr1P.c:647), not a geometry control, so it belongs with
+	//   the texture scale rather than the geometry one; left alone so the two
+	//   scales above stay separable. depthScale and recursiveNearDepthThreshold
+	//   are seeded by retail but have NO reader anywhere in game/ -- do not add
+	//   them here expecting an effect.
+	// - DrawLevelOvr1P_SetSplitGroundThresholdScratch (226_00_DrawLevelOvr1P.c:8074)
+	//   re-seeds the texture thresholds from fixed constants for split-ground
+	//   blocks, so g_ctrLodTexScale does not reach those. It does not touch
+	//   bspLodDistanceThreshold, so the geometry scale is unaffected.
+}
+#endif
+
 void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struct mesh_info *ptr_mesh_info)
 {
 	int i;
@@ -953,6 +1131,16 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 	{
 		extern void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh);
 		NativeTrackMesh_Frame(level1, ptr_mesh_info);
+	}
+#endif
+
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+	// Model/keyframe accounting, once per level (platform/native_model_census.c).
+	// Deliberately OUTSIDE the track-renderer gate above: it answers a question
+	// about karts, not track, and has to be readable from a plain PC build.
+	{
+		extern void NativeModelCensus_Report(struct GameTracker *gGT, struct Level *level);
+		NativeModelCensus_Report(gGT, level1);
 	}
 #endif
 
@@ -1018,6 +1206,34 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 			scratch->fullDynamicFadeDepthStart = CTR_MipsAddLo(scratch->bspLodDistanceThreshold, MAIN_RENDER_LEVEL_GEOMETRY_FULL_DYNAMIC_FADE_OFFSET);
 		}
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_LOD_BIAS
+		// After both branches, before the lists are built: RenderLists_Init1P2P
+		// reads bspLodDistanceThreshold straight out of this scratch, so the bias
+		// lands on a whole frame or not at all. Covers the cutscene branch too --
+		// the intro is in-engine track flybys (hardware, 2026-07-28), not video.
+		RenderAllLevelGeometry_ApplyLodBias(scratch);
+#endif
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+		{
+			extern int g_lodProbeSlot[6];
+			extern int g_lodProbeEarlyOut;
+			extern int g_lodProbeDistTested;
+			static int s_lodProbeFrames;
+
+			if (++s_lodProbeFrames >= 64)
+			{
+				Platform_Log("[LODPROBE] thr=%d early=%d distTested=%d | 4x4=%d subdiv=%d 4x2=%d 4x1=%d water=%d fulldyn=%d\n",
+				             scratch->bspLodDistanceThreshold, g_lodProbeEarlyOut, g_lodProbeDistTested, g_lodProbeSlot[0], g_lodProbeSlot[1],
+				             g_lodProbeSlot[2], g_lodProbeSlot[3], g_lodProbeSlot[4], g_lodProbeSlot[5]);
+				s_lodProbeFrames = 0;
+				g_lodProbeEarlyOut = 0;
+				g_lodProbeDistTested = 0;
+				memset(g_lodProbeSlot, 0, sizeof(g_lodProbeSlot));
+			}
+		}
+#endif
+
 		RenderLists_PreInit();
 		gGT->bspLeafsDrawn = 0;
 
@@ -1063,7 +1279,16 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 		int skipRetailTrackDraw;
 		{
 			extern int g_dbg_trackRender;
-			skipRetailTrackDraw = (g_dbg_trackRender == 1);
+			extern int g_dbg_trackGapFill;
+
+			/*
+			 * Gap fill keeps this call ALIVE in state 1 -- the render-list
+			 * builder (RenderLevel/RenderLists.c) has already withheld every
+			 * leaf the resident mesh owns, so what arrives here is only the
+			 * leaves residency excluded. Without it, state 1 skips the draw
+			 * entirely and those leaves are drawn by nobody.
+			 */
+			skipRetailTrackDraw = (g_dbg_trackRender == 1) && !g_dbg_trackGapFill;
 		}
 #else
 		const int skipRetailTrackDraw = 0;

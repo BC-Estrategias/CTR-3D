@@ -110,7 +110,28 @@ internal void NativeTrackFrame_WalkList(const struct VisMemBspListNode *bspListB
 					 * NativeTrackMesh_Frame's own u16-index-buffer guard
 					 * (native_track_mesh.c) at BUILD time, long before a
 					 * frame gets here. */
-					dst->leafSlot[dst->leafCount++] = (u16)leafIdx;
+					/* Rung 3b: one leaf is now one range PER ATLAS UNIT, and
+					 * the reverse map points at the first of them. The
+					 * binning pass emits a leaf's sub-ranges contiguously and
+					 * in ascending bin order (native_track_mesh.c), so walking
+					 * forward while bspIndex matches collects exactly this
+					 * leaf's ranges and stops at the next leaf's. A leaf that
+					 * fits in one atlas unit still yields one range, i.e. this
+					 * degenerates to the rung-3a behaviour. */
+					unsigned slot = (unsigned)leafIdx;
+					unsigned slotBsp, slotFirst, slotCount;
+
+					while ((dst->leafCount < NATIVE_TRACK_FRAME_MAX_LEAVES) && NativeTrackMesh_LeafAt(slot, &slotBsp, &slotFirst, &slotCount)
+					       && (slotBsp == (unsigned)bspIndex))
+					{
+						dst->leafSlot[dst->leafCount++] = (u16)slot;
+						slot++;
+					}
+
+					if (dst->leafCount >= NATIVE_TRACK_FRAME_MAX_LEAVES)
+					{
+						dst->droppedLeaves++;
+					}
 				}
 				else
 				{
@@ -705,7 +726,8 @@ void NativeTrackDraw_IssueForWalk(void)
 			}
 		}
 
-		N3DS_TrackDraw_Leaf((int)firstIndex, (int)indexCount, otIndexLo, ordinalLo, ordinalSpan, invIndexSpan);
+		N3DS_TrackDraw_Leaf((int)firstIndex, (int)indexCount, otIndexLo, ordinalLo, ordinalSpan, invIndexSpan,
+		                    (int)NativeTrackMesh_LeafAtlasBin(snap->leafSlot[i]));
 		drawsIssued++;
 		indicesDrawn += indexCount;
 	}
@@ -716,72 +738,10 @@ void NativeTrackDraw_IssueForWalk(void)
 
 	if (--s_logCountdown == 0)
 	{
-		s_logCountdown = 64;
+		s_logCountdown = 512;
 		Platform_Log("[TRKDRAW] toggle=%d draws=%u leaves=%u skippedOrdinal=%u skippedOrdinalTotal=%u idx=%u degraded=%d\n", g_dbg_trackRender, drawsIssued,
 		             snap->leafCount, leavesSkippedOrdinal, s_totalSkippedOrdinal, indicesDrawn, snap->degraded);
 
-		/*
-		 * DIAGNOSTIC ONLY (uncommitted rung 3a occlusion investigation, no
-		 * behavior change): same 64-window cadence as [TRKDRAW] above, so the
-		 * two lines always describe the exact same frame.
-		 *
-		 * [TRKDEPTH] ordMin/ordMax: the lowest and highest ordinal value ANY
-		 * drawn leaf this frame fed the shader (over {ordinalLo,
-		 * ordinalLo+ordinalSpan} per leaf -- see the aggregation comment
-		 * above the loop for why this isn't just ordinalLo/ordinalLo+span
-		 * taken naively). otIdxMin/otIdxMax: the lowest and highest OT bucket
-		 * index any leaf computed (otIndexLo / otIndexLo+1/invIndexSpan
-		 * territory, reported directly rather than reconstructed).
-		 * finalOrdinal: this frame's highest STAMPED packet ordinal
-		 * (NativeGpu_GetFrameEmitOrdinal) -- if ordMax sits at or near this
-		 * value, the track is drawing at (or past) the very end of the
-		 * frame's depth range, which is consistent with "something is
-		 * feeding it end-of-frame ordinals" rather than the mid-walk values
-		 * its own leaves' depth should map to. walkOtCount: the OT slot count
-		 * the bucket->ordinal table believes it recorded (should match the
-		 * game's own OT size for this player count, e.g. ~1030 for 1P).
-		 * minContentBucket: the depth-compose fix's clamp floor
-		 * (NativeGpu_GetMinContentBucket) -- the lowest OT bucket that held
-		 * real content this walk, i.e. what otIdxMin gets clamped up to
-		 * before any leaf's ordinals are trusted. -1 means the accessor
-		 * reported failure (recorder inactive or no content-advance
-		 * recorded this walk) rather than a real bucket. Post-fix
-		 * expectation: ordMax strictly < finalOrdinal, and otIdxMin at or
-		 * above minContentBucket rather than 0.
-		 */
-		{
-			u32 dbgMinContentBucket;
-			int dbgMinContentValid = NativeGpu_GetMinContentBucket(&dbgMinContentBucket);
-			int dbgMinContentBucketForLog = dbgMinContentValid ? (int)dbgMinContentBucket : -1;
-
-			if (dbgAggValid)
-			{
-				Platform_Log("[TRKDEPTH] ordMin=%d ordMax=%d otIdxMin=%d otIdxMax=%d finalOrdinal=%u walkOtCount=%u minContentBucket=%d\n",
-				             (int)dbgOrdMin, (int)dbgOrdMax, (int)dbgOtIdxMin, (int)dbgOtIdxMax, (unsigned)NativeGpu_GetFrameEmitOrdinal(),
-				             (unsigned)dbgWalkOtCount, dbgMinContentBucketForLog);
-			}
-			else
-			{
-				Platform_Log("[TRKDEPTH] no leaf produced a valid depth range this window (draws=%u) minContentBucket=%d\n", drawsIssued,
-				             dbgMinContentBucketForLog);
-			}
-		}
-
-		/*
-		 * [TRKDEPTH0]: full detail for exactly one representative leaf -- the
-		 * first leaf actually drawn this window (matches [TRKDRAW]'s existing
-		 * "first" convention elsewhere in this file). viewZLo/viewZHi are
-		 * printed as integers per this task's request; they are the retail-
-		 * SZ3-clamped view-z BEFORE the >>6 quantization to otIndex (see
-		 * NativeTrackDraw_ComputeLeafDepthRange's comment on those two
-		 * out-params) -- a sane Labs leaf should show a visible spread of
-		 * positive values here, not zeros or negatives.
-		 */
-		if (dbgLeaf0Captured)
-		{
-			Platform_Log("[TRKDEPTH0] otIndexLo=%d otIndexHi=%d ordinalLo=%d ordinalHi=%d viewZLo=%d viewZHi=%d\n", (int)dbgLeaf0OtIndexLo,
-			             (int)dbgLeaf0OtIndexHi, (int)dbgLeaf0OrdinalLo, (int)dbgLeaf0OrdinalHi, (int)dbgLeaf0ViewZLo, (int)dbgLeaf0ViewZHi);
-		}
 	}
 }
 #endif /* __3DS__ */

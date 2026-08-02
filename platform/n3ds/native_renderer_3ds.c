@@ -267,6 +267,146 @@ global_variable u32 s_mergeBinSpills = 0;
 global_variable u32 s_mergeEscalations = 0;
 #endif /* CTR_NATIVE_DRAW_MERGE */
 
+/* s29 ordering A/B (dumpreq 'trackafter') -- see NativeRenderer_EndScene.
+ * Defined outside the DRAW_MERGE gate on purpose: the question it asks is
+ * about the resident track draw's position relative to the frame's last
+ * flush, which exists in both merge and non-merge builds. */
+int g_dbg_trackAfterMerge = 0;
+
+/*
+ * Bottom-screen verbosity (SELECT+X, dumpreq 'verbose'). OFF by default as of
+ * s29: the stats block had accreted every instrument this port has ever needed
+ * -- decode-cache hits/misses/evictions/stale, sub-page routing, hazard
+ * counters, scene begin/end, audio thread microsecond profile, per-bucket perf
+ * -- and on real hardware that screen is the ONLY readout there is. The owner
+ * could not find the numbers that matter in the wall of ones that don't.
+ *
+ * This gates the DIAGNOSTIC lines only. What stays unconditional: frames/fps,
+ * heap, game state, the toggle block, draws/frame, merge state, and total
+ * frame/work time -- i.e. everything you steer by. Each gated group is pure
+ * output; no counter update or reset lives inside one, so flipping this cannot
+ * change what any instrument measures, only whether it is displayed.
+ */
+int g_dbg_statsVerbose = 0;
+
+/*
+ * s29 AUTOMATED CONFIG SWEEP (SELECT+B, dumpreq 'sweep').
+ *
+ * The hardware run that motivated this produced retail n=13 windows against
+ * ours n=137, clustered in different stretches of the same race -- so the one
+ * number that mattered (is the resident track renderer faster than the OT walk
+ * it replaces?) came out unmatched, and the honest answer had to be "direction
+ * yes, magnitude untrustworthy". Hand-driving four chords mid-race cannot fix
+ * that; only equal exposure on the same content can.
+ *
+ * While on, this walks the config table below, holding each for
+ * N3DS_SWEEP_WINDOWS stats windows and emitting one [SWEEP] line per config
+ * with that config's OWN averaged frame/work microseconds. Every config sees
+ * the same lap, in rotation, so scene content averages out instead of being
+ * confounded with the variable under test -- the exact failure mode
+ * PORT_FEASIBILITY_3DS.md's "How to measure" section was written about.
+ *
+ * The first window after a config change is DISCARDED (s_sweepSettling): the
+ * stats block averages over the window it just finished, so the window
+ * spanning a switch contains both configs.
+ */
+int g_dbg_sweep = 0;
+
+typedef struct
+{
+	const char *name;
+	int trackRender;    /* g_dbg_trackRender       */
+	int packetDepth;    /* g_dbg_packetDepth       */
+	int skipInstances;  /* gCtrDebugSkipInstances  */
+	int skipEffects;    /* gCtrDebugSkipEffects    */
+	int skipHUD;        /* gCtrDebugSkipHUD        */
+	int vsyncCredit;    /* g_dbg_vsyncCredit       */
+} N3DS_SweepConfig;
+
+/*
+ * s29 CONTENT ABLATION. The depth-bias configs (b64/b256) that lived here in
+ * s29 are gone: they came out inside noise of ours-depth on both measured
+ * tracks, which is what the near-clamp saturation predicts -- an offset has
+ * nothing to act on once every near primitive already pins to depthMinWorld.
+ *
+ * What replaces them answers the only open perf question. On Polar Pass,
+ * ours-depth spends 15.3ms in draw_all_splits and 12.5ms in draw_otag_parse of
+ * a 55ms frame, and with the resident track drawing itself, none of those 28ms
+ * is track. Each row below removes exactly one content class; frame-time delta
+ * from "full" is that class's entire cost, game-side build plus submission.
+ * "retail" stays first as the anchor that validates the harness every run.
+ */
+static const N3DS_SweepConfig s_sweepConfigs[] = {
+    {"retail", 0, 0, 0, 0, 0, 1},     /* the baseline every fps claim must beat   */
+    {"full", 1, 1, 0, 0, 0, 1},       /* shipping config; ablation baseline       */
+    {"no-vsyncfx", 1, 1, 0, 0, 0, 0}, /* s29 vblank credit fix, OFF -- not content */
+    {"no-inst", 1, 1, 1, 0, 0, 1},    /* karts, drivers, crates, weapons, pickups */
+    {"no-hud", 1, 1, 0, 0, 1, 1},     /* race HUD                                 */
+};
+
+/*
+ * no-fx (particles, weather, tires, shadows) is GONE, not disabled: it crashed
+ * the s29 hardware run. Those RenderAll* calls advance state the rest of the
+ * frame reads, so removing the draw removes a side effect something else
+ * depends on. Ablating them needs the state/draw split done first.
+ */
+
+#define N3DS_SWEEP_CONFIG_COUNT ((int)(sizeof(s_sweepConfigs) / sizeof(s_sweepConfigs[0])))
+
+/*
+ * ONE measured window per config, NOT four.
+ *
+ * Four windows held each config for ~12 seconds of a lap, so with only one
+ * cycle completed each config was measured on a DIFFERENT stretch of track --
+ * and a stretch of Polar Pass differs from another stretch by more than the
+ * variables under test. That is not a smaller version of the right experiment;
+ * it is the same confound that made s29 report "ours is slower" from a log that
+ * actually said the opposite, reintroduced by the harness written to prevent
+ * it. Long blocks only average out if the run lasts many cycles, and runs get
+ * cut short.
+ *
+ * Short blocks instead: a config change costs one discarded settling window, so
+ * one measured window is ~6s of wall clock per config and a full 5-config cycle
+ * fits in ~30s. Several cycles per lap, adjacent configs seeing near-identical
+ * track, and a run that crashes early still leaves matched cycles behind.
+ * Average the per-cycle [SWEEP] lines afterwards; do NOT read a single cycle.
+ */
+#define N3DS_SWEEP_WINDOWS 1
+
+static int s_sweepIndex = 0;
+static int s_sweepWindowsLeft = 0;
+static int s_sweepSettling = 0;
+static int s_sweepWasOn = 0;
+static unsigned long s_sweepTotalUs = 0;
+static unsigned long s_sweepWorkUs = 0;
+static int s_sweepSamples = 0;
+
+static void N3DS_SweepApply(int idx)
+{
+	extern int g_dbg_packetDepth;
+	extern int g_dbg_pktDepthBias;
+	extern int g_dbg_trackRender;
+	extern volatile int gCtrDebugSkipInstances;
+	extern volatile int gCtrDebugSkipEffects;
+	extern volatile int gCtrDebugSkipHUD;
+	extern int g_dbg_vsyncCredit;
+	const N3DS_SweepConfig *cfg = &s_sweepConfigs[idx];
+
+	g_dbg_trackRender = cfg->trackRender;
+	g_dbg_packetDepth = cfg->packetDepth;
+	gCtrDebugSkipInstances = cfg->skipInstances;
+	gCtrDebugSkipEffects = cfg->skipEffects;
+	gCtrDebugSkipHUD = cfg->skipHUD;
+	g_dbg_vsyncCredit = cfg->vsyncCredit;
+
+	/*
+	 * Forced, not carried: the sweep no longer varies bias, so a stray SELECT+Y
+	 * before the sweep started would otherwise ride along through every config
+	 * and silently make the whole run un-comparable to the last one.
+	 */
+	g_dbg_pktDepthBias = 0;
+}
+
 /*
  * Debug-only, mirrors PC's g_dbg_texturelessMode (native_renderer.c:79,
  * F2 key). No keyboard here -- toggled by ZL, see n3ds_backend.c's
@@ -333,6 +473,22 @@ int g_dbg_atlasView = 0;
  * Runtime A/B: dumpreq 'resolvememo'.
  */
 int g_dbg_resolveMemo = 1;
+
+/* PROBE (s27): ablate the per-triangle fb-mirror overlap test inside
+ * N3DS_ResolveTriangleTexture. Platform_EndScene re-arms s_fbMirrorStale
+ * every frame (native_platform.c StoreFrameBuffer call), so the footprint
+ * test RUNS on every textured triangle of every frame even though it only
+ * FIRES for freeze-frame consumers (pause background, screen-copy wipes).
+ * s26's memo A/B bounded the resolve floor at ~7-8us/call with the hash
+ * probe itself worth only ~1us -- this test plus its function call is one
+ * of the remaining preamble suspects. Toggle ON = skip the test entirely:
+ * pause backgrounds/wipes may show stale frames while ON (instrument, not
+ * a shipping mode). Runtime A/B: dumpreq 'fbtest' in Azahar (SELECT+ZR was
+ * reassigned to the native track renderer toggle, rung 3a -- this probe is
+ * dumpreq-only now). If the A/B pays, the shippable form is arm-time invalidation
+ * of display-region cache entries (once per frame) instead of a per-
+ * triangle test -- see docs/NATIVE_TRACK_RENDERER_DESIGN.md section 9. */
+int g_dbg_skipFbTriTest = 0;
 global_variable int s_rmemoValid = 0;
 global_variable u8 s_rmemoTier; /* 1 = sub-page, 2 = full-page */
 global_variable s16 s_rmemoPage, s_rmemoClut;
@@ -2002,6 +2158,12 @@ internal void N3DS_MergeFlush(void)
 		return;
 	}
 
+	/* [MERGEDBG] removed (s29): it existed to answer ONE question -- whether
+	 * content reached the merge bins and was emitted, or never got binned. It
+	 * answered it (emitted, and invisible), which located the uniform-register
+	 * collision fixed in N3DS_BindPacketDrawState. Question closed, instrument
+	 * deleted rather than left to accrete on a screen the owner has to read. */
+
 	for (i = 0; i < N3DS_MERGE_BIN_COUNT; i++)
 	{
 		int baseVertex;
@@ -2250,7 +2412,7 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 	 * test fired on essentially every frame of menu and race content
 	 * (measured in Azahar, session 17). Costs a few integer ops per textured
 	 * triangle when it doesn't fire. */
-	if (s_fbMirrorStale)
+	if (s_fbMirrorStale && !g_dbg_skipFbTriTest)
 	{
 		const int pageX = (texPage & 0xF) * 64;
 		const int pageY = (texPage & 0x10) ? 256 : 0;
@@ -2604,6 +2766,22 @@ void NativeRenderer_EndScene(void)
 	 * NativeTrackFrame_Record, needed because main.c's unity chain includes
 	 * this file before that one.
 	 */
+	/*
+	 * s29: the ONE difference that tracks the symptom. With merge OFF, packet
+	 * content is drawn immediately DURING the walk -- before this call -- and
+	 * karts/UI/crates all appear with the resident renderer on. With merge ON,
+	 * essentially all packet content is deferred to N3DS_MergeFlush() below,
+	 * i.e. AFTER this call, and it never reaches the screen (owner-confirmed
+	 * on the demo race; direct emit ruled out separately -- OFF changes
+	 * nothing, so it is the deferral itself, not the direct-emit bin writer).
+	 * This toggle moves the track draw to the far side of the flush so the
+	 * ordering can be A/B'd at runtime instead of rebuilt: dumpreq
+	 * 'trackafter'. Not a proposed fix -- the existing order is deliberate
+	 * (see the comment below on landing under blended packets) -- it is the
+	 * discriminator between "deferred draws die" and "the track draw poisons
+	 * what follows it".
+	 */
+	if (!g_dbg_trackAfterMerge)
 	{
 		extern void NativeTrackDraw_IssueForWalk(void);
 		NativeTrackDraw_IssueForWalk();
@@ -2636,6 +2814,15 @@ void NativeRenderer_EndScene(void)
 	N3DS_MergeFlush();
 #else
 	N3DS_FlushPendingRun();
+#endif
+
+#if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	/* Other half of the s29 ordering A/B above. */
+	if (g_dbg_trackAfterMerge)
+	{
+		extern void NativeTrackDraw_IssueForWalk(void);
+		NativeTrackDraw_IssueForWalk();
+	}
 #endif
 
 #ifdef CTR_INTERNAL
@@ -2729,7 +2916,16 @@ void NativeRenderer_SwapWindow(void)
 	 * an aliased pointer. */
 	s_frameCounterForDump = (unsigned int)s_frameCounter;
 
-	if ((s_frameCounter & 31) == 0)
+	/*
+	 * s29: was `& 31` -- every 32 frames, i.e. roughly once a SECOND at real
+	 * race framerate, and this block both redraws the console AND writes a
+	 * dozen lines to the SD card. `& 63` halves the SD traffic (owner: "are we
+	 * recording too much to the SD card every second") while keeping the
+	 * on-screen toggle readout refreshing fast enough to dial SELECT+Y by eye.
+	 * Windowed counters below derive their deltas from the previous sample, so
+	 * they stay correct at any cadence -- only the sampling period changes.
+	 */
+	if ((s_frameCounter & 63) == 0)
 	{
 		/*
 		 * On-screen stats block. Getting files off the console is awkward (the
@@ -2784,10 +2980,45 @@ void NativeRenderer_SwapWindow(void)
 		 * (BUGREPORT_audio_arena_growth.md); after the fix it should show a
 		 * small number that stays flat across track transitions instead of
 		 * one that doubles over a session. */
-		printf("heap   %-6lu  xaBuf %d/%d underrun %-4lu voice %-5d KiB\n", heapKiB,
-		       NativeAudio_XAStreamSectorsBuffered(), NATIVE_AUDIO_XA_RING_SECTORS, s_audio.xaStream.underrunEvents,
-		       s_audio.voicePcmArena.capacity / 1024);
-		printf("state  %-4d vram[0] %04x            \n", (int)sdata->mainGameState, (unsigned)vram[0]);
+		printf("heap   %-6lu KiB  xa %d/%d ur %-4lu\n", heapKiB, NativeAudio_XAStreamSectorsBuffered(), NATIVE_AUDIO_XA_RING_SECTORS,
+		       (unsigned long)s_audio.xaStream.underrunEvents);
+		printf("state  %-4d                        \n", (int)sdata->mainGameState);
+
+		/*
+		 * TOGGLES -- the only lines on this screen that are ACTIONABLE mid-race,
+		 * so they sit at the top where they can be read at a glance on real
+		 * hardware. Everything below is diagnostic and now hides behind
+		 * g_dbg_statsVerbose. The depth-bias readout that lived here is gone with
+		 * the knob itself; what replaced it is which content class the sweep is
+		 * currently ablating, because "the crates are missing" is otherwise
+		 * indistinguishable from a renderer bug when read off a photo.
+		 */
+		{
+			extern int g_dbg_depthTest;
+			extern int g_dbg_packetDepth;
+			extern int g_dbg_trackRender;
+			extern volatile int gCtrDebugSkipInstances;
+			extern volatile int gCtrDebugSkipEffects;
+			extern volatile int gCtrDebugSkipHUD;
+			extern int g_dbg_vsyncCredit;
+			extern int g_dbg_trackGapFill;
+			static const char *const trackNames[3] = {"retail", "OURS", "both"};
+			static const char *const depthNames[3] = {"norm", "NOTEST", "TRACK-RO"};
+			int tr = g_dbg_trackRender;
+			int dt = g_dbg_depthTest;
+
+			/* The console is 40 columns. Every line here is written to fit
+			 * inside that WITHOUT wrapping -- a wrapped line costs two rows and
+			 * reads as garbage in a photo, which is how this screen actually
+			 * gets used on hardware. */
+			printf("\n>> track %-6s dmodel %-3s\n", trackNames[(tr >= 0 && tr <= 2) ? tr : 0], g_dbg_packetDepth ? "ON" : "off");
+			printf(">> ztest %-8s sweep %-8s\n", depthNames[(dt >= 0 && dt <= 2) ? dt : 0],
+			       g_dbg_sweep ? s_sweepConfigs[s_sweepIndex].name : "off");
+			printf(">> skip  %-4s %-4s %-4s  vbl %-3s\n", gCtrDebugSkipInstances ? "inst" : "-", gCtrDebugSkipEffects ? "fx" : "-",
+			       gCtrDebugSkipHUD ? "hud" : "-", g_dbg_vsyncCredit ? "ON" : "off");
+			printf(">> gapfill %-3s                     \n", g_dbg_trackGapFill ? "ON" : "off");
+			printf(">> ZR=trk L=dmodel ZL=ztest B=sweep\n\n");
+		}
 
 		snprintf(line, sizeof(line),
 		         "[CTR-3DS] frames=%lu vbl=%lu fps_now=%lu.%lu heapKiB=%lu xaBuf=%d/%d underrun=%lu voiceKiB=%d state=%d",
@@ -2822,6 +3053,7 @@ void NativeRenderer_SwapWindow(void)
 			s_lastStatStaleMisses = s_decodeCacheStaleMisses;
 			s_lastStatCapacityMisses = s_decodeCacheCapacityMisses;
 
+			if (g_dbg_statsVerbose)
 			printf("cache  hits %-8lu miss %-6lu (+%-4lu/w) evict %-4lu (+%-4lu/w)\n", (unsigned long)s_decodeCacheHits,
 			       (unsigned long)s_decodeCacheMisses, missesWindow, (unsigned long)s_decodeCacheEvictions, evictionsWindow);
 			/* WHY the misses happened. cap = working set exceeds the cache;
@@ -2831,20 +3063,29 @@ void NativeRenderer_SwapWindow(void)
 			 * N3DS_FULLPAGE_RESERVED_CELLS, the whole-page tier's own budget
 			 * since the two-tier split -- was N3DS_TOTAL_CELLS-1 before);
 			 * dirty = generation bumps since boot. */
+			if (g_dbg_statsVerbose)
 			printf("miss   cap %-6lu (+%-4lu/w) stale %-6lu (+%-4lu/w)\n", (unsigned long)s_decodeCacheCapacityMisses,
 			       capacityWindow, (unsigned long)s_decodeCacheStaleMisses, staleWindow);
+			if (g_dbg_statsVerbose)
 			printf("set    peak %-4lu /%-4d cells   vramDirty %-8lu\n", (unsigned long)s_frameTouchedPeak,
 			       (int)N3DS_FULLPAGE_RESERVED_CELLS, (unsigned long)s_vramDirtyBumps);
 			/* Nonzero = a cell was overwritten while a queued draw still
 			 * referenced it, i.e. visible texture corruption. */
+			if (g_dbg_statsVerbose)
 			printf("hazard evictInUse %-8lu\n", (unsigned long)s_evictHazards);
-			printf("draws  total %-8lu +%-6lu/w  ~%lu.%lu draws/frame        \n", (unsigned long)s_drawCallCount, drawsWindow,
-			       drawsPerFrameAvgX10 / 10UL, drawsPerFrameAvgX10 % 10UL);
+			/* 40 columns: draws/frame is the number worth steering by, the
+			 * running total is not. Total moves behind verbose with the rest. */
+			printf("draws  ~%lu.%lu/frame  (+%lu/w)      \n", drawsPerFrameAvgX10 / 10UL, drawsPerFrameAvgX10 % 10UL, drawsWindow);
+			if (g_dbg_statsVerbose)
+			{
+				printf("draws  total %-8lu\n", (unsigned long)s_drawCallCount);
+			}
 #ifdef CTR_NATIVE_DRAW_MERGE
 			/* The A/B instrument for the cross-bucket merge: read
 			 * draws/frame above with merge on vs off ('drawmerge' in
 			 * dumpreq.txt). op/bl split says where the remaining draws come from;
 			 * spill/esc nonzero means capacity tuning is needed. */
+			if (g_dbg_statsVerbose)
 			printf("merge  %-3s op %-8lu bl %-8lu spill %-4lu esc %-4lu\n", s_mergeActive ? "ON" : "off",
 			       (unsigned long)s_mergeEmitOpaque, (unsigned long)s_mergeEmitBlend, (unsigned long)s_mergeBinSpills,
 			       (unsigned long)s_mergeEscalations);
@@ -3035,6 +3276,7 @@ void NativeRenderer_SwapWindow(void)
 				         (unsigned long)s_trianglesRoutedSubPage, (unsigned long)s_trianglesRoutedFullPage);
 				N3DS_DebugLog(cacheLine);
 
+				if (g_dbg_statsVerbose)
 				printf("route  sub %-8lu full %-8lu  subMiss %-5lu subEvict %-5lu\n",
 				       (unsigned long)s_trianglesRoutedSubPage, (unsigned long)s_trianglesRoutedFullPage,
 				       (unsigned long)s_subPageCacheMisses, (unsigned long)s_subPageCacheEvictions);
@@ -3047,6 +3289,7 @@ void NativeRenderer_SwapWindow(void)
 			 * other than absent models. peak approaching the ceiling is the
 			 * early warning for the same thing.
 			 */
+			if (g_dbg_statsVerbose)
 			printf("verts  peak %-7d /%-7d  dropped %-6lu\n", N3DS_C3DFrameVertexHighWater(),
 			       (int)N3DS_MAX_FRAME_VERTICES, (unsigned long)s_droppedRuns);
 
@@ -3054,6 +3297,7 @@ void NativeRenderer_SwapWindow(void)
 			         N3DS_C3DFrameVertexHighWater(), (int)N3DS_MAX_FRAME_VERTICES, (unsigned long)s_droppedRuns);
 			N3DS_DebugLog(cacheLine);
 
+			if (g_dbg_statsVerbose)
 			printf("scene  begin %-8lu end %-8lu (vs %lu swaps)\n", (unsigned long)s_beginSceneCount,
 			       (unsigned long)s_endSceneCount, frames);
 
@@ -3075,6 +3319,7 @@ void NativeRenderer_SwapWindow(void)
 				s_audioShapeVoiceAccum = 0;
 				s_audioShapeVblanks = 0;
 
+				if (g_dbg_statsVerbose)
 				printf("audio  voices ~%lu.%lu  reverbSmp %-6d xa %d  ndspQ %d drop %d\n", voicesX10 / 10UL, voicesX10 % 10UL,
 				       s_audioShapeReverbSamples, s_audioShapeXaActive, N3DS_NdspGetQueuedBlocks(), N3DS_NdspGetDroppedBlocks());
 
@@ -3117,8 +3362,11 @@ void NativeRenderer_SwapWindow(void)
 					         prof.vblanks, prof.parcels, prof.lockWaitUs, prof.renderUs, prof.lifecycleUs, prof.mirrorUs, prof.parcelUs, prof.pumpUs);
 					N3DS_DebugLog(profLine);
 
-					printf("aprof  wake %-5d life %-6d mir %-5d\n", prof.wakes, prof.lifecycleUs, prof.mirrorUs);
-					printf("aprof  parc %-6d pump %-6d lock %-6d\n", prof.parcelUs, prof.pumpUs, prof.lockWaitUs);
+					if (g_dbg_statsVerbose)
+					{
+						printf("aprof  wake %-5d life %-6d mir %-5d\n", prof.wakes, prof.lifecycleUs, prof.mirrorUs);
+						printf("aprof  parc %-6d pump %-6d lock %-6d\n", prof.parcelUs, prof.pumpUs, prof.lockWaitUs);
+					}
 				}
 			}
 
@@ -3145,16 +3393,102 @@ void NativeRenderer_SwapWindow(void)
 			 * DrawTriangles bailed": uvb counts UpdateVertexBuffer (reached
 			 * only via DrawAllSplits), dtri counts DrawTriangles entries.
 			 */
+			if (g_dbg_statsVerbose)
 			printf("load   stage %-4d vlc %-4d           \n", (int)sdata->Loading.stage, (int)sdata->bool_IsLoaded_VlcTable);
+			if (g_dbg_statsVerbose)
 			printf("call   uvb %-8lu dtri %-8lu    \n", (unsigned long)s_updateVertexBufferCalls, (unsigned long)s_drawTrianglesCalls);
 
 			printf("perf   frame %lu.%lums  work %lu.%lums        \n", (unsigned long)s_perfConsoleTotalUs / 1000UL,
 			       ((unsigned long)s_perfConsoleTotalUs % 1000UL) / 100UL, (unsigned long)s_perfConsoleWorkUs / 1000UL,
 			       ((unsigned long)s_perfConsoleWorkUs % 1000UL) / 100UL);
-			for (int i = 0; i < NATIVE_PERF_3DS_CONSOLE_BUCKETS; i++)
+
+			/*
+			 * Sweep step. Driven from HERE, not from a frame counter, so a
+			 * config is always held for a whole number of stats windows and
+			 * its [SWEEP] average is built from exactly the windows it owned.
+			 */
+			if (g_dbg_sweep)
 			{
-				printf(" %-24s %lu.%lums   \n", (s_perfConsoleName[i] != NULL) ? s_perfConsoleName[i] : "-",
-				       (unsigned long)s_perfConsoleUs[i] / 1000UL, ((unsigned long)s_perfConsoleUs[i] % 1000UL) / 100UL);
+				char sweepLine[128];
+
+				if (!s_sweepWasOn)
+				{
+					/* Entering the sweep: start at config 0 rather than
+					 * wherever the owner's manual dials happened to be. */
+					s_sweepWasOn = 1;
+					s_sweepIndex = 0;
+					s_sweepWindowsLeft = N3DS_SWEEP_WINDOWS;
+					s_sweepSettling = 1;
+					s_sweepTotalUs = 0;
+					s_sweepWorkUs = 0;
+					s_sweepSamples = 0;
+					N3DS_SweepApply(s_sweepIndex);
+				}
+				else if (s_sweepSettling)
+				{
+					/* Discard the window that straddled the config change. */
+					s_sweepSettling = 0;
+				}
+				else
+				{
+					s_sweepTotalUs += (unsigned long)s_perfConsoleTotalUs;
+					s_sweepWorkUs += (unsigned long)s_perfConsoleWorkUs;
+					s_sweepSamples++;
+
+					if (--s_sweepWindowsLeft <= 0)
+					{
+						if (s_sweepSamples > 0)
+						{
+							unsigned long t = s_sweepTotalUs / (unsigned long)s_sweepSamples;
+							unsigned long w = s_sweepWorkUs / (unsigned long)s_sweepSamples;
+							unsigned long fpsX10 = (t > 0) ? (10000000UL / t) : 0UL;
+
+							/* lvl is in the line so windows from different
+							 * tracks are never averaged together -- the
+							 * confound that made the hand-driven run's
+							 * retail-vs-ours comparison untrustworthy. */
+							snprintf(sweepLine, sizeof(sweepLine), "[SWEEP] cfg=%s lvl=%d n=%d totalUs=%lu workUs=%lu fps=%lu.%lu",
+							         s_sweepConfigs[s_sweepIndex].name, NativePerf_CurrentLevelID(), s_sweepSamples, t, w, fpsX10 / 10UL, fpsX10 % 10UL);
+							N3DS_DebugLog(sweepLine);
+						}
+						s_sweepIndex = (s_sweepIndex + 1) % N3DS_SWEEP_CONFIG_COUNT;
+						s_sweepWindowsLeft = N3DS_SWEEP_WINDOWS;
+						s_sweepSettling = 1;
+						s_sweepTotalUs = 0;
+						s_sweepWorkUs = 0;
+						s_sweepSamples = 0;
+						N3DS_SweepApply(s_sweepIndex);
+					}
+				}
+				printf("SWEEP  %-10s  %d/%d win\n", s_sweepConfigs[s_sweepIndex].name, N3DS_SWEEP_WINDOWS - s_sweepWindowsLeft + 1, N3DS_SWEEP_WINDOWS);
+			}
+			else if (s_sweepWasOn)
+			{
+				/*
+				 * Leaving the sweep restores every content class. Without this,
+				 * switching it off during no-inst leaves the karts gone and the
+				 * next thing the owner sees looks like a renderer bug.
+				 */
+				extern volatile int gCtrDebugSkipInstances;
+				extern volatile int gCtrDebugSkipEffects;
+				extern volatile int gCtrDebugSkipHUD;
+				extern int g_dbg_vsyncCredit;
+
+				gCtrDebugSkipInstances = 0;
+				gCtrDebugSkipEffects = 0;
+				gCtrDebugSkipHUD = 0;
+				g_dbg_vsyncCredit = 1;
+				s_sweepWasOn = 0;
+			}
+			/* The per-bucket breakdown is the single biggest block of text on
+			 * this screen and is only meaningful during a profiling pass. */
+			if (g_dbg_statsVerbose)
+			{
+				for (int i = 0; i < NATIVE_PERF_3DS_CONSOLE_BUCKETS; i++)
+				{
+					printf(" %-24s %lu.%lums   \n", (s_perfConsoleName[i] != NULL) ? s_perfConsoleName[i] : "-",
+					       (unsigned long)s_perfConsoleUs[i] / 1000UL, ((unsigned long)s_perfConsoleUs[i] % 1000UL) / 100UL);
+				}
 			}
 		}
 	}

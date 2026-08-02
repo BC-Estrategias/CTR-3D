@@ -175,6 +175,51 @@ internal void Platform_TakeScreenshot(void)
 }
 #endif
 
+#if defined(CTR_INTERNAL) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+// Starting scales from the command line, so a measurement run does not depend
+// on someone pressing F4 at the right moment. That matters more than it sounds:
+// [OTPROF] reports prims and OT nodes per window, those counts are game content
+// and so transfer to 3DS unchanged, and two scripted PC replays at different
+// scales price the whole idea before anyone spends a netload evening on it.
+internal void NativePlatform_LodBiasConfigureFromArgs(int argc, char *argv[])
+{
+	int i;
+
+	for (i = 1; i < argc; i++)
+	{
+		int *scale = NULL;
+
+		if (strcmp(argv[i], "--lod-geo") == 0)
+		{
+			scale = &g_ctrLodGeoScale;
+		}
+		else if (strcmp(argv[i], "--lod-tex") == 0)
+		{
+			scale = &g_ctrLodTexScale;
+		}
+
+		if (scale == NULL)
+		{
+			continue;
+		}
+
+		if ((i + 1) >= argc)
+		{
+			Platform_LogWarn("[CTR Native] %s needs a percentage (100 = retail)\n", argv[i]);
+			continue;
+		}
+
+		i++;
+		*scale = CTR_LodBias_Clamp(atoi(argv[i]));
+	}
+
+	if ((g_ctrLodGeoScale != 100) || (g_ctrLodTexScale != 100))
+	{
+		Platform_LogWarn("[CTR Native] LOD scale: level %d%%, texture %d%%\n", g_ctrLodGeoScale, g_ctrLodTexScale);
+	}
+}
+#endif
+
 #if defined(CTR_INTERNAL) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 // Review fix, FIX 1 (highest severity): the PC counterpart of the 3DS
 // dumpreq 'trackrender'/SELECT+ZR toggle, copying NativePlatform_LodBias-
@@ -216,6 +261,61 @@ internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[]
 	// dumpreq/button handlers do on 3DS -- this is the line the verification
 	// loop greps for to confirm the flag actually took.
 	Platform_LogWarn("[CTR Native] track render: %d\n", g_dbg_trackRender);
+}
+#endif
+
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+// --gte-capture 0|1|2: PC surface for the capture cost ablation (3DS has
+// SELECT+D-UP / dumpreq 'gtecapture'). The measurement it exists for happens on
+// hardware, but the switch is exercised here first: in a capture-ON,
+// desnap-OFF build all three states must produce the identical golden
+// checksum, which is what proves the ablation only removes writes nobody is
+// reading.
+internal void NativePlatform_GteCaptureConfigureFromArgs(int argc, char *argv[])
+{
+	int i;
+
+	for (i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "--gte-capture") != 0)
+		{
+			continue;
+		}
+
+		if ((i + 1) >= argc)
+		{
+			Platform_LogWarn("[CTR Native] --gte-capture needs 0 (ablate), 1 (full) or 2 (store only)\n");
+			continue;
+		}
+
+		i++;
+		{
+			int n = atoi(argv[i]);
+
+			g_dbg_gteCapture = (n < 0) ? 0 : (n > 2) ? 2 : n;
+		}
+	}
+
+	Platform_LogWarn("[CTR Native] gte capture: %d\n", g_dbg_gteCapture);
+}
+
+// --sz-probe arms the [SZPROBE] stamp-time hit-rate counters (native_gpu.c).
+// PC-only by intent: the question is a content question, and content counts
+// transfer off-device (s24), so this never needs to cost a netload.
+internal void NativePlatform_SzProbeConfigureFromArgs(int argc, char *argv[])
+{
+	extern int g_dbg_szProbe;
+	int i;
+
+	for (i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "--sz-probe") == 0)
+		{
+			g_dbg_szProbe = 1;
+		}
+	}
+
+	Platform_LogWarn("[CTR Native] sz probe: %d\n", g_dbg_szProbe);
 }
 #endif
 
@@ -278,6 +378,20 @@ internal void Platform_HandleKey(int key, char down)
 		case SDL_SCANCODE_F8:
 			NativeSaveState_RequestLoad();
 			break;
+#if defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+		// PC counterpart of the 3DS 'lodgeo'/'lodtex' dumpreq words. Worth having
+		// on PC even though the payoff is a 3DS one: [OTPROF] counts prims and OT
+		// nodes per window, and those are game content, so PC can measure how much
+		// geometry a scale actually deletes before anyone spends a netload on it.
+		case SDL_SCANCODE_F4:
+			g_ctrLodGeoScale = CTR_LodBias_Step(g_ctrLodGeoScale);
+			Platform_LogWarn("[CTR Native] level LOD scale: %d%%\n", g_ctrLodGeoScale);
+			break;
+		case SDL_SCANCODE_F6:
+			g_ctrLodTexScale = CTR_LodBias_Step(g_ctrLodTexScale);
+			Platform_LogWarn("[CTR Native] texture LOD scale: %d%%\n", g_ctrLodTexScale);
+			break;
+#endif
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 		// Review fix, FIX 1: PC debug key for the native track renderer's
 		// runtime toggle, --track-render N's mid-run companion (same
@@ -659,6 +773,15 @@ global_variable u64 s_nextVBlankCounter = 0;
 global_variable u64 s_vblankRemainder = 0;
 global_variable int s_nativeVBlankCount = 0;
 
+/*
+ * ON by default -- see the long comment in VSync for what it does and why it
+ * cannot change game speed. It stays a runtime flag rather than a compile-time
+ * one purely so the [SWEEP] harness can A/B it on the same lap: this is worth
+ * ~8.8ms/frame by construction, which is the same order as the entire resident
+ * track renderer, and a claim that size does not get to go in unmeasured.
+ */
+int g_dbg_vsyncCredit = 1;
+
 internal u64 Native_CounterFromMicroseconds(u64 freq, u64 microseconds)
 {
 	return (freq * microseconds) / 1000000;
@@ -820,7 +943,33 @@ int VSync(int mode)
 
 	emittedVBlanks += Native_CatchUpDueVBlanks();
 
-	for (s32 i = 0; i < requestedVBlanks; i++)
+	/*
+	 * CREDIT THE CATCH-UP (s29). Native_CatchUpDueVBlanks emits, without
+	 * waiting, every vblank whose 60Hz deadline has ALREADY passed while this
+	 * frame was being drawn. Those are real vblanks -- the game's clock has
+	 * advanced by them. Starting the loop below at 0 then waited for
+	 * requestedVBlanks MORE on top, so a frame that had already overrun its
+	 * deadline by two vblank periods still sat idle until the next boundary.
+	 *
+	 * That idle is what NATIVE_PERF_BUCKET_VSYNC_WAIT was measuring: 8.8ms per
+	 * frame on Polar Pass at 18fps, which is half a 16.67ms period -- exactly
+	 * the average phase offset to the next boundary, and the signature of
+	 * waiting for a deadline that had nothing to do with the request.
+	 *
+	 * Crediting them does NOT let the game run fast. Emits stay locked to the
+	 * 60Hz target counter either way (both paths advance it by exactly one
+	 * period per emit), so vblanks-per-second of real time is unchanged -- and
+	 * with it HOWL's per-vblank music tempo and every timer the game drives off
+	 * the vblank count. What changes is only that a late frame stops paying for
+	 * a deadline that already went by.
+	 *
+	 * Under-budget frames are unaffected: nothing is overdue, catch-up emits
+	 * zero, and the loop waits exactly as it always did.
+	 *
+	 * The replay path above is deliberately NOT changed -- it consumes a
+	 * recorded vblank count and must stay bit-reproducible.
+	 */
+	for (s32 i = g_dbg_vsyncCredit ? emittedVBlanks : 0; i < requestedVBlanks; i++)
 	{
 		Native_WaitAndEmitVBlank();
 		emittedVBlanks++;

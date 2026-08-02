@@ -112,6 +112,15 @@ struct NativePerfFrameInfo
 #if defined(CTR_INTERNAL)
 int NativePerf_ConfigureFromArgs(int argc, char **argv);
 void NativePerf_Shutdown(void);
+/*
+ * The levelID [PERF] itself stamps on every window (s_frameBeginInfo, captured
+ * at frame begin). Exposed so other instruments tag their lines from the SAME
+ * source rather than a lookalike field: s29's [SWEEP] first used the save-data
+ * struct's levelID and logged 39 for a race that was demonstrably N. Gin Labs
+ * (11), which cost a round of hand-correlating two log streams to recover.
+ */
+int NativePerf_CurrentLevelID(void);
+
 void NativePerf_BeginFrame(const struct NativePerfFrameInfo *info);
 void NativePerf_EndFrame(const struct NativePerfFrameInfo *info);
 void NativePerf_BeginScope(enum NativePerfBucket bucket);

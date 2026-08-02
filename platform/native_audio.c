@@ -5218,6 +5218,25 @@ internal int NativeAudio_GoldenRun(const char *statePath, const char *rawPath)
 		return 1;
 	}
 
+	/*
+	 * Render on the deterministic clock, exactly as the 3DS does, so this
+	 * measures the same code path the port actually runs.
+	 *
+	 * This MUST happen before RestoreState, not after it. Platform_Init has
+	 * already opened and resumed the output device by the time --audio-golden
+	 * is handled (main.c), and outside deterministic mode the device thread's
+	 * callback mixes directly -- NativeAudio_StreamCallback's else branch calls
+	 * NativeAudio_RenderFramesNoLock. With the flip after the restore, any
+	 * callback firing in between advanced the very snapshot under test, and
+	 * whether it won that window was a scheduling coin flip. That was this
+	 * gate's long-standing flake, measured s29 at 15 runs -> 13x bbe92bbc, 2x
+	 * 1c9d6254, uncorrelated with anything under test. In deterministic mode
+	 * the same callback only drains already-rendered PCM and cannot touch mixer
+	 * state, so ordering alone closes it -- no SDL call, and nothing here the
+	 * 3DS build cannot compile.
+	 */
+	NativeAudio_SetDeterministicRenderMode(1);
+
 	file = fopen(statePath, "rb");
 	if (file == NULL)
 	{
@@ -5243,12 +5262,6 @@ internal int NativeAudio_GoldenRun(const char *statePath, const char *rawPath)
 		return 1;
 	}
 	free(blob);
-
-	/*
-	 * Render on the deterministic clock, exactly as the 3DS does, so this
-	 * measures the same code path the port actually runs.
-	 */
-	NativeAudio_SetDeterministicRenderMode(1);
 
 	if (rawPath != NULL)
 	{

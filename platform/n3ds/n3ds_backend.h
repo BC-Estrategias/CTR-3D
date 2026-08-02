@@ -455,7 +455,9 @@ void N3DS_TrackGeom_Free(void);
  * list. No-op (Leaf silently skips its draw) if Upload was never called or
  * last failed. */
 void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h);
-void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan);
+/* atlasBin: which atlas unit these indices sample (rung 3b). At or past the
+ * allocated unit count means no placed texture -- drawn untextured. */
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin);
 void N3DS_TrackDraw_End(void);
 
 /* The top-screen CONTENT region: N3DS_C3DBeginFrame pillarboxes every

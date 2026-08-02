@@ -9,12 +9,27 @@
 // always visible; each caller gates its own use behind CTR_NATIVE_GTE_CAPTURE,
 // so a flag-off build never emits a call and these never need to be defined.
 
+// Runtime ablation of the capture writes, for measuring what the subsystem
+// costs before a feature commits to depending on it. Three states, because the
+// two per-vertex calls answer different questions:
+//   1 = full capture (NoteMatrix + Store) -- today's compiled-in behavior
+//   2 = Store only, no NoteMatrix -- what a depth consumer actually needs
+//   0 = neither; every later lookup misses and each consumer takes the exact
+//       snapped fallback it already has for collisions and evictions, so 0 is
+//       behaviorally today's flag-off build.
+// 1-vs-2 prices the matrix-class probe; 2-vs-0 prices the table itself.
+// Defined only in CTR_NATIVE_GTE_CAPTURE builds (every caller gates on it).
+extern int g_dbg_gteCapture;
+
 void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3, s16 vx, s16 vy, s16 vz);
 int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8);
 // Model-space vector that produced this screen coordinate (same rendezvous
 // and same miss-on-collision safety as GTECapture_Lookup). Consumed by the
 // OTWALK_PROFILE retainability instrument; the retained-geometry play proper
 // will grow its own keyed-by-content variant.
+// True view-space depth (SZ3) for a packet's screen coordinate -- the shared
+// depth axis the track renderer already uses. docs/PACKET_DEPTH_DESIGN.md.
+int GTECapture_LookupDepth(s16 sx, s16 sy, u16 *outSz3);
 int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3]);
 // Model vector plus the frame-scoped matrix-state id the projection ran
 // under (s26 matrix-class probe; the retained full form's matrix classes).

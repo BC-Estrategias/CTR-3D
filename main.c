@@ -99,6 +99,13 @@
 // campaign (s27). Both read game level structs, so they must come after
 // game_unity.h like everything here.
 #include "platform/native_track_census.c"
+// Model/keyframe accounting for the retained-models question (s29). Sits with
+// the track censuses because it is the same kind of thing -- a once-per-level
+// read of game data that answers a "does this fit" question with a number
+// instead of an estimate. Called from MainFrame_RenderFrame, NOT from the
+// track mesh builder -- it must run on a plain PC build, where
+// CTR_NATIVE_TRACK_RENDERER is off.
+#include "platform/native_model_census.c"
 #include "platform/native_track_mesh.c"
 // Per-frame camera/visibility snapshot recorder (rung 3a step 1) -- after
 // native_track_mesh.c so it can call the mesh accessors (NativeTrackMesh_*)
@@ -287,12 +294,26 @@ int main(int argc, char *argv[])
 	// (docs/OFFSCREEN_RENDER_VRAM_DESIGN.md Phase 0/1). No-op stub on 3DS.
 	NativeOffscreenCapture_ConfigureFromArgs(argc, argv);
 
+#if defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+	// --lod-geo / --lod-tex start the run at a non-retail LOD distance, so a
+	// scripted replay can be re-run at another scale and the [OTPROF] prim
+	// counts compared. F4/F6 step the same two scales mid-run.
+	NativePlatform_LodBiasConfigureFromArgs(argc, argv);
+#endif
+
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 	// --track-render N (0/1/2) is the PC surface for the native track
 	// renderer's runtime toggle (review fix, FIX 1) -- see
 	// NativePlatform_TrackRenderConfigureFromArgs for why this is what makes
 	// rung 3a step 1 verifiable at all. F13 steps the same toggle mid-run.
 	NativePlatform_TrackRenderConfigureFromArgs(argc, argv);
+#endif
+
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+	// --gte-capture 0|1 ablates the capture writes; the golden loop runs both
+	// states to prove the ablation is output-neutral before hardware prices it.
+	NativePlatform_GteCaptureConfigureFromArgs(argc, argv);
+	NativePlatform_SzProbeConfigureFromArgs(argc, argv);
 #endif
 #endif
 

@@ -313,7 +313,20 @@ internal int GTE_RotTransPers(int idx, int lm)
 	// Matrix-class probe: R11..R33 + TRX/Y/Z are CP2C words 0..7, contiguous
 	// (gtereg.h). One memcmp per projected vertex tags this frame's Stores
 	// with which matrix state produced them.
-	GTECapture_NoteMatrix(&gteRegs.CP2C.p[0]);
+	//
+	// g_dbg_gteCapture gates this and the Store below for the cost A/B. The
+	// test itself is paid on every side of that A/B, so a measured delta is
+	// the capture work alone and not the branch.
+	//
+	// State 2 keeps Store but drops this memcmp, because the two are priced
+	// separately on purpose: NoteMatrix serves only the s26 matrix-class
+	// probe, and the depth model that is about to depend on this table needs
+	// sz3, not mtxId. Without the 1-vs-2 split, instrumentation this project
+	// is free to delete would be charged against the design being decided.
+	if (g_dbg_gteCapture == 1)
+	{
+		GTECapture_NoteMatrix(&gteRegs.CP2C.p[0]);
+	}
 #endif
 
 	C2_MAC1 = A1(/*int44*/ (s64)((s64)C2_TRX << 12) + (C2_R11 * VX(idx)) + (C2_R12 * VY(idx)) + (C2_R13 * VZ(idx)));
@@ -343,7 +356,7 @@ internal int GTE_RotTransPers(int idx, int lm)
 	// Lm_G1/Lm_G2 themselves stay untouched; re-derive their clamp bounds
 	// read-only here and skip capture on either axis clamping -- the
 	// coordinate is off-screen and the fraction is meaningless.
-	if ((sxFull >> 16) >= -0x400 && (sxFull >> 16) <= 0x3ff && (syFull >> 16) >= -0x400 && (syFull >> 16) <= 0x3ff)
+	if (g_dbg_gteCapture && (sxFull >> 16) >= -0x400 && (sxFull >> 16) <= 0x3ff && (syFull >> 16) >= -0x400 && (syFull >> 16) <= 0x3ff)
 	{
 		GTECapture_Store((s16)C2_SX2, (s16)C2_SY2, sxFull, syFull, (u16)C2_SZ3, h_over_sz3, (s16)VX(idx), (s16)VY(idx), (s16)VZ(idx));
 	}

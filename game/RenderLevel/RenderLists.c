@@ -122,38 +122,71 @@ static int RenderLists_ProjectDistance(struct PushBuffer *pb, const struct Bound
 	return distance;
 }
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+int g_lodProbeSlot[6];
+int g_lodProbeEarlyOut;
+int g_lodProbeDistTested;
+#endif
+
 static int RenderLists_Select1P2PSlot(const struct BSP *bsp, struct PushBuffer *pb, int lodDistanceThreshold)
 {
 	if ((bsp->flag & BSP_LEAF_FLAG_WATER) != 0)
 	{
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+		g_lodProbeEarlyOut++;
+		g_lodProbeSlot[RENDER_LIST_SLOT_WATER]++;
+#endif
 		return RENDER_LIST_SLOT_WATER;
 	}
 
 	if ((bsp->flag & BSP_RENDER_LEAF_FLAG_DYNAMIC_SUBDIV) != 0)
 	{
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+		g_lodProbeEarlyOut++;
+		g_lodProbeSlot[RENDER_LIST_SLOT_DYNAMIC_SUBDIV]++;
+#endif
 		return RENDER_LIST_SLOT_DYNAMIC_SUBDIV;
 	}
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+	g_lodProbeDistTested++;
+#endif
+
 	if (RenderLists_ProjectDistance(pb, &bsp->box) > lodDistanceThreshold)
 	{
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+		g_lodProbeSlot[RENDER_LIST_SLOT_FULL_DYNAMIC]++;
+#endif
 		return RENDER_LIST_SLOT_FULL_DYNAMIC;
 	}
 
 	if ((bsp->flag & BSP_RENDER_LEAF_FLAG_4X4) != 0)
 	{
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+		g_lodProbeSlot[RENDER_LIST_SLOT_4X4]++;
+#endif
 		return RENDER_LIST_SLOT_4X4;
 	}
 
 	if ((bsp->flag & BSP_RENDER_LEAF_FLAG_4X1) != 0)
 	{
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+		g_lodProbeSlot[RENDER_LIST_SLOT_4X1]++;
+#endif
 		return RENDER_LIST_SLOT_4X1;
 	}
 
 	if ((bsp->flag & BSP_RENDER_LEAF_FLAG_4X2) != 0)
 	{
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+		g_lodProbeSlot[RENDER_LIST_SLOT_4X2]++;
+#endif
 		return RENDER_LIST_SLOT_4X2;
 	}
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
+	g_lodProbeSlot[RENDER_LIST_SLOT_DYNAMIC_SUBDIV]++;
+#endif
 	return RENDER_LIST_SLOT_DYNAMIC_SUBDIV;
 }
 
@@ -191,6 +224,30 @@ static void RenderLists_LinkBsp(struct BSP *bspRoot, struct BSP *bsp, struct Vis
 {
 	struct VisMemBspListNode *node;
 	int bspIndex = bsp - bspRoot;
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	/*
+	 * Gap fill (platform/native_track_mesh.c's g_dbg_trackGapFill): when the
+	 * resident track renderer owns this leaf, keep it out of the retail render
+	 * list so the retail draw covers ONLY what residency excluded. Filtering
+	 * here rather than inside DrawLevelOvr1P keeps overlay 226 untouched --
+	 * a leaf that never enters the list is never walked, sorted or drawn.
+	 *
+	 * Gated on trackRender == 1 specifically: in the retail sweep config (0)
+	 * retail must draw everything, and in "both" (2) the whole point is the
+	 * overlap.
+	 */
+	{
+		extern int g_dbg_trackGapFill;
+		extern int g_dbg_trackRender;
+		extern int NativeTrackMesh_LeafIndexForBsp(unsigned bspIndex);
+
+		if (g_dbg_trackGapFill && (g_dbg_trackRender == 1) && (NativeTrackMesh_LeafIndexForBsp((unsigned)bspIndex) >= 0))
+		{
+			return;
+		}
+	}
+#endif
 
 	node = &bspList[bspIndex];
 

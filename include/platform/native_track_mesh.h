@@ -55,6 +55,8 @@ unsigned NativeTrackMesh_LeafCount(void);
 // never need to search -- see NativeTrackMesh_LeafIndexForBsp for the
 // reverse direction.
 int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirstIndex, unsigned *outIndexCount);
+// Rung 3b: atlas unit this range samples; >= the unit count means untextured.
+unsigned NativeTrackMesh_LeafAtlasBin(unsigned i);
 
 // Leaf i's STATIC BSP bounding box (model-space corners, copied from
 // mesh->bspRoot[bspIndex].box at BUILD time -- see native_track_mesh.c's
