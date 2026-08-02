@@ -167,7 +167,35 @@ struct NativeTrackMeshState
 	/* texRef -> rect index into the atlas layout (-1 = unplaced). */
 	s16 texRectIndex[1024];
 	struct NativeTrackAtlasLayout atlas;
+
+	/*
+	 * s30 animated-vertex patching. Leaves touching an animated vertex used to
+	 * be dropped whole (Polar Pass: 43 of 77 missing leaves); they are kept now,
+	 * which means the few genuinely moving vertices inside them have to be
+	 * refreshed per frame or they sit frozen.
+	 *
+	 * The source data really does move under us: AnimateWater1P / AnimateQuad
+	 * (game/RenderLevel/AnimateWater.c) write straight into LevVertex.pos and
+	 * .color_hi, and MainFrame_RenderFrame.c:1174-1181 calls them every frame
+	 * for 1P regardless of which renderer draws -- checked, because a patcher
+	 * reading an array nobody animates would look like it worked.
+	 *
+	 * srcVert is parallel to verts (NOT a field on it -- NativeTrackVert is
+	 * pinned at 16 bytes by a static assert). TRACK_SRCVERT_NONE means "never
+	 * animate this one", which covers both non-animated vertices and, more
+	 * importantly, WELDED ones: the emit loop may replace a vertex's position
+	 * with an edge's canonical mid to close a T-junction crack, and re-copying
+	 * the raw source every frame would silently undo that repair and reopen the
+	 * crack on exactly the water edges this feature exists to animate.
+	 */
+	u16 *srcVert;
+	u32 *animVerts; /* indices into verts[] that need a per-frame refresh */
+	u32 animVertCount;
+	u32 animVertWelded; /* animated in the source but frozen by the weld above */
+	const struct LevVertex *animSrcArray;
 };
+
+#define TRACK_SRCVERT_NONE 0xFFFFu
 
 global_variable struct NativeTrackMeshState s_trackMesh;
 
@@ -278,6 +306,11 @@ static void NativeTrackMesh_Free(void)
 	free(s_trackMesh.leafRanges);
 	free(s_trackMesh.bspToLeafIndex);
 	free(s_trackMesh.texTable);
+	free(s_trackMesh.srcVert);
+	free(s_trackMesh.animVerts);
+	/* The memset below is what clears animSrcArray -- a pointer into the
+	 * level's own vertex pool, borrowed not owned, and dangling the moment the
+	 * level it came from is torn down. */
 	memset(&s_trackMesh, 0, sizeof(s_trackMesh));
 }
 
@@ -1162,9 +1195,11 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	s_trackMesh.leafRanges = (struct NativeTrackLeafRange *)malloc((size_t)mesh->numBspNodes * sizeof(struct NativeTrackLeafRange));
 	s_trackMesh.bspToLeafIndex = (s32 *)malloc((size_t)mesh->numBspNodes * sizeof(s32));
 	s_trackMesh.texTable = (uintptr_t *)malloc(1024 * sizeof(uintptr_t));
+	/* Parallel to verts, same worst-case sizing, same lifetime. */
+	s_trackMesh.srcVert = (u16 *)malloc(maxVerts * sizeof(u16));
 
 	if ((s_trackMesh.verts == NULL) || (s_trackMesh.indices == NULL) || (s_trackMesh.leafRanges == NULL) || (s_trackMesh.bspToLeafIndex == NULL) ||
-	    (s_trackMesh.texTable == NULL))
+	    (s_trackMesh.texTable == NULL) || (s_trackMesh.srcVert == NULL))
 	{
 		NativeTrackMesh_Free();
 		free(animMark);
@@ -1217,6 +1252,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	int weldCount = 0;
 
 	int leavesTotal = 0, leavesExcluded = 0, facesDoubleSided = 0, facesNoTexture = 0, facesAnimTex = 0;
+	/* Split out of leavesExcluded so the s30 change is legible in one log line:
+	 * exclWater is what is still dropped, keptAnim is what used to be dropped
+	 * and now is not. Before this change the two were summed and unreadable. */
+	int leavesExclWater = 0, leavesKeptAnim = 0, leavesSkippedEmpty = 0;
+	/* Both were silent `continue`s before s30 -- see their guard comments. */
+	int facesDroppedIndexCap = 0, facesDroppedCapacity = 0;
+	int animVertsWelded = 0, leavesEmittedNothing = 0;
 	/* notex classification (s27: the water track reported 368 unclassified
 	 * faces): null pointer / AnimTex with null active frame / implausible
 	 * tpage word. Two raw samples of the bad-tpage case ride in the log. */
@@ -1234,10 +1276,47 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 		leavesTotal++;
 
-		if (((bsp->flag & BSP_LEAF_FLAG_WATER) != 0) || NativeTrackMesh_LeafTouchesAnim(bsp, animMark, numVertex, numQuadBlock))
+		/*
+		 * s30: animated-vertex leaves are now KEPT. The old rule dropped a whole
+		 * leaf if any ONE of its vertices was in the level's animated list, and
+		 * the owner reported the resulting Polar Pass gaps as ordinary road --
+		 * which the rule permits, because it discards the leaf, not the moving
+		 * vertex. On Polar Pass that is 43 of the 77 dropped leaves.
+		 *
+		 * The alternative considered and rejected was leaving these leaves out
+		 * and reviving the retail draw to paint them (g_dbg_trackGapFill's
+		 * approach). Owner rejected it on direction -- the whole point of this
+		 * renderer is that the PICA draws the track -- and the arithmetic agrees:
+		 * the resident renderer is worth ~6% (s29 part 2's sweep: 25.5 vs 24.0
+		 * fps Time Trial, 19.8 vs 18.8 Arcade, NOT the 18% an earlier reading
+		 * claimed), so running DrawLevelOvr1P again every frame for 15% of the
+		 * track spends a real fraction of the entire win to fix a hole.
+		 *
+		 * What is knowingly wrong until the vertex patcher lands: the handful of
+		 * genuinely animated vertices inside these leaves are frozen at their
+		 * load-time positions, so water inside them sits flat instead of
+		 * rippling. Flat water is a visual downgrade (owner's standing ruling
+		 * covers those); a hole in the road is a defect.
+		 *
+		 * BSP_LEAF_FLAG_WATER leaves stay excluded, deliberately. Those are the
+		 * water SURFACES, and this renderer bakes every face opaque
+		 * (dst->a = 0xff below, and N3DS_TrackDraw_Begin asserts opaque blend
+		 * once for the whole draw). Drawing them would hide whatever is meant to
+		 * show through them -- which can look worse than the gap, unlike the
+		 * road case above. They wait for the semi-transparency work.
+		 */
+		if ((bsp->flag & BSP_LEAF_FLAG_WATER) != 0)
 		{
 			leavesExcluded++;
+			leavesExclWater++;
 			continue;
+		}
+
+		if (NativeTrackMesh_LeafTouchesAnim(bsp, animMark, numVertex, numQuadBlock))
+		{
+			/* Kept, but counted -- this is the population the vertex patcher
+			 * has to cover, and the number is how we know whether it did. */
+			leavesKeptAnim++;
 		}
 
 		int numQuads = bsp->data.leaf.numQuads;
@@ -1245,6 +1324,14 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 		if ((range == NULL) || (numQuads <= 0) || (numQuads > numQuadBlock))
 		{
+			/* s30: counted. This guard was silent, and the arithmetic exposed
+			 * it -- Crash Cove reported leaves=273/504 with excl=174, leaving
+			 * 57 leaves belonging to neither bucket and no line saying where
+			 * they went. An empty leaf is legitimate asset data, but "silently
+			 * absent" and "legitimately empty" have to be distinguishable in
+			 * the log, because the whole point of this session's work is
+			 * telling missing geometry from geometry that was never there. */
+			leavesSkippedEmpty++;
 			continue;
 		}
 
@@ -1328,9 +1415,19 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 				/* u16 index buffer (PICA's native format): the biggest
 				 * measured track builds ~44k verts; refuse past the format
-				 * limit rather than wrap. Logged via the vert count below. */
+				 * limit rather than wrap.
+				 *
+				 * s30: counted explicitly rather than "logged via the vert
+				 * count below". Keeping animated-vertex leaves adds roughly a
+				 * tenth more geometry, which moves 44k nearer to 65535 without
+				 * reaching it -- and a silent `continue` here would present as
+				 * faces quietly missing from the track, i.e. the exact defect
+				 * this change exists to remove, wearing a different hat. This
+				 * session has already been fooled three times by a cap sitting
+				 * at its own value with nothing saying so. */
 				if (s_trackMesh.vertCount + 4 > 0xffff)
 				{
+					facesDroppedIndexCap++;
 					continue;
 				}
 
@@ -1339,6 +1436,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				 * overlapping leaf ranges could exceed it. Never write past. */
 				if (((size_t)s_trackMesh.vertCount + 4 > maxVerts) || ((size_t)s_trackMesh.indexCount + 6 > maxIndices))
 				{
+					facesDroppedCapacity++;
 					continue;
 				}
 
@@ -1377,7 +1475,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				{
 					int gridSlot = sTrackFaceCorners[face][c];
 					const struct LevVertex *src = &vertexArray[block->index[gridSlot]];
-					struct NativeTrackVert *dst = &s_trackMesh.verts[s_trackMesh.vertCount++];
+					u32 dstIndex = s_trackMesh.vertCount++;
+					struct NativeTrackVert *dst = &s_trackMesh.verts[dstIndex];
+
+					/* s30: remember which LevVertex this came from, so the
+					 * per-frame patcher can re-read a moving one. Set BEFORE the
+					 * weld snap below, which may revoke it. */
+					s_trackMesh.srcVert[dstIndex] = block->index[gridSlot];
 
 					dst->x = src->pos.x;
 					dst->y = src->pos.y;
@@ -1407,6 +1511,20 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 									dst->y = (s16)(u16)((canon - 1) >> 16);
 									dst->z = (s16)(u16)(canon - 1);
 									weldCount++;
+
+									/* This vertex's position is no longer its
+									 * source's -- it is the canonical mid of a
+									 * shared edge, chosen to close a crack. A
+									 * per-frame re-copy from the source would
+									 * undo that repair, so revoke provenance.
+									 * Frozen-but-welded beats animated-and-
+									 * cracked; the count is reported so the
+									 * trade is visible rather than assumed. */
+									if (animMark[block->index[gridSlot]])
+									{
+										animVertsWelded++;
+									}
+									s_trackMesh.srcVert[dstIndex] = TRACK_SRCVERT_NONE;
 								}
 							}
 						}
@@ -1446,6 +1564,81 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 			 * reverse mapping at that same index before advancing it. */
 			s_trackMesh.bspToLeafIndex[n] = (s32)s_trackMesh.leafCount;
 			s_trackMesh.leafCount++;
+		}
+		else
+		{
+			/* s30, and the last hole in the accounting: a leaf that was NOT
+			 * excluded, NOT empty, and still contributed nothing. Crash Cove
+			 * reported 273 resident of 504 with 174 excluded and 0 empty --
+			 * 57 leaves belonging to no bucket at all. They are these: every
+			 * face in them was skipped for having no texture pointer (the same
+			 * run reports notex=372).
+			 *
+			 * Whether that is a DEFECT is not settled here. Retail's own
+			 * resolver returns NULL for those faces too
+			 * (DrawLevelOvr1P_ResolveTexturePointer), so it may well draw
+			 * nothing either -- in which case this is correct behaviour and the
+			 * count is just bookkeeping. Counted rather than concluded. */
+			leavesEmittedNothing++;
+		}
+	}
+
+	/*
+	 * s30: collect the resident vertices that need a per-frame refresh, now
+	 * that both the emit loop (which set provenance) and the weld snap (which
+	 * revokes it) have run. Built once per level, walked per frame -- the
+	 * alternative, testing animMark inside the frame loop, would mean keeping
+	 * animMark alive for the level and re-deriving the same answer 60 times a
+	 * second from data that cannot change.
+	 *
+	 * Sized to the count, not the worst case: this is a per-level allocation
+	 * that outlives the build, unlike animMark/weldTable freed just below, and
+	 * on a 2MB retail-pressure heap the difference between "the animated ones"
+	 * and "every vertex" is worth the extra pass.
+	 */
+	s_trackMesh.animVertCount = 0;
+	s_trackMesh.animVertWelded = 0;
+	s_trackMesh.animSrcArray = vertexArray;
+	{
+		u32 needed = 0;
+		u32 i;
+
+		for (i = 0; i < s_trackMesh.vertCount; i++)
+		{
+			u16 sv = s_trackMesh.srcVert[i];
+
+			if ((sv != TRACK_SRCVERT_NONE) && ((int)sv < numVertex) && animMark[sv])
+			{
+				needed++;
+			}
+		}
+
+		/* Counted at the weld site itself, where the source index is still
+		 * known -- these are vertices that ARE animated in the source but hold
+		 * a canonical edge mid instead. A large number would mean the crack
+		 * repair is quietly freezing most of a water surface, which is worth
+		 * knowing before anyone concludes the patcher does not work. */
+		s_trackMesh.animVertWelded = (u32)animVertsWelded;
+
+		if (needed > 0)
+		{
+			s_trackMesh.animVerts = (u32 *)malloc((size_t)needed * sizeof(u32));
+
+			if (s_trackMesh.animVerts != NULL)
+			{
+				for (i = 0; i < s_trackMesh.vertCount; i++)
+				{
+					u16 sv = s_trackMesh.srcVert[i];
+
+					if ((sv != TRACK_SRCVERT_NONE) && ((int)sv < numVertex) && animMark[sv])
+					{
+						s_trackMesh.animVerts[s_trackMesh.animVertCount++] = i;
+					}
+				}
+			}
+			/* NULL here is not fatal -- animVertCount stays 0, the patcher
+			 * does nothing, and the level renders exactly as it does before
+			 * this feature: frozen but present. Degrade, never drop. */
 		}
 	}
 
@@ -1594,9 +1787,12 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * NativePerf_CurrentLevelID's comment for why a second level field is not
 	 * an option.
 	 */
-	Platform_Log("[TRKMESH] lvl=%d lev=%p leaves=%u/%d (excl=%d) verts=%u idx=%u tex=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d | welds=%d\n",
-	             NativePerf_CurrentLevelID(), (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, s_trackMesh.vertCount, s_trackMesh.indexCount,
-	             s_trackMesh.texCount,
+	Platform_Log("[TRKMESH] lvl=%d lev=%p leaves=%u/%d (excl=%d water=%d keptAnim=%d empty=%d noFaces=%d) verts=%u idx=%u tex=%u dropIdxCap=%d dropCap=%d "
+	             "animVerts=%u animWelded=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d | welds=%d\n",
+	             NativePerf_CurrentLevelID(), (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, leavesExclWater, leavesKeptAnim, leavesSkippedEmpty,
+	             leavesEmittedNothing,
+	             s_trackMesh.vertCount, s_trackMesh.indexCount, s_trackMesh.texCount, facesDroppedIndexCap, facesDroppedCapacity,
+	             s_trackMesh.animVertCount, s_trackMesh.animVertWelded,
 	             (u32)(s_trackMesh.vertCount * sizeof(struct NativeTrackVert) / 1024), (u32)(s_trackMesh.indexCount * sizeof(u16) / 1024), facesDoubleSided,
 	             facesAnimTex, facesNoTexture, weldCount);
 
