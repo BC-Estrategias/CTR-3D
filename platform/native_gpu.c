@@ -260,6 +260,11 @@ typedef struct
 
 int g_dbg_otzWiden = 0;
 
+/* See include/platform/native_gpu.h. Lives here, not in the 3DS renderer that
+ * writes it, so the windowed instruments that READ it (native_perf.c, the
+ * [OTPROF] block below) do not depend on a 3DS-only file being in the build. */
+const char *g_dbg_ablateConfig = "none";
+
 /*
  * Rung 3a step 1: the bucket->ordinal recorder above was built for the
  * standalone 'otz' instrument (g_dbg_otzWiden), but the track renderer's
@@ -296,6 +301,28 @@ global_variable NativeGpuState s_gpu;
  * count as reused; a "frame" here is the span between ClearSplits calls that
  * saw content, which is one presented frame in the normal one-DrawOTag flow.
  */
+/*
+ * On 3DS these lines go to the SAME sink as [PERF] and [MERGEB] (ctr3ds.log,
+ * via N3DS_DebugLog) rather than Platform_Log's separate "Crash Team
+ * Racing.log". They are only readable together: an [OTPROF] window's content
+ * counts are meaningless without the [PERF] window's microseconds beside them,
+ * and hand-correlating two files with no shared timestamp is precisely how
+ * this project has previously matched the wrong windows to each other.
+ * N3DS_DebugLog appends its own newline, so the formats below carry none and
+ * the PC path adds one.
+ */
+#if defined(__3DS__)
+#define OTPROF_LOG(...)                                                                                          \
+	do                                                                                                            \
+	{                                                                                                             \
+		char otprofLine[256];                                                                                     \
+		snprintf(otprofLine, sizeof(otprofLine), __VA_ARGS__);                                                    \
+		N3DS_DebugLog(otprofLine);                                                                                \
+	} while (0)
+#else
+#define OTPROF_LOG(fmt, ...) Platform_Log(fmt "\n", ##__VA_ARGS__)
+#endif
+
 #define OTPROF_WINDOW_FRAMES 64
 #define OTPROF_MAX_HASHES    16384
 #define OTPROF_PREV_SET_SIZE 32768 /* power of two, ~2x OTPROF_MAX_HASHES */
@@ -362,6 +389,9 @@ typedef struct
 	u32 winMtxIds;      /* sum of per-frame distinct matrix counts */
 	u32 winTruncated;
 	u32 winDryMismatch;
+	/* g_dbg_ablateConfig as it stood when this window opened; the window is
+	 * cut short if it changes, so every reported window has exactly one. */
+	const char *winCfg;
 } OTWalkProfileState;
 
 global_variable OTWalkProfileState s_otprof;
@@ -657,11 +687,30 @@ internal void OTProf_CountDraw(void)
 	s_otprof.frameDraws++;
 }
 
+internal void OTProf_ReportWindow(void);
+
 internal void OTProf_FoldFrame(void)
 {
 	if (s_otprof.frameNodes == 0 && s_otprof.framePrims == 0)
 	{
 		return; /* GPU-disabled or empty scene edge; not a rendered frame */
+	}
+
+	/*
+	 * Ablation-config boundary: report what is already banked BEFORE this
+	 * frame joins it. The sweep applies a config at the end of a frame, so
+	 * this frame is the first one that ran under the new one -- folding it in
+	 * first and noticing afterwards would put one contaminated frame in the
+	 * outgoing window every switch. winCfg is NULL only on the very first
+	 * fold after boot, when there is nothing banked to protect.
+	 */
+	if ((s_otprof.winCfg != g_dbg_ablateConfig) && (s_otprof.winFrames > 0))
+	{
+		OTProf_ReportWindow();
+	}
+	if (s_otprof.winFrames == 0)
+	{
+		s_otprof.winCfg = g_dbg_ablateConfig;
 	}
 
 	u32 reused = 0;
@@ -829,21 +878,35 @@ internal void OTProf_FoldFrame(void)
 		return;
 	}
 
-	const u32 f = s_otprof.winFrames;
+	OTProf_ReportWindow();
+}
+
+/*
+ * Emit one window and reset the accumulators. Split out of OTProf_FoldFrame so
+ * a window can also be cut EARLY, when the ablation config changes underneath
+ * it (see g_dbg_ablateConfig): a [OTPROF] window that spans "full" and "no-hud"
+ * describes neither, and reading one as if it did is exactly the unmatched-
+ * exposure mistake PORT_FEASIBILITY_3DS.md's "How to measure" was written
+ * about.
+ */
+internal void OTProf_ReportWindow(void)
+{
+	const u32 f = s_otprof.winFrames ? s_otprof.winFrames : 1;
 	const u32 p = s_otprof.winPrims ? s_otprof.winPrims : 1;
 	const u32 hp = s_otprof.winHashed ? s_otprof.winHashed : 1;
-	Platform_Log("[OTPROF] f=%lu nodes/f=%lu prims/f=%lu draws/f=%lu keys/f=%lu ktrans/f=%lu pkreuse=%lu%% pk/f=%lu trunc=%lu drymis=%lu\n",
+	OTPROF_LOG("[OTPROF] cfg=%s f=%lu nodes/f=%lu prims/f=%lu draws/f=%lu keys/f=%lu ktrans/f=%lu pkreuse=%lu%% pk/f=%lu trunc=%lu drymis=%lu",
+	             s_otprof.winCfg ? s_otprof.winCfg : "none",
 	             (unsigned long)f, (unsigned long)(s_otprof.winNodes / f), (unsigned long)(s_otprof.winPrims / f), (unsigned long)(s_otprof.winDraws / f),
 	             (unsigned long)(s_otprof.winKeys / f), (unsigned long)(s_otprof.winKeyTransitions / f), (unsigned long)(s_otprof.winReused * 100u / hp),
 	             (unsigned long)(s_otprof.winHashed / f), (unsigned long)s_otprof.winTruncated, (unsigned long)s_otprof.winDryMismatch);
-	Platform_Log("[OTPROF] blend%%: opq=%lu avg=%lu add=%lu sub=%lu aq=%lu | tex=%lu%%\n", (unsigned long)(s_otprof.winBlend[BM_NONE] * 100u / p),
+	OTPROF_LOG("[OTPROF] blend%%: opq=%lu avg=%lu add=%lu sub=%lu aq=%lu | tex=%lu%%", (unsigned long)(s_otprof.winBlend[BM_NONE] * 100u / p),
 	             (unsigned long)(s_otprof.winBlend[BM_AVERAGE] * 100u / p), (unsigned long)(s_otprof.winBlend[BM_ADD] * 100u / p),
 	             (unsigned long)(s_otprof.winBlend[BM_SUBTRACT] * 100u / p), (unsigned long)(s_otprof.winBlend[BM_ADD_QUATER_SOURCE] * 100u / p),
 	             (unsigned long)(s_otprof.winTextured * 100u / p));
 	{
 		const u32 sh = s_otprof.winShapeHashed ? s_otprof.winShapeHashed : 1;
 		const u32 mh = s_otprof.winMHashed ? s_otprof.winMHashed : 1;
-		Platform_Log("[OTPROF] shape=%lu%% shp/f=%lu shapeSkip=%lu mshape=%lu%% mshp/f=%lu nomdl/f=%lu\n",
+		OTPROF_LOG("[OTPROF] shape=%lu%% shp/f=%lu shapeSkip=%lu mshape=%lu%% mshp/f=%lu nomdl/f=%lu",
 		             (unsigned long)(s_otprof.winShapeReused * 100u / sh), (unsigned long)(s_otprof.winShapeHashed / f), (unsigned long)s_otprof.winShapeSkip,
 		             (unsigned long)(s_otprof.winMReused * 100u / mh), (unsigned long)(s_otprof.winMHashed / f), (unsigned long)(s_otprof.winMNoModel / f));
 	}
@@ -858,7 +921,7 @@ internal void OTProf_FoldFrame(void)
 		 * coverage number: frame-over-frame stable AND camera-class. */
 		const u32 mh2 = s_otprof.winMHashed ? s_otprof.winMHashed : 1;
 
-		Platform_Log("[OTPROF] mtx: single=%lu%% singleDom=%lu%% multi=%lu%% stableDom=%lu%% | ids/f=%lu domStores=%lu%%\n",
+		OTPROF_LOG("[OTPROF] mtx: single=%lu%% singleDom=%lu%% multi=%lu%% stableDom=%lu%% | ids/f=%lu domStores=%lu%%",
 		             (unsigned long)(s_otprof.winMSingle * 100u / mn), (unsigned long)(s_otprof.winMSingleDom * 100u / mn),
 		             (unsigned long)(s_otprof.winMMulti * 100u / mn), (unsigned long)(s_otprof.winMReusedDom * 100u / mh2),
 		             (unsigned long)(s_otprof.winMtxIds / f), (unsigned long)(s_otprof.winMtxDomShare / f));
@@ -889,6 +952,7 @@ internal void OTProf_FoldFrame(void)
 	s_otprof.winMtxIds = 0;
 	s_otprof.winTruncated = 0;
 	s_otprof.winDryMismatch = 0;
+	s_otprof.winCfg = g_dbg_ablateConfig;
 }
 #endif /* CTR_NATIVE_OTWALK_PROFILE */
 

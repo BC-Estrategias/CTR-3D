@@ -179,6 +179,9 @@ global_variable u32 s_windowFrames;
 global_variable f64 s_windowTotalMs;
 global_variable f64 s_windowWorkMs;
 global_variable f64 s_windowBucketMs[NATIVE_PERF_BUCKET_COUNT];
+/* g_dbg_ablateConfig as it stood when this window opened; a change cuts the
+ * window so no report ever averages two ablation configs together. */
+global_variable const char *s_windowCfg;
 
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 /*
@@ -451,7 +454,8 @@ internal void NativePerf_Report3DSWindow(void)
 	 * project has recorded so far came from menu/attract content -- three of
 	 * its wrong conclusions came from exactly that gap.
 	 */
-	snprintf(header, sizeof(header), "[PERF] frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s lvl=%d mode=%d load=%d audioBacklog=%d audioDropped=%d", s_windowFrames, s_perfConsoleTotalUs,
+	snprintf(header, sizeof(header), "[PERF] cfg=%s frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s lvl=%d mode=%d load=%d audioBacklog=%d audioDropped=%d",
+	         s_windowCfg ? s_windowCfg : "none", s_windowFrames, s_perfConsoleTotalUs,
 	         s_perfConsoleWorkUs, N3DS_NdspIsUp() ? "ndsp" : "mute", s_frameBeginInfo.levelID, s_frameBeginInfo.gameMode1,
 	         s_frameBeginInfo.loadingStage, N3DS_AudioThreadGetBacklog(), N3DS_AudioThreadGetDropped());
 	N3DS_DebugLog(header);
@@ -535,6 +539,11 @@ internal void NativePerf_Report3DSWindow(void)
 	s_windowTotalMs = 0.0;
 	s_windowWorkMs = 0.0;
 	memset(s_windowBucketMs, 0, sizeof(s_windowBucketMs));
+	{
+		extern const char *g_dbg_ablateConfig;
+
+		s_windowCfg = g_dbg_ablateConfig;
+	}
 }
 #endif
 
@@ -832,6 +841,28 @@ void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 	}
 
 #if defined(__3DS__)
+	/*
+	 * Ablation-config boundary (see include/platform/native_gpu.h). The sweep
+	 * holds a config for two 32-frame stats windows while this report is on a
+	 * 64-frame cycle of its own, so without the cut a [PERF] window routinely
+	 * straddled two configs and its per-bucket microseconds belonged to
+	 * neither -- which is precisely the attribution the sweep exists to make.
+	 * Reported BEFORE this frame is folded in: the config changed at the end
+	 * of the previous frame, so this one already ran under the new one.
+	 */
+	{
+		extern const char *g_dbg_ablateConfig;
+
+		if ((s_windowCfg != g_dbg_ablateConfig) && (s_windowFrames > 0))
+		{
+			NativePerf_Report3DSWindow();
+		}
+		if (s_windowFrames == 0)
+		{
+			s_windowCfg = g_dbg_ablateConfig;
+		}
+	}
+
 	s_windowFrames++;
 	s_windowTotalMs += totalMs;
 	s_windowWorkMs += workMs;

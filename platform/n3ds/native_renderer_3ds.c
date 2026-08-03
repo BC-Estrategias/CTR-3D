@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include <macros.h>
+#include <platform/native_gpu.h>
 #include <platform/native_perf.h>
 #include <platform/native_render_queue.h>
 #include <platform/native_renderer.h>
@@ -265,6 +266,51 @@ global_variable u32 s_mergeEmitOpaque = 0;
 global_variable u32 s_mergeEmitBlend = 0;
 global_variable u32 s_mergeBinSpills = 0;
 global_variable u32 s_mergeEscalations = 0;
+
+/*
+ * s31 UI probe. The counters above say HOW MANY draws each class costs; these
+ * say how BIG they are and WHY the blend ones end where they do.
+ *
+ * The question they exist to answer: opaque content is binned by state across
+ * the whole OT walk, so it collapses to ~one draw per atlas, but blended
+ * content cannot join a bin -- blending is order-dependent and the bins are
+ * order-free -- so it stays a sequence of runs, each ended by the next state
+ * change and each becoming its own draw. If the HUD's cost is that structure,
+ * blend draws will be numerous and TINY (verts/draw near the per-call floor)
+ * while opaque draws are few and huge. If instead verts/draw is comparable
+ * across the two, the draw structure is not where the HUD's milliseconds are
+ * and the blend hypothesis is dead -- which is a result, not a null.
+ *
+ * The close-cause split then says what to fix if it survives: an atlas-change
+ * majority is a texture-locality problem (reachable by atlas packing), a
+ * state-change majority is a content problem (the HUD really does alternate
+ * blend modes), and frame-end is just the tail run every frame pays once.
+ */
+/* Accumulated at each emit CALL SITE, next to the draw counter it will be
+ * divided by, rather than inside N3DS_MergeEmit keyed off the blend mode: the
+ * first version did the latter and immediately reported 43 blend draws holding
+ * 60 vertices, because the mode it keyed off had been clobbered before the
+ * emit. Counting the two together at one site makes that class of drift
+ * impossible. */
+global_variable u32 s_mergeVertsOpaque = 0;
+global_variable u32 s_mergeVertsBlend = 0;
+global_variable u32 s_blendCloseAtlas = 0;
+global_variable u32 s_blendCloseState = 0;
+global_variable u32 s_blendCloseFrameEnd = 0;
+/* Previous window's values, for the [MERGEB] deltas. */
+global_variable u32 s_lastStatMergeEmitOpaque = 0;
+global_variable u32 s_lastStatMergeEmitBlend = 0;
+global_variable u32 s_lastStatMergeVertsOpaque = 0;
+global_variable u32 s_lastStatMergeVertsBlend = 0;
+global_variable u32 s_lastStatBlendCloseAtlas = 0;
+global_variable u32 s_lastStatBlendCloseState = 0;
+global_variable u32 s_lastStatBlendCloseFrameEnd = 0;
+
+enum N3DS_BlendCloseCause
+{
+	N3DS_BLEND_CLOSE_ATLAS = 0, /* mid-run atlas change (texture locality)   */
+	N3DS_BLEND_CLOSE_STATE,     /* blend mode or textured/untextured change  */
+};
 #endif /* CTR_NATIVE_DRAW_MERGE */
 
 /* s29 ordering A/B (dumpreq 'trackafter') -- see NativeRenderer_EndScene.
@@ -398,6 +444,11 @@ static void N3DS_SweepApply(int idx)
 	gCtrDebugSkipEffects = cfg->skipEffects;
 	gCtrDebugSkipHUD = cfg->skipHUD;
 	g_dbg_vsyncCredit = cfg->vsyncCredit;
+
+	/* Publish the config to the windowed instruments so [PERF] and [OTPROF]
+	 * cut their windows here too -- see include/platform/native_gpu.h. The
+	 * table's name literals are the identity, so this is a pointer store. */
+	g_dbg_ablateConfig = cfg->name;
 
 	/*
 	 * Forced, not carried: the sweep no longer varies bias, so a stray SELECT+Y
@@ -2101,7 +2152,7 @@ internal void N3DS_MergeEmit(int blendMode, int doubling, int atlas, int baseVer
  * the barrier itself emits the open run directly as its last draw, which
  * is what makes the capacity escalation below non-recursive.
  */
-internal void N3DS_MergeCloseBlendRun(void)
+internal void N3DS_MergeCloseBlendRun(enum N3DS_BlendCloseCause cause)
 {
 	int baseVertex;
 
@@ -2109,6 +2160,17 @@ internal void N3DS_MergeCloseBlendRun(void)
 	{
 		s_runAtlas = -1;
 		return;
+	}
+
+	/* Counted before the escalation branch: the run really is being closed
+	 * for this reason either way, and escalation is counted separately. */
+	if (cause == N3DS_BLEND_CLOSE_ATLAS)
+	{
+		s_blendCloseAtlas++;
+	}
+	else
+	{
+		s_blendCloseState++;
 	}
 
 	if (s_mergeBlendSegCount >= N3DS_MERGE_MAX_BLEND_SEGS)
@@ -2151,6 +2213,21 @@ internal void N3DS_MergeFlush(void)
 {
 	int lastDoubling = -1;
 	int i;
+	/*
+	 * The still-open run's OWN state, snapshotted before anything else emits.
+	 * N3DS_MergeEmit assigns s_runBlendMode as a side effect (it keeps the
+	 * non-merge entry guard's change-gating truthful), so by the time the
+	 * trailing-run block below ran, the opaque bin emits had already
+	 * overwritten it with BM_NONE -- and the frame's last blend run was
+	 * submitted with blending OFF, or with the last blend SEGMENT's mode when
+	 * there was one. Found by the s31 [MERGEB] counters disagreeing with
+	 * themselves: 43 blend draws carrying 60 vertices between them, because
+	 * two thirds of them were being classified as opaque at emit time.
+	 * s_runUntextured is not clobbered the same way, but is snapshotted with
+	 * it so the pair is read from one point in time.
+	 */
+	const int pendingBlendMode = s_runBlendMode;
+	const int pendingUntextured = s_runUntextured;
 
 	if (!s_mergeActive)
 	{
@@ -2182,6 +2259,7 @@ internal void N3DS_MergeFlush(void)
 			N3DS_MergeEmit(0 /* BM_NONE */, (i == N3DS_MERGE_UNTEX_BIN) ? 0 : 1,
 			               (i == N3DS_MERGE_UNTEX_BIN) ? N3DS_WHITE_ATLAS : i, baseVertex, s_mergeBinUsed[i], &lastDoubling);
 			s_mergeEmitOpaque++;
+			s_mergeVertsOpaque += (u32)s_mergeBinUsed[i];
 		}
 		s_mergeBinUsed[i] = 0;
 	}
@@ -2192,6 +2270,7 @@ internal void N3DS_MergeFlush(void)
 
 		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
 		s_mergeEmitOpaque++;
+		s_mergeVertsOpaque += (u32)seg->vertCount;
 	}
 	s_mergeOpaqueSegCount = 0;
 
@@ -2201,6 +2280,7 @@ internal void N3DS_MergeFlush(void)
 
 		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
 		s_mergeEmitBlend++;
+		s_mergeVertsBlend += (u32)seg->vertCount;
 	}
 	s_mergeBlendSegCount = 0;
 
@@ -2214,8 +2294,10 @@ internal void N3DS_MergeFlush(void)
 		}
 		else
 		{
-			N3DS_MergeEmit(s_runBlendMode, s_runUntextured ? 0 : 1, s_runAtlas, baseVertex, s_runVertCount, &lastDoubling);
+			N3DS_MergeEmit(pendingBlendMode, pendingUntextured ? 0 : 1, s_runAtlas, baseVertex, s_runVertCount, &lastDoubling);
 			s_mergeEmitBlend++;
+			s_mergeVertsBlend += (u32)s_runVertCount;
+			s_blendCloseFrameEnd++;
 		}
 	}
 	s_runVertCount = 0;
@@ -3093,6 +3175,45 @@ void NativeRenderer_SwapWindow(void)
 			         s_mergeActive, (unsigned long)s_mergeEmitOpaque, (unsigned long)s_mergeEmitBlend,
 			         (unsigned long)s_mergeBinSpills, (unsigned long)s_mergeEscalations);
 			N3DS_DebugLog(cacheLine);
+
+			/*
+			 * s31 UI probe: the same split as WINDOW DELTAS, with the size of
+			 * each class of draw and why the blend ones ended. Deltas, not the
+			 * running totals above, because the question is per-config -- the
+			 * [SWEEP] harness changes what is on screen every few windows and a
+			 * since-boot total cannot follow it. v/d is the number to read:
+			 * opaque should be in the hundreds or thousands, and blend near 6
+			 * means the blend path is paying a full draw call per handful of
+			 * triangles. cfg tags which ablation config was live at the end of
+			 * this window; a config change mid-window makes one line mixed, so
+			 * compare lines that share a cfg with the [PERF] window next to
+			 * them rather than reading any single line in isolation.
+			 */
+			{
+				char blendLine[224];
+				const unsigned long opDraws = (unsigned long)(s_mergeEmitOpaque - s_lastStatMergeEmitOpaque);
+				const unsigned long blDraws = (unsigned long)(s_mergeEmitBlend - s_lastStatMergeEmitBlend);
+				const unsigned long opVerts = (unsigned long)(s_mergeVertsOpaque - s_lastStatMergeVertsOpaque);
+				const unsigned long blVerts = (unsigned long)(s_mergeVertsBlend - s_lastStatMergeVertsBlend);
+
+				s_lastStatMergeEmitOpaque = s_mergeEmitOpaque;
+				s_lastStatMergeEmitBlend = s_mergeEmitBlend;
+				s_lastStatMergeVertsOpaque = s_mergeVertsOpaque;
+				s_lastStatMergeVertsBlend = s_mergeVertsBlend;
+
+				snprintf(blendLine, sizeof(blendLine),
+				         "[MERGEB] cfg=%s opDraws=%lu opVerts=%lu opV/D=%lu blDraws=%lu blVerts=%lu blV/D=%lu closeAtlas=%lu closeState=%lu closeFrameEnd=%lu",
+				         g_dbg_ablateConfig, opDraws, opVerts, opDraws ? (opVerts / opDraws) : 0UL, blDraws, blVerts,
+				         blDraws ? (blVerts / blDraws) : 0UL,
+				         (unsigned long)(s_blendCloseAtlas - s_lastStatBlendCloseAtlas),
+				         (unsigned long)(s_blendCloseState - s_lastStatBlendCloseState),
+				         (unsigned long)(s_blendCloseFrameEnd - s_lastStatBlendCloseFrameEnd));
+				N3DS_DebugLog(blendLine);
+
+				s_lastStatBlendCloseAtlas = s_blendCloseAtlas;
+				s_lastStatBlendCloseState = s_blendCloseState;
+				s_lastStatBlendCloseFrameEnd = s_blendCloseFrameEnd;
+			}
 #endif
 
 			snprintf(cacheLine, sizeof(cacheLine),
@@ -3478,6 +3599,7 @@ void NativeRenderer_SwapWindow(void)
 				gCtrDebugSkipEffects = 0;
 				gCtrDebugSkipHUD = 0;
 				g_dbg_vsyncCredit = 1;
+				g_dbg_ablateConfig = "none";
 				s_sweepWasOn = 0;
 			}
 			/* The per-bucket breakdown is the single biggest block of text on
@@ -4046,7 +4168,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		{
 			if ((s_runVertCount > 0) && ((untextured != s_runUntextured) || (s_currentBlendMode != s_runBlendMode)))
 			{
-				N3DS_MergeCloseBlendRun();
+				N3DS_MergeCloseBlendRun(N3DS_BLEND_CLOSE_STATE);
 			}
 			s_runUntextured = untextured;
 			s_runBlendMode = s_currentBlendMode;
@@ -4199,7 +4321,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			if (s_mergeActive)
 			{
 				/* Blend run under merge: recorded segment, not a draw. */
-				N3DS_MergeCloseBlendRun();
+				N3DS_MergeCloseBlendRun(N3DS_BLEND_CLOSE_ATLAS);
 			}
 			else
 #endif

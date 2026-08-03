@@ -15,6 +15,23 @@ extern DISPENV activeDispEnv;
 extern DRAWENV activeDrawEnv;
 extern int g_GPUDisabledState;
 
+/*
+ * Name of the content-ablation configuration currently live, as a pointer to a
+ * static string ("none" when nothing is ablating). Written by the 3DS [SWEEP]
+ * harness (N3DS_SweepApply); read by the windowed instruments -- [PERF] and
+ * [OTPROF] -- which CUT THEIR WINDOW when it changes.
+ *
+ * That cut is the whole point. The sweep holds a config for two 32-frame stats
+ * windows while [PERF] and [OTPROF] report every 64 frames on their own phase,
+ * so before this every reported window could straddle two configs and average
+ * "full" with "no-hud" into a number belonging to neither. The [SWEEP] line's
+ * own frame/work microseconds were the only per-config figures in the log;
+ * bucket and content attribution had no way to follow the ablation. Identity is
+ * the POINTER, not the text -- every writer passes a literal from one static
+ * table, so a compare is one instruction and needs no strcmp.
+ */
+extern const char *g_dbg_ablateConfig;
+
 int NativeGpu_HasPendingSplits(void);
 void NativeGpu_ResetEmitOrdinal(void);
 void ClearSplits(void);
