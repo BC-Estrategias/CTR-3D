@@ -586,9 +586,28 @@ global_variable int s_pendingVertexCount = 0;
  * pages decoded from them. A decode cache entry records the cell
  * generation(s) it was decoded against and is stale if any has since moved.
  */
+/*
+ * VRAM dirty-tracking grid. 64 wide, but only 8 TALL (s31) -- the two axes are
+ * not symmetric and one of them is load-bearing.
+ *
+ * CTR's display buffers are 512x216 at y=0 and y=296 (MainMain.c's
+ * SetDefDrawEnv/SetDefDispEnv), leaving the strip y=216..295 free, and that is
+ * exactly where the HUD's sprite sheets and their CLUTs live. With 64-tall
+ * cells, row 3 covered y=192..255 -- straddling the bottom of display buffer A
+ * AND the top of the free strip -- so every frame the picture changed, cell
+ * row 3's generation moved and every HUD texture sourced from the free strip
+ * was declared stale and re-decoded. 216 is a multiple of 8, so an 8-tall grid
+ * puts the last framebuffer row (215) in cell row 26 and the first free row
+ * (216) in cell row 27, and the false sharing disappears by construction.
+ *
+ * Cost is 1024 u32s instead of 128, and N3DS_DirtyVRAMRect bumping ~8x more
+ * cells per write -- both trivial against one 65536-texel page decode.
+ */
 #define N3DS_VRAM_CELL_COLS  16
-#define N3DS_VRAM_CELL_ROWS  8
-#define N3DS_VRAM_CELL_DIM   64
+#define N3DS_VRAM_CELL_ROWS  64
+#define N3DS_VRAM_CELL_DIM   64 /* X only; kept for the atlas-coincidence note below */
+#define N3DS_VRAM_CELL_DIM_X 64
+#define N3DS_VRAM_CELL_DIM_Y 8
 global_variable u32 s_vramCellGen[N3DS_VRAM_CELL_ROWS * N3DS_VRAM_CELL_COLS];
 
 /*
@@ -600,8 +619,8 @@ global_variable u32 s_vramDirtyBumps = 0;
 
 internal int N3DS_VRAMCellIndex(int x, int y)
 {
-	int col = x / N3DS_VRAM_CELL_DIM;
-	int row = y / N3DS_VRAM_CELL_DIM;
+	int col = x / N3DS_VRAM_CELL_DIM_X;
+	int row = y / N3DS_VRAM_CELL_DIM_Y;
 
 	if (col < 0) { col = 0; } else if (col >= N3DS_VRAM_CELL_COLS) { col = N3DS_VRAM_CELL_COLS - 1; }
 	if (row < 0) { row = 0; } else if (row >= N3DS_VRAM_CELL_ROWS) { row = N3DS_VRAM_CELL_ROWS - 1; }
@@ -629,11 +648,11 @@ internal void N3DS_DirtyVRAMRect(int x, int y, int w, int h)
 	x1 = x + w - 1;
 	y1 = y + h - 1;
 
-	for (cy = y / N3DS_VRAM_CELL_DIM; cy <= y1 / N3DS_VRAM_CELL_DIM; cy++)
+	for (cy = y / N3DS_VRAM_CELL_DIM_Y; cy <= y1 / N3DS_VRAM_CELL_DIM_Y; cy++)
 	{
-		for (cx = x / N3DS_VRAM_CELL_DIM; cx <= x1 / N3DS_VRAM_CELL_DIM; cx++)
+		for (cx = x / N3DS_VRAM_CELL_DIM_X; cx <= x1 / N3DS_VRAM_CELL_DIM_X; cx++)
 		{
-			s_vramCellGen[N3DS_VRAMCellIndex(cx * N3DS_VRAM_CELL_DIM, cy * N3DS_VRAM_CELL_DIM)]++;
+			s_vramCellGen[N3DS_VRAMCellIndex(cx * N3DS_VRAM_CELL_DIM_X, cy * N3DS_VRAM_CELL_DIM_Y)]++;
 			s_vramDirtyBumps++;
 		}
 	}
@@ -745,7 +764,7 @@ internal void N3DS_RefreshFramebufferMirrorSlot(N3DS_FBStoreSlot *slot)
 		{
 			const u8 *srcRow = s_fbCopyScratch + ((size_t)row * (size_t)w * 3);
 			u16 *dstRow = vram + ((size_t)(y + row) * VRAM_WIDTH) + x;
-			u32 *rowMask = &changedMask[(y + row) / N3DS_VRAM_CELL_DIM];
+			u32 *rowMask = &changedMask[(y + row) / N3DS_VRAM_CELL_DIM_Y];
 
 			for (col = 0; col < w; col++)
 			{
@@ -755,7 +774,7 @@ internal void N3DS_RefreshFramebufferMirrorSlot(N3DS_FBStoreSlot *slot)
 				if (dstRow[col] != packed)
 				{
 					dstRow[col] = packed;
-					*rowMask |= (1u << ((u32)(x + col) / N3DS_VRAM_CELL_DIM));
+					*rowMask |= (1u << ((u32)(x + col) / N3DS_VRAM_CELL_DIM_X));
 				}
 			}
 		}
@@ -1019,6 +1038,216 @@ global_variable u32 s_lastStatSpStaleByPageGen = 0;
 global_variable u32 s_lastStatSpStaleByClutGen = 0;
 global_variable u32 s_fpStaleByPageId[32];
 global_variable u32 s_spStaleByPageId[32];
+
+/*
+ * s31 stale-SOURCE probe. The histograms above name which page IDs re-decode;
+ * this names WHERE IN VRAM the thing that invalidated them lives, which is the
+ * question that picks the fix.
+ *
+ * Context: the sweep showed the HUD owns essentially 100% of stale full-page
+ * misses (Arcade 3.27/frame with it, 0.05 without) at ~1.3ms per opponent, and
+ * that the framebuffer mirror refreshes EVERY frame during a race, alternating
+ * two 512x216 display rects. So the left half of PSX VRAM is legitimately
+ * dirty every frame. Two possibilities remain and they have different fixes:
+ *
+ *   in   -- the page/CLUT genuinely lives inside a display rect. The
+ *           invalidation is CORRECT; the fix is to make the re-decode cheap
+ *           (route these to the sub-page tier: 1/16 the texels).
+ *   cell -- the page/CLUT does NOT touch a display rect, but shares a 64x64
+ *           generation cell with one. Pure false sharing; the fix is finer
+ *           dirty tracking, and it costs a full-page decode per frame for
+ *           nothing.
+ *   out  -- neither: something else wrote there, and this probe is looking in
+ *           the wrong place.
+ *
+ * Deliberately a PROBE, not an instrument: delete it once the answer is
+ * recorded, the way [MERGEDBG] was in s29. Cost is a <=12-entry linear scan on
+ * a stale miss (~3/frame), and two log lines per stats window.
+ */
+/*
+ * s31 framebuffer-page probe, the follow-up [STALESRC] made necessary.
+ *
+ * [STALESRC] found every stale full-page decode of a race lap tracing to
+ * tpages 4, 5 and 6 -- VRAM x=256/320/384, y=0 -- which is INSIDE display
+ * buffer A. The game's own setup confirms it: MainMain.c does
+ * SetDefDrawEnv(db[0], 0, 0, 0x200, 0xd8), so the game draws over x 0..511,
+ * y 0..215 every frame. Nothing can be stored there.
+ *
+ * So either the HUD deliberately samples the screen region (a real PS1
+ * technique, and this port already implements the pause/wipe version of it),
+ * or those tpages are junk carried by primitives that never meaningfully
+ * sample anything -- in which case we are decoding a 256x256 page of
+ * framebuffer per frame for nothing. OPPOSITE FIXES, so this measures rather
+ * than assumes.
+ *
+ * What separates them is the FOOTPRINT. A real screen-sample tracks a
+ * meaningful region of the display and its UVs sweep; junk shows up as a
+ * degenerate or pinned UV box. The screen box additionally says WHERE on
+ * screen the sampler is, which identifies the HUD element on sight.
+ *
+ * Probe, not instrument: delete with [STALESRC] once the answer is recorded.
+ */
+internal int N3DS_RectsOverlap(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh)
+{
+	if ((aw <= 0) || (ah <= 0) || (bw <= 0) || (bh <= 0))
+	{
+		return 0;
+	}
+	return ((ax < (bx + bw)) && (bx < (ax + aw)) && (ay < (by + bh)) && (by < (ay + ah)));
+}
+
+#define N3DS_FBPAGE_MAX 6
+typedef struct
+{
+	s16 page;
+	s16 clut;
+	s16 sx0, sy0, sx1, sy1; /* screen-space bbox of the sampling triangles */
+	u8 u0, v0, u1, v1;      /* UV bbox within the page                     */
+	u8 blendMode;
+	u8 untextured;
+	u32 tris;
+} N3DS_FbPageSample;
+global_variable N3DS_FbPageSample s_fbPageSample[N3DS_FBPAGE_MAX];
+global_variable int s_fbPageSampleCount = 0;
+
+internal void N3DS_FbPageRecord(const GrVertex *v, int blendMode, int untextured)
+{
+	int i;
+	N3DS_FbPageSample *s = NULL;
+
+	for (i = 0; i < s_fbPageSampleCount; i++)
+	{
+		if ((s_fbPageSample[i].page == v[0].page) && (s_fbPageSample[i].clut == v[0].clut))
+		{
+			s = &s_fbPageSample[i];
+			break;
+		}
+	}
+	if (s == NULL)
+	{
+		if (s_fbPageSampleCount >= N3DS_FBPAGE_MAX)
+		{
+			return;
+		}
+		s = &s_fbPageSample[s_fbPageSampleCount++];
+		s->page = v[0].page;
+		s->clut = v[0].clut;
+		s->sx0 = s->sy0 = 0x7FFF;
+		s->sx1 = s->sy1 = -0x7FFF;
+		s->u0 = s->v0 = 255;
+		s->u1 = s->v1 = 0;
+		s->tris = 0;
+	}
+
+	for (i = 0; i < 3; i++)
+	{
+		if (v[i].x < s->sx0) { s->sx0 = v[i].x; }
+		if (v[i].x > s->sx1) { s->sx1 = v[i].x; }
+		if (v[i].y < s->sy0) { s->sy0 = v[i].y; }
+		if (v[i].y > s->sy1) { s->sy1 = v[i].y; }
+		if (v[i].u < s->u0) { s->u0 = v[i].u; }
+		if (v[i].u > s->u1) { s->u1 = v[i].u; }
+		if (v[i].v < s->v0) { s->v0 = v[i].v; }
+		if (v[i].v > s->v1) { s->v1 = v[i].v; }
+	}
+	s->blendMode = (u8)blendMode;
+	s->untextured = (u8)(untextured ? 1 : 0);
+	s->tris++;
+}
+
+/* True for a tpage whose VRAM origin lands inside either armed display rect --
+ * i.e. a page that cannot hold stored texture data because the game draws
+ * over it. Same origin decode N3DS_FindOrDecodeTexture uses. */
+internal int N3DS_PageIsInDisplay(s16 page)
+{
+	const int pageX = (page & 0xF) * 64;
+	const int pageY = (page & 0x10) ? 256 : 0;
+	int i;
+
+	for (i = 0; i < 2; i++)
+	{
+		if (N3DS_RectsOverlap(pageX, pageY, 64, 256, s_fbStore[i].x, s_fbStore[i].y, s_fbStore[i].w, s_fbStore[i].h))
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+#define N3DS_STALESRC_MAX 12
+typedef struct
+{
+	s16 page;
+	s16 clut;
+	u8 byPage;
+	u8 byClut;
+	u32 count;
+} N3DS_StaleSrc;
+global_variable N3DS_StaleSrc s_staleSrc[N3DS_STALESRC_MAX];
+global_variable int s_staleSrcCount = 0;
+global_variable u32 s_staleSrcOverflow = 0;
+
+/*
+ * "in" if the rect itself touches an armed display rect, "cell" if only its
+ * 64x64 generation cells do (false sharing), "out" if neither. Declared before
+ * the recorder so both live next to the comment that explains the verdicts.
+ */
+internal const char *N3DS_ClassifyVsDisplay(int x, int y, int w, int h)
+{
+	const int cellX = (x / N3DS_VRAM_CELL_DIM_X) * N3DS_VRAM_CELL_DIM_X;
+	const int cellY = (y / N3DS_VRAM_CELL_DIM_Y) * N3DS_VRAM_CELL_DIM_Y;
+	/* Cell span of the whole rect, not just its origin. */
+	const int cellW = ((((x + w - 1) / N3DS_VRAM_CELL_DIM_X) * N3DS_VRAM_CELL_DIM_X) + N3DS_VRAM_CELL_DIM_X) - cellX;
+	const int cellH = ((((y + h - 1) / N3DS_VRAM_CELL_DIM_Y) * N3DS_VRAM_CELL_DIM_Y) + N3DS_VRAM_CELL_DIM_Y) - cellY;
+	int i;
+
+	for (i = 0; i < 2; i++)
+	{
+		if (N3DS_RectsOverlap(x, y, w, h, s_fbStore[i].x, s_fbStore[i].y, s_fbStore[i].w, s_fbStore[i].h))
+		{
+			return "in";
+		}
+	}
+	for (i = 0; i < 2; i++)
+	{
+		if (N3DS_RectsOverlap(cellX, cellY, cellW, cellH, s_fbStore[i].x, s_fbStore[i].y, s_fbStore[i].w, s_fbStore[i].h))
+		{
+			return "cell";
+		}
+	}
+	return "out";
+}
+
+internal void N3DS_StaleSrcRecord(s16 page, s16 clut, int byPage, int byClut)
+{
+	int i;
+
+	for (i = 0; i < s_staleSrcCount; i++)
+	{
+		if ((s_staleSrc[i].page == page) && (s_staleSrc[i].clut == clut))
+		{
+			s_staleSrc[i].count++;
+			s_staleSrc[i].byPage |= (u8)(byPage ? 1 : 0);
+			s_staleSrc[i].byClut |= (u8)(byClut ? 1 : 0);
+			return;
+		}
+	}
+
+	if (s_staleSrcCount >= N3DS_STALESRC_MAX)
+	{
+		/* Counted, not silently dropped: a large overflow means the stale set
+		 * is diffuse and "the top offender" is the wrong mental model. */
+		s_staleSrcOverflow++;
+		return;
+	}
+
+	s_staleSrc[s_staleSrcCount].page = page;
+	s_staleSrc[s_staleSrcCount].clut = clut;
+	s_staleSrc[s_staleSrcCount].byPage = (u8)(byPage ? 1 : 0);
+	s_staleSrc[s_staleSrcCount].byClut = (u8)(byClut ? 1 : 0);
+	s_staleSrc[s_staleSrcCount].count = 1;
+	s_staleSrcCount++;
+}
 
 internal u32 N3DS_TexKeyHash(s16 page, s16 clut, TexFormat format, N3DS_TexView view, int tileX, int tileY)
 {
@@ -1434,9 +1663,28 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, N3
  * (256x256 regions of a shared GPU texture) -- they are unrelated grids that
  * happen to share a name and a size.
  */
-internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N3DS_TexView view)
+/*
+ * sampV0 is the FIRST PAGE ROW THIS LOOKUP ACTUALLY READS (the triangle's UV
+ * bbox minV), and it is what page freshness is keyed on -- not the page
+ * anchor. s31: CTR's HUD sheets live in the free VRAM strip below display
+ * buffer A, in pages ANCHORED at y=0, i.e. inside the framebuffer. Keying off
+ * the anchor cell therefore watched live picture on behalf of a texture that
+ * sits 216 rows below it, and every HUD page re-decoded 65536 texels every
+ * frame. The sibling test at N3DS_ResolveTriangleTexture's mirror-refresh call
+ * already learned this in s17 -- its comment says so in as many words -- and
+ * this is the same correction applied to the freshness key.
+ *
+ * Consequence to know: an entry's stored pageGen belongs to the row band of
+ * whichever lookup decoded it. A later lookup reading a DIFFERENT band of the
+ * same (page,clut) computes a different cell and will usually miss, costing
+ * one re-decode. That is bounded (it is exactly today's behaviour) and does
+ * not happen for the content this fixes, where each sheet has one stable
+ * footprint. Pass 0 when no footprint is known -- that restores the old
+ * anchor-keyed behaviour for that caller.
+ */
+internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N3DS_TexView view, int sampV0)
 {
-	const int pageCell = N3DS_VRAMCellIndex((texPage & 0xF) * 64, (texPage & 0x10) ? 256 : 0);
+	const int pageCell = N3DS_VRAMCellIndex((texPage & 0xF) * 64, ((texPage & 0x10) ? 256 : 0) + sampV0);
 	const int clutOriginX = (clut & 0x3F) * 16;
 	const int clutOriginY = clut >> 6;
 	const int clutCellA = N3DS_VRAMCellIndex(clutOriginX, clutOriginY);
@@ -1609,6 +1857,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N
 			s_fullPageStaleByClutGen++;
 		}
 		s_fpStaleByPageId[(u32)(u16)texPage & 0x1F]++;
+		N3DS_StaleSrcRecord(texPage, hasClut ? clut : (s16)-1, staleSawPageGen, staleSawClutGen);
 	}
 	else
 	{
@@ -1773,14 +2022,17 @@ decodeIntoSlot:
  * and the hazard-fallback victim is slot 0, not 1.
  */
 internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat format, N3DS_TexView view, int tileX,
-                                              int tileY)
+                                              int tileY, int sampV0)
 {
 	const int pageOriginX = (texPage & 0xF) * 64;
 	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
-	/* The one VRAM dirty-cell exactly covering this 64x64 tile -- both
-	 * pageOriginX/Y and tileX*64/tileY*64 are multiples of N3DS_VRAM_CELL_DIM,
-	 * so this is exact, not an approximation (see the struct's own comment). */
-	const int pageCell = N3DS_VRAMCellIndex(pageOriginX + (tileX * 64), pageOriginY + (tileY * 64));
+	/* Keyed on the SAMPLED row, same correction as the full-page tier (s31).
+	 * This used to key on the tile's top row and note that a tile maps exactly
+	 * onto one dirty cell -- true when cells were 64 tall, no longer true now
+	 * they are 8, and not the property that matters anyway: a 64-tall tile
+	 * whose top rows are live framebuffer and whose sampled rows are not was
+	 * exactly the false-sharing case this fixes. */
+	const int pageCell = N3DS_VRAMCellIndex(pageOriginX + (tileX * 64), pageOriginY + sampV0);
 	const int clutOriginX = (clut & 0x3F) * 16;
 	const int clutOriginY = clut >> 6;
 	const int clutCellA = N3DS_VRAMCellIndex(clutOriginX, clutOriginY);
@@ -2527,7 +2779,7 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 			return 1;
 		}
 
-		N3DS_SubCellIndexToAtlasCoord(N3DS_FindOrDecodeSubPageTexture(texPage, clut, format, view, tileX0, tileY0),
+		N3DS_SubCellIndexToAtlasCoord(N3DS_FindOrDecodeSubPageTexture(texPage, clut, format, view, tileX0, tileY0, minV),
 		                               &atlasIdx, &physCellX, &physCellY, &subX, &subY);
 		*outAtlasIdx = atlasIdx;
 		*outPixelBaseU = (physCellX * N3DS_DECODE_TEXTURE_DIM) + (subX * N3DS_SUBPAGE_DIM);
@@ -2571,7 +2823,7 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 			return 0;
 		}
 
-		N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(texPage, clut, format, view), &atlasIdx, &cellX, &cellY);
+		N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(texPage, clut, format, view, minV), &atlasIdx, &cellX, &cellY);
 		*outAtlasIdx = atlasIdx;
 		*outPixelBaseU = cellX * N3DS_DECODE_TEXTURE_DIM;
 		*outPixelBaseV = cellY * N3DS_DECODE_TEXTURE_DIM;
@@ -3189,6 +3441,88 @@ void NativeRenderer_SwapWindow(void)
 			 * compare lines that share a cfg with the [PERF] window next to
 			 * them rather than reading any single line in isolation.
 			 */
+			/*
+			 * s31 stale-SOURCE probe report. See N3DS_StaleSrcRecord. Emits
+			 * the armed display rects first, then the window's top stale
+			 * sources with their VRAM geometry and a verdict, sorted by count
+			 * (selection sort over <=12 entries, once per window).
+			 */
+			{
+				char srcLine[224];
+				int order[N3DS_STALESRC_MAX];
+				int i, j, shown;
+
+				snprintf(srcLine, sizeof(srcLine), "[STALESRC] fbRects a=%d,%d %dx%d b=%d,%d %dx%d refreshes=%lu overflow=%lu",
+				         s_fbStore[0].x, s_fbStore[0].y, s_fbStore[0].w, s_fbStore[0].h, s_fbStore[1].x, s_fbStore[1].y,
+				         s_fbStore[1].w, s_fbStore[1].h, (unsigned long)s_fbMirrorRefreshes, (unsigned long)s_staleSrcOverflow);
+				N3DS_DebugLog(srcLine);
+
+				for (i = 0; i < s_staleSrcCount; i++)
+				{
+					order[i] = i;
+				}
+				for (i = 0; i < s_staleSrcCount; i++)
+				{
+					for (j = i + 1; j < s_staleSrcCount; j++)
+					{
+						if (s_staleSrc[order[j]].count > s_staleSrc[order[i]].count)
+						{
+							const int t = order[i];
+
+							order[i] = order[j];
+							order[j] = t;
+						}
+					}
+				}
+
+				shown = (s_staleSrcCount < 6) ? s_staleSrcCount : 6;
+				for (i = 0; i < shown; i++)
+				{
+					const N3DS_StaleSrc *s = &s_staleSrc[order[i]];
+					/* Page geometry: origin from the tpage bits, 64 VRAM words
+					 * wide by 256 tall -- the same decode N3DS_FindOrDecodeTexture
+					 * does. CLUT: 16-aligned origin, 16 wide for 4-bit and 256
+					 * for 8-bit; width is unknown here (format is not part of
+					 * the key), so the WIDER 8-bit span is assumed -- it can
+					 * only over-report an overlap, never miss one. */
+					const int pageX = (s->page & 0xF) * 64;
+					const int pageY = (s->page & 0x10) ? 256 : 0;
+					const int clutX = (s->clut >= 0) ? ((s->clut & 0x3F) * 16) : -1;
+					const int clutY = (s->clut >= 0) ? (s->clut >> 6) : -1;
+					const char *pageVerdict = N3DS_ClassifyVsDisplay(pageX, pageY, 64, 256);
+					const char *clutVerdict = (clutX >= 0) ? N3DS_ClassifyVsDisplay(clutX, clutY, 256, 1) : "none";
+
+					snprintf(srcLine, sizeof(srcLine),
+					         "[STALESRC] n=%lu by=%s%s page=%d(%d,%d 64x256)=%s clut=%d(%d,%d 256x1)=%s",
+					         (unsigned long)s->count, s->byPage ? "page" : "", s->byClut ? "clut" : "", (int)s->page, pageX,
+					         pageY, pageVerdict, (int)s->clut, clutX, clutY, clutVerdict);
+					N3DS_DebugLog(srcLine);
+				}
+
+				s_staleSrcCount = 0;
+				s_staleSrcOverflow = 0;
+			}
+
+			/*
+			 * s31 framebuffer-page probe report. scr= says WHERE on screen the
+			 * sampler draws (identifies the HUD element on sight, since the
+			 * 3DS frame is 400x240); uv= says whether the sample is
+			 * meaningful. A near-degenerate uv box on a page that is really
+			 * just live framebuffer means we are decoding 65k texels a frame
+			 * to sample almost none of them.
+			 */
+			for (int fp = 0; fp < s_fbPageSampleCount; fp++)
+			{
+				const N3DS_FbPageSample *s = &s_fbPageSample[fp];
+				char fbLine[224];
+
+				snprintf(fbLine, sizeof(fbLine), "[FBPAGE] page=%d clut=%d tris=%lu blend=%d scr=(%d,%d)-(%d,%d) uv=(%d,%d)-(%d,%d)",
+				         (int)s->page, (int)s->clut, (unsigned long)s->tris, (int)s->blendMode, (int)s->sx0, (int)s->sy0,
+				         (int)s->sx1, (int)s->sy1, (int)s->u0, (int)s->v0, (int)s->u1, (int)s->v1);
+				N3DS_DebugLog(fbLine);
+			}
+			s_fbPageSampleCount = 0;
+
 			{
 				char blendLine[224];
 				const unsigned long opDraws = (unsigned long)(s_mergeEmitOpaque - s_lastStatMergeEmitOpaque);
@@ -4254,7 +4588,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 					s_forcedTexValid = 1;
 				}
 
-				N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(s_forcedPage, s_forcedClut, s_forcedFormat, N3DS_TEXVIEW_OPAQUE),
+				N3DS_CellIndexToAtlasCoord(N3DS_FindOrDecodeTexture(s_forcedPage, s_forcedClut, s_forcedFormat, N3DS_TEXVIEW_OPAQUE, 0),
 				                            &atlasIdx, &fCellX, &fCellY);
 				pixelBaseU = fCellX * N3DS_DECODE_TEXTURE_DIM;
 				pixelBaseV = fCellY * N3DS_DECODE_TEXTURE_DIM;
@@ -4271,6 +4605,14 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		if (perfScopes)
 		{
 			NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_RESOLVE);
+		}
+
+		/* s31 framebuffer-page probe -- see N3DS_FbPageRecord. Only fires for
+		 * textured triangles whose page origin lands inside a display rect,
+		 * which is ~3 pages a frame; every other triangle pays one compare. */
+		if (!untextured && N3DS_PageIsInDisplay(triVerts[0].page))
+		{
+			N3DS_FbPageRecord(triVerts, s_currentBlendMode, untextured);
 		}
 
 #ifdef CTR_NATIVE_DRAW_MERGE
