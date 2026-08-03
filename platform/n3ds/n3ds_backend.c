@@ -789,7 +789,7 @@ static void N3DS_FrameTrace(const char *msg)
 }
 
 /*
- * s29 occlusion split (docs/HANDOFF_s29.md). The resident track renderer hides
+ * s29 occlusion split (docs/archive/HANDOFF_s29.md). The resident track renderer hides
  * karts/characters/skybox/HUD, and four theories for WHY were refuted in one
  * sitting (extra geometry, GPU state leak between the two paths, a track/HUD
  * depth tie, and the uiZ=0 "anomaly" -- which turned out to be an instrument

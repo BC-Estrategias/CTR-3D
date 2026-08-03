@@ -190,7 +190,7 @@ u32 main(void)
 			// arena pair (xaPcmArena / xaPendingPcmArena), whose capacity used to
 			// ratchet up and never release -- it has since been replaced by a
 			// fixed-size streaming ring in native_audio.c, see
-			// BUGREPORT_audio_arena_growth.md for history. Keeping this reset is
+			// docs/archive/BUGREPORT_audio_arena_growth.md for history. Keeping this reset is
 			// defensible tidiness, but do not mistake it for the fix.
 			NativeAudio_ResetVoicePcmArena();
 #endif

@@ -3100,7 +3100,7 @@ void NativeRenderer_SwapWindow(void)
 		/* Break the heap down: XA now reports ring occupancy (sectors buffered
 		 * / ring depth) and underrun count instead of arena KiB -- this is the
 		 * same instrumentation that originally proved the old arena-growth bug
-		 * (BUGREPORT_audio_arena_growth.md); after the fix it should show a
+		 * (docs/archive/BUGREPORT_audio_arena_growth.md); after the fix it should show a
 		 * small number that stays flat across track transitions instead of
 		 * one that doubles over a session. */
 		printf("heap   %-6lu KiB  xa %d/%d ur %-4lu\n", heapKiB, NativeAudio_XAStreamSectorsBuffered(), NATIVE_AUDIO_XA_RING_SECTORS,

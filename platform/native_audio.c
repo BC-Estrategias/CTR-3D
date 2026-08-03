@@ -169,7 +169,7 @@ global_variable struct
 #define XA_SAMPLE_RATE_18900                18900
 
 // NOTE(aalhendi): Streaming ring for decoded XA PCM (replaces the old
-// whole-track arenas, see BUGREPORT_audio_arena_growth.md for history).
+// whole-track arenas, see docs/archive/BUGREPORT_audio_arena_growth.md for history).
 // One physical sector's worth of ring-slot capacity: 18*8*28 = 4032. This is
 // the MONO decode count (DecodeXASectorMono pushes 18*8*28 raw mono samples,
 // which after L=R duplication become 4032 output frames). A STEREO sector
@@ -387,7 +387,7 @@ struct NativeAudioXaSource
 
 // NOTE(aalhendi): Fixed-size streaming ring for one XA track's decoded PCM.
 // Replaces the old ever-growing xaPcmArena/xaPendingPcmArena (see
-// BUGREPORT_audio_arena_growth.md). ringPcm points at a static backing array
+// docs/archive/BUGREPORT_audio_arena_growth.md). ringPcm points at a static backing array
 // (not inline -- see s_xaRingPcmLive/s_xaRingPcmPending), assigned once,
 // lazily, by NativeAudio_XAStreamInitRingBackingIfNeeded.
 //
@@ -2326,7 +2326,7 @@ internal void NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock(void)
  * NativeAudio_ScanSpuSampleExtent, so this no longer books the worst case
  * from addr to the end of SPU RAM (up to ~1.8 MB per key-on, the multi-MB
  * malloc+memcpy spike docs/VOICE_START_DECODE_DESIGN.md step 2 removes; the
- * 128 MiB arena peak in BUGREPORT_audio_arena_growth.md was this mechanism).
+ * 128 MiB arena peak in docs/archive/BUGREPORT_audio_arena_growth.md was this mechanism).
  */
 internal int NativeAudio_PrepareVoicePcmBuffer(int sampleCount, struct NativeAudioPcmBuffer *pcm, int *markerOut)
 {
