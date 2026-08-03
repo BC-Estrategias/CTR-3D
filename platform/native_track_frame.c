@@ -216,13 +216,14 @@ void NativeTrackFrame_Record(struct GameTracker *gGT, struct mesh_info *mesh, st
 		 *      so there is no retail behavior left for FULL_DYNAMIC leaves
 		 *      to approximate differently from any other resident leaf.
 		 *
-		 * WATER slot leaves need no separate exclusion test here: the mesh
-		 * builder (native_track_mesh.c) never creates a resident range for
-		 * a BSP_LEAF_FLAG_WATER leaf in the first place, so
-		 * NativeTrackMesh_LeafIndexForBsp already returns -1 for every one
-		 * of them and NativeTrackFrame_WalkList drops them by construction
-		 * when list[RENDER_LIST_SLOT_WATER] is walked above -- asserted by
-		 * this comment rather than re-tested by a second flag check.
+		 * WATER slot leaves are ordinary resident leaves too, as of the owner's
+		 * s30 ruling. This comment used to assert the opposite -- that the mesh
+		 * builder never creates a resident range for a BSP_LEAF_FLAG_WATER leaf,
+		 * so the walk dropped them by construction. It does now, so the water
+		 * slot walked in the loop above contributes real leaves, and they draw
+		 * opaque until the semi-transparency work lands. Nothing here needed to
+		 * change for that; the note is corrected because a reader trusting the
+		 * old wording would conclude a whole render-list slot was dead.
 		 */
 		NativeTrackFrame_WalkList(bspListBase, renderList->bspListStart_FullDynamic, dst, nodeCap);
 
@@ -314,6 +315,39 @@ void NativeTrackFrame_Clear(void)
 const struct NativeTrackFrameSnapshot *NativeTrackFrame_ForWalk(void)
 {
 	return &s_trackFrameBuf[s_trackFrameReadIdx];
+}
+
+/*
+ * Does the resident renderer replace the retail track draw THIS frame?
+ *
+ * The toggle alone is not enough to answer that, which is the bug this
+ * function exists to close. `g_dbg_trackRender == 1` means "resident replaces
+ * retail" -- but the resident DRAW path below is __3DS__-only, so on a PC
+ * build state 1 used to switch retail off with nothing to take its place. The
+ * whole level then simply vanished: the owner hit it as "Oxide's cutscene lost
+ * his spaceship, he's floating in space", which is exactly right -- the ship
+ * IS the level geometry, and nothing was drawing level geometry at all.
+ *
+ * PC's job for this feature is the counts loop (mesh build, frame recorder,
+ * animation patcher, [TRKMESH]/[TRKFRAME]/[TRKANIM]), all of which run fine
+ * with the retail draw left alone. It has never been able to verify pixels and
+ * does not become able to by blanking them. So: on any platform without a
+ * resident draw, state 1 drives the recorder and leaves retail drawing.
+ *
+ * Lives here rather than in game/ so the platform test stays out of the
+ * decomp -- MainFrame_RenderFrame.c calls this and never learns what a 3DS is.
+ */
+int NativeTrackFrame_SkipRetailDraw(void)
+{
+#if defined(__3DS__)
+	extern int g_dbg_trackGapFill;
+
+	/* Gap fill keeps the retail call alive for the leaves residency excluded
+	 * -- see the call site's own comment for that contract. */
+	return (g_dbg_trackRender == 1) && !g_dbg_trackGapFill;
+#else
+	return 0;
+#endif
 }
 
 #if defined(__3DS__)

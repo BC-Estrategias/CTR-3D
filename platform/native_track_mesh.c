@@ -215,6 +215,11 @@ struct NativeTrackMeshState
 	u32 animVertCount;
 	u32 animVertWelded; /* animated in the source but frozen by the weld above */
 	const struct LevVertex *animSrcArray;
+	/* animSrcArray's element count, latched with the pointer. The build-time
+	 * filter already bounds every srcVert against it, but the PATCH re-reads
+	 * those indices a frame later and must not trust that on its own -- same
+	 * reasoning bspNodeCount exists for above. */
+	u32 animSrcCount;
 
 	/*
 	 * s30 AnimTex ("picture flip") patching -- turbo-pad arrows, waterfall
@@ -293,6 +298,7 @@ static u32 s_animPatchSteps;  /* chain frame-changes actually applied this windo
  * its own batch: it runs every frame over every animated vertex, where the UV
  * batch above runs only when a texture chain steps. Sharing one batch would
  * make the cheap case pay the expensive case's flush range. */
+static u32 s_vertPatchSrcOOB; /* srcVert indices outside the latched source array -- see the patch loop */
 static u16 s_vertPatchIndex[TRACK_ANIM_PATCH_CHUNK];
 static s16 s_vertPatchXYZ[TRACK_ANIM_PATCH_CHUNK * 3];
 static u8 s_vertPatchRGB[TRACK_ANIM_PATCH_CHUNK * 3];
@@ -426,6 +432,7 @@ static void NativeTrackMesh_Free(void)
 	s_animPatchFrames = 0;
 	s_animPatchSteps = 0;
 	s_vertPatchCount = 0;
+	s_vertPatchSrcOOB = 0;
 }
 
 /* Merge one TextureLayout's corner bbox into the per-(tpage,clut) rect
@@ -906,6 +913,18 @@ static u32 NativeTrackAnim_PatchVertices(void)
 			continue;
 		}
 
+		/* Re-bounded here even though the build-time filter already applied the
+		 * identical test, because this read happens a frame or more later,
+		 * against a pointer this file does not own. Counted rather than
+		 * silently skipped: a non-zero srcOOB is direct evidence that the
+		 * source array is not the one these indices were built against, which
+		 * is a different bug from the patch simply doing nothing. */
+		if ((u32)sv >= s_trackMesh.animSrcCount)
+		{
+			s_vertPatchSrcOOB++;
+			continue;
+		}
+
 		src = &s_trackMesh.animSrcArray[sv];
 		vert = &s_trackMesh.verts[vi];
 
@@ -964,9 +983,38 @@ void NativeTrackAnim_PatchFrame(void)
 	u32 patched = 0;
 	u32 skipUnit = 0, skipRect = 0;
 
+	/*
+	 * TWO conditions, and the second one is the important one.
+	 *
+	 * builtFor says a mesh exists. It does NOT say the level that mesh was
+	 * built from is still loaded -- and animSrcArray is a borrowed pointer
+	 * into that level's own vertex pool, which MEMPACK frees and reuses on a
+	 * level change. This function runs from DrawOTag, which is called from far
+	 * more than the race path: FMV, the error screen, load-time clears. Every
+	 * one of those frames would otherwise walk 13,000 indices into a freed
+	 * arena. (Roo's Tubes is the first level with a non-empty animated-vertex
+	 * list, and a PC attract run reaching it died with SIGSEGV -- this is the
+	 * fix for that.)
+	 *
+	 * The frame snapshot is exactly the "this level is live and rendering"
+	 * signal, and it already crosses to the walk thread safely: Record sets
+	 * valid only after NativeTrackMesh_IsBuiltFor passes, and Clear
+	 * invalidates it every ResetDB, so a frame that did not render the track
+	 * publishes valid=0 by construction. Reusing it here costs one load and
+	 * needs no new protocol.
+	 */
 	if (s_trackMesh.builtFor == NULL)
 	{
 		return;
+	}
+
+	{
+		const struct NativeTrackFrameSnapshot *snap = NativeTrackFrame_ForWalk();
+
+		if ((snap == NULL) || (snap->valid == 0))
+		{
+			return;
+		}
 	}
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_TRACK_ANIM);
@@ -1112,8 +1160,9 @@ static void NativeTrackAnim_Report(void)
 	 * clock and stays comparable between a capped and an uncapped build. */
 	if (s_animPatchFrames >= 600)
 	{
-		Platform_Log("[TRKANIM] window steps=%u vertsLast=%u skipUnit=%u skipRect=%u animVerts=%u\n", s_animPatchSteps, s_trackMesh.animPatchVertsLast,
-		             s_trackMesh.animPatchSkipUnit, s_trackMesh.animPatchSkipRect, s_trackMesh.animVertCount);
+		Platform_Log("[TRKANIM] window steps=%u vertsLast=%u skipUnit=%u skipRect=%u animVerts=%u srcOOB=%u\n", s_animPatchSteps,
+		             s_trackMesh.animPatchVertsLast, s_trackMesh.animPatchSkipUnit, s_trackMesh.animPatchSkipRect, s_trackMesh.animVertCount,
+		             s_vertPatchSrcOOB);
 		s_animPatchFrames = 0;
 		s_animPatchSteps = 0;
 	}
@@ -1854,10 +1903,14 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	int weldCount = 0;
 
 	int leavesTotal = 0, leavesExcluded = 0, facesDoubleSided = 0, facesNoTexture = 0, facesAnimTex = 0;
-	/* Split out of leavesExcluded so the s30 change is legible in one log line:
-	 * exclWater is what is still dropped, keptAnim is what used to be dropped
-	 * and now is not. Before this change the two were summed and unreadable. */
-	int leavesExclWater = 0, leavesKeptAnim = 0, leavesSkippedEmpty = 0;
+	/* keptWater and keptAnim are both populations that USED to be dropped whole
+	 * and now are not -- the two halves of the s30 hole fix, kept as separate
+	 * columns because they answer different questions. keptWater is how much
+	 * geometry is being drawn opaque that shouldn't be (the transparency work's
+	 * scope); keptAnim is what the vertex patcher has to cover. leavesExcluded
+	 * is now only ever incremented by guards that are genuinely errors, so a
+	 * non-zero value in the log is a real signal rather than routine. */
+	int leavesKeptWater = 0, leavesKeptAnim = 0, leavesSkippedEmpty = 0;
 	/* Both were silent `continue`s before s30 -- see their guard comments. */
 	int facesDroppedIndexCap = 0, facesDroppedCapacity = 0;
 	int animVertsWelded = 0, leavesEmittedNothing = 0;
@@ -1894,24 +1947,30 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		 * claimed), so running DrawLevelOvr1P again every frame for 15% of the
 		 * track spends a real fraction of the entire win to fix a hole.
 		 *
-		 * What is knowingly wrong until the vertex patcher lands: the handful of
-		 * genuinely animated vertices inside these leaves are frozen at their
-		 * load-time positions, so water inside them sits flat instead of
-		 * rippling. Flat water is a visual downgrade (owner's standing ruling
-		 * covers those); a hole in the road is a defect.
+		 * BSP_LEAF_FLAG_WATER leaves are kept too, as of the owner's ruling this
+		 * session ("in future don't skip the water-flagged chunks"). They used
+		 * to be excluded on the argument that this renderer bakes every face
+		 * opaque (dst->a = 0xff below; N3DS_TrackDraw_Begin asserts opaque blend
+		 * once for the whole draw), so drawing them would hide whatever should
+		 * show through -- possibly worse than the gap.
 		 *
-		 * BSP_LEAF_FLAG_WATER leaves stay excluded, deliberately. Those are the
-		 * water SURFACES, and this renderer bakes every face opaque
-		 * (dst->a = 0xff below, and N3DS_TrackDraw_Begin asserts opaque blend
-		 * once for the whole draw). Drawing them would hide whatever is meant to
-		 * show through them -- which can look worse than the gap, unlike the
-		 * road case above. They wait for the semi-transparency work.
+		 * That argument does not survive the scale. Crash Cove flags 174 of its
+		 * 504 leaves as water: most of a beach track, and not just the sea
+		 * surface but everything binned into the water render-list slot with it.
+		 * A solid sea is a visual downgrade, which the standing perf-over-parity
+		 * ruling covers; a third of the level missing is a hole, which it does
+		 * not. Semi-transparency remains the real fix and is still deferred --
+		 * this makes the interim state the better-looking one, not the correct
+		 * one.
+		 *
+		 * Counted, not silent: `water=` in [TRKMESH] now reports water leaves
+		 * KEPT rather than dropped, because the number still matters -- it is
+		 * how much geometry is being drawn opaque that should not be, and it is
+		 * what the transparency work will have to cover.
 		 */
 		if ((bsp->flag & BSP_LEAF_FLAG_WATER) != 0)
 		{
-			leavesExcluded++;
-			leavesExclWater++;
-			continue;
+			leavesKeptWater++;
 		}
 
 		if (NativeTrackMesh_LeafTouchesAnim(bsp, animMark, numVertex, numQuadBlock))
@@ -2207,6 +2266,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	s_trackMesh.animVertCount = 0;
 	s_trackMesh.animVertWelded = 0;
 	s_trackMesh.animSrcArray = vertexArray;
+	s_trackMesh.animSrcCount = (u32)numVertex;
 	{
 		u32 needed = 0;
 		u32 i;
@@ -2452,10 +2512,10 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * NativePerf_CurrentLevelID's comment for why a second level field is not
 	 * an option.
 	 */
-	Platform_Log("[TRKMESH] lvl=%d lev=%p leaves=%u/%d (excl=%d water=%d keptAnim=%d empty=%d noFaces=%d) verts=%u idx=%u tex=%u dropIdxCap=%d dropCap=%d "
+	Platform_Log("[TRKMESH] lvl=%d lev=%p leaves=%u/%d (excl=%d keptWater=%d keptAnim=%d empty=%d noFaces=%d) verts=%u idx=%u tex=%u dropIdxCap=%d dropCap=%d "
 	             "animVerts=%u animWelded=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d | welds=%d\n",
-	             NativePerf_CurrentLevelID(), (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, leavesExclWater, leavesKeptAnim, leavesSkippedEmpty,
-	             leavesEmittedNothing,
+	             NativePerf_CurrentLevelID(), (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, leavesKeptWater, leavesKeptAnim,
+	             leavesSkippedEmpty, leavesEmittedNothing,
 	             s_trackMesh.vertCount, s_trackMesh.indexCount, s_trackMesh.texCount, facesDroppedIndexCap, facesDroppedCapacity,
 	             s_trackMesh.animVertCount, s_trackMesh.animVertWelded,
 	             (u32)(s_trackMesh.vertCount * sizeof(struct NativeTrackVert) / 1024), (u32)(s_trackMesh.indexCount * sizeof(u16) / 1024), facesDoubleSided,

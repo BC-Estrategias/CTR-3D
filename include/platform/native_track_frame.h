@@ -151,6 +151,13 @@ void NativeTrackFrame_Record(struct GameTracker *gGT, struct mesh_info *mesh, st
 // NativeTrackFrame_Clear (see the file-header comment for why).
 void NativeTrackFrame_PublishForWalk(void);
 
+// 1 when game/MAIN/MainFrame_RenderFrame.c must skip retail's DrawLevelOvr1P
+// because the resident renderer is drawing the track instead. Not simply
+// "g_dbg_trackRender == 1": the resident draw path is 3DS-only, so on any other
+// platform state 1 drives the recorder and leaves retail drawing rather than
+// blanking the level. See the .c definition for the bug that wording fixes.
+int NativeTrackFrame_SkipRetailDraw(void);
+
 // Flip-and-invalidate, called from MainFrame_ResetDB (game/MAIN/MainFrame.c)
 // at the exact same call site as GTECapture_Clear, same idiom: write ^= 1,
 // then the NEW write buffer's valid is forced to 0. This is what guarantees a

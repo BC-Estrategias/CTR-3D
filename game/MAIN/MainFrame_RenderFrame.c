@@ -1292,17 +1292,18 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 		int skipRetailTrackDraw;
 		{
-			extern int g_dbg_trackRender;
-			extern int g_dbg_trackGapFill;
+			extern int NativeTrackFrame_SkipRetailDraw(void);
 
 			/*
-			 * Gap fill keeps this call ALIVE in state 1 -- the render-list
-			 * builder (RenderLevel/RenderLists.c) has already withheld every
-			 * leaf the resident mesh owns, so what arrives here is only the
-			 * leaves residency excluded. Without it, state 1 skips the draw
-			 * entirely and those leaves are drawn by nobody.
+			 * The toggle state alone does NOT decide this -- see
+			 * NativeTrackFrame_SkipRetailDraw's own comment. It also weighs
+			 * whether a resident draw exists on this platform at all (it is
+			 * 3DS-only) and whether gap fill needs the retail call kept alive
+			 * for the leaves residency excluded. Asking one function keeps that
+			 * policy in platform/ where it belongs instead of spreading a
+			 * platform test through the decomp.
 			 */
-			skipRetailTrackDraw = (g_dbg_trackRender == 1) && !g_dbg_trackGapFill;
+			skipRetailTrackDraw = NativeTrackFrame_SkipRetailDraw();
 		}
 #else
 		const int skipRetailTrackDraw = 0;
