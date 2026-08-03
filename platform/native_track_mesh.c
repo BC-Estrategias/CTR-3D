@@ -125,6 +125,28 @@ struct NativeTrackAtlasLayout
 	u32 packedTexels;
 };
 
+/* One animated texture chain that at least one resident face samples. `anim`
+ * is borrowed from the level's own data (cleared with the rest of the state on
+ * teardown, same contract as animSrcArray). buildUnit is the atlas unit the
+ * ACTIVE frame landed in at build time, which is the unit
+ * NativeTrackMesh_BinLeavesByAtlasUnit binned this texture's leaves against --
+ * a frame that packed into a different unit therefore cannot be patched in
+ * without the leaf sampling the wrong atlas, so it is skipped and counted. */
+struct NativeTrackAnimTexEntry
+{
+	const struct AnimTex *anim;
+	u16 texRef;
+	u16 numFrames;
+	u32 frameSlot; /* first index into animFrameRect */
+	u32 vertFirst; /* first index into animTexVerts */
+	u32 vertCount;
+	s16 curFrame; /* frame currently baked into the GPU buffer; -1 = "as built" */
+	u8 buildUnit;
+};
+
+#define TRACK_ANIMTEX_MAX 128
+#define TRACK_ANIMTEX_MAX_FRAMESLOTS 4096
+
 struct NativeTrackMeshState
 {
 	struct mesh_info *builtFor; /* rebuild latch, same idiom as the census */
@@ -193,11 +215,88 @@ struct NativeTrackMeshState
 	u32 animVertCount;
 	u32 animVertWelded; /* animated in the source but frozen by the weld above */
 	const struct LevVertex *animSrcArray;
+
+	/*
+	 * s30 AnimTex ("picture flip") patching -- turbo-pad arrows, waterfall
+	 * sheets, lava. Distinct from the animated-VERTEX case above and far more
+	 * visible: nothing moves, the game just repoints a face at the next frame
+	 * of a texture chain every vblank (CTR_CycleTex_LEV, called unconditionally
+	 * from MainFrame_RenderFrame.c:102). Checked that this is the ONLY runtime
+	 * appearance change a track face can have: nothing in game/ ever writes
+	 * QuadBlock.ptr_texture_mid, so every scrolling/blinking track surface in
+	 * the game reaches the screen through this one indirection.
+	 *
+	 * The expensive half was already done at load: EVERY frame of every chain
+	 * is decoded and packed into the track atlas (the AddLayout loop below).
+	 * Only the ACTIVE frame's rect index was kept, which is exactly why the
+	 * resident renderer freezes them on whatever frame happened to be up when
+	 * the level loaded.
+	 *
+	 * Two things are needed per frame and both are recorded here at build time:
+	 *   - animFrameRect: every frame's rect index, not just the active one.
+	 *     Slot f of an entry is frame f, ALWAYS allocated even when that frame
+	 *     was unusable (NULL icon group, bad tpage) -- it holds -1 then, so the
+	 *     frame index the game hands us indexes straight in with no remap.
+	 *   - animTexVerts: which resident vertices belong to each animated texRef,
+	 *     so the patch is O(that texture's vertices), not O(track).
+	 *
+	 * A frame swap is NOT just a rect swap. Atlas rects are keyed by
+	 * (tpage, clut) and MERGED (NativeTrackAtlas_AddLayout), so two frames of
+	 * one chain may share a rect and differ only in their page-space corner
+	 * UVs -- which is what the baked NativeTrackVert.u/.v came from. So the
+	 * patch re-reads the frame's own TextureLayout corners and re-encodes,
+	 * rather than translating the old UV into a new rect. The corner each
+	 * vertex used is stashed in faceFlags bits 3-4 at emit time (the field's
+	 * own comment already reserved them as "rotation scratch"; nothing outside
+	 * this file reads it, and the GPU mirror does not carry it at all).
+	 */
+	struct NativeTrackAnimTexEntry *animTex;
+	u32 animTexCount;
+	s16 *animFrameRect;
+	u32 animFrameSlotCount;
+	u32 *animTexVerts;
+	u32 animTexVertCount;
+
+	/* Per-frame patch outcome, reported once per level and then only when it
+	 * changes -- see NativeTrackAnim_PatchFrame. */
+	u32 animPatchSkipUnit;  /* frame lives in a different atlas unit than the leaf bin assumes */
+	u32 animPatchSkipRect;  /* frame never got a placed rect */
+	u32 animPatchVertsLast; /* vertices rewritten on the most recent patching frame */
 };
 
 #define TRACK_SRCVERT_NONE 0xFFFFu
 
 global_variable struct NativeTrackMeshState s_trackMesh;
+
+/*
+ * Scatter-write staging for the per-frame AnimTex patch
+ * (NativeTrackAnim_PatchFrame, far below -- declared up here only because
+ * NativeTrackMesh_Free has to reset it and comes first in this file).
+ *
+ * Batched rather than one backend call per vertex because the expensive part
+ * of the write is not the store, it is the cache flush that has to follow it
+ * before the GPU reads the block: one flush over a chunk's touched range beats
+ * one flush per vertex by orders of magnitude, and a fixed 4KB of static
+ * staging beats a per-frame malloc on a path that runs every vblank.
+ */
+#define TRACK_ANIM_PATCH_CHUNK 512
+
+static u16 s_animPatchIndex[TRACK_ANIM_PATCH_CHUNK];
+static s16 s_animPatchUV[TRACK_ANIM_PATCH_CHUNK * 2];
+static u32 s_animPatchCount;
+static u32 s_animPatchOutOfRect;
+static u32 s_animPatchOutOfRectLogged;
+static u32 s_animPatchFrames; /* heartbeat divider -- see the [TRKANIM] window line */
+static u32 s_animPatchSteps;  /* chain frame-changes actually applied this window */
+
+/* The animated-VERTEX staging (water surfaces that physically move), kept in
+ * its own batch: it runs every frame over every animated vertex, where the UV
+ * batch above runs only when a texture chain steps. Sharing one batch would
+ * make the cheap case pay the expensive case's flush range. */
+static u16 s_vertPatchIndex[TRACK_ANIM_PATCH_CHUNK];
+static s16 s_vertPatchXYZ[TRACK_ANIM_PATCH_CHUNK * 3];
+static u8 s_vertPatchRGB[TRACK_ANIM_PATCH_CHUNK * 3];
+static u32 s_vertPatchCount;
 
 /* The four mid-LOD quads of the 3x3 grid (design section 2 / ctr-tools),
  * counter-clockwise in grid space; triangulated (0,2,1)(1,2,3) per quad,
@@ -308,10 +407,25 @@ static void NativeTrackMesh_Free(void)
 	free(s_trackMesh.texTable);
 	free(s_trackMesh.srcVert);
 	free(s_trackMesh.animVerts);
+	free(s_trackMesh.animTex);
+	free(s_trackMesh.animFrameRect);
+	free(s_trackMesh.animTexVerts);
 	/* The memset below is what clears animSrcArray -- a pointer into the
 	 * level's own vertex pool, borrowed not owned, and dangling the moment the
-	 * level it came from is torn down. */
+	 * level it came from is torn down. Each animTex entry's `anim` pointer is
+	 * borrowed the same way and cleared by the same memset. */
 	memset(&s_trackMesh, 0, sizeof(s_trackMesh));
+
+	/* Patch staging is static, so it does NOT ride the memset -- a half-filled
+	 * chunk left over from the outgoing level would otherwise be flushed
+	 * against the incoming one's vertex buffer, writing UVs into whatever
+	 * geometry happens to share those indices. */
+	s_animPatchCount = 0;
+	s_animPatchOutOfRect = 0;
+	s_animPatchOutOfRectLogged = 0;
+	s_animPatchFrames = 0;
+	s_animPatchSteps = 0;
+	s_vertPatchCount = 0;
 }
 
 /* Merge one TextureLayout's corner bbox into the per-(tpage,clut) rect
@@ -503,6 +617,506 @@ static void NativeTrackAtlas_Pack(void)
 	 * above (review finding #7) -- clamp rather than report one more unit
 	 * than the pool actually has. */
 	atlas->unitsUsed = (atlas->rectCount > 0) ? TRKMESH_MIN(unit + 1, TRACK_ATLAS_MAX_UNITS) : 0;
+}
+
+/*
+ * PAGE-space texel coord -> the GPU-side s16 atlas UV, in ONE place.
+ *
+ * Both writers of a resident vertex's UV go through here: the one-time upload
+ * repack (NativeTrackGeom_UploadToBackend) and the per-frame AnimTex patch
+ * (NativeTrackAnim_PatchFrame). That is a hard requirement, not tidiness --
+ * the ten-session texture-quilt bug was a COPY of this arithmetic that dropped
+ * the V flip, and a patcher carrying a second copy would reintroduce it on
+ * exactly the surfaces (waterfalls, turbo pads) whose whole point is to be
+ * looked at.
+ *
+ * The encoding, and why each part of it: 2x fixed point with +1 for the texel
+ * CENTRE (sampling corners shifts every fetch half a texel under GPU_NEAREST),
+ * and V flipped because PICA reads the atlas bottom-up, so memory row `a` is
+ * addressed by numerator (2*DIM - 1) - 2a. U is not flipped; horizontal order
+ * already matches. Denominator is 2*TRACK_ATLAS_DIM = 1024, which is what
+ * ctr_track.v.pica's atlasScale must be. Spelled with this file's own
+ * TRACK_ATLAS_DIM rather than the backend's N3DS_TRACK_ATLAS_DIM so the
+ * arithmetic also compiles (and can be count-verified) on PC, where the
+ * backend header is absent; the two are static-asserted equal on 3DS.
+ *
+ * Reads srcU/srcV, never minU/minV -- see NativeTrackAtlasRect's own field
+ * comment for why those differ on tall rects. Returns the RAW pre-encode atlas
+ * coords through outAtlasU/outAtlasV so a caller can range-check placement
+ * against the rect without re-deriving (or, worse, checking the encoding
+ * against itself); pass NULL when not validating.
+ */
+static void NativeTrackAtlas_EncodeUV(const struct NativeTrackAtlasRect *rect, u8 pageU, u8 pageV, s16 *outU, s16 *outV, int *outAtlasU, int *outAtlasV)
+{
+	const int atlasU = (int)rect->atlasX + ((int)pageU - (int)rect->srcU);
+	const int atlasV = (int)rect->atlasY + ((int)pageV - (int)rect->srcV);
+
+	*outU = (s16)((atlasU << 1) + 1);
+	*outV = (s16)(((2 * TRACK_ATLAS_DIM) - 1) - (atlasV << 1));
+
+	if (outAtlasU != NULL)
+	{
+		*outAtlasU = atlasU;
+	}
+	if (outAtlasV != NULL)
+	{
+		*outAtlasV = atlasV;
+	}
+}
+
+/*
+ * Once per level, after the atlas upload and the leaf binning: work out which
+ * resident vertices belong to each animated texture chain, and which atlas
+ * unit that chain's leaves were binned against.
+ *
+ * Two passes (count, then fill) so the flat list is sized to what is actually
+ * there rather than to a worst case -- an animated chain is typically a
+ * handful of faces on a track of twenty thousand quadblocks. The texRef ->
+ * entry direction goes through a 1024-entry scratch map rather than a linear
+ * scan per vertex, because the naive form is vertCount x animTexCount and
+ * both of those are level data, not constants.
+ *
+ * Allocation failure here is a degrade, not a level drop: animTexVerts stays
+ * NULL, the patch does nothing, and the track renders exactly as it did before
+ * this feature -- frozen but present.
+ */
+static void NativeTrackAnim_BuildVertexLists(void)
+{
+	static s16 refToEntry[1024];
+	u32 i, e, total = 0;
+
+	if ((s_trackMesh.animTexCount == 0) || (s_trackMesh.animTex == NULL) || (s_trackMesh.verts == NULL))
+	{
+		return;
+	}
+
+	for (i = 0; i < 1024; i++)
+	{
+		refToEntry[i] = -1;
+	}
+
+	for (e = 0; e < s_trackMesh.animTexCount; e++)
+	{
+		struct NativeTrackAnimTexEntry *entry = &s_trackMesh.animTex[e];
+		s16 rectIdx = (entry->texRef < 1024) ? s_trackMesh.texRectIndex[entry->texRef] : (s16)-1;
+
+		entry->vertCount = 0;
+		entry->vertFirst = 0;
+
+		/* The unit the ACTIVE frame landed in, which is the unit
+		 * NativeTrackMesh_BinLeavesByAtlasUnit binned this chain's leaves
+		 * against. A later frame that packed into a DIFFERENT unit cannot be
+		 * swapped in without that leaf sampling the wrong atlas, so the patch
+		 * skips it and counts the skip rather than drawing garbage. */
+		if ((rectIdx >= 0) && (rectIdx < s_trackMesh.atlas.rectCount))
+		{
+			entry->buildUnit = s_trackMesh.atlas.rects[rectIdx].atlasUnit;
+		}
+
+		if (entry->texRef < 1024)
+		{
+			refToEntry[entry->texRef] = (s16)e;
+		}
+	}
+
+	for (i = 0; i < s_trackMesh.vertCount; i++)
+	{
+		u16 ref = s_trackMesh.verts[i].texRef;
+		s16 e16 = (ref < 1024) ? refToEntry[ref] : (s16)-1;
+
+		if (e16 >= 0)
+		{
+			s_trackMesh.animTex[e16].vertCount++;
+			total++;
+		}
+	}
+
+	if (total == 0)
+	{
+		return;
+	}
+
+	s_trackMesh.animTexVerts = (u32 *)malloc((size_t)total * sizeof(u32));
+
+	if (s_trackMesh.animTexVerts == NULL)
+	{
+		for (e = 0; e < s_trackMesh.animTexCount; e++)
+		{
+			s_trackMesh.animTex[e].vertCount = 0;
+		}
+		return;
+	}
+
+	{
+		u32 cursor = 0;
+
+		for (e = 0; e < s_trackMesh.animTexCount; e++)
+		{
+			s_trackMesh.animTex[e].vertFirst = cursor;
+			cursor += s_trackMesh.animTex[e].vertCount;
+			s_trackMesh.animTex[e].vertCount = 0; /* re-counted as a fill cursor below */
+		}
+	}
+
+	for (i = 0; i < s_trackMesh.vertCount; i++)
+	{
+		u16 ref = s_trackMesh.verts[i].texRef;
+		s16 e16 = (ref < 1024) ? refToEntry[ref] : (s16)-1;
+
+		if (e16 >= 0)
+		{
+			struct NativeTrackAnimTexEntry *entry = &s_trackMesh.animTex[e16];
+
+			s_trackMesh.animTexVerts[entry->vertFirst + entry->vertCount] = i;
+			entry->vertCount++;
+		}
+	}
+
+	s_trackMesh.animTexVertCount = total;
+}
+
+static void NativeTrackAnim_FlushQueuedUV(void)
+{
+	if (s_animPatchCount == 0)
+	{
+		return;
+	}
+
+#if defined(__3DS__)
+	N3DS_TrackGeom_PatchUV(s_animPatchIndex, s_animPatchUV, (int)s_animPatchCount);
+#endif
+
+	s_animPatchCount = 0;
+}
+
+static void NativeTrackAnim_QueueVertexUV(u32 vertIndex, const struct NativeTrackAtlasRect *rect, u8 pageU, u8 pageV)
+{
+	s16 u, v;
+	int atlasU, atlasV;
+
+	if (vertIndex > 0xffff)
+	{
+		return;
+	}
+
+	NativeTrackAtlas_EncodeUV(rect, pageU, pageV, &u, &v, &atlasU, &atlasV);
+
+	/* The same in-rect self-check the one-time upload runs ([TRKUV]), applied
+	 * to every animation frame rather than only the one that happened to be up
+	 * at load. A frame whose corners fall outside its own rect is sampling a
+	 * NEIGHBOURING texture -- the quilt failure mode in an animation costume,
+	 * and precisely the class of bug that stayed hidden for ten sessions
+	 * because it looks like plausible texture rather than like an error.
+	 * Counted, never asserted. */
+	if ((atlasU < (int)rect->atlasX) || (atlasU >= (int)(rect->atlasX + rect->allocW)) || (atlasV < (int)rect->atlasY)
+	    || (atlasV >= (int)(rect->atlasY + rect->allocH)))
+	{
+		s_animPatchOutOfRect++;
+	}
+
+	s_animPatchIndex[s_animPatchCount] = (u16)vertIndex;
+	s_animPatchUV[s_animPatchCount * 2 + 0] = u;
+	s_animPatchUV[s_animPatchCount * 2 + 1] = v;
+	s_animPatchCount++;
+
+	if (s_animPatchCount == TRACK_ANIM_PATCH_CHUNK)
+	{
+		NativeTrackAnim_FlushQueuedUV();
+	}
+}
+
+static void NativeTrackAnim_FlushQueuedVerts(void)
+{
+	if (s_vertPatchCount == 0)
+	{
+		return;
+	}
+
+#if defined(__3DS__)
+	N3DS_TrackGeom_PatchPosColor(s_vertPatchIndex, s_vertPatchXYZ, s_vertPatchRGB, (int)s_vertPatchCount);
+#endif
+
+	s_vertPatchCount = 0;
+}
+
+static void NativeTrackAnim_QueueVertexPos(u32 vertIndex, const struct NativeTrackVert *vert)
+{
+	if (vertIndex > 0xffff)
+	{
+		return;
+	}
+
+	s_vertPatchIndex[s_vertPatchCount] = (u16)vertIndex;
+	s_vertPatchXYZ[s_vertPatchCount * 3 + 0] = vert->x;
+	s_vertPatchXYZ[s_vertPatchCount * 3 + 1] = vert->y;
+	s_vertPatchXYZ[s_vertPatchCount * 3 + 2] = vert->z;
+	s_vertPatchRGB[s_vertPatchCount * 3 + 0] = vert->r;
+	s_vertPatchRGB[s_vertPatchCount * 3 + 1] = vert->g;
+	s_vertPatchRGB[s_vertPatchCount * 3 + 2] = vert->b;
+	s_vertPatchCount++;
+
+	if (s_vertPatchCount == TRACK_ANIM_PATCH_CHUNK)
+	{
+		NativeTrackAnim_FlushQueuedVerts();
+	}
+}
+
+/*
+ * The animated-VERTEX half: re-read the moving water vertices from the level's
+ * own pool and push them at the GPU copy.
+ *
+ * This is the reason animated-vertex leaves are kept at all now instead of
+ * being dropped whole (which is what put the holes in Polar Pass). srcVert
+ * carries provenance per resident vertex and is TRACK_SRCVERT_NONE for anything
+ * the weld pass moved -- re-copying one of those would reopen the T-junction
+ * crack the weld exists to close, on exactly the water edges this animates. So
+ * "frozen but welded" is chosen deliberately for those, and counted
+ * (animWelded) rather than left to be discovered.
+ *
+ * Position AND color: AnimateQuadVertex writes both (LevVertex.pos and
+ * .color_hi), so patching position alone would animate the shape of a water
+ * surface while its shading stayed fixed at load.
+ */
+static u32 NativeTrackAnim_PatchVertices(void)
+{
+	u32 i;
+	u32 patched = 0;
+
+	if ((s_trackMesh.animVertCount == 0) || (s_trackMesh.animVerts == NULL) || (s_trackMesh.animSrcArray == NULL) || (s_trackMesh.srcVert == NULL))
+	{
+		return 0;
+	}
+
+	for (i = 0; i < s_trackMesh.animVertCount; i++)
+	{
+		u32 vi = s_trackMesh.animVerts[i];
+		struct NativeTrackVert *vert;
+		const struct LevVertex *src;
+		u16 sv;
+
+		if (vi >= s_trackMesh.vertCount)
+		{
+			continue;
+		}
+
+		sv = s_trackMesh.srcVert[vi];
+
+		if (sv == TRACK_SRCVERT_NONE)
+		{
+			continue;
+		}
+
+		src = &s_trackMesh.animSrcArray[sv];
+		vert = &s_trackMesh.verts[vi];
+
+		vert->x = src->pos.x;
+		vert->y = src->pos.y;
+		vert->z = src->pos.z;
+		vert->r = src->color_hi[0];
+		vert->g = src->color_hi[1];
+		vert->b = src->color_hi[2];
+
+		NativeTrackAnim_QueueVertexPos(vi, vert);
+		patched++;
+	}
+
+	NativeTrackAnim_FlushQueuedVerts();
+	return patched;
+}
+
+/*
+ * The per-frame half. Repoints every resident vertex of every animated texture
+ * chain at the frame the game has advanced to -- turbo-pad arrows, waterfalls,
+ * lava. Without it the resident renderer shows whichever frame happened to be
+ * active when the level loaded, forever.
+ *
+ * WHERE THIS RUNS MATTERS. It writes into the single linearAlloc block
+ * N3DS_TrackGeom_Upload handed the GPU, and on render-thread builds core 2
+ * draws out of that block. It is therefore called from CtrGpu_ExecDrawOTag --
+ * i.e. on the WALK thread, whichever that is, at the head of a walk. The
+ * render queue is FIFO with one worker, so the previous frame's walk has
+ * already finished by then and the next one has not started: no fence, no
+ * double buffer, and no argument about whether some other call site happens to
+ * be a barrier today.
+ *
+ * The game-state it reads (AnimTex.frameCurr, and the frame's own
+ * TextureLayout) is written by CTR_CycleTex_LEV on the game thread early in
+ * the frame. Reading it a walk later can only ever show one frame of a
+ * scrolling texture early; there is no tear that produces an invalid UV,
+ * because a frame index is read once and everything else follows from it.
+ *
+ * Work is proportional to the vertices of chains that ACTUALLY CHANGED frame
+ * (curFrame latch), not to the track: a chain with frameSkip set holds for
+ * several vblanks and costs nothing on the frames in between.
+ *
+ * RESIDUAL, stated rather than papered over: the mesh REBUILD runs on the game
+ * thread (NativeTrackMesh_Frame, from the 1P gate) and starts by freeing
+ * s_trackMesh, so a level transition can in principle free these arrays
+ * between this function's builtFor check and its use of them. That is the
+ * exact exposure the existing resident DRAW path already has against
+ * leafRanges, and closing it properly means a build/teardown handshake for the
+ * whole mesh, not a lock bolted onto this one reader. Matched to the existing
+ * path deliberately; do not read this comment as a claim that it is safe.
+ */
+void NativeTrackAnim_PatchFrame(void)
+{
+	u32 e;
+	u32 patched = 0;
+	u32 skipUnit = 0, skipRect = 0;
+
+	if (s_trackMesh.builtFor == NULL)
+	{
+		return;
+	}
+
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_TRACK_ANIM);
+
+	patched = NativeTrackAnim_PatchVertices();
+
+	/* Deliberately NOT an early return: a track can have moving water and no
+	 * animated textures, and the heartbeat below is the only runtime evidence
+	 * this function ran at all. An early return here would report "steps=0" as
+	 * silence rather than as a number. */
+	if ((s_trackMesh.animTexCount == 0) || (s_trackMesh.animTexVerts == NULL))
+	{
+		goto report;
+	}
+
+	for (e = 0; e < s_trackMesh.animTexCount; e++)
+	{
+		struct NativeTrackAnimTexEntry *entry = &s_trackMesh.animTex[e];
+		const struct AnimTex *anim = entry->anim;
+		struct IconGroup4 **frames;
+		const struct TextureLayout *layout;
+		const struct NativeTrackAtlasRect *rect;
+		s16 rectIdx;
+		int f;
+		u32 v;
+
+		if ((anim == NULL) || (entry->vertCount == 0))
+		{
+			continue;
+		}
+
+		f = (int)anim->frameCurr;
+
+		if ((f < 0) || (f >= (int)entry->numFrames))
+		{
+			continue;
+		}
+
+		if (f == (int)entry->curFrame)
+		{
+			continue;
+		}
+
+		rectIdx = s_trackMesh.animFrameRect[entry->frameSlot + (u32)f];
+
+		if ((rectIdx < 0) || (rectIdx >= s_trackMesh.atlas.rectCount))
+		{
+			skipRect++;
+			continue;
+		}
+
+		rect = &s_trackMesh.atlas.rects[rectIdx];
+
+		if ((rect->atlasUnit == TRACK_ATLAS_UNIT_INVALID) || (rect->atlasUnit != entry->buildUnit))
+		{
+			skipUnit++;
+			continue;
+		}
+
+		frames = ANIMTEX_GETARRAY((struct AnimTex *)anim);
+
+		if (frames[f] == NULL)
+		{
+			skipRect++;
+			continue;
+		}
+
+		layout = (const struct TextureLayout *)frames[f] + 2; /* near */
+
+		{
+			const u8 *uvBytes = &layout->u0;
+
+			for (v = 0; v < entry->vertCount; v++)
+			{
+				u32 vi = s_trackMesh.animTexVerts[entry->vertFirst + v];
+				struct NativeTrackVert *vert;
+				int corner;
+
+				if (vi >= s_trackMesh.vertCount)
+				{
+					continue;
+				}
+
+				vert = &s_trackMesh.verts[vi];
+				corner = (vert->faceFlags >> 3) & 3;
+
+				/* Same corner, different frame's layout -- the per-face
+				 * rotation/flip was already resolved into faceFlags at emit
+				 * time, so this is a straight re-read, not a re-derivation. */
+				vert->u = uvBytes[sTrackUvByteOfs[corner]];
+				vert->v = uvBytes[sTrackUvByteOfs[corner] + 1];
+
+				NativeTrackAnim_QueueVertexUV(vi, rect, vert->u, vert->v);
+				patched++;
+			}
+		}
+
+		entry->curFrame = (s16)f;
+		s_animPatchSteps++;
+	}
+
+	NativeTrackAnim_FlushQueuedUV();
+
+report:
+	s_trackMesh.animPatchSkipUnit = skipUnit;
+	s_trackMesh.animPatchSkipRect = skipRect;
+	s_trackMesh.animPatchVertsLast = patched;
+
+	/* Counters only. NOTHING here logs: this function runs on the walk thread,
+	 * and the 3DS log is an unlocked FILE* (n3ds_backend.c) -- two threads
+	 * inside fputs on it is a corrupted log at best. NativeTrackAnim_Report
+	 * below does the emitting, from the game thread. */
+	s_animPatchFrames++;
+
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_TRACK_ANIM);
+}
+
+/*
+ * Game-thread reporter for the patcher above, called once per frame from
+ * NativeTrackMesh_Frame.
+ *
+ * The heartbeat exists to make ONE hardware sitting enough. If turbo pads still
+ * do not move, this line separates three bugs that look identical through a
+ * camera: `steps=0` means the patcher never ran, `steps` climbing means it ran
+ * and the frame swap is wrong, and non-zero skipUnit/skipRect means those
+ * frames were unswappable in the first place.
+ *
+ * The counters are written on the walk thread and read here without
+ * synchronisation. That is deliberate and safe in the only sense that matters:
+ * they are u32 diagnostics, a torn read costs one wrong number in one log line,
+ * and the alternative -- a lock on the per-vertex path -- would cost more than
+ * the thing being measured.
+ */
+static void NativeTrackAnim_Report(void)
+{
+	if ((s_animPatchOutOfRect != 0) && (s_animPatchOutOfRectLogged == 0))
+	{
+		s_animPatchOutOfRectLogged = 1;
+		Platform_Log("[TRKANIM] WARNING outOfRect=%u -- an animation frame is sampling outside its own atlas rect\n", s_animPatchOutOfRect);
+	}
+
+	/* Frame-counted rather than time-counted -- ~10s at 60Hz -- so it needs no
+	 * clock and stays comparable between a capped and an uncapped build. */
+	if (s_animPatchFrames >= 600)
+	{
+		Platform_Log("[TRKANIM] window steps=%u vertsLast=%u skipUnit=%u skipRect=%u animVerts=%u\n", s_animPatchSteps, s_trackMesh.animPatchVertsLast,
+		             s_trackMesh.animPatchSkipUnit, s_trackMesh.animPatchSkipRect, s_trackMesh.animVertCount);
+		s_animPatchFrames = 0;
+		s_animPatchSteps = 0;
+	}
 }
 
 #if defined(__3DS__)
@@ -917,31 +1531,13 @@ static int NativeTrackGeom_UploadToBackend(struct mesh_info *mesh, int numQuadBl
 				if ((rectIdx >= 0) && (rectIdx < s_trackMesh.atlas.rectCount) && (s_trackMesh.atlas.rects[rectIdx].atlasUnit != TRACK_ATLAS_UNIT_INVALID))
 				{
 					const struct NativeTrackAtlasRect *rect = &s_trackMesh.atlas.rects[rectIdx];
-					const int atlasU = (int)rect->atlasX + ((int)src->u - (int)rect->srcU);
-					const int atlasV = (int)rect->atlasY + ((int)src->v - (int)rect->srcV);
+					int atlasU, atlasV;
 
-					/* Store in the SAME convention the packet path's atlas uses
-					 * (native_renderer_3ds.c, the N3DS_Vertex UV write): 2x
-					 * fixed point, +1 for the texel CENTRE, and V FLIPPED --
-					 * PICA reads the atlas bottom-up, so memory row `a` is
-					 * targeted by numerator (2*DIM - 1) - 2a. U is not flipped;
-					 * horizontal order matches.
-					 *
-					 * This is not optional polish. Sampling texel corners
-					 * instead of centres shifts every fetch by half a texel
-					 * under GPU_NEAREST, and omitting the flip mirrors each
-					 * rect vertically INTO ITS NEIGHBOURS -- which is the
-					 * ten-session texture-quilt bug, rediscovered. An earlier
-					 * version of this code did both, on the strength of a
-					 * comment I wrote claiming the flip lived in the upload.
-					 * It does not: the fix is sample-side, and that file says
-					 * so in the comment directly above the code being mirrored
-					 * here.
-					 *
-					 * Denominator is therefore 2*N3DS_TRACK_ATLAS_DIM = 1024,
-					 * which is what ctr_track.v.pica's atlasScale must be. */
-					dst->u = (s16)((atlasU << 1) + 1);
-					dst->v = (s16)(((2 * N3DS_TRACK_ATLAS_DIM) - 1) - (atlasV << 1));
+					/* The 2x/centre/V-flip encoding lives in ONE function, shared
+					 * with the per-frame AnimTex patcher -- see
+					 * NativeTrackAtlas_EncodeUV for the whole derivation and for
+					 * the quilt bug a second copy of it caused. */
+					NativeTrackAtlas_EncodeUV(rect, src->u, src->v, &dst->u, &dst->v, &atlasU, &atlasV);
 
 					/* Self-check, because "does it look right" is not available:
 					 * attract never holds a scene long enough for a same-frame
@@ -1113,6 +1709,12 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * mesh->numBspNodes read live (which could have already changed under
 	 * a stale-but-pointer-equal mesh). */
 	static int s_builtQb = -1, s_builtVtx = -1, s_builtBspNodes = -1;
+
+	/* Before every early return below: this is the game-thread half of the
+	 * per-frame animation patch, and the common case IS an early return (the
+	 * mesh is already built). Reporting after the latch check would emit
+	 * nothing on exactly the frames the patcher is doing its work. */
+	NativeTrackAnim_Report();
 
 	if ((level == NULL) || (mesh == NULL))
 	{
@@ -1530,7 +2132,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 						}
 					}
 					dst->drawOrder = drawOrder;
-					dst->faceFlags = (u8)(doubleSided | (faceMode << 1));
+					/* Bits 3-4 carry which of the layout's four corners this
+					 * vertex's UV came from, so the AnimTex patcher can re-read
+					 * the SAME corner out of a different frame's layout. The
+					 * per-face rotation/flip is already resolved into it, which
+					 * is the point -- the patcher never has to re-derive
+					 * faceBits from a QuadBlock it no longer holds. */
+					dst->faceFlags = (u8)(doubleSided | (faceMode << 1) | ((uvPerm[c] & 3) << 3));
 					dst->r = src->color_hi[0];
 					dst->g = src->color_hi[1];
 					dst->b = src->color_hi[2];
@@ -1656,6 +2264,16 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 	int atlasAnimFrames = 0;
 
+	/* s30: every frame's rect index is kept now, not just the active one --
+	 * without them the resident renderer can only ever show the frame that
+	 * happened to be up at load, which is why turbo pads and waterfalls sit
+	 * frozen. Allocated lazily and capped; running out is a degrade (that
+	 * chain stays frozen), never a dropped level. */
+	s_trackMesh.animTex = (struct NativeTrackAnimTexEntry *)malloc(TRACK_ANIMTEX_MAX * sizeof(struct NativeTrackAnimTexEntry));
+	s_trackMesh.animFrameRect = (s16 *)malloc(TRACK_ANIMTEX_MAX_FRAMESLOTS * sizeof(s16));
+
+	int animTexOverflow = 0, animSlotOverflow = 0;
+
 	for (u32 t = 0; t < s_trackMesh.texCount; t++)
 	{
 		uintptr_t texPtr = s_trackMesh.texTable[t];
@@ -1667,6 +2285,41 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 			if ((anim->numFrames > 0) && (anim->numFrames <= 256))
 			{
 				struct IconGroup4 **frames = ANIMTEX_GETARRAY((struct AnimTex *)anim);
+				struct NativeTrackAnimTexEntry *entry = NULL;
+
+				/* Reserve this chain's frame slots up front so slot f is frame
+				 * f with no remap -- the game hands us a frame INDEX every
+				 * vblank, and a compacted table would need a second lookup to
+				 * undo. Unusable frames below simply leave their slot at -1. */
+				if ((s_trackMesh.animTex != NULL) && (s_trackMesh.animFrameRect != NULL))
+				{
+					if (s_trackMesh.animTexCount >= TRACK_ANIMTEX_MAX)
+					{
+						animTexOverflow++;
+					}
+					else if (s_trackMesh.animFrameSlotCount + (u32)anim->numFrames > TRACK_ANIMTEX_MAX_FRAMESLOTS)
+					{
+						animSlotOverflow++;
+					}
+					else
+					{
+						entry = &s_trackMesh.animTex[s_trackMesh.animTexCount++];
+						entry->anim = anim;
+						entry->texRef = (u16)t;
+						entry->numFrames = (u16)anim->numFrames;
+						entry->frameSlot = s_trackMesh.animFrameSlotCount;
+						entry->vertFirst = 0;
+						entry->vertCount = 0;
+						entry->curFrame = -1;
+						entry->buildUnit = TRACK_ATLAS_UNIT_INVALID;
+						s_trackMesh.animFrameSlotCount += (u32)anim->numFrames;
+
+						for (int f = 0; f < anim->numFrames; f++)
+						{
+							s_trackMesh.animFrameRect[entry->frameSlot + (u32)f] = -1;
+						}
+					}
+				}
 
 				for (int f = 0; f < anim->numFrames; f++)
 				{
@@ -1684,13 +2337,18 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 					atlasAnimFrames++;
 
+					s16 frameRect = -1;
+
+					NativeTrackAtlas_AddLayout(frameLayout, &frameRect);
+
+					if (entry != NULL)
+					{
+						s_trackMesh.animFrameRect[entry->frameSlot + (u32)f] = frameRect;
+					}
+
 					if ((uintptr_t)frames[f] == (uintptr_t)anim->ptrActiveTex)
 					{
-						NativeTrackAtlas_AddLayout(frameLayout, &s_trackMesh.texRectIndex[t]);
-					}
-					else
-					{
-						NativeTrackAtlas_AddLayout(frameLayout, NULL);
+						s_trackMesh.texRectIndex[t] = frameRect;
 					}
 				}
 			}
@@ -1724,6 +2382,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	int trackBinOk = NativeTrackMesh_BinLeavesByAtlasUnit();
 	int trackGeomOk = trackBinOk && NativeTrackGeom_UploadToBackend(mesh, numQuadBlock, numVertex);
 #endif
+
+	/* AFTER the atlas upload and the leaf binning, both of which this depends
+	 * on: the upload is what clears atlasUnit on rects it skipped, and the
+	 * binning is what fixes which atlas unit each leaf's draw will bind. On PC
+	 * neither runs, so the unit column below is optimistic there -- PC verifies
+	 * COUNTS and UV arithmetic, never pixels, same as the rest of this file. */
+	NativeTrackAnim_BuildVertexLists();
 
 	/* Latch only now, on success -- see the fingerprint comment up top. On
 	 * 3DS, a transient track-atlas allocation shortfall (linear-heap
@@ -1795,6 +2460,50 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	             s_trackMesh.animVertCount, s_trackMesh.animVertWelded,
 	             (u32)(s_trackMesh.vertCount * sizeof(struct NativeTrackVert) / 1024), (u32)(s_trackMesh.indexCount * sizeof(u16) / 1024), facesDoubleSided,
 	             facesAnimTex, facesNoTexture, weldCount);
+
+	/*
+	 * The animated-texture ledger. `chains` is how many texture chains any
+	 * resident face samples, `frames` how many of their frames got a rect,
+	 * `verts` how much geometry a frame change actually has to rewrite (the
+	 * per-vblank cost, and the reason this is proportional to the animation
+	 * rather than to the track). `unitSplit` is the one that would silently
+	 * lose animation: frames of one chain that packed into DIFFERENT atlas
+	 * units cannot be swapped in, because the leaf's draw binds a single unit
+	 * chosen at build time -- those chains stay frozen and say so here rather
+	 * than quietly not moving.
+	 *
+	 * chains=0 on a track with visible turbo pads would mean the animated faces
+	 * are not resident at all (excluded, or untextured) -- a different bug than
+	 * "the patcher does not work", which is why the two are separate columns.
+	 */
+	{
+		u32 framesPlaced = 0, unitSplit = 0;
+
+		for (u32 e = 0; e < s_trackMesh.animTexCount; e++)
+		{
+			const struct NativeTrackAnimTexEntry *entry = &s_trackMesh.animTex[e];
+
+			for (u32 f = 0; f < entry->numFrames; f++)
+			{
+				s16 r = s_trackMesh.animFrameRect[entry->frameSlot + f];
+
+				if ((r < 0) || (r >= s_trackMesh.atlas.rectCount))
+				{
+					continue;
+				}
+
+				framesPlaced++;
+
+				if (s_trackMesh.atlas.rects[r].atlasUnit != entry->buildUnit)
+				{
+					unitSplit++;
+				}
+			}
+		}
+
+		Platform_Log("[TRKANIM] lvl=%d chains=%u frames=%u/%u verts=%u unitSplit=%u overflow=%d/%d\n", NativePerf_CurrentLevelID(), s_trackMesh.animTexCount,
+		             framesPlaced, s_trackMesh.animFrameSlotCount, s_trackMesh.animTexVertCount, unitSplit, animTexOverflow, animSlotOverflow);
+	}
 
 	if (facesNoTexture != 0)
 	{
@@ -1946,6 +2655,10 @@ unsigned NativeTrackMesh_IndexCount(void)
 int NativeTrackMesh_IsBuilt(void)
 {
 	return 0;
+}
+
+void NativeTrackAnim_PatchFrame(void)
+{
 }
 
 int NativeTrackMesh_IsBuiltFor(const struct mesh_info *mesh)

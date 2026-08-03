@@ -96,6 +96,25 @@ int NativeTrackMesh_LeafDrawOrderRange(unsigned i, s8 *outMin, s8 *outMax);
 // without a linear search per frame.
 int NativeTrackMesh_LeafIndexForBsp(unsigned bspIndex);
 
+// s30: advance every animated track texture (turbo-pad arrows, waterfall
+// sheets, lava) to the frame the game has cycled to, rewriting the affected
+// resident vertices' UVs in the GPU-resident buffer. Without this the resident
+// renderer shows whichever frame happened to be active when the level loaded,
+// for the whole race.
+//
+// MUST be called on the thread that WALKS, at the head of a walk --
+// platform/native_libgpu.c calls it from CtrGpu_ExecDrawOTag. That call site
+// is not a style choice: the buffer it writes is the same single linearAlloc
+// block the core-2 render worker draws from, and the render queue being FIFO
+// with one worker is what guarantees the previous walk has finished and the
+// next has not begun. Calling it from the game thread instead would need
+// either a fence (which costs the render thread's whole win) or a second copy
+// of the vertex block.
+//
+// No-op when nothing is built, when the level has no animated textures, or
+// when the gate is compiled out.
+void NativeTrackAnim_PatchFrame(void);
+
 // Raw vertex/index arrays backing every leaf range above, and their counts.
 // NULL/0 when nothing is built. u16 indices -- see the .c file's build-time
 // guard against exceeding that format's range.

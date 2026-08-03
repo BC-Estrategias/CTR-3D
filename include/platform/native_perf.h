@@ -105,6 +105,17 @@ enum NativePerfBucket
 	 * indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_MODEL_DEPTH_RANGE,
+	/*
+	 * s30 per-frame track-animation patch (NativeTrackAnim_PatchFrame): the
+	 * scatter writes that make turbo pads, waterfalls and lava move under the
+	 * resident renderer, plus the cache flush each batch needs before the GPU
+	 * reads it. Measured because the flush cost is range-proportional and the
+	 * whole resident renderer is only worth ~6% -- a patch that quietly spends
+	 * a millisecond a frame would be eating most of the feature it decorates.
+	 * Sits INSIDE the walk (draw_otag_ms), at its head. Appended, never
+	 * inserted: s_bucketInfo is indexed by this enum.
+	 */
+	NATIVE_PERF_BUCKET_TRACK_ANIM,
 	NATIVE_PERF_BUCKET_COUNT
 };
 

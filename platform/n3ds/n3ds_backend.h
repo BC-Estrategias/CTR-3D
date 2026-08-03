@@ -439,6 +439,20 @@ int N3DS_TrackGeom_Upload(const void *verts, int vertCount, int vertStride, cons
 /* Called from NativeTrackMesh_Free alongside N3DS_TrackAtlas_Free -- a
  * level's only teardown path. Safe to call with nothing uploaded. */
 void N3DS_TrackGeom_Free(void);
+/* s30: rewrite `count` already-uploaded vertices' UV pairs in place, batched.
+ * uvPairs holds two shorts per entry, in the same encoding the upload wrote
+ * (2x fixed point, texel centre, V flipped -- one implementation of that lives
+ * in native_track_mesh.c's NativeTrackAtlas_EncodeUV and BOTH writers go
+ * through it). Bounds-checked against the uploaded vertex count and followed
+ * by a single cache flush over the touched range; see the .c definition for
+ * the thread rule. This is what makes animated track textures -- turbo pads,
+ * waterfalls, lava -- move under the resident renderer. */
+void N3DS_TrackGeom_PatchUV(const unsigned short *vertIndices, const short *uvPairs, int count);
+/* s30: the same in-place batched rewrite for POSITION (three shorts per entry)
+ * and COLOR (three bytes per entry) -- the animated-VERTEX case, i.e. water
+ * surfaces that physically move. Kept separate from PatchUV because the two
+ * populations and cadences are nothing alike; see the .c definition. */
+void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short *xyz, const unsigned char *rgb, int count);
 
 /* Begin/Leaf/End bracket one frame's resident-track draw batch, called from
  * NativeRenderer_EndScene (rung 3a step 2) immediately before the packet

@@ -427,6 +427,14 @@ static C3D_BufInfo s_trackBufInfo;
 static void *s_trackGeomMem = NULL;
 static const void *s_trackIndexPtr = NULL;
 static int s_trackGeomReady = 0;
+/* Recorded by the upload so N3DS_TrackGeom_PatchUV can bound-check a vertex
+ * index against the block it is actually writing into, rather than against a
+ * count the caller believes is current. The staging array the upload copied
+ * from is freed immediately, so this block is the ONLY surviving copy of the
+ * resident geometry -- a bad index here corrupts the level's mesh with nothing
+ * to restore it from short of a full rebuild. */
+static int s_trackGeomVertCount = 0;
+static int s_trackGeomVertStride = 0;
 /* Set by Begin only when geometry is actually ready; End always clears it
  * and always restores packet state regardless (cheap, and foolproof against
  * any Begin/Leaf/End call-order mistake upstream). */
@@ -1278,6 +1286,8 @@ int N3DS_TrackGeom_Upload(const void *verts, int vertCount, int vertStride, cons
 
 	s_trackGeomMem = block;
 	s_trackIndexPtr = block + indexOffset;
+	s_trackGeomVertCount = vertCount;
+	s_trackGeomVertStride = vertStride;
 
 	/* Rebuilt every upload (not just once): base_paddr depends on THIS
 	 * level's linearAlloc address, which N3DS_TrackAtlas_Alloc-style level
@@ -1299,6 +1309,166 @@ void N3DS_TrackGeom_Free(void)
 	}
 	s_trackIndexPtr = NULL;
 	s_trackGeomReady = 0;
+	s_trackGeomVertCount = 0;
+	s_trackGeomVertStride = 0;
+}
+
+/*
+ * s30: rewrite the UV pair of `count` already-uploaded vertices in place.
+ *
+ * This is how animated track textures (turbo-pad arrows, waterfalls, lava)
+ * move at all under the resident renderer -- everything else about a resident
+ * vertex is fixed at load, but which frame of a texture chain it samples is
+ * not, and the chain advances every vblank.
+ *
+ * Two things this must get right, both learned the hard way elsewhere in this
+ * file:
+ *   - The GPU reads PHYSICAL memory and the CPU wrote through the data cache,
+ *     so the touched range has to be flushed before the next draw or the GPU
+ *     samples the previous frame's UVs (or worse, a mix). Flushed as ONE range
+ *     spanning min..max of the batch rather than per vertex: a cache-clean
+ *     call has fixed overhead that swamps 4 bytes of payload.
+ *   - Every index is bounds-checked against the block's OWN recorded vertex
+ *     count. The staging buffer the upload copied from is freed, so this block
+ *     is the only copy of the level's geometry that exists.
+ *
+ * THREAD: called on the walk thread at the head of a walk (see
+ * NativeTrackAnim_PatchFrame's comment), never concurrently with a draw out of
+ * this same block.
+ */
+void N3DS_TrackGeom_PatchUV(const unsigned short *vertIndices, const short *uvPairs, int count)
+{
+	u8 *base;
+	int i;
+	int lo = 0, hi = 0, touched = 0;
+
+	if (!s_trackGeomReady || (s_trackGeomMem == NULL) || (vertIndices == NULL) || (uvPairs == NULL) || (count <= 0))
+	{
+		return;
+	}
+
+	base = (u8 *)s_trackGeomMem;
+
+	for (i = 0; i < count; i++)
+	{
+		int vi = (int)vertIndices[i];
+		s16 *uv;
+
+		if ((vi < 0) || (vi >= s_trackGeomVertCount))
+		{
+			continue;
+		}
+
+		/* Offset 6 in N3DS_TrackVertex -- see the struct's field comments in
+		 * n3ds_backend.h, which pin every s16 to an even offset for exactly
+		 * this kind of direct write. */
+		uv = (s16 *)(void *)(base + ((size_t)vi * (size_t)s_trackGeomVertStride) + 6);
+		uv[0] = uvPairs[i * 2 + 0];
+		uv[1] = uvPairs[i * 2 + 1];
+
+		if (!touched)
+		{
+			lo = vi;
+			hi = vi;
+			touched = 1;
+		}
+		else
+		{
+			if (vi < lo)
+			{
+				lo = vi;
+			}
+			if (vi > hi)
+			{
+				hi = vi;
+			}
+		}
+	}
+
+	if (touched)
+	{
+		size_t first = (size_t)lo * (size_t)s_trackGeomVertStride;
+		size_t last = ((size_t)hi + 1u) * (size_t)s_trackGeomVertStride;
+
+		GSPGPU_FlushDataCache(base + first, (u32)(last - first));
+	}
+}
+
+/*
+ * s30: the same in-place batched rewrite, for POSITION and COLOR rather than
+ * UV -- the animated-vertex case (water surfaces that physically rise and
+ * fall, AnimateWater.c writing LevVertex.pos/.color_hi every frame).
+ *
+ * Separate from PatchUV rather than one call with optional arguments because
+ * the two have completely different populations and cadences: UVs change only
+ * when a texture chain steps to its next frame (often several vblanks apart,
+ * a handful of vertices), positions change every single frame for every
+ * animated vertex on the track. Fusing them would make the cheap case pay the
+ * expensive case's flush range.
+ *
+ * xyz is three shorts per entry (offset 0), rgb three bytes (offset 10) -- see
+ * N3DS_TrackVertex. Same bounds check and same single range flush as PatchUV,
+ * same thread rule.
+ */
+void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short *xyz, const unsigned char *rgb, int count)
+{
+	u8 *base;
+	int i;
+	int lo = 0, hi = 0, touched = 0;
+
+	if (!s_trackGeomReady || (s_trackGeomMem == NULL) || (vertIndices == NULL) || (xyz == NULL) || (rgb == NULL) || (count <= 0))
+	{
+		return;
+	}
+
+	base = (u8 *)s_trackGeomMem;
+
+	for (i = 0; i < count; i++)
+	{
+		int vi = (int)vertIndices[i];
+		u8 *vert;
+		s16 *pos;
+
+		if ((vi < 0) || (vi >= s_trackGeomVertCount))
+		{
+			continue;
+		}
+
+		vert = base + ((size_t)vi * (size_t)s_trackGeomVertStride);
+		pos = (s16 *)(void *)vert;
+		pos[0] = xyz[i * 3 + 0];
+		pos[1] = xyz[i * 3 + 1];
+		pos[2] = xyz[i * 3 + 2];
+		vert[10] = rgb[i * 3 + 0];
+		vert[11] = rgb[i * 3 + 1];
+		vert[12] = rgb[i * 3 + 2];
+
+		if (!touched)
+		{
+			lo = vi;
+			hi = vi;
+			touched = 1;
+		}
+		else
+		{
+			if (vi < lo)
+			{
+				lo = vi;
+			}
+			if (vi > hi)
+			{
+				hi = vi;
+			}
+		}
+	}
+
+	if (touched)
+	{
+		size_t first = (size_t)lo * (size_t)s_trackGeomVertStride;
+		size_t last = ((size_t)hi + 1u) * (size_t)s_trackGeomVertStride;
+
+		GSPGPU_FlushDataCache(base + first, (u32)(last - first));
+	}
 }
 
 void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h)
@@ -1561,6 +1731,21 @@ int N3DS_TrackGeom_Upload(const void *verts, int vertCount, int vertStride, cons
 
 void N3DS_TrackGeom_Free(void)
 {
+}
+
+void N3DS_TrackGeom_PatchUV(const unsigned short *vertIndices, const short *uvPairs, int count)
+{
+	(void)vertIndices;
+	(void)uvPairs;
+	(void)count;
+}
+
+void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short *xyz, const unsigned char *rgb, int count)
+{
+	(void)vertIndices;
+	(void)xyz;
+	(void)rgb;
+	(void)count;
 }
 
 void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h)

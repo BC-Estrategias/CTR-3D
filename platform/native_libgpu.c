@@ -13,6 +13,7 @@
 #include <platform/native_perf.h>
 #include <platform/native_render_queue.h>
 #include <platform/native_track_frame.h>
+#include <platform/native_track_mesh.h>
 #include <gpu.h>
 #include <platform.h>
 
@@ -468,6 +469,21 @@ uint32_t DrawSyncCallback(void (*func)(void))
 
 void CtrGpu_ExecDrawOTag(void *p)
 {
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	// s30: advance animated track textures (turbo pads, waterfalls, lava) to
+	// the frame the game has cycled to. Deliberately HERE and not next to the
+	// PublishForWalk above -- this writes into the GPU-resident vertex block
+	// that the core-2 worker draws from, and this function IS the walk. The
+	// render queue being FIFO with a single worker is what makes "previous
+	// walk finished, next one not started" true by construction rather than by
+	// an argument about whether some other call site is a barrier.
+	//
+	// Outside the retry loop below: it is idempotent (the per-chain frame latch
+	// makes a repeat a no-op), so running it once per walk rather than once per
+	// paused-emulator repaint costs nothing and claims less.
+	NativeTrackAnim_PatchFrame();
+#endif
+
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_OTAG);
 	do
 	{
