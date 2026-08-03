@@ -138,6 +138,34 @@ void Platform_Log(const char *fmt, ...)
 	va_end(args);
 }
 
+void Platform_LogInstrument(const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+#if defined(__3DS__)
+	{
+		char text[512];
+		int written = vsnprintf(text, sizeof(text), fmt, args);
+
+		if (written > 0)
+		{
+			text[sizeof(text) - 1] = '\0';
+			/* N3DS_DebugLog appends its own newline and would otherwise
+			 * emit a blank line per instrument line. */
+			if ((written < (int)sizeof(text)) && (written > 0) && (text[written - 1] == '\n'))
+			{
+				text[written - 1] = '\0';
+			}
+			N3DS_DebugLog(text);
+		}
+	}
+#else
+	Platform_LogV(stdout, fmt, args);
+#endif
+	va_end(args);
+}
+
 void Platform_LogWarn(const char *fmt, ...)
 {
 	va_list args;

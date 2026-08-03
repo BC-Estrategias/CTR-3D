@@ -1619,7 +1619,7 @@ void NativeGpu_ResetEmitOrdinal(void)
 
 			Platform_Log("[PKTDEPTHZ] realZ=%u..%u backZ=%u..%u uiZ=%u..%u (larger = nearer)\n", s_pktDepth.realMin, s_pktDepth.realMax,
 			             s_pktDepth.backMin, s_pktDepth.backMax, s_pktDepth.uiMin, s_pktDepth.uiMax);
-			Platform_Log("[PKTDEPTH] frames=%lu prims=%lu real=%lu fellBack=%lu realPct=%lu ui2d=%lu stamps=%lu escaped=%ld\n",
+			Platform_LogInstrument("[PKTDEPTH] frames=%lu prims=%lu real=%lu fellBack=%lu realPct=%lu ui2d=%lu stamps=%lu escaped=%ld\n",
 			             (unsigned long)s_pktDepth.frames, (unsigned long)prims, (unsigned long)s_pktDepth.real,
 			             (unsigned long)s_pktDepth.fellBack, (unsigned long)(prims ? ((s_pktDepth.real * 100u) / prims) : 0u),
 			             (unsigned long)s_pktDepth.suppressed2d, (unsigned long)s_pktDepthStamps, (long)((long)s_pktDepthStamps - (long)seen));
@@ -2705,7 +2705,7 @@ void DrawAllSplits()
 			{
 				u32 total = s_pktDepthPerVertHits + s_pktDepthFlatFallback;
 
-				Platform_Log("[PKTDEPTH] perVert=%u flat=%u (%u%% flat) lastFallback appended=%d resolved=%d\n", s_pktDepthPerVertHits,
+				Platform_LogInstrument("[PKTDEPTH] perVert=%u flat=%u (%u%% flat) lastFallback appended=%d resolved=%d\n", s_pktDepthPerVertHits,
 				             s_pktDepthFlatFallback, (total > 0) ? ((s_pktDepthFlatFallback * 100u) / total) : 0u, s_pktDepthLastAppended,
 				             s_pktDepthLastResolved);
 				s_pktDepthLogCountdown = 64;

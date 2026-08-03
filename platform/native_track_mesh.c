@@ -1153,14 +1153,14 @@ static void NativeTrackAnim_Report(void)
 	if ((s_animPatchOutOfRect != 0) && (s_animPatchOutOfRectLogged == 0))
 	{
 		s_animPatchOutOfRectLogged = 1;
-		Platform_Log("[TRKANIM] WARNING outOfRect=%u -- an animation frame is sampling outside its own atlas rect\n", s_animPatchOutOfRect);
+		Platform_LogInstrument("[TRKANIM] WARNING outOfRect=%u -- an animation frame is sampling outside its own atlas rect\n", s_animPatchOutOfRect);
 	}
 
 	/* Frame-counted rather than time-counted -- ~10s at 60Hz -- so it needs no
 	 * clock and stays comparable between a capped and an uncapped build. */
 	if (s_animPatchFrames >= 600)
 	{
-		Platform_Log("[TRKANIM] window steps=%u vertsLast=%u skipUnit=%u skipRect=%u animVerts=%u srcOOB=%u\n", s_animPatchSteps,
+		Platform_LogInstrument("[TRKANIM] window steps=%u vertsLast=%u skipUnit=%u skipRect=%u animVerts=%u srcOOB=%u\n", s_animPatchSteps,
 		             s_trackMesh.animPatchVertsLast, s_trackMesh.animPatchSkipUnit, s_trackMesh.animPatchSkipRect, s_trackMesh.animVertCount,
 		             s_vertPatchSrcOOB);
 		s_animPatchFrames = 0;
@@ -2561,7 +2561,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 			}
 		}
 
-		Platform_Log("[TRKANIM] lvl=%d chains=%u frames=%u/%u verts=%u unitSplit=%u overflow=%d/%d\n", NativePerf_CurrentLevelID(), s_trackMesh.animTexCount,
+		Platform_LogInstrument("[TRKANIM] lvl=%d chains=%u frames=%u/%u verts=%u unitSplit=%u overflow=%d/%d\n", NativePerf_CurrentLevelID(), s_trackMesh.animTexCount,
 		             framesPlaced, s_trackMesh.animFrameSlotCount, s_trackMesh.animTexVertCount, unitSplit, animTexOverflow, animSlotOverflow);
 	}
 

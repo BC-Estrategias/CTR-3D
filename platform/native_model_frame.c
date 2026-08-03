@@ -198,16 +198,16 @@ void NativeModelFrame_EndFrame(void)
 	{
 		u32 f = s_windowFrames;
 
-		Platform_Log("[MODELFRAME] lvl=%d f=%lu inst/f=%lu tris/f=%lu verts/f=%lu pages/f=%lu unscanned=%lu\n", NativePerf_CurrentLevelID(),
+		Platform_LogInstrument("[MODELFRAME] lvl=%d f=%lu inst/f=%lu tris/f=%lu verts/f=%lu pages/f=%lu unscanned=%lu\n", NativePerf_CurrentLevelID(),
 		             (unsigned long)f, (unsigned long)(s_window.instances / f), (unsigned long)(s_window.tris / f), (unsigned long)(s_window.verts / f),
 		             (unsigned long)(s_window.texPages / f), (unsigned long)s_window.unscanned);
 
-		Platform_Log("[MODELFRAME] lvl=%d static inst/f=%lu tris/f=%lu | anim inst/f=%lu tris/f=%lu | rung+1 tris/f=%lu (%lu%% of now)\n",
+		Platform_LogInstrument("[MODELFRAME] lvl=%d static inst/f=%lu tris/f=%lu | anim inst/f=%lu tris/f=%lu | rung+1 tris/f=%lu (%lu%% of now)\n",
 		             NativePerf_CurrentLevelID(), (unsigned long)(s_window.staticInstances / f), (unsigned long)(s_window.staticTris / f),
 		             (unsigned long)(s_window.animInstances / f), (unsigned long)(s_window.animTris / f), (unsigned long)(s_window.nextRungTris / f),
 		             (s_window.tris > 0) ? (unsigned long)((s_window.nextRungTris * 100u) / s_window.tris) : 0ul);
 
-		Platform_Log("[MODELFRAME] lvl=%d rungs/f: 0=%lu 1=%lu 2=%lu 3=%lu beyond=%lu\n", NativePerf_CurrentLevelID(), (unsigned long)(s_window.rung[0] / f),
+		Platform_LogInstrument("[MODELFRAME] lvl=%d rungs/f: 0=%lu 1=%lu 2=%lu 3=%lu beyond=%lu\n", NativePerf_CurrentLevelID(), (unsigned long)(s_window.rung[0] / f),
 		             (unsigned long)(s_window.rung[1] / f), (unsigned long)(s_window.rung[2] / f), (unsigned long)(s_window.rung[3] / f),
 		             (unsigned long)(s_window.rungBeyond / f));
 	}

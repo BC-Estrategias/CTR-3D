@@ -525,7 +525,7 @@ internal void DirectEmit_FoldFrame(void)
 		N3DS_DebugLog(line);
 	}
 #else
-	Platform_Log("[DEMIT] f=%lu nodes=%lu elig=%lu (%lu%%) prims=%lu tris=%lu null=%lu emit=%lu skip env=%lu poly=%lu blend=%lu fmt16=%lu mal=%lu\n",
+	Platform_LogInstrument("[DEMIT] f=%lu nodes=%lu elig=%lu (%lu%%) prims=%lu tris=%lu null=%lu emit=%lu skip env=%lu poly=%lu blend=%lu fmt16=%lu mal=%lu\n",
 	             (unsigned long)s_demit.winFrames, (unsigned long)s_demit.winNodes, (unsigned long)s_demit.winElig,
 	             (unsigned long)((s_demit.winNodes != 0) ? ((s_demit.winElig * 100u) / s_demit.winNodes) : 0u), (unsigned long)s_demit.winPrims,
 	             (unsigned long)s_demit.winTris, (unsigned long)s_demit.winNullPrims, (unsigned long)s_demit.winEmitTris,
