@@ -1765,9 +1765,20 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	 * them untextured rather than binding a stale unit and sampling another
 	 * rect's texels, which would look like garbage welded onto the track.
 	 *
-	 * The texture-enable selector rides hParam.w (see the shader): the vertex
-	 * program cannot branch cheaply, so it always computes the atlas UV and the
-	 * fragment side is what decides whether to sample.
+	 * Texture enable is a TEXTURE-COMBINER decision, not a vertex-shader one:
+	 * the vertex program cannot branch cheaply, so it always computes the atlas
+	 * UV and N3DS_TrackDraw_SetTextured picks the combiner setup that either
+	 * samples it or ignores it.
+	 *
+	 * This used to say the selector "rides hParam.w". It does not, and s32 made
+	 * that actively misleading: hParam.w is now the road depth bias (dumpreq
+	 * `trkbias`, see the NEAR-BAND block in ctr_track.v.pica). Anyone trusting
+	 * the old wording would have gone looking for a texture flag in a depth
+	 * uniform -- and on a part whose uniform names are offsets into ONE shared
+	 * physical register file, a wrong belief about who owns a component is
+	 * exactly how the s29 collision happened. Caught by the parallel
+	 * transparency session, whose own uvOffset was added as a NEW uniform
+	 * rather than parked on a spare component for the same reason.
 	 */
 	if ((atlasBin >= 0) && (atlasBin < s_trackAtlasUnitsAllocated))
 	{
