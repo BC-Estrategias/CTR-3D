@@ -17,6 +17,24 @@
 #define RB_MODEL_PERF_END(bucket)   ((void)0)
 #endif
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+/*
+ * s32 rung 1 capture hooks (platform/native_model_emit.c). Declared here rather
+ * than by including platform/native_model_emit.h, matching the existing
+ * NativeModelFrame_Sample hook further down this file: game_unity.h's include
+ * order is load-bearing and this file sits ahead of the platform headers in it.
+ * The prototypes are checked against the definitions when main.c's unity build
+ * reaches native_model_emit.c, which sees the real header.
+ */
+struct InstDrawPerPlayer;
+struct PushBuffer;
+struct TextureLayout;
+extern int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb);
+extern int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex);
+extern void NativeModelEmit_EndInstance(void);
+extern int NativeModelEmit_SkipRetailDraw(void);
+#endif
+
 struct RenderBucketEntry
 {
 	struct Instance *inst;
@@ -4389,6 +4407,22 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 {
 	u32 *pCmd;
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	// PICA-native model renderer, rung 1 (docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+	// Opened here rather than in RenderBucket_DispatchDrawFunc so the result is
+	// a LOCAL the per-triangle site can test: with the toggle off this is 0 and
+	// the capture costs one call per instance, not one per triangle. Toggle 0
+	// is the A/B baseline every fps claim is measured against, so it has to be
+	// indistinguishable from a build with the feature compiled out.
+	// Implementation: platform/native_model_emit.c.
+	const int mdlCapture = NativeModelEmit_BeginInstance(ctx->idpp, ctx->pb);
+	/* State 1 means the native path REPLACES this one, so the packet write
+	 * below is skipped and what reaches the screen is unambiguously ours.
+	 * Evaluated once per instance, not per triangle, and only meaningful when
+	 * the capture is actually running. */
+	const int mdlReplaces = mdlCapture && NativeModelEmit_SkipRetailDraw();
+#endif
+
 	// NOTE(aalhendi): ASM-verified NTSC-U 926 0x8006a52c-0x8006a8e0;
 	// native uses the accepted explicit RenderBucketDrawContext command/FIFO ABI.
 	pCmd = (u32 *)ctx->idpp->ptrCommandList;
@@ -4485,14 +4519,74 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 				continue;
 			}
 
-			if (RenderBucket_DispatchDrawInstPrim(ctx, drawCommand, tex, depthMac0) < 0)
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+			// Capture point. Moved AHEAD of the packet write so it still runs
+			// when the packet write is skipped (state 1) -- the capture is the
+			// input the native draw consumes, so it cannot be downstream of the
+			// path it replaces.
+			//
+			// Still after projection and the texture lookup, so the captured
+			// set remains exactly the set retail would have drawn: same
+			// backface/off-screen rejection, same texture resolution. Deleting
+			// the projection is a later rung and changes that population.
+			//
+			// tempPacked[1..3] and tempColor[1..3] are the same three slots
+			// RenderBucket_LoadPrimRTPT loads into GTE registers 0-5 and
+			// RenderBucket_LoadPrimColors into 20-22, in the same order, so the
+			// capture and the projection see one set of vertices, not two.
+			// Per TRIANGLE, not per instance: the capture may decline an
+			// individual triangle (semi-transparent texture, snapshot full),
+			// and a declined triangle still needs its packet written.
+			int mdlClaimed = 0;
+
+			if (mdlCapture)
 			{
-				return;
+				const u32 mdlXY[3] = {ctx->tempPacked[1].xy, ctx->tempPacked[2].xy, ctx->tempPacked[3].xy};
+				const u32 mdlZ[3] = {ctx->tempPacked[1].z, ctx->tempPacked[2].z, ctx->tempPacked[3].z};
+				const int mdlColor[3] = {ctx->tempColor[1], ctx->tempColor[2], ctx->tempColor[3]};
+
+				mdlClaimed = NativeModelEmit_Triangle(mdlXY, mdlZ, mdlColor, tex);
+			}
+
+			// State 1: the native path draws this instance, so do not also
+			// write a packet for it. Everything above still ran -- the vertex
+			// decode, the projection, the colour roll -- because the capture
+			// depends on it; only the OT write is skipped.
+			//
+			// ...unless the capture DECLINED this triangle, in which case the
+			// native path is not going to draw it and skipping the packet would
+			// delete it from the frame. mdlClaimed is 0 whenever mdlCapture is
+			// 0, and mdlReplaces already implies mdlCapture, so the two states
+			// that must keep drawing packets (toggle 0, toggle 2) are unchanged.
+			if (!mdlReplaces || !mdlClaimed)
+#endif
+			{
+				if (RenderBucket_DispatchDrawInstPrim(ctx, drawCommand, tex, depthMac0) < 0)
+				{
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+					// PrimMem exhaustion ends the walk mid-model. Close the
+					// capture here too, or the open instance leaks into the
+					// next frame and its triangles get attributed to whatever
+					// opens next.
+					if (mdlCapture)
+					{
+						NativeModelEmit_EndInstance();
+					}
+#endif
+					return;
+				}
 			}
 		}
 
 		ctx->stripLength++;
 	}
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	if (mdlCapture)
+	{
+		NativeModelEmit_EndInstance();
+	}
+#endif
 }
 
 static u32 RenderBucket_MirrorSpecialPackedXY(struct RenderBucketDrawContext *ctx, u32 packedXY)

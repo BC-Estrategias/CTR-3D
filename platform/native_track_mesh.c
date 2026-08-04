@@ -114,7 +114,60 @@ struct NativeTrackAtlasRect
 	u16 allocW, allocH; /* (maxU-minU+1)/(maxV-minV+1) rounded UP to multiples of 8 and capped at 256 (one PSX page) -- the
 	                      * shelf-packed/uploaded size, distinct from the true bbox above (rung 2b, upload needs 8x8-tile-
 	                      * aligned rects) */
+	/* SEMI-TRANSPARENCY (docs/TRANSPARENCY_DESIGN.md 3): a rect whose tpage ABR
+	 * field is not 3 draws in TWO passes on PS1 -- its non-STP texels opaque,
+	 * its STP texels blended -- so it needs two decoded views, not one. The
+	 * primary placement above then holds N3DS_TEXVIEW_PASS1 (the opaque body)
+	 * instead of N3DS_TEXVIEW_OPAQUE, and this second placement holds
+	 * N3DS_TEXVIEW_PASS2 (the blended texels). Same allocW/allocH, same
+	 * srcU/srcV, same decode source -- only the visibility predicate differs, so
+	 * a vertex's baked UV addresses BOTH views once translated by the delta
+	 * between the two placements (that delta is what the blend pass hands the
+	 * shader as a uniform; see NativeTrackMesh_LeafUvOffset).
+	 *
+	 * TRACK_ATLAS_UNIT_INVALID whenever this rect is opaque (ABR 3, the common
+	 * case -- measured at 95%+ of packed texel area on race tracks) or when the
+	 * packer/backend declined the second placement. The blend pass skips a rect
+	 * carrying the sentinel rather than sampling whatever sits at atlas origin,
+	 * exactly as the primary placement's own sentinel works. */
+	u8 p2Unit;
+	u16 p2X, p2Y;
 };
+
+/* Retail's own semi-transparency test, lifted to the rect because the rect key
+ * (tpage, clut) already contains it -- see docs/TRANSPARENCY_DESIGN.md 1.
+ * DrawLevelOvr1P_SelectRawPrimitiveCode (game/226/226_00_DrawLevelOvr1P.c:2133,
+ * six call sites) selects the semi-transparent primitive code when
+ * (uv1 & 0x00600000) != 0x00600000, and uv1's high halfword IS the layout's
+ * tpage (:677) -- so the field is tpage bits 5-6, the PSX ABR (semi-transparency
+ * mode). ABR 3 is CTR's "this page is opaque" sentinel; 0/1/2 mark the face
+ * semi-transparent AND name the blend mode (0 = B/2+F/2, 1 = B+F, 2 = B-F).
+ *
+ * Because rects are keyed on (tpage, clut) and MERGED, every face sharing a rect
+ * shares its ABR: a rect is blend-homogeneous by construction, not by
+ * approximation over its faces. */
+#define TRACK_ABR_OPAQUE 3
+#define TRACK_RECT_ABR(rect) ((int)(((rect)->tpage >> 5) & 3))
+#define TRACK_RECT_IS_SEMITRANS(rect) (TRACK_RECT_ABR(rect) != TRACK_ABR_OPAQUE)
+
+/*
+ * Draw-bin space (filled by NativeTrackMesh_DrawBinForIndex, which is 3DS-only
+ * because only the 3DS binds textures; the DECODER below is platform-neutral
+ * because the read-only accessors at the bottom of this file are).
+ *
+ *   0 .. TRACK_ATLAS_MAX_UNITS       OPAQUE content, binned per atlas unit
+ *                                    (top value = the "no placed unit" catch-all)
+ *   OPAQUE_COUNT + rectIndex         SEMI-TRANSPARENT content, binned per RECT
+ *
+ * Sized off TRACK_ATLAS_MAX_UNITS rather than the backend's N3DS_ twin so this
+ * compiles on PC, where that header's constant isn't in scope; the two are
+ * statically asserted equal in the 3DS section below.
+ */
+#define TRACK_DRAW_BIN_OPAQUE_COUNT (TRACK_ATLAS_MAX_UNITS + 1)
+#define TRACK_DRAW_BIN_COUNT (TRACK_DRAW_BIN_OPAQUE_COUNT + TRACK_ATLAS_MAX_RECTS)
+
+/* Decoder lives just below s_trackMesh's own declaration -- it reads the rect
+ * table. */
 
 struct NativeTrackAtlasLayout
 {
@@ -122,6 +175,12 @@ struct NativeTrackAtlasLayout
 	int rectCount;
 	int unitsUsed;
 	int rectsDropped;
+	/* Semi-transparent rects whose SECOND view found no room. Counted rather
+	 * than silent because the consequence is invisible in a log otherwise: the
+	 * rect still draws, but opaque, so a waterfall quietly goes solid and looks
+	 * like the feature was never built. Distinct from rectsDropped, which means
+	 * the surface disappears entirely. */
+	int p2Dropped;
 	u32 packedTexels;
 };
 
@@ -272,6 +331,53 @@ struct NativeTrackMeshState
 #define TRACK_SRCVERT_NONE 0xFFFFu
 
 global_variable struct NativeTrackMeshState s_trackMesh;
+
+/* Decode a draw bin back to what a draw needs (bin space defined up with
+ * TRACK_DRAW_BIN_COUNT). Blend is the rect's ABR for a blended bin and
+ * TRACK_ABR_OPAQUE otherwise; the UV delta is the texel offset from the primary
+ * placement to the PASS2 placement, which is what the blend pass adds to the
+ * vertex's baked UV to reach the second view.
+ *
+ * Platform-neutral on purpose, unlike the binning that PRODUCES these values:
+ * the read-only accessors at the bottom of this file compile on PC too. */
+static void NativeTrackMesh_DecodeDrawBin(u32 bin, int *outUnit, int *outP2Unit, int *outBlend, int *outUvDx, int *outUvDy)
+{
+	*outBlend = TRACK_ABR_OPAQUE;
+	*outUvDx = 0;
+	*outUvDy = 0;
+
+	if (bin < (u32)TRACK_DRAW_BIN_OPAQUE_COUNT)
+	{
+		*outUnit = (int)bin;
+		*outP2Unit = (int)bin;
+		return;
+	}
+
+	{
+		u32 rectIdx = bin - (u32)TRACK_DRAW_BIN_OPAQUE_COUNT;
+
+		if (rectIdx >= (u32)s_trackMesh.atlas.rectCount)
+		{
+			*outUnit = TRACK_ATLAS_MAX_UNITS; /* draws untextured rather than binding garbage */
+			*outP2Unit = TRACK_ATLAS_MAX_UNITS;
+			return;
+		}
+
+		{
+			const struct NativeTrackAtlasRect *rect = &s_trackMesh.atlas.rects[rectIdx];
+
+			/* BOTH placements, because a semi-transparent range draws from both:
+			 * its PASS1 half out of the primary placement in the opaque pass, its
+			 * PASS2 half out of the second placement in the blend pass. Returning
+			 * only p2Unit is what made the opaque half unreachable. */
+			*outUnit = (int)rect->atlasUnit;
+			*outP2Unit = (int)rect->p2Unit;
+			*outBlend = TRACK_RECT_ABR(rect);
+			*outUvDx = (int)rect->p2X - (int)rect->atlasX;
+			*outUvDy = (int)rect->p2Y - (int)rect->atlasY;
+		}
+	}
+}
 
 /*
  * Scatter-write staging for the per-frame AnimTex patch
@@ -503,6 +609,9 @@ static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *
 	rect->maxU = maxU;
 	rect->maxV = maxV;
 	rect->atlasUnit = TRACK_ATLAS_UNIT_INVALID;
+	rect->p2Unit = TRACK_ATLAS_UNIT_INVALID;
+	rect->p2X = 0;
+	rect->p2Y = 0;
 
 	if (outRectIndex != NULL)
 	{
@@ -546,11 +655,54 @@ static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *
  *     computed here per rect -- see the struct comment on those fields for
  *     why plain minV isn't safe to decode from directly.
  */
+/* Shelf cursor, extracted so a rect can claim more than one slot without the
+ * placement rules being written twice (semi-transparent rects take two -- see
+ * the p2Unit comment on NativeTrackAtlasRect). Returns 0 when the pool is
+ * exhausted, having advanced nothing; the caller stops packing. */
+struct NativeTrackAtlasCursor
+{
+	int unit, cursorX, cursorY, shelfH;
+};
+
+static int NativeTrackAtlas_PlaceOne(struct NativeTrackAtlasCursor *cur, int w, int h, u8 *outUnit, u16 *outX, u16 *outY)
+{
+	if (cur->cursorX + w > TRACK_ATLAS_DIM)
+	{
+		cur->cursorX = 0;
+		cur->cursorY += cur->shelfH;
+		cur->shelfH = 0;
+	}
+
+	if (cur->cursorY + h > TRACK_ATLAS_DIM)
+	{
+		cur->unit++;
+		cur->cursorX = 0;
+		cur->cursorY = 0;
+		cur->shelfH = 0;
+
+		if (cur->unit >= TRACK_ATLAS_MAX_UNITS)
+		{
+			return 0;
+		}
+	}
+
+	*outUnit = (u8)cur->unit;
+	*outX = (u16)TRKMESH_ROUND8(cur->cursorX);
+	*outY = (u16)TRKMESH_ROUND8(cur->cursorY);
+	cur->cursorX += w;
+	cur->shelfH = TRKMESH_MAX(cur->shelfH, h);
+	return 1;
+}
+
 static void NativeTrackAtlas_Pack(void)
 {
 	struct NativeTrackAtlasLayout *atlas = &s_trackMesh.atlas;
-	int unit = 0;
-	int cursorX = 0, cursorY = 0, shelfH = 0;
+	struct NativeTrackAtlasCursor cur;
+
+	cur.unit = 0;
+	cur.cursorX = 0;
+	cur.cursorY = 0;
+	cur.shelfH = 0;
 
 	for (int i = 0; i < atlas->rectCount; i++)
 	{
@@ -576,25 +728,10 @@ static void NativeTrackAtlas_Pack(void)
 			continue;
 		}
 
-		if (cursorX + w > TRACK_ATLAS_DIM)
+		if (!NativeTrackAtlas_PlaceOne(&cur, w, h, &rect->atlasUnit, &rect->atlasX, &rect->atlasY))
 		{
-			cursorX = 0;
-			cursorY += shelfH;
-			shelfH = 0;
-		}
-
-		if (cursorY + h > TRACK_ATLAS_DIM)
-		{
-			unit++;
-			cursorX = 0;
-			cursorY = 0;
-			shelfH = 0;
-
-			if (unit >= TRACK_ATLAS_MAX_UNITS)
-			{
-				atlas->rectsDropped += atlas->rectCount - i;
-				break;
-			}
+			atlas->rectsDropped += atlas->rectCount - i;
+			break;
 		}
 
 		/* Decode origin (review finding #1): pull srcV up from minV just far
@@ -610,20 +747,42 @@ static void NativeTrackAtlas_Pack(void)
 		rect->srcU = rect->minU;
 		rect->srcV = (u8)srcV;
 
-		rect->atlasUnit = (u8)unit;
-		rect->atlasX = (u16)TRKMESH_ROUND8(cursorX);
-		rect->atlasY = (u16)TRKMESH_ROUND8(cursorY);
 		rect->allocW = (u16)w;
 		rect->allocH = (u16)h;
-		cursorX += w;
-		shelfH = TRKMESH_MAX(shelfH, h);
 		atlas->packedTexels += (u32)(w * h);
+
+		/*
+		 * Second view for semi-transparent rects. Placed immediately after the
+		 * primary so the two land in the same unit whenever the shelf has room,
+		 * which keeps the blend pass's texture bind identical to the opaque
+		 * pass's -- but NOT relied upon: the blend pass binds p2Unit explicitly
+		 * and the UV delta is computed from the two placements, so a second view
+		 * that spilled into the next unit still draws correctly.
+		 *
+		 * Failure here is NOT fatal and must not drop the rect: the primary
+		 * placement is already valid, so leaving p2Unit at the sentinel degrades
+		 * this rect to "drawn opaque", which is exactly today's behaviour. That
+		 * is a visual downgrade under the standing perf-over-parity ruling, not
+		 * a hole -- unlike dropping the rect, which would delete the surface.
+		 */
+		if (TRACK_RECT_IS_SEMITRANS(rect))
+		{
+			if (NativeTrackAtlas_PlaceOne(&cur, w, h, &rect->p2Unit, &rect->p2X, &rect->p2Y))
+			{
+				atlas->packedTexels += (u32)(w * h);
+			}
+			else
+			{
+				rect->p2Unit = TRACK_ATLAS_UNIT_INVALID;
+				atlas->p2Dropped++;
+			}
+		}
 	}
 
 	/* unit can reach TRACK_ATLAS_MAX_UNITS exactly at the overflow break
 	 * above (review finding #7) -- clamp rather than report one more unit
 	 * than the pool actually has. */
-	atlas->unitsUsed = (atlas->rectCount > 0) ? TRKMESH_MIN(unit + 1, TRACK_ATLAS_MAX_UNITS) : 0;
+	atlas->unitsUsed = (atlas->rectCount > 0) ? TRKMESH_MIN(cur.unit + 1, TRACK_ATLAS_MAX_UNITS) : 0;
 }
 
 /*
@@ -1228,9 +1387,30 @@ static u16 s_trackAtlasStaging[256 * 256]; /* one PSX page, RGBA5551 tiled -- 12
  * unplaced rect, or a rect the backend declined to upload all land there and
  * draw untextured rather than sampling whatever happens to sit at atlas origin.
  */
-static u32 NativeTrackMesh_UnitBinForIndex(u16 vertexIndex)
+/*
+ * Bin space, widened for semi-transparency (docs/TRANSPARENCY_DESIGN.md 3-4).
+ *
+ *   0 .. N3DS_TRACK_ATLAS_MAX_UNITS      OPAQUE content, binned per atlas unit
+ *                                        (unchanged; the top value is the
+ *                                        "no placed unit" catch-all)
+ *   OPAQUE_COUNT + rectIndex             SEMI-TRANSPARENT content, binned per
+ *                                        RECT
+ *
+ * Why opaque bins by UNIT but blended bins by RECT: a draw binds one texture, so
+ * unit is the only thing opaque content must agree on. Blended content
+ * additionally needs its own UV delta to the rect's second (PASS2) placement and
+ * its own blend mode, and neither is a property of the unit -- two rects can sit
+ * in one unit with different ABRs and different deltas. Binning blended content
+ * per rect makes each blend range exactly homogeneous in all three.
+ *
+ * The cost of the finer key is bounded by how little blended content there is:
+ * measured at 4-5 rects and ~4% of vertices on race tracks, so this adds a
+ * handful of draws per frame, not hundreds.
+ */
+static u32 NativeTrackMesh_DrawBinForIndex(u16 vertexIndex)
 {
 	const unsigned texRefMax = (unsigned)(sizeof(s_trackMesh.texRectIndex) / sizeof(s_trackMesh.texRectIndex[0]));
+	const struct NativeTrackAtlasRect *rect;
 	u16 texRef;
 	s16 rectIdx;
 	u8 unit;
@@ -1252,8 +1432,25 @@ static u32 NativeTrackMesh_UnitBinForIndex(u16 vertexIndex)
 		return N3DS_TRACK_ATLAS_MAX_UNITS;
 	}
 
-	unit = s_trackMesh.atlas.rects[rectIdx].atlasUnit;
-	return (unit >= N3DS_TRACK_ATLAS_MAX_UNITS) ? (u32)N3DS_TRACK_ATLAS_MAX_UNITS : (u32)unit;
+	rect = &s_trackMesh.atlas.rects[rectIdx];
+	unit = rect->atlasUnit;
+
+	if (unit >= N3DS_TRACK_ATLAS_MAX_UNITS)
+	{
+		return N3DS_TRACK_ATLAS_MAX_UNITS;
+	}
+
+	/* A semi-transparent rect only earns its own bin once BOTH views are
+	 * actually uploaded. Without the second placement there is nothing to blend
+	 * from, its primary view was baked OPAQUE rather than PASS1 (see the bake),
+	 * and it must stay in the ordinary opaque unit bin -- otherwise the blend
+	 * pass would draw it sampling a placement that was never written. */
+	if (TRACK_RECT_IS_SEMITRANS(rect) && (rect->p2Unit != TRACK_ATLAS_UNIT_INVALID))
+	{
+		return (u32)TRACK_DRAW_BIN_OPAQUE_COUNT + (u32)rectIdx;
+	}
+
+	return (u32)unit;
 }
 
 /*
@@ -1300,7 +1497,7 @@ static int NativeTrackMesh_BinLeavesByAtlasUnit(void)
 	for (leaf = 0; leaf < s_trackMesh.leafCount; leaf++)
 	{
 		const struct NativeTrackLeafRange *range = &s_trackMesh.leafRanges[leaf];
-		u8 seen[N3DS_TRACK_ATLAS_MAX_UNITS + 1];
+		u8 seen[TRACK_DRAW_BIN_COUNT];
 		u32 tri;
 
 		memset(seen, 0, sizeof(seen));
@@ -1310,7 +1507,7 @@ static int NativeTrackMesh_BinLeavesByAtlasUnit(void)
 			 * exactly 256 triangles in one bin, which real leaves reach, and an
 			 * undercount here under-allocates the array pass 2 then writes
 			 * past. Presence is all this pass needs. */
-			seen[NativeTrackMesh_UnitBinForIndex(s_trackMesh.indices[range->firstIndex + tri])] = 1;
+			seen[NativeTrackMesh_DrawBinForIndex(s_trackMesh.indices[range->firstIndex + tri])] = 1;
 		}
 		for (u32 b = 0; b < sizeof(seen); b++)
 		{
@@ -1339,17 +1536,35 @@ static int NativeTrackMesh_BinLeavesByAtlasUnit(void)
 	{
 		const struct NativeTrackLeafRange *src = &s_trackMesh.leafRanges[leaf];
 		int firstForThisLeaf = 1;
+		u8 seen[TRACK_DRAW_BIN_COUNT];
+		u32 scanTri;
 
-		for (u32 bin = 0; bin <= N3DS_TRACK_ATLAS_MAX_UNITS; bin++)
+		/* Which bins this leaf actually uses, recomputed rather than carried
+		 * over from pass 1 (one O(triangles) scan, against an O(triangles) inner
+		 * loop per bin below). This matters now that the bin space is 521 wide
+		 * instead of 9: iterating every bin for every leaf would be ~500x the
+		 * scan work at level load for content that occupies a handful of bins. */
+		memset(seen, 0, sizeof(seen));
+		for (scanTri = 0; scanTri + 2 < src->indexCount; scanTri += 3)
+		{
+			seen[NativeTrackMesh_DrawBinForIndex(s_trackMesh.indices[src->firstIndex + scanTri])] = 1;
+		}
+
+		for (u32 bin = 0; bin < (u32)TRACK_DRAW_BIN_COUNT; bin++)
 		{
 			const u32 rangeStart = newIndexCursor;
 			u32 tri;
+
+			if (seen[bin] == 0)
+			{
+				continue;
+			}
 
 			for (tri = 0; tri + 2 < src->indexCount; tri += 3)
 			{
 				const u16 i0 = s_trackMesh.indices[src->firstIndex + tri];
 
-				if (NativeTrackMesh_UnitBinForIndex(i0) != bin)
+				if (NativeTrackMesh_DrawBinForIndex(i0) != bin)
 				{
 					continue;
 				}
@@ -1398,7 +1613,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 	unsigned long long freq = N3DS_GetTickFrequency();
 	unsigned long long tStart;
 	int allocated;
-	int rectsUploaded = 0, skipOversize = 0, skipNoUnit = 0;
+	int rectsUploaded = 0, skipOversize = 0, skipNoUnit = 0, stpRectsUploaded = 0;
 	u32 texelsDecoded = 0;
 	long long elapsedUs;
 	unsigned int freeKiB;
@@ -1447,15 +1662,58 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 
 		format = GetTPageFormat(rect->tpage);
 
-		/* srcU/srcV, NOT minU/minV -- see the struct comment on
-		 * NativeTrackAtlasRect (review finding #1: minV can put the decode
-		 * window past the end of vram[] for a bottom-half page). */
-		N3DS_DecodeAndTilePage((s16)rect->tpage, (s16)rect->clut, format, N3DS_TEXVIEW_OPAQUE, rect->srcU, rect->srcV, rect->allocW, rect->allocH,
-		                       rect->allocW / 8, s_trackAtlasStaging);
-		N3DS_TrackAtlas_UploadRect(rect->atlasUnit, rect->atlasX, rect->atlasY, rect->allocW, rect->allocH, s_trackAtlasStaging);
+		/*
+		 * Which STP view the primary placement gets (docs/TRANSPARENCY_DESIGN.md
+		 * 3). An OPAQUE rect keeps N3DS_TEXVIEW_OPAQUE -- any non-zero texel
+		 * visible, punch-through alpha, exactly as before this feature existed.
+		 *
+		 * A SEMI-TRANSPARENT rect instead splits into the two views that
+		 * partition it: PASS1 (non-STP texels only -- the opaque body, drawn
+		 * with blending OFF in the normal walk) into the primary placement, and
+		 * PASS2 (STP texels only, drawn blended by the blend pass) into the
+		 * second. Drawing both composes the full PS1 result, which is what the
+		 * packet path has done per-primitive since s17 (native_gpu.c:2670); the
+		 * only difference here is that the split is baked at load instead of
+		 * being decided per draw.
+		 *
+		 * If the second placement was declined, the primary falls back to
+		 * OPAQUE rather than PASS1 -- otherwise the rect would lose its STP
+		 * texels entirely (PASS1 alone is a strict subset) and a waterfall would
+		 * come out with holes in it instead of merely being solid. Degrade to
+		 * today's appearance, never to less than it.
+		 */
+		{
+			int wantTwoViews = TRACK_RECT_IS_SEMITRANS(rect) && (rect->p2Unit != TRACK_ATLAS_UNIT_INVALID) && ((int)rect->p2Unit < allocated);
+			N3DS_TexView primaryView = wantTwoViews ? N3DS_TEXVIEW_PASS1 : N3DS_TEXVIEW_OPAQUE;
 
-		texelsDecoded += (u32)rect->allocW * (u32)rect->allocH;
-		rectsUploaded++;
+			if (!wantTwoViews)
+			{
+				/* Either opaque, or a semi-trans rect whose second view has no
+				 * home. Both draw from the primary placement alone, so make
+				 * sure nothing later thinks a blend pass is available. */
+				rect->p2Unit = TRACK_ATLAS_UNIT_INVALID;
+			}
+
+			/* srcU/srcV, NOT minU/minV -- see the struct comment on
+			 * NativeTrackAtlasRect (review finding #1: minV can put the decode
+			 * window past the end of vram[] for a bottom-half page). */
+			N3DS_DecodeAndTilePage((s16)rect->tpage, (s16)rect->clut, format, primaryView, rect->srcU, rect->srcV, rect->allocW, rect->allocH,
+			                       rect->allocW / 8, s_trackAtlasStaging);
+			N3DS_TrackAtlas_UploadRect(rect->atlasUnit, rect->atlasX, rect->atlasY, rect->allocW, rect->allocH, s_trackAtlasStaging);
+
+			texelsDecoded += (u32)rect->allocW * (u32)rect->allocH;
+			rectsUploaded++;
+
+			if (wantTwoViews)
+			{
+				N3DS_DecodeAndTilePage((s16)rect->tpage, (s16)rect->clut, format, N3DS_TEXVIEW_PASS2, rect->srcU, rect->srcV, rect->allocW,
+				                       rect->allocH, rect->allocW / 8, s_trackAtlasStaging);
+				N3DS_TrackAtlas_UploadRect(rect->p2Unit, rect->p2X, rect->p2Y, rect->allocW, rect->allocH, s_trackAtlasStaging);
+
+				texelsDecoded += (u32)rect->allocW * (u32)rect->allocH;
+				stpRectsUploaded++;
+			}
+		}
 	}
 
 	/* us, not ms (review finding #9): an ms-rounded field silently prints 0
@@ -1465,8 +1723,15 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 	elapsedUs = (long long)(((N3DS_GetTickCount() - tStart) * 1000000ull) / (freq ? freq : 1ull));
 	freeKiB = (unsigned int)(N3DS_LinearFreeBytes() / 1024ul);
 
-	Platform_Log("[TRKATLAS3DS] units=%d/%d rects=%d/%d skipOversize=%d skipNoUnit=%d texels=%u KB=%u us=%d freeKiB=%u\n", allocated, atlas->unitsUsed,
-	             rectsUploaded, atlas->rectCount, skipOversize, skipNoUnit, texelsDecoded, (texelsDecoded * 2u) / 1024u, (int)elapsedUs, freeKiB);
+	/* stp= is the count of rects that got BOTH views uploaded, i.e. the ones the
+	 * blend pass can actually draw; p2drop= is semi-transparent rects that found
+	 * no room for a second view and are therefore still drawing solid. A
+	 * waterfall that stayed opaque on hardware is one of those two numbers being
+	 * lower than [TRKSTP]'s rect count, and without them the failure looks
+	 * identical to the feature not working at all. */
+	Platform_Log("[TRKATLAS3DS] units=%d/%d rects=%d/%d stp=%d p2drop=%d skipOversize=%d skipNoUnit=%d texels=%u KB=%u us=%d freeKiB=%u\n", allocated,
+	             atlas->unitsUsed, rectsUploaded, atlas->rectCount, stpRectsUploaded, atlas->p2Dropped, skipOversize, skipNoUnit, texelsDecoded,
+	             (texelsDecoded * 2u) / 1024u, (int)elapsedUs, freeKiB);
 
 	if (allocated < atlas->unitsUsed)
 	{
@@ -2571,10 +2836,90 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		             notexSample[1]);
 	}
 
-	Platform_Log("[TRKATLAS] lvl=%d rects=%d units=%d/%d fill=%d%% texelKB=%u animFrames=%d dropped=%d\n", NativePerf_CurrentLevelID(),
+	/*
+	 * Semi-transparency census (docs/TRANSPARENCY_DESIGN.md 3). Platform-neutral
+	 * and load-time, so it runs on a PC attract lap -- no hardware, no Azahar,
+	 * no frame timing involved. This is the number that GATES the track half of
+	 * the transparency work: a semi-transparent rect needs TWO baked atlas views
+	 * (PASS1 opaque body + PASS2 blended texels) instead of one, against a pool
+	 * that is already tight enough to have its own GIVEUP path above.
+	 *
+	 * The classifier is retail's own, not a heuristic: DrawLevelOvr1P picks the
+	 * semi-transparent primitive code from (uv1 & 0x00600000) != 0x00600000
+	 * (226_00_DrawLevelOvr1P.c:2133, six call sites), uv1's high halfword IS the
+	 * layout's tpage (:677), so those are tpage bits 5-6 -- the PSX ABR field.
+	 * ABR 3 is CTR's "this page is opaque" sentinel; every other value both marks
+	 * the face semi-transparent AND names the blend mode. Rects are keyed on
+	 * (tpage, clut) by NativeTrackAtlas_AddLayout, so ABR is part of the key and
+	 * a rect is blend-homogeneous by construction -- one classification per rect
+	 * is exact, not an approximation over its faces.
+	 *
+	 * Three quantities, because they answer three different questions and have
+	 * been confused before: rect COUNT is how many extra bakes; texel AREA is
+	 * what the pool actually pays; VERTEX share is how much of what you look at
+	 * is currently wrong. A track can be a handful of rects that cover half the
+	 * screen (a sea) or many rects covering almost nothing (scattered decals),
+	 * and those want opposite decisions.
+	 */
+	{
+		const unsigned texRefMax = (unsigned)(sizeof(s_trackMesh.texRectIndex) / sizeof(s_trackMesh.texRectIndex[0]));
+		int stpRects = 0, abrCount[3] = {0, 0, 0};
+		u32 stpTexels = 0, placedTexels = 0, stpVerts = 0;
+
+		for (int i = 0; i < s_trackMesh.atlas.rectCount; i++)
+		{
+			const struct NativeTrackAtlasRect *rect = &s_trackMesh.atlas.rects[i];
+			int abr = (rect->tpage >> 5) & 3;
+			u32 area;
+
+			/* Unplaced rects cost the pool nothing, so they stay out of the area
+			 * totals -- but they still count as rects, because a rect that failed
+			 * to place this run is not evidence that it never will. */
+			area = (rect->atlasUnit != TRACK_ATLAS_UNIT_INVALID) ? ((u32)rect->allocW * (u32)rect->allocH) : 0u;
+			placedTexels += area;
+
+			if (abr == 3)
+			{
+				continue;
+			}
+
+			stpRects++;
+			stpTexels += area;
+			abrCount[abr]++;
+		}
+
+		if (stpRects != 0)
+		{
+			for (u32 v = 0; v < s_trackMesh.vertCount; v++)
+			{
+				u16 texRef = s_trackMesh.verts[v].texRef;
+				s16 rectIdx = (texRef < texRefMax) ? s_trackMesh.texRectIndex[texRef] : (s16)-1;
+
+				if ((rectIdx >= 0) && (rectIdx < s_trackMesh.atlas.rectCount) && (((s_trackMesh.atlas.rects[rectIdx].tpage >> 5) & 3) != 3))
+				{
+					stpVerts++;
+				}
+			}
+		}
+
+		/* Vertices rather than faces or triangles: every emitted face contributes
+		 * exactly 4 (the corner loop above), so the SHARE is the same either way,
+		 * and a raw vertex count can't be misread as a triangle count the way a
+		 * "faces" label invites. Denominators are printed alongside every
+		 * numerator on purpose -- a bare percentage here would be the same shape
+		 * of trap as [PKTDEPTH]'s. */
+		Platform_Log("[TRKSTP] lvl=%d rects=%d/%d texels=%u/%u verts=%u/%u abr0=%d abr1=%d abr2=%d\n", NativePerf_CurrentLevelID(), stpRects,
+		             s_trackMesh.atlas.rectCount, stpTexels, placedTexels, stpVerts, s_trackMesh.vertCount, abrCount[0], abrCount[1], abrCount[2]);
+	}
+
+	/* p2drop= is semi-transparent rects whose SECOND view found no room in the
+	 * pool. Reported on the platform-neutral line as well as the 3DS one because
+	 * the PACKER runs on both, so a PC attract lap is enough to catch a track
+	 * whose blended surfaces would silently come out solid on hardware. */
+	Platform_Log("[TRKATLAS] lvl=%d rects=%d units=%d/%d fill=%d%% texelKB=%u animFrames=%d dropped=%d p2drop=%d\n", NativePerf_CurrentLevelID(),
 	             s_trackMesh.atlas.rectCount, s_trackMesh.atlas.unitsUsed,
 	             TRACK_ATLAS_MAX_UNITS, s_trackMesh.atlas.unitsUsed ? (int)((s_trackMesh.atlas.packedTexels * 100u) / ((u32)s_trackMesh.atlas.unitsUsed * TRACK_ATLAS_DIM * TRACK_ATLAS_DIM)) : 0,
-	             (s_trackMesh.atlas.packedTexels * 2u) / 1024u, atlasAnimFrames, s_trackMesh.atlas.rectsDropped);
+	             (s_trackMesh.atlas.packedTexels * 2u) / 1024u, atlasAnimFrames, s_trackMesh.atlas.rectsDropped, s_trackMesh.atlas.p2Dropped);
 }
 
 /*
@@ -2617,9 +2962,58 @@ int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirst
 /* Rung 3b: which atlas unit this range samples. Values at or above the unit
  * count mean "no placed texture" -- the draw side must leave texturing off for
  * those rather than binding a stale unit. */
-unsigned NativeTrackMesh_LeafAtlasBin(unsigned i)
+unsigned NativeTrackMesh_LeafAtlasBin(unsigned i, int wantPass2)
 {
-	return (i < s_trackMesh.leafCount) ? (unsigned)s_trackMesh.leafRanges[i].atlasBin : 0xFFFFu;
+	int unit, p2Unit, blend, dx, dy;
+
+	if (i >= s_trackMesh.leafCount)
+	{
+		return 0xFFFFu;
+	}
+
+	/* Decoded, not returned raw: the stored bin is now a WIDER key than an atlas
+	 * unit (it encodes per-rect blended bins above the unit range -- see
+	 * NativeTrackMesh_DrawBinForIndex), and every existing caller of this
+	 * function feeds the result straight to a texture bind. Returning the raw
+	 * bin here would have silently bound unit 9, 10, 200... on the first track
+	 * with any semi-transparency. */
+	NativeTrackMesh_DecodeDrawBin((u32)s_trackMesh.leafRanges[i].atlasBin, &unit, &p2Unit, &blend, &dx, &dy);
+	return (unsigned)(wantPass2 ? p2Unit : unit);
+}
+
+/* TRACK_ABR_OPAQUE (3) for an ordinary range; the rect's PSX ABR blend mode
+ * (0 = B/2+F/2, 1 = B+F, 2 = B-F) for a range the blend pass owns. The draw side
+ * uses this both to split its two passes and to pick the blend mode. */
+unsigned NativeTrackMesh_LeafBlend(unsigned i)
+{
+	int unit, p2Unit, blend, dx, dy;
+
+	if (i >= s_trackMesh.leafCount)
+	{
+		return TRACK_ABR_OPAQUE;
+	}
+
+	NativeTrackMesh_DecodeDrawBin((u32)s_trackMesh.leafRanges[i].atlasBin, &unit, &p2Unit, &blend, &dx, &dy);
+	return (unsigned)blend;
+}
+
+/* Texel delta from the rect's primary (PASS1) placement to its PASS2 placement.
+ * The blend pass hands this to the shader, which adds it to each vertex's baked
+ * UV -- that is what lets ONE set of resident vertices address BOTH decoded
+ * views without a second copy of the geometry. Zero for opaque ranges. */
+void NativeTrackMesh_LeafUvOffset(unsigned i, int *outDx, int *outDy)
+{
+	int unit, p2Unit, blend;
+
+	*outDx = 0;
+	*outDy = 0;
+
+	if (i >= s_trackMesh.leafCount)
+	{
+		return;
+	}
+
+	NativeTrackMesh_DecodeDrawBin((u32)s_trackMesh.leafRanges[i].atlasBin, &unit, &p2Unit, &blend, outDx, outDy);
 }
 
 int NativeTrackMesh_LeafBox(unsigned i, s16 outMin[3], s16 outMax[3])

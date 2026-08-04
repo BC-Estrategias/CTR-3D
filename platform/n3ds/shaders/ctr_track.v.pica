@@ -110,6 +110,26 @@
                      ; which is the only way this gets accepted. Collapse to the
                      ; winner once the owner has ruled.
 .fvec depthRange     ; (-otIndexLo, ordinalLo, ordinalSpan, invIndexSpan) -- per leaf
+; SEMI-TRANSPARENCY (docs/TRANSPARENCY_DESIGN.md 3). x/y = the UV delta, in this
+; file's own ENCODED units (2x fixed point -- the CPU doubles the texel delta
+; before it gets here, see N3DS_TrackDraw_Leaf), from a rect's primary placement
+; to its PASS2 placement. z/w unused.
+;
+; This is what lets ONE resident vertex buffer address BOTH decoded views of a
+; semi-transparent texture. A rect that needs blending is decoded twice at level
+; load -- PASS1 (its non-STP texels) into the primary placement and PASS2 (its
+; STP texels) into a second one -- and the baked vertex UV points at the primary.
+; The blend pass redraws the same indices with this offset set, so the identical
+; geometry samples the other view. No second copy of the vertices, and no
+; per-vertex attribute: the offset is a property of the RECT, and build-time
+; binning makes every blend draw rect-homogeneous precisely so it can be a
+; per-draw uniform instead.
+;
+; ZERO for every opaque draw, and written on EVERY draw rather than only the
+; blended ones -- an unset uniform component holds whatever the last program to
+; use that physical register left there, which is exactly the class of bug the
+; s29 projection-register collision was.
+.fvec uvOffset
 
 ; Constants
 .constf constants(0.0, 1.0, -1.0, 0.0)
@@ -273,6 +293,63 @@
 	mul r4.y, bucketToDepth, r2.z       ; drawOrder in view.z units
 	add r4.z, r2.x, r4.y                ; viewZ + tie-break (both temps, order-free)
 	max r4.z, depthMinWorld, r4.z       ; stay out of the 2D near band
+
+	; ---- NEAR-BAND POLARITY (s32) ----------------------------------------
+	; The max above is the last surviving suspect in the sinking-kart bug, and
+	; the direction is what makes it one: a vertex at or behind the eye has
+	; viewZ <= 0, and max() maps it to 256 -- the NEAREST depth this axis can
+	; express. Track visibility is leaf-granular and retail's per-polygon
+	; near-clip was deleted for track content, so a leaf straddling the eye is
+	; handed to the GPU whole. The hardware clips the triangle correctly, but
+	; the attributes it interpolates at the near-plane intersection come from
+	; the vertex we just declared to be maximally NEAR -- so the surviving
+	; sliver of road draws at near-maximum nearness across a large screen area,
+	; and it is the road right under the player. Measured in a race
+	; ([TRKNEAR], platform/native_track_frame.c, lvl 3 demo): 19-45 straddling
+	; and 2-108 fully-behind triangles per frame.
+	;
+	; Two rival explanations were killed before this one was written, and
+	; neither is worth re-deriving:
+	;   * near-band COLLAPSE (everything under 256 flattening to one value)
+	;     cannot bury anything -- the depth test is LEQUAL and models draw
+	;     after the track, so a tie is won by the kart;
+	;   * screen-linear interpolation of view.z always OVER-estimates (the
+	;     true value is the harmonic blend), so it can only push the road
+	;     away mid-triangle, never nearer.
+	;
+	; This flips the polarity: a vertex the near band would have moved is sent
+	; to the FAR end instead of the near one, so the artefact loses the depth
+	; test where it used to win. Unlike the s29 near-plane reject (still
+	; disabled below) it discards nothing -- the triangle still draws, it just
+	; stops outranking things genuinely in front of it -- so it cannot put
+	; holes in the track surface, which is the trade the owner rejected then.
+	;
+	; SUPERSEDED -- the polarity flip that used to live here is GONE, and
+	; hParam.w now carries a plain additive depth bias instead. The owner
+	; watched the flip and reported racers still sunk **on sweeping aerial
+	; shots**, where there is no geometry at or behind the eye for it to touch:
+	; falsified. A sink unchanged by camera distance AND angle is a CONSTANT
+	; OFFSET, and hParam.w was the only free uniform component left to measure
+	; one with -- keeping a dead knob parked on it would have cost the
+	; measurement.
+	;
+	; What replaced it, and why a bias is an INSTRUMENT here rather than a fix:
+	; by this point both depth sources are proven bit-exact against the GTE for
+	; the same vertex ([MDLDEPTH] maxErr=0 over ~5M samples, [TRKDEPTHCHK]
+	; err=0..0 over 600k), and the road's drawOrder tie-break is measured at
+	; range 0..10 with ZERO negative values, so it can only push the road
+	; FARTHER. Every candidate that could produce a wrong NUMBER is eliminated,
+	; yet the road still buries racers on a shared axis. The bias answers the
+	; question those eliminations left: HOW BIG is the gap? A handful of units
+	; means precision or tie-breaking; hundreds means something structural is
+	; still unaccounted for. Binary-search it at runtime (dumpreq `trkbias N`,
+	; positive = push the road away) and the magnitude names the mechanism.
+	;
+	; Applied AFTER the near-band max and BEFORE the far clamp, so a bias can
+	; never push a vertex out of the representable range.
+	add r4.z, hParam.wwww, r4.z
+	; ----------------------------------------------------------------------
+
 	min r4.z, depthMax, r4.z
 	mul r4.w, negOne, r4.z              ; -depth (no SUB opcode)
 	add r6.y, zOrdFromDepth, r4.w       ; zOrd_true = 32767 - depth
@@ -363,7 +440,13 @@
 	;
 	; Every declared output component must still be written (the s14 hardware
 	; boot hang; Azahar does not enforce this), so z/w get explicit zeros.
-	mul outtc0.xy, atlasScale, intc.xy
+	; Semi-transparency: shift to the rect's PASS2 placement before normalising.
+	; uvOffset is zero on every opaque draw, so this add is a no-op there rather
+	; than a second code path. Both operands are non-constant (uniform + input
+	; attribute), so src1/src2 order is unconstrained here -- unlike the
+	; mul below, whose constant must lead.
+	add r8.xy, uvOffset.xy, intc.xy
+	mul outtc0.xy, atlasScale, r8.xy
 	mov outtc0.zw, zeros
 
 	; outclr: colorScale rescales the raw GPU_UNSIGNED_BYTE fetch back to

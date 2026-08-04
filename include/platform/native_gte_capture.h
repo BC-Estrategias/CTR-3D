@@ -57,4 +57,18 @@ void GTECapture_BeginOTWalk(void);
 void GTECapture_MarkOTNode(const void *node);
 int GTECapture_LookupSuppressed(void);
 
+// DEPTHLESS-GEOMETRY suppression (s32). Bracket any producer whose GTE
+// projection runs with the translation vector zeroed -- i.e. geometry drawn as
+// if infinitely far, whose SZ3 is a function of the mesh's own radius and NOT
+// of its distance from the camera. DrawSky_Full is the one such producer in
+// the game. Stores are dropped between Set(1) and Set(0); lookups for those
+// screen coordinates then miss, and the packet-depth path falls back to
+// deriving depth from the OT bucket, which IS retail's own statement of how
+// far the content is. See GTECapture_SetStoreSuppressed's definition for the
+// bug this closes.
+//
+// Game-thread only, same ownership as Store itself. Not a runtime toggle: the
+// suppressed population has no valid depth to capture in any configuration.
+void GTECapture_SetStoreSuppressed(int suppressed);
+
 #endif

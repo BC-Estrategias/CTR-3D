@@ -257,10 +257,127 @@ internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[]
 		}
 	}
 
+	// --track-near-census: turns on [TRKNEAR], the behind-the-eye / near-band
+	// triangle census (platform/native_track_frame.c). Lives in THIS parser,
+	// not the model one, because the counter it sets is compiled under
+	// CTR_NATIVE_TRACK_RENDERER -- reaching it from the model parser would
+	// break any build with models on and the track off.
+	//
+	// It also implies --track-render: the leaf list it walks is only recorded
+	// while that toggle is set, and on PC the toggle costs nothing visible
+	// (NativeTrackFrame_SkipRetailDraw returns 0 off-3DS, so retail still
+	// draws the level). Implied rather than required so the measurement can't
+	// silently report zero triangles because a flag was forgotten.
+	{
+		extern int g_dbg_trackNearCensus;
+
+		for (i = 1; i < argc; i++)
+		{
+			if (strcmp(argv[i], "--track-near-census") == 0)
+			{
+				g_dbg_trackNearCensus = 1;
+			}
+		}
+
+		if (g_dbg_trackNearCensus)
+		{
+			if (g_dbg_trackRender == 0)
+			{
+				g_dbg_trackRender = 1;
+			}
+			Platform_LogWarn("[CTR Native] track near census: on\n");
+		}
+	}
+
+	// --track-depth-check: [TRKDEPTHCHK], ours-vs-retail road depth for the
+	// same vertex. Implies --track-render for the same reason the census does
+	// (it reads the snapshot's camera, which is only recorded while the toggle
+	// is set), and on PC that toggle changes nothing visible.
+	{
+		extern int g_dbg_trackDepthCheck;
+
+		for (i = 1; i < argc; i++)
+		{
+			if (strcmp(argv[i], "--track-depth-check") == 0)
+			{
+				g_dbg_trackDepthCheck = 1;
+			}
+		}
+
+		if (g_dbg_trackDepthCheck)
+		{
+			if (g_dbg_trackRender == 0)
+			{
+				g_dbg_trackRender = 1;
+			}
+			Platform_LogWarn("[CTR Native] track depth check: on\n");
+		}
+	}
+
 	// Always log the resulting state (even the default 0), same as the
 	// dumpreq/button handlers do on 3DS -- this is the line the verification
 	// loop greps for to confirm the flag actually took.
 	Platform_LogWarn("[CTR Native] track render: %d\n", g_dbg_trackRender);
+}
+#endif
+
+#if defined(CTR_INTERNAL) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+// --model-render 0|1|2: PC surface for g_dbg_modelRender, the PICA-native model
+// renderer's runtime toggle (docs/NATIVE_MODEL_RENDERER_DESIGN.md section 9).
+// Same template as --track-render above, and it exists for the same reason: a
+// toggle with no PC setter can never leave 0 on PC, which is where rung 1 is
+// verified. The track renderer shipped a step whose recorder had never once
+// executed on any platform because this was missing; that is not repeated here.
+internal void NativePlatform_ModelRenderConfigureFromArgs(int argc, char *argv[])
+{
+	extern int g_dbg_modelRender;
+	int i;
+
+	for (i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "--model-render") != 0)
+		{
+			continue;
+		}
+
+		if ((i + 1) >= argc)
+		{
+			Platform_LogWarn("[CTR Native] --model-render needs a state (0=off 1=on 2=both)\n");
+			continue;
+		}
+
+		i++;
+		{
+			int n = atoi(argv[i]);
+
+			g_dbg_modelRender = (n < 0) ? 0 : (n > 2) ? 2 : n;
+		}
+	}
+
+	// --model-depth-check: turns on [MDLDEPTH], the GTE-vs-ours depth
+	// comparison (platform/native_model_emit.c). Separate from --model-render
+	// because it only needs the CAPTURE, which state 1 and state 2 both run --
+	// so the check can be read on PC without the 3DS draw path existing.
+	{
+		extern int g_dbg_modelDepthCheck;
+
+		for (i = 1; i < argc; i++)
+		{
+			if (strcmp(argv[i], "--model-depth-check") == 0)
+			{
+				g_dbg_modelDepthCheck = 1;
+			}
+		}
+
+		if (g_dbg_modelDepthCheck)
+		{
+			Platform_LogWarn("[CTR Native] model depth check: on\n");
+		}
+	}
+
+	// Logged even at the default 0 -- this is the line the verification loop
+	// greps for to confirm the flag took.
+	Platform_LogWarn("[CTR Native] model render: %d\n", g_dbg_modelRender);
 }
 #endif
 

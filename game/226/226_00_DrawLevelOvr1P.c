@@ -1047,6 +1047,34 @@ static void Ovr226_800a0f78_ProjectVertexTripleFullDepth(struct LevVertex *verti
 	CTR_GteStoreSXY3(&projected[index0].posScreen[0], &projected[index1].posScreen[0], &projected[index2].posScreen[0]);
 	gte_stsz3(&depth0, &depth1, &depth2);
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	// [TRKDEPTHCHK]: hand the resident track renderer retail's own projected
+	// depth for these three vertices, so it can compare against what its
+	// snapshotted camera produces for the SAME source positions. Road-side
+	// counterpart of the model path's [MDLDEPTH] check, and placed HERE, at
+	// retail's projection, because this is the only point where "the vertex"
+	// and "the GTE's answer for that vertex" are both in hand -- anywhere else
+	// needs a vertex match that could silently pair the wrong two numbers.
+	// Off unless --track-depth-check; see platform/native_track_frame.c.
+	{
+		extern int g_dbg_trackDepthCheck;
+		extern void NativeTrackFrame_NoteRetailVertexDepth(const s16 *pos, u32 retailDepth);
+
+		// Tested HERE, not just inside the callee. This is the innermost loop
+		// of retail's track projection -- three unconditional calls per
+		// triangle that immediately return is not "free", and toggle-0 has to
+		// be indistinguishable from a build with the instrument absent or every
+		// fps number measured against it is quietly wrong. Same rule the track
+		// renderer's own toggle-0 early-outs already follow.
+		if (g_dbg_trackDepthCheck)
+		{
+			NativeTrackFrame_NoteRetailVertexDepth(vertex0->pos.v, depth0);
+			NativeTrackFrame_NoteRetailVertexDepth(vertex1->pos.v, depth1);
+			NativeTrackFrame_NoteRetailVertexDepth(vertex2->pos.v, depth2);
+		}
+	}
+#endif
+
 	DrawLevelOvr1P_StoreProjectedDepthWord(&projected[index0], depth0);
 	DrawLevelOvr1P_StoreProjectedDepthWord(&projected[index1], depth1);
 	DrawLevelOvr1P_StoreProjectedDepthWord(&projected[index2], depth2);

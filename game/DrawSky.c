@@ -1,5 +1,19 @@
 #include <common.h>
 
+#ifndef CTR_NATIVE_GTE_CAPTURE
+#define CTR_NATIVE_GTE_CAPTURE 0
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+// Declared locally rather than by including platform/native_gte_capture.h:
+// this file sits earlier in game_unity.h's include chain than the first file
+// that pulls that header in (MAIN/MainFrame.c), and the chain's order is
+// load-bearing. Same idiom as the NativeTrackFrame_Record / NativeModelFrame_
+// Sample hooks elsewhere in game/. The prototype is checked against the real
+// one at the point MainFrame.c does include the header.
+extern void GTECapture_SetStoreSuppressed(int suppressed);
+#endif
+
 struct DrawSkyContext
 {
 	const struct ShortVertex *verts;
@@ -130,6 +144,20 @@ void DrawSky_Full(void *skybox, struct PushBuffer *pb, struct PrimMem *primMem)
 		int faceIndex;
 		int countIndex;
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		// The three CTC2(0, 5..7) below zero the GTE's translation vector: the
+		// skybox rotates with the camera and never translates, because it is
+		// meant to be at infinity. That makes every SZ3 this function produces a
+		// function of the sky mesh's own radius rather than of distance, so
+		// nothing downstream may treat those depths as real. Suppress the
+		// capture stores for the whole projection and let the packet-depth path
+		// derive depth from the OT bucket instead -- which is retail's own
+		// statement of how far this content is. Full reasoning, including the
+		// second failure mode (sky vertices EVICTING world vertices from a table
+		// keyed by screen coordinate), is on GTECapture_SetStoreSuppressed.
+		GTECapture_SetStoreSuppressed(1);
+#endif
+
 		CTC2(DrawSky_ReadWord(&pb->matrix_ViewProj, 0x00), 0);
 		CTC2(DrawSky_ReadWord(&pb->matrix_ViewProj, 0x04), 1);
 		CTC2(DrawSky_ReadWord(&pb->matrix_ViewProj, 0x08), 2);
@@ -170,6 +198,13 @@ void DrawSky_Full(void *skybox, struct PushBuffer *pb, struct PrimMem *primMem)
 		faceIndex = (int)(baseFaceOffset >> 2);
 		countIndex = (int)(baseCountOffset >> 1);
 		prim = DrawSky_Piece(sky, &ctx, faceIndex, countIndex, prim);
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		// Cleared inside the same `if (sky != NULL)` block that set it, and
+		// after the last DrawSky_Piece, so the flag can never outlive this
+		// call -- there is no early return between the two.
+		GTECapture_SetStoreSuppressed(0);
+#endif
 	}
 
 	primMem->cursor = prim;

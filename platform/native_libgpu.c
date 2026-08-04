@@ -12,6 +12,7 @@
 #include <platform/native_gpu.h>
 #include <platform/native_perf.h>
 #include <platform/native_render_queue.h>
+#include <platform/native_model_emit.h>
 #include <platform/native_track_frame.h>
 #include <platform/native_track_mesh.h>
 #include <gpu.h>
@@ -519,6 +520,13 @@ void DrawOTag(void *p)
 	// post, so the render queue's own lock/signal orders it for whichever
 	// thread ends up walking (worker on 3DS render-thread builds).
 	NativeTrackFrame_PublishForWalk();
+#endif
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	// s32 rung 1: same publish point, same ordering argument, for the model
+	// capture the rung-2 draw side will read. Nothing consumes it yet; the pair
+	// is wired now so the draw side lands as a consumer and not as plumbing.
+	NativeModelEmit_PublishForWalk();
 #endif
 
 	if (NativeRenderQueue_Route())

@@ -20,6 +20,11 @@
  * CTR_NATIVE_TRACK_RENDERER option) -- see platform/n3ds/shaders/ctr_track.v.pica. */
 #include "ctr_track_shbin.h"
 #endif
+#ifdef CTR_NATIVE_MODEL_RENDERER
+/* Rung 2's model shader, same picasso -> bin2s pipeline, guarded by the same
+ * CTR_NATIVE_MODEL_RENDERER option -- see platform/n3ds/shaders/ctr_model.v.pica. */
+#include "ctr_model_shbin.h"
+#endif
 
 /*
  * Diagnostics go to two places because neither alone is sufficient:
@@ -398,6 +403,36 @@ static C3D_Tex s_vramDisplayTex[N3DS_VRAM_DISPLAY_TEX_COUNT];
 static C3D_Tex s_trackAtlasTextures[N3DS_TRACK_ATLAS_MAX_UNITS];
 static int s_trackAtlasUnitsAllocated = 0;
 
+#ifdef CTR_NATIVE_MODEL_RENDERER
+/*
+ * Rung 2 model program (docs/NATIVE_MODEL_RENDERER_DESIGN.md). Only the program
+ * and its uniform locations live here -- no attribute layout and no buffer
+ * info, because model draws deliberately reuse the packet path's. See
+ * n3ds_backend.h's N3DS_ModelDraw_* comment for why that is safe and what it
+ * costs in field reinterpretation.
+ *
+ * Kept OUTSIDE the CTR_NATIVE_TRACK_RENDERER block below on purpose: the two
+ * options are independent, and a model-renderer build with the track renderer
+ * off is a configuration this campaign will actually want (it isolates the
+ * model path's fps contribution from the track's).
+ */
+static DVLB_s *s_modelShaderDvlb = NULL;
+static shaderProgram_s s_modelShaderProgram;
+static int s_modelULocQx = -1, s_modelULocQy = -1, s_modelULocQw = -1;
+static int s_modelULocProjection = -1, s_modelULocH = -1;
+/* Texenv memo, same idea and lifetime rule as s_trackTexturedState: reset by
+ * N3DS_ModelDraw_Begin because the packet path owns texenv 0 between model
+ * frames. -1 = unknown, so the first Run after a Begin always emits. */
+static int s_modelTexturedState = -1;
+/* Last atlas a model Run bound. Only trusted between Begin and End -- the
+ * packet path binds atlases too -- so Begin resets it. */
+static int s_modelBoundAtlas = -1;
+/* Depth-write memo for the model blend pass, same contract as the track's
+ * s_trackDepthWriteState: -1 = not asserted in this bracket. */
+static int s_modelDepthWriteState = -1;
+static int s_modelDrawActive = 0;
+#endif
+
 #ifdef CTR_NATIVE_TRACK_RENDERER
 /*
  * Rung 3a step 2: the resident-mesh draw path's own program/attribute
@@ -411,6 +446,11 @@ static DVLB_s *s_trackShaderDvlb = NULL;
 static shaderProgram_s s_trackShaderProgram;
 static int s_trackULocQx = -1, s_trackULocQy = -1, s_trackULocQw = -1;
 static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange = -1;
+static int s_trackULocUvOffset = -1;
+/* Memo for the blend pass's depth-write state, so a frame with no semi-
+ * transparent content pays nothing and a frame with some flips the pair exactly
+ * twice. -1 = unknown/not set this bracket, forcing the first draw to assert. */
+static int s_trackDepthWriteState = -1;
 /* Rung 3b texenv memo -- see N3DS_TrackDraw_SetTextured. Declared up here with
  * the other track statics because N3DS_TrackDraw_Begin resets it and sits above
  * the function that uses it. */
@@ -712,6 +752,7 @@ int N3DS_C3DInit(void)
 	s_trackULocProjection = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "projection");
 	s_trackULocH = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "hParam");
 	s_trackULocDepthRange = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "depthRange");
+	s_trackULocUvOffset = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "uvOffset");
 
 	/* Fixed attribute layout for N3DS_TrackVertex -- does not depend on any
 	 * per-level allocation (unlike s_trackBufInfo, built in
@@ -725,6 +766,30 @@ int N3DS_C3DInit(void)
 	AttrInfo_AddLoader(&s_trackAttrInfo, 1, GPU_SHORT, 2);         /* v1 = texcoord (u, v) -- unused in 3a */
 	AttrInfo_AddLoader(&s_trackAttrInfo, 2, GPU_UNSIGNED_BYTE, 4); /* v2 = color + biased drawOrder */
 #endif /* CTR_NATIVE_TRACK_RENDERER */
+
+#ifdef CTR_NATIVE_MODEL_RENDERER
+	/* Rung 2's program. Fatal on failure for the same reason the other two
+	 * are: a model-renderer build with no model shader would draw nothing the
+	 * moment the toggle is flipped, and "nothing appeared" is a far more
+	 * expensive thing to debug than a loud boot failure.
+	 *
+	 * NO AttrInfo built here. Model draws reuse the packet layout, which
+	 * N3DS_BindPacketDrawState installs; building a second identical one would
+	 * be a copy that can silently drift from the layout the vertices are
+	 * actually written in. */
+	s_modelShaderDvlb = DVLB_ParseFile((u32 *)ctr_model_shbin, ctr_model_shbin_size);
+	if (s_modelShaderDvlb == NULL)
+	{
+		return 0;
+	}
+	shaderProgramInit(&s_modelShaderProgram);
+	shaderProgramSetVsh(&s_modelShaderProgram, &s_modelShaderDvlb->DVLE[0]);
+	s_modelULocProjection = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "projection");
+	s_modelULocQx = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "qx");
+	s_modelULocQy = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "qy");
+	s_modelULocQw = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "qw");
+	s_modelULocH = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "hParam");
+#endif /* CTR_NATIVE_MODEL_RENDERER */
 
 	return 1;
 }
@@ -822,6 +887,32 @@ static void N3DS_FrameTrace(const char *msg)
  * s27 moved resolve-memo off it; a dumpreq file cannot be placed mid-race).
  */
 int g_dbg_depthTest = 0;
+
+/*
+ * s32 near-band polarity (ctr_track.v.pica's NEAR-BAND POLARITY block). 0 is
+ * the pre-s32 build bit-for-bit; 1 sends track vertices at or behind the eye
+ * to the FAR end of the depth axis instead of the near end.
+ *
+ * Lives in THIS translation unit like g_dbg_depthTest, because both of its
+ * readers (the hParam uniform write and the dumpreq handler) are here.
+ *
+ * dumpreq `nearfar` only -- deliberately NOT a button. Every existing chord is
+ * taken, and unlike a perf A/B this one does not need a mid-race flip: the
+ * sink is visible in a still frame, so booting once each way settles it, and a
+ * dumpreq IS placeable before launch even on hardware.
+ *
+ * DEFAULT 0, INCLUDING in demo builds. It briefly rode
+ * CTR_NATIVE_RENDERER_DEFAULT_ON so a watch-only sitting would see it armed;
+ * the owner then watched that build and reported racers still sunk **on
+ * sweeping aerial shots**, which falsifies the theory outright -- from a
+ * camera high above the track there is no geometry at or behind the eye for
+ * this to touch, so it cannot be what buries anything. A sink that is
+ * unchanged by camera distance and angle is a CONSTANT OFFSET, a different
+ * failure entirely. Kept (it is still strictly more correct than clamping
+ * behind-eye vertices to maximally-near) but off, and no longer allowed to
+ * ride along in a build where something else is being judged.
+ */
+int g_dbg_trackNearFar = 0; /* retained name; now the additive road depth bias, view.z units */
 
 /*
  * Preset ladder for the packet depth bias (see g_dbg_pktDepthBias, native_gpu.c).
@@ -1521,6 +1612,13 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	 */
 	N3DS_C3DSetBlendMode(0);
 
+	/* Depth writes are ON entering the bracket (N3DS_C3DBeginFrame's frame-wide
+	 * pair, or state 2's read-only variant just above). The blend pass turns
+	 * them off for its own draws and this memo tracks that; -1 rather than 1 so
+	 * the first draw of the frame asserts explicitly instead of trusting an
+	 * inherited state that a future change to BeginFrame could alter. */
+	s_trackDepthWriteState = -1;
+
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQx, qx[0], qx[1], qx[2], qx[3]);
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQy, qy[0], qy[1], qy[2], qy[3]);
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocQw, qw[0], qw[1], qw[2], qw[3]);
@@ -1545,7 +1643,14 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 		}
 #endif
 
-		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, selTrueDepth, 1.0f - selTrueDepth, 0.0f);
+		/* hParam.w: near-band polarity flip (s32, see the NEAR-BAND POLARITY
+		 * block in ctr_track.v.pica). 0 = today's behaviour bit-for-bit,
+		 * 1000 = vertices at or behind the eye go to the FAR end instead of
+		 * the near one. Carried on a uniform rather than a shader constant so
+		 * it is a mid-race hardware A/B (SELECT+D-UP / dumpreq `nearfar`);
+		 * the sink has to be judged by eye on the thing that shows it, and a
+		 * rebuild between legs is how a confounded comparison happens. */
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, selTrueDepth, 1.0f - selTrueDepth, (float)g_dbg_trackNearFar);
 
 		/* Prove the selector actually REACHES the shader. Every depth number
 		 * logged so far is CPU-side arithmetic showing what the value would be,
@@ -1644,7 +1749,7 @@ static void N3DS_TrackDraw_SetTextured(int textured)
 	s_trackTexturedState = textured;
 }
 
-void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin)
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin, int blend, int uvDx, int uvDy)
 {
 	const u16 *indexBase;
 
@@ -1686,6 +1791,68 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	 */
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocDepthRange, -otIndexLo, ordinalLo, ordinalSpan, invIndexSpan);
 
+	/*
+	 * SEMI-TRANSPARENCY (docs/TRANSPARENCY_DESIGN.md 3-4).
+	 *
+	 * blend is the rect's PSX ABR mode for a range the blend pass owns, or 3
+	 * (TRACK_ABR_OPAQUE) for ordinary content. uvDx/uvDy are the TEXEL delta to
+	 * the rect's PASS2 placement; the shader wants them in its own encoded units,
+	 * which are 2x fixed point, so the doubling happens here -- next to the
+	 * comment that says why -- rather than in the mesh builder, which thinks in
+	 * texels throughout.
+	 *
+	 * Written on EVERY draw including opaque ones. An unset uniform component
+	 * holds whatever the last program to use that physical register left there,
+	 * and PICA uniforms are shared physical registers across programs, not
+	 * per-program handles -- the s29 projection collision was exactly that
+	 * mistake and it destroyed every packet drawn after a track draw.
+	 */
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocUvOffset, (float)(uvDx * 2), (float)(uvDy * 2), 0.0f, 0.0f);
+
+	/*
+	 * Blended ranges draw with their own PS1 blend mode and, critically, with
+	 * depth WRITES OFF. Test stays on, so blended geometry is still correctly
+	 * hidden by opaque things in front of it; but it must not write, or two
+	 * blended surfaces would occlude each other by depth instead of compositing,
+	 * and a waterfall would punch a hole in whatever is behind it.
+	 *
+	 * The caller guarantees every opaque range is issued before any blended one
+	 * (platform/native_track_frame.c runs two passes), so this pair of state
+	 * changes happens at most twice per frame, not per draw. Memoized anyway
+	 * because "at most twice" is a property of the caller, and a future caller
+	 * that interleaved would otherwise pay a GPU state change per draw silently.
+	 */
+	{
+		const int wantDepthWrite = (blend == 3) ? 1 : 0;
+
+		if (s_trackDepthWriteState != wantDepthWrite)
+		{
+			s_trackDepthWriteState = wantDepthWrite;
+#ifdef CTR_NATIVE_OT_DEPTH
+			/* Leave state 2 (TRACKRO) alone -- it already means "test but never
+			 * write" for the whole track, which is a superset of what the blend
+			 * pass needs, and stomping it here would silently disable the
+			 * isolation diagnostic. */
+			if (g_dbg_depthTest != 2)
+			{
+				C3D_DepthTest(true, GPU_LEQUAL, wantDepthWrite ? GPU_WRITE_ALL : GPU_WRITE_COLOR);
+			}
+#endif
+		}
+
+		/* ABR -> BlendMode is +1, and that is not a guess: native_gpu.c:49 spells
+		 * the packet path's own conversion as
+		 *   #define GET_TPAGE_BLEND(tpage) ((BlendMode)(((tpage >> 5) & 3) + 1))
+		 * -- the same field, the same arithmetic. The enum
+		 * (include/platform/native_renderer_types.h) lines up term for term:
+		 * BM_NONE=0, BM_AVERAGE=1 (ABR0, B/2+F/2), BM_ADD=2 (ABR1, B+F),
+		 * BM_SUBTRACT=3 (ABR2, B-F), BM_ADD_QUATER_SOURCE=4 (ABR3). Track
+		 * content and packet content therefore reach identical GPU blend state
+		 * from identical source data, which is the only way the two can agree on
+		 * a waterfall drawn half by each. */
+		N3DS_C3DSetBlendMode((blend == 3) ? 0 : (blend + 1));
+	}
+
 	indexBase = (const u16 *)s_trackIndexPtr + firstIndex;
 	C3D_DrawElements(GPU_TRIANGLES, indexCount, C3D_UNSIGNED_SHORT, indexBase);
 }
@@ -1712,8 +1879,20 @@ void N3DS_TrackDraw_End(void)
 	{
 		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
 	}
+	else if (s_trackDepthWriteState == 0)
+	{
+		/* The blend pass turned depth writes off for its own draws. Restore the
+		 * frame-wide pair before the packet path's merge flush runs, or every
+		 * packet drawn after the track this frame would silently stop writing
+		 * depth -- karts would then fail to occlude each other, on exactly the
+		 * frames that happened to contain a waterfall. Conditioned on the memo
+		 * rather than run unconditionally so a frame with no blended content
+		 * issues no redundant state change at all. */
+		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+	}
 #endif
 
+	s_trackDepthWriteState = -1;
 	s_trackDrawActive = 0;
 }
 
@@ -1756,7 +1935,7 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	(void)h;
 }
 
-void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin)
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin, int blend, int uvDx, int uvDy)
 {
 	(void)firstIndex;
 	(void)indexCount;
@@ -1765,6 +1944,9 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	(void)ordinalSpan;
 	(void)invIndexSpan;
 	(void)atlasBin;
+	(void)blend;
+	(void)uvDx;
+	(void)uvDy;
 }
 
 void N3DS_TrackDraw_End(void)
@@ -1772,6 +1954,210 @@ void N3DS_TrackDraw_End(void)
 }
 
 #endif /* CTR_NATIVE_TRACK_RENDERER */
+
+#ifdef CTR_NATIVE_MODEL_RENDERER
+/*
+ * Rung 2 model draw bracket. Mirrors N3DS_TrackDraw_* in shape; the differences
+ * are all consequences of models being per-frame dynamic rather than resident.
+ */
+void N3DS_ModelDraw_Begin(void)
+{
+	/*
+	 * Start from the packet path's own state, then swap only the program.
+	 * BindPacketDrawState installs the attribute layout AND the buffer binding
+	 * model vertices were appended into (N3DS_C3DAppendVertices writes the
+	 * shared per-frame buffer), so this is not a lazy shortcut -- it is the
+	 * only way to be sure the layout matches what wrote the data.
+	 */
+	N3DS_BindPacketDrawState();
+	C3D_BindProgram(&s_modelShaderProgram);
+
+	/*
+	 * The SAME ortho matrix the packet path uses. The model shader declares
+	 * projection[4] first precisely so it occupies the registers ctr.v.pica
+	 * expects, but "the registers hold the right value" is a separate claim
+	 * from "the registers are where we think" -- upload it explicitly rather
+	 * than inheriting whatever the last bound program left, which is the class
+	 * of assumption that produced the s29 uniform-collision bug.
+	 */
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_modelULocProjection, &s_projection);
+
+	/*
+	 * Assert opaque blending, for the reason spelled out at length in
+	 * N3DS_TrackDraw_Begin: N3DS_C3DSetBlendMode memoizes, so without this the
+	 * model pass silently inherits additive or subtractive state from whatever
+	 * packet content happened to draw last -- an intermittent, content-
+	 * dependent difference, which is the worst kind to meet during an fps A/B.
+	 */
+	N3DS_C3DSetBlendMode(0);
+
+	/* The packet path owns texenv 0 and the atlas binding between model
+	 * frames, so both memos are stale by now. */
+	s_modelTexturedState = -1;
+	s_modelBoundAtlas = -1;
+	s_modelDepthWriteState = -1;
+	s_modelDrawActive = 1;
+}
+
+void N3DS_ModelDraw_Instance(const float *qx, const float *qy, const float *qw, float h)
+{
+	if (!s_modelDrawActive)
+	{
+		return;
+	}
+
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_modelULocQx, qx[0], qx[1], qx[2], qx[3]);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_modelULocQy, qy[0], qy[1], qy[2], qy[3]);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_modelULocQw, qw[0], qw[1], qw[2], qw[3]);
+
+	/* Only .x is read by the shader; the other three are written because
+	 * leaving uniform components unset means "whatever the last program that
+	 * used this register put there". */
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_modelULocH, h, 0.0f, 0.0f, 0.0f);
+}
+
+/*
+ * Textured/untextured combiner, memoized. 35% of a real frame's model triangles
+ * are untextured (measured, design section 7), so both states are hot and the
+ * memo earns its keep.
+ *
+ * Colour doubling is part of the state: PS1 texel*colour modulate is 2x, which
+ * is why the untextured leg turns it off -- the same pairing N3DS_TrackDraw_
+ * SetTextured makes, and for the same reason (without it every model texture
+ * reads half-brightness against retail).
+ */
+static void N3DS_ModelDraw_SetTextured(int textured)
+{
+	C3D_TexEnv *env;
+
+	if (s_modelTexturedState == textured)
+	{
+		return;
+	}
+
+	env = C3D_GetTexEnv(0);
+	if (textured)
+	{
+		C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+		C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+	}
+	else
+	{
+		C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, 0);
+		C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+	}
+	C3D_DirtyTexEnv(env);
+	N3DS_C3DSetColorDoubling(textured ? 1 : 0);
+	s_modelTexturedState = textured;
+}
+
+void N3DS_ModelDraw_Run(int startVertex, int triangleCount, int atlasIndex, int textured, int blend)
+{
+	if (!s_modelDrawActive || (triangleCount <= 0) || (startVertex < 0))
+	{
+		return;
+	}
+
+	/*
+	 * Semi-transparency (docs/TRANSPARENCY_DESIGN.md 5). blend is a BlendMode:
+	 * 0 = opaque, 1..4 the PSX modes. A blended run is the PASS2 half of a
+	 * semi-transparent face and must not WRITE depth -- its PASS1 half already
+	 * wrote it in pass 0, and letting the blended half write again would make two
+	 * overlapping translucent surfaces occlude rather than composite.
+	 *
+	 * The caller issues every opaque run before any blended one, so this pair of
+	 * state changes happens at most twice per frame. Memoized regardless, because
+	 * "at most twice" is a property of the caller and a future interleaving one
+	 * would otherwise pay a GPU state change per run without anyone noticing.
+	 */
+	{
+		const int wantDepthWrite = (blend == 0) ? 1 : 0;
+
+		if (s_modelDepthWriteState != wantDepthWrite)
+		{
+			s_modelDepthWriteState = wantDepthWrite;
+#ifdef CTR_NATIVE_OT_DEPTH
+			C3D_DepthTest(true, GPU_LEQUAL, wantDepthWrite ? GPU_WRITE_ALL : GPU_WRITE_COLOR);
+#endif
+		}
+
+		N3DS_C3DSetBlendMode(blend);
+	}
+
+	if (textured && (atlasIndex >= 0) && (atlasIndex < N3DS_ATLAS_COUNT))
+	{
+		/* Bind only on change. The caller sorts a frame's triangles into
+		 * texture-homogeneous runs, so consecutive runs frequently share an
+		 * atlas across instances and this skips most of the binds. */
+		if (s_modelBoundAtlas != atlasIndex)
+		{
+			N3DS_C3DBindAtlas(atlasIndex);
+			s_modelBoundAtlas = atlasIndex;
+		}
+		N3DS_ModelDraw_SetTextured(1);
+	}
+	else
+	{
+		/* Out-of-range atlas draws untextured rather than binding a stale unit
+		 * and sampling another texture's texels, which would read as garbage
+		 * welded onto a kart. Same rule N3DS_TrackDraw_Leaf applies. */
+		N3DS_ModelDraw_SetTextured(0);
+	}
+
+	C3D_DrawArrays(GPU_TRIANGLES, startVertex, triangleCount * 3);
+}
+
+void N3DS_ModelDraw_End(void)
+{
+	/* Restores program, attribute layout, buffer binding and the modulate
+	 * combiner -- the full set this bracket touched. Unconditional for the
+	 * same reason N3DS_TrackDraw_End is: cheap, idempotent, and it cannot
+	 * desync if Begin returned early. */
+	N3DS_BindPacketDrawState();
+
+#ifdef CTR_NATIVE_OT_DEPTH
+	/* The blend pass turned depth writes off. Restore the frame-wide pair before
+	 * anything else draws, or every packet issued after the models this frame
+	 * would silently stop writing depth -- and only on frames that happened to
+	 * contain a particle or a shadow, which is the intermittent, content-
+	 * dependent kind of bug that costs a hardware sitting to find. */
+	if (s_modelDepthWriteState == 0)
+	{
+		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+	}
+#endif
+
+	s_modelDrawActive = 0;
+	s_modelTexturedState = -1;
+	s_modelBoundAtlas = -1;
+	s_modelDepthWriteState = -1;
+}
+#else
+void N3DS_ModelDraw_Begin(void)
+{
+}
+
+void N3DS_ModelDraw_Instance(const float *qx, const float *qy, const float *qw, float h)
+{
+	(void)qx;
+	(void)qy;
+	(void)qw;
+	(void)h;
+}
+
+void N3DS_ModelDraw_Run(int startVertex, int triangleCount, int atlasIndex, int textured, int blend)
+{
+	(void)startVertex;
+	(void)triangleCount;
+	(void)atlasIndex;
+	(void)textured;
+	(void)blend;
+}
+
+void N3DS_ModelDraw_End(void)
+{
+}
+#endif /* CTR_NATIVE_MODEL_RENDERER */
 
 /*
  * PS1 semi-transparency (the four ABR modes) via PICA's fixed-function blend
@@ -2120,6 +2506,21 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] packet depth bias: %d (units nearer)", g_dbg_pktDepthBias);
 					N3DS_DebugLog(msg);
 				}
+				else if (strncmp(word, "trkbias", 7) == 0)
+				{
+					/* s32 sinking-kart A/B -- see the NEAR-BAND POLARITY block
+					 * in ctr_track.v.pica. OFF is today's build bit-for-bit. */
+					/* 'trkbias N' sets the road depth bias in view.z units;
+					 * positive pushes the road AWAY from the camera. */
+					char biasMsg[96];
+
+					if (word[7] == ' ')
+					{
+						g_dbg_trackNearFar = atoi(&word[8]);
+					}
+					snprintf(biasMsg, sizeof(biasMsg), "[CTR-3DS] track depth bias: %d (view.z units, + = road farther)", g_dbg_trackNearFar);
+					N3DS_DebugLog(biasMsg);
+				}
 				else if (strncmp(word, "trackafter", 10) == 0)
 				{
 					extern int g_dbg_trackAfterMerge;
@@ -2170,6 +2571,34 @@ unsigned int N3DS_ReadButtons(void)
 						g_dbg_trackRender = (g_dbg_trackRender + 1) % 3;
 					}
 					snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
+					N3DS_DebugLog(msg);
+				}
+#endif
+#ifdef CTR_NATIVE_MODEL_RENDERER
+				else if (strncmp(word, "modelrender", 11) == 0)
+				{
+					extern int g_dbg_modelRender;
+					static const char *const names[3] = {"OFF (packets only)", "ON (PICA-native models)", "BOTH (native + packet overlay)"};
+					char msg[64];
+
+					/* Same idiom as 'trackrender' directly above: 'modelrender N'
+					 * sets a state, bare 'modelrender' cycles. Rung 2 draws the
+					 * native models in states 1 and 2 and does NOT yet suppress
+					 * the packet ones, so both currently look the same -- the
+					 * suppression is rung 4. Stated here because "1 and 2 look
+					 * identical" is otherwise a convincing symptom of a broken
+					 * toggle. */
+					if (word[11] == ' ')
+					{
+						int n = atoi(&word[12]);
+
+						g_dbg_modelRender = (n < 0) ? 0 : (n > 2) ? 2 : n;
+					}
+					else
+					{
+						g_dbg_modelRender = (g_dbg_modelRender + 1) % 3;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] model render: %s", names[g_dbg_modelRender]);
 					N3DS_DebugLog(msg);
 				}
 #endif
@@ -2377,6 +2806,35 @@ unsigned int N3DS_ReadButtons(void)
 		g_dbg_trackRender = (g_dbg_trackRender == 0) ? 1 : 0;
 		snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
 		N3DS_DebugLog(msg);
+	}
+#endif
+
+#ifdef CTR_NATIVE_MODEL_RENDERER
+	/* SELECT held + A: PICA-native models on/off (rung 2). A BUTTON for the
+	 * same reason trackrender is one -- this is the A/B the sunk-kart question
+	 * gets settled against, and it has to be flippable mid-race with a kart
+	 * visibly sitting on the road.
+	 *
+	 * WAS D-RIGHT, which was a COLLISION, not a free chord: D-RIGHT has been
+	 * textureless mode since the owner moved it there on 2026-07-29 (see that
+	 * handler above), so one press flipped both, and every A/B either control
+	 * was supposed to settle would have been confounded by the other. The
+	 * comment that used to sit here asserted D-RIGHT was free after checking
+	 * only the OTHER three d-pad directions.
+	 *
+	 * A is safe despite being accelerate: this tests hidKeysDown(), the
+	 * press EDGE, so an already-held A (the whole race) never fires it -- only
+	 * pressing A after SELECT is already down does. Every other chord is
+	 * taken (B/X/Y/L/R/ZL/ZR and all four d-pad directions).
+	 *
+	 * Two states, not three, matching the trackrender button's reasoning: BOTH
+	 * stays reachable as 'modelrender 2' via dumpreq. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_A))
+	{
+		extern int g_dbg_modelRender;
+
+		g_dbg_modelRender = (g_dbg_modelRender == 0) ? 1 : 0;
+		N3DS_DebugLog(g_dbg_modelRender ? "[CTR-3DS] model render: ON (PICA-native models)" : "[CTR-3DS] model render: off (packets only)");
 	}
 #endif
 #endif

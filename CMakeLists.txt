@@ -272,21 +272,51 @@ if(CTR_NATIVE_TRACK_RENDERER)
     endif()
 endif()
 
-# PICA-native model renderer (s30, docs/HANDOFF_s30_pica_native.md). Current
-# state: rung 0 -- load-time per-ModelHeader topology scan ([MODELMESH] and
-# [MODELGATE] per level) plus a per-frame instance sampler ([MODELFRAME] per
-# 64 content frames). Count-only on every platform; draws nothing, changes no
-# game state, and the two hooks in game/ compile to empty calls with this off.
+# PICA-native model renderer (s30-s32, docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+# Current state: rung 1.
+#   rung 0 -- load-time per-ModelHeader topology scan ([MODELMESH]/[MODELGATE]
+#             per level) plus a per-frame instance sampler ([MODELFRAME]).
+#   rung 1 -- per-frame capture of every model triangle the packet path draws,
+#             in model space with its instance's model->view matrix, into a
+#             double-buffered snapshot ([MDLEMIT]).
+# Still count-only on every platform: nothing draws from the snapshot, no game
+# state changes, and every hook in game/ compiles to nothing with this off. The
+# runtime toggle (g_dbg_modelRender) additionally starts at 0, so even an
+# enabled build is inert until it is switched on.
 #
 # Deliberately carries NO 3DS prerequisites yet, unlike the track renderer
 # above: nothing here reaches the GPU, so requiring OT_DEPTH/DRAW_MERGE would
 # only stop the measurement from running in configs where it is perfectly
-# valid. The draw side will add them when it lands.
+# valid. Rung 2's draw side will add them when it lands.
 option(CTR_NATIVE_MODEL_RENDERER
-    "PICA-native model renderer: instance topology + per-frame census (in progress)"
+    "PICA-native model renderer: instance topology, per-frame census, triangle capture (in progress)"
     OFF)
 if(CTR_NATIVE_MODEL_RENDERER)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_MODEL_RENDERER=1)
+endif()
+
+# Boot the three in-progress renderer toggles ON instead of OFF:
+# g_dbg_trackRender, g_dbg_packetDepth (the shared true-depth axis, "dmodel"),
+# and g_dbg_modelRender. Each is normally 0 at boot so that an enabled build is
+# inert until a button/dumpreq turns it on, which is what keeps toggle-0 an
+# honest A/B baseline.
+#
+# This exists so a "show me the new renderer" build doesn't need three button
+# presses before the first frame anyone looks at -- particularly in Azahar,
+# where reaching race content takes minutes and a missed press invalidates the
+# sitting. It does NOT change what the toggles mean or remove the buttons: all
+# three still flip at runtime, so the A/B is still available in the same build,
+# just starting from the other end.
+#
+# Deliberately a separate option rather than editing the three initialisers:
+# those defaults are load-bearing for every measurement this project has taken,
+# and an "I'll change it back later" edit to them is exactly the kind of thing
+# that survives into a session where somebody quotes a baseline number off it.
+option(CTR_NATIVE_RENDERER_DEFAULT_ON
+    "Boot the track/model/packet-depth toggles ON (demo + Azahar convenience; runtime toggles unchanged)"
+    OFF)
+if(CTR_NATIVE_RENDERER_DEFAULT_ON)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_RENDERER_DEFAULT_ON=1)
 endif()
 
 # Render worker thread on core 2 (New3DS-only core; core 1 is the audio
@@ -490,6 +520,33 @@ if(NINTENDO_3DS)
             PROPERTIES LANGUAGE ASM)
 
         target_sources(ctr_native PRIVATE "${CTR_N3DS_SHADER_GEN}/ctr_track_shbin.S")
+    endif()
+
+    # PICA-native model renderer (rung 2): third shader, same pipeline again.
+    # Guarded by CTR_NATIVE_MODEL_RENDERER so a build without the gate never
+    # looks for it.
+    if(CTR_NATIVE_MODEL_RENDERER)
+        set(CTR_N3DS_MODEL_SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/platform/n3ds/shaders/ctr_model.v.pica")
+        set(CTR_N3DS_MODEL_SHADER_SHBIN "${CTR_N3DS_SHADER_GEN}/ctr_model.shbin")
+
+        add_custom_command(
+            OUTPUT "${CTR_N3DS_MODEL_SHADER_SHBIN}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CTR_N3DS_SHADER_GEN}"
+            COMMAND ${CTR_PICASSO_EXE} -o "${CTR_N3DS_MODEL_SHADER_SHBIN}" "${CTR_N3DS_MODEL_SHADER_SRC}"
+            DEPENDS "${CTR_N3DS_MODEL_SHADER_SRC}"
+            COMMENT "picasso: ctr_model.v.pica -> ctr_model.shbin"
+        )
+        add_custom_command(
+            OUTPUT "${CTR_N3DS_SHADER_GEN}/ctr_model_shbin.S" "${CTR_N3DS_SHADER_GEN}/ctr_model_shbin.h"
+            COMMAND ${DKP_BIN2S} -a ${DKP_BIN2S_ALIGNMENT} -H "${CTR_N3DS_SHADER_GEN}/ctr_model_shbin.h"
+                    "${CTR_N3DS_MODEL_SHADER_SHBIN}" > "${CTR_N3DS_SHADER_GEN}/ctr_model_shbin.S"
+            DEPENDS "${CTR_N3DS_MODEL_SHADER_SHBIN}"
+            COMMENT "bin2s: embedding ctr_model.shbin"
+        )
+        set_source_files_properties("${CTR_N3DS_SHADER_GEN}/ctr_model_shbin.S"
+            PROPERTIES LANGUAGE ASM)
+
+        target_sources(ctr_native PRIVATE "${CTR_N3DS_SHADER_GEN}/ctr_model_shbin.S")
     endif()
 
     # citro3d before ctru: the linker resolves left to right and citro3d pulls

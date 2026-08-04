@@ -916,6 +916,19 @@ void RenderBucket_ExecuteAllInstances(struct GameTracker *gGT)
 	}
 
 	RenderBucket_Execute(gGT->ptrRenderBucketInstance, &gGT->backBuffer->primMem);
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	// s32 rung 1 frame edge for the emit capture. NOT the same edge as
+	// NativeModelFrame_EndFrame's, which sits at the tail of the QUEUE pass --
+	// the capture is filled by RenderBucket_Execute just above, which runs a
+	// separate pass later in the frame (MainFrame_RenderFrame:195), so sealing
+	// it at the queue edge would report every frame as empty.
+	// Implementation: platform/native_model_emit.c.
+	{
+		extern void NativeModelEmit_EndFrame(void);
+		NativeModelEmit_EndFrame();
+	}
+#endif
 }
 
 void RenderAllTires(struct GameTracker *gGT)

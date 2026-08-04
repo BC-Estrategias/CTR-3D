@@ -169,11 +169,65 @@ void GTECapture_PublishForWalk(void)
 	s_gteCaptureReadIdx = s_gteCaptureWriteIdx;
 }
 
+/*
+ * Depthless-geometry suppression (s32). Game-thread only -- Store's own
+ * ownership rule -- and never buffered: it is set and cleared inside one
+ * producer's call, so no walk can observe it half-applied.
+ *
+ * WHY THIS EXISTS. DrawSky_Full (game/DrawSky.c) projects the skybox mesh with
+ * the GTE's translation vector explicitly zeroed (`CTC2(0, 5..7)`), because a
+ * skybox is meant to sit at infinity and rotate with the camera without ever
+ * translating. Its SZ3 is therefore R3-dot-v/4096 with no TRZ: a function of the
+ * sky mesh's own radius, in the same numeric range as near-field world content,
+ * and completely unrelated to how far away it is.
+ *
+ * Every projected vertex funnels through GTE_RotTransPers, so the skybox stored
+ * those bogus depths like any other geometry, and the packet-depth path
+ * (native_gpu.c's PacketDepth_ResolveXY) read them back as real view depth. Two
+ * failures fall out of that, and this one flag closes both:
+ *
+ *   1. The skybox competes on depth with the track and with karts instead of
+ *      losing to everything -- the "skybox drawing over distant track" report.
+ *   2. WORSE, and not in any report because it does not look like a skybox bug:
+ *      the table is keyed by SCREEN COORDINATE, the skybox covers the whole
+ *      screen, and DrawSky_Full runs AFTER the track and the instance queue. So
+ *      a sky vertex EVICTS whatever world vertex hashed to its slot, and that
+ *      world primitive then gets stamped with the sky's depth.
+ *
+ * Suppressing the store makes those lookups miss, which is a path that already
+ * exists and is already correct: PacketDepth_ResolveXY derives depth from the OT
+ * bucket the walk is parsing (0xFFFF - (otIndex << 6)). The skybox's bucket is
+ * pushBuffer->ptrOT[0x3ff] biased by each face's own signed D offset -- i.e.
+ * retail's own painter's-algorithm statement of "farthest, and here is the
+ * internal layering". Deriving from it preserves that layering exactly, rather
+ * than inventing a depth for content that has none.
+ *
+ * Cost to the other consumers: sky vertices lose sub-pixel de-snapping
+ * (CTR_NATIVE_VERTEX_DESNAP) and cannot be retained. Both are acceptable and
+ * neither is shipping -- and de-snapping a mesh whose whole purpose is to be a
+ * static backdrop is not a feature anyone would notice missing.
+ */
+global_variable int s_gteCaptureStoreSuppressed;
+
+void GTECapture_SetStoreSuppressed(int suppressed)
+{
+	s_gteCaptureStoreSuppressed = suppressed;
+}
+
 void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3, s16 vx, s16 vy, s16 vz)
 {
 	GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureWriteIdx];
 	u32 key = GTECapture_PackKey(sx, sy);
 	GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
+
+	/* Suppressed producers must not even EVICT -- see the comment above; the
+	 * eviction is the half of the bug that does not look like a skybox
+	 * problem. Tested here rather than at the GTE_RotTransPers call site so
+	 * there is exactly one place a store can be dropped. */
+	if (s_gteCaptureStoreSuppressed)
+	{
+		return;
+	}
 
 	entry->key = key;
 	entry->generation = buf->generation;

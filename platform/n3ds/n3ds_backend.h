@@ -468,10 +468,47 @@ void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short
  * draws correctly -- see N3DS_TrackDraw_End's own comment for the exact
  * list. No-op (Leaf silently skips its draw) if Upload was never called or
  * last failed. */
+/* -------------------------------------------------- native model draw --- */
+/* Rung 2 of docs/NATIVE_MODEL_RENDERER_DESIGN.md: model instances drawn from
+ * model-space geometry through ctr_model.v.pica, on the same depth axis as the
+ * packets and the resident track.
+ *
+ * Deliberately thinner than the track's API above, because models REUSE the
+ * packet path's vertex plumbing rather than owning their own. Model geometry is
+ * per-frame dynamic (animation is delta-decoded on the CPU every frame -- see
+ * the design's section 3), so there is no resident buffer to upload; it goes
+ * through N3DS_C3DAppendVertices like any packet run. And N3DS_Vertex already
+ * has exactly the fields a model vertex needs -- position, texcoord, colour --
+ * so the packet attribute layout and buffer binding are reused verbatim. The
+ * ONLY thing that differs is which vertex program is bound and what its
+ * uniforms say, which is what these four calls do.
+ *
+ * Field reinterpretation, stated because it is the one subtle part: on the
+ * packet path N3DS_Vertex.x/y are SCREEN pixels and z is a depth stamp. Here
+ * x/y/z are the model-space position the software GTE would have received, and
+ * the shader does the projection. Same 14 bytes, same loader, different
+ * meaning -- so never mix model and packet vertices in one draw.
+ *
+ * Bracketing: Begin binds the program and uploads the shared projection;
+ * Instance uploads one instance's composed camera rows (see the shader header
+ * for the derivation); Run draws one texture-homogeneous span of the vertices
+ * appended for that instance; End restores every piece of packet-path state,
+ * the same contract N3DS_TrackDraw_End has. Instance may be called many times
+ * between one Begin/End pair. */
+void N3DS_ModelDraw_Begin(void);
+void N3DS_ModelDraw_Instance(const float *qx, const float *qy, const float *qw, float h);
+/* startVertex is an N3DS_C3DAppendVertices return value; triangleCount spans
+ * 3*triangleCount vertices from it. atlasIndex is a decode-cache atlas (the
+ * same pool the packet path binds); textured 0 draws vertex-colour only, which
+ * is a third of a real frame (measured, design section 7) and not an edge
+ * case. */
+void N3DS_ModelDraw_Run(int startVertex, int triangleCount, int atlasIndex, int textured, int blend);
+void N3DS_ModelDraw_End(void);
+
 void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h);
 /* atlasBin: which atlas unit these indices sample (rung 3b). At or past the
  * allocated unit count means no placed texture -- drawn untextured. */
-void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin);
+void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin, int blend, int uvDx, int uvDy);
 void N3DS_TrackDraw_End(void);
 
 /* The top-screen CONTENT region: N3DS_C3DBeginFrame pillarboxes every

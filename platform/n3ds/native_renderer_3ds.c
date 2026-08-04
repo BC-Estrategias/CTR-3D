@@ -2939,6 +2939,30 @@ void NativeRenderer_EndScene(void)
 	N3DS_FlushPendingRun();
 #endif
 
+#if defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	/*
+	 * PICA-native model instances (rung 2, docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+	 *
+	 * AFTER the merge flush, deliberately, unlike the track draw above. Model
+	 * draws append into the SAME per-frame vertex buffer the merge bins hold
+	 * offsets into, and they rebind the program and attribute layout to draw.
+	 * Issuing them before the flush would mean the bins' own draws execute
+	 * against whatever state the model pass left -- N3DS_ModelDraw_End restores
+	 * it, but ordering the two so the question cannot arise is cheaper than
+	 * relying on that restore being exhaustive. Depth ordering is unaffected:
+	 * models carry real depth and the depth test owns layering, which is the
+	 * entire point of putting them on this axis.
+	 *
+	 * Costs nothing at toggle 0 -- NativeModelDraw_IssueForWalk returns before
+	 * touching any GPU state, the same early-out shape the track draw uses so
+	 * its own A/B baseline stays honest.
+	 */
+	{
+		extern void NativeModelDraw_IssueForWalk(void);
+		NativeModelDraw_IssueForWalk();
+	}
+#endif
+
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 	/* Other half of the s29 ordering A/B above. */
 	if (g_dbg_trackAfterMerge)

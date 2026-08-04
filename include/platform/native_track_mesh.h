@@ -56,7 +56,29 @@ unsigned NativeTrackMesh_LeafCount(void);
 // reverse direction.
 int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirstIndex, unsigned *outIndexCount);
 // Rung 3b: atlas unit this range samples; >= the unit count means untextured.
-unsigned NativeTrackMesh_LeafAtlasBin(unsigned i);
+//
+// wantPass2 picks WHICH placement for a blended range (see LeafBlend), because
+// such a range is drawn twice: 0 gives the primary placement, holding its PASS1
+// (opaque body) view for the opaque pass; 1 gives the second placement, holding
+// its PASS2 (translucent texels) view for the blend pass. Opaque ranges return
+// the same unit either way, so callers that never blend can pass 0 and ignore
+// this entirely.
+unsigned NativeTrackMesh_LeafAtlasBin(unsigned i, int wantPass2);
+
+// Semi-transparency (docs/TRANSPARENCY_DESIGN.md). 3 means opaque -- the normal
+// case and the value returned for an out-of-range i. 0/1/2 are the PSX ABR blend
+// modes (B/2+F/2, B+F, B-F) and mark a range the BLEND pass owns: it must be
+// drawn after all opaque content, with blending on and depth writes off.
+//
+// Ranges are homogeneous in this by construction: build-time binning keys
+// blended content per atlas RECT, and a rect's ABR comes from its tpage, which
+// is part of the rect's own identity key.
+unsigned NativeTrackMesh_LeafBlend(unsigned i);
+
+// Texel offset from the rect's primary placement to its PASS2 placement, which
+// the blend pass adds to each vertex's baked UV so one set of resident vertices
+// can address both decoded views. (0, 0) for opaque ranges and out-of-range i.
+void NativeTrackMesh_LeafUvOffset(unsigned i, int *outDx, int *outDy);
 
 // Leaf i's STATIC BSP bounding box (model-space corners, copied from
 // mesh->bspRoot[bspIndex].box at BUILD time -- see native_track_mesh.c's

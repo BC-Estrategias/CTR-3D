@@ -27,7 +27,14 @@
 /* Runtime toggle (0 off / 1 on / 2 both) -- see the header comment for what
  * each state means. Starts OFF: an enabled build must be inert until a
  * dumpreq token, hardware combo, PC argv flag, or PC debug key turns it on. */
-int g_dbg_trackRender = 0;
+/* Boot default; see CTR_NATIVE_RENDERER_DEFAULT_ON in CMakeLists.txt. Normally
+ * 0 so an enabled build is inert until a dumpreq token, hardware combo, PC argv
+ * flag or PC debug key turns it on. */
+#ifndef CTR_NATIVE_RENDERER_DEFAULT_ON
+#define CTR_NATIVE_RENDERER_DEFAULT_ON 0
+#endif
+
+int g_dbg_trackRender = CTR_NATIVE_RENDERER_DEFAULT_ON;
 
 global_variable struct NativeTrackFrameSnapshot s_trackFrameBuf[2];
 /* Game-thread cursor: which buffer Record() writes. */
@@ -141,6 +148,366 @@ internal void NativeTrackFrame_WalkList(const struct VisMemBspListNode *bspListB
 		}
 
 		node = node->next;
+	}
+}
+
+/*
+ * ----------------------------------------------------------------- [TRKNEAR]
+ *
+ * Road-side half of the sinking-kart investigation. s32 measured the MODEL
+ * side to be exact: [MDLDEPTH] compared this renderer's per-vertex view.z
+ * against the GTE's own SZ for the same vertex and got maxErr=0 over 263,517
+ * samples, so the kart's depth is provably retail's own number. That leaves
+ * the road, which is where the owner pointed before the code did.
+ *
+ * The specific suspect is already written down in ctr_track.v.pica and has
+ * been since s29, filed as a leftover rather than as the cause: track
+ * visibility is LEAF-granular and retail's per-polygon near-clip was deleted
+ * for track content, so a leaf straddling the eye is drawn WHOLE, and
+ * depthMinWorld then maps every vertex with view.z < 256 onto exactly 256 --
+ * the nearest depth the axis can express. Geometry that should not be on
+ * screen at all therefore outranks a kart that genuinely is.
+ *
+ * Interpolation was eliminated as an alternative before writing this: depth
+ * is exact at a triangle's vertices and screen-linear between them, and
+ * screen-linear interpolation of view.z always over-estimates (the true value
+ * is the harmonic blend, which is smaller). So interpolation can only push the
+ * road AWAY mid-triangle, never nearer -- it cannot bury anything.
+ *
+ * What this counts, per drawn leaf, over the exact index list the 3DS draw
+ * would issue:
+ *   behind   -- triangles with all three vertices at view.z <= 0
+ *   straddle -- triangles with some but not all vertices at view.z <= 0
+ *   clamped  -- triangles with at least one vertex in (0, 256), i.e. one the
+ *               near-band floor moves
+ * Counts, not screen area: a count is what promotes or kills the theory, and
+ * an area estimate would need the rasteriser. If `behind` and `straddle` are
+ * ~zero in a race, this theory is dead and the road is not the cause either.
+ *
+ * PC-side deliberately (no __3DS__ guard): the snapshot, the mesh and the
+ * camera all exist on PC, so this needs no hardware and no emulator, and PC
+ * is where a wrong instrument is cheapest to catch. It is off unless
+ * --track-near-census is passed, and it samples 1 frame in 8 -- walking every
+ * vertex of every visible leaf every frame is real work, and the failure being
+ * measured is a steady-state property of the camera, not a transient.
+ */
+int g_dbg_trackNearCensus;
+
+global_variable u32 s_trkNearFrames;
+global_variable u32 s_trkNearSampleCountdown = 1;
+global_variable u32 s_trkNearTris;
+global_variable u32 s_trkNearBehind;
+global_variable u32 s_trkNearStraddle;
+global_variable u32 s_trkNearClamped;
+global_variable s32 s_trkNearViewZLo;
+global_variable s32 s_trkNearViewZHi;
+global_variable s32 s_trkDordLo;
+global_variable s32 s_trkDordHi;
+global_variable u32 s_trkDordSamples;
+global_variable u32 s_trkDordNeg;
+global_variable u32 s_trkDordPos;
+global_variable double s_trkDordNegSum;
+
+/*
+ * -------------------------------------------------------------- [TRKDEPTHCHK]
+ *
+ * The road-side twin of [MDLDEPTH], and the measurement three sessions of
+ * assumption skipped.
+ *
+ * [MDLDEPTH] proved the MODEL path's view.z is bit-identical to the GTE's own
+ * SZ for the same vertex (242 windows, maxErr=0). Nothing equivalent was ever
+ * run for the ROAD -- its depth was trusted because "our renderer computes it
+ * properly", which is a description of intent, not a measurement. Meanwhile
+ * every symptom points at the road: dumpreq `depthtest 2` (road tests but does
+ * not write depth) makes racers sit cleanly on the surface, and the racers'
+ * own numbers are provably right, so the road must be reading nearer than it
+ * should.
+ *
+ * This compares, for the SAME source vertex in the SAME frame:
+ *   ours   = (snapshot.rot[2] . pos)/4096 + snapshot.trans[2]   -- what the
+ *            track shader will use, from the matrix we snapshotted
+ *   retail = the GTE's SZ, which retail just computed for that vertex
+ *            (Ovr226_800a0f78_ProjectVertexTripleFullDepth's gte_stsz3)
+ *
+ * Called from retail's own projection site, so there is no vertex matching to
+ * get wrong and no second copy of the geometry -- the two numbers describe one
+ * vertex by construction. A nonzero error IS the sinking bug, and its shape
+ * says which kind: a constant difference means we snapshot the wrong matrix
+ * (a candidate is already written down -- Ovr226_800aa790_TerminalPreamble
+ * loads IDENTITY into GTE R/TR and puts matrix_ViewProj in the LIGHT matrix
+ * registers instead), a proportional one means a units/scale mismatch.
+ *
+ * The snapshot read is the WRITE buffer, not ForWalk()'s published one:
+ * NativeTrackFrame_Record runs earlier in the same MainFrame_RenderFrame pass
+ * that is about to call DrawLevelOvr1P, so the write buffer is this frame's
+ * camera. Using the published buffer would compare against the PREVIOUS
+ * frame's camera and manufacture a motion-dependent error that isn't real.
+ */
+int g_dbg_trackDepthCheck;
+
+global_variable u32 s_trkChkSamples;
+global_variable u32 s_trkChkOver1;
+global_variable double s_trkChkSumAbsErr;
+global_variable s32 s_trkChkMaxAbsErr;
+global_variable s32 s_trkChkMinErr;
+global_variable s32 s_trkChkMaxErr;
+global_variable s32 s_trkChkOursLo;
+global_variable s32 s_trkChkOursHi;
+global_variable s32 s_trkChkRetailLo;
+global_variable s32 s_trkChkRetailHi;
+
+void NativeTrackFrame_NoteRetailVertexDepth(const s16 *pos, u32 retailDepth)
+{
+	const struct NativeTrackFrameSnapshot *snap = &s_trackFrameBuf[s_trackFrameWriteIdx];
+	s64 mac3;
+	s32 ours;
+	s32 retail = (s32)retailDepth;
+	s32 err;
+
+	if ((g_dbg_trackDepthCheck == 0) || (pos == NULL) || (snap->valid == 0))
+	{
+		return;
+	}
+
+	mac3 = ((s64)snap->trans[2] * 4096) + ((s64)snap->rot[2][0] * pos[0]) + ((s64)snap->rot[2][1] * pos[1]) + ((s64)snap->rot[2][2] * pos[2]);
+	ours = (s32)(mac3 >> 12);
+
+	/* Same unsigned-16-bit saturation the GTE applies to SZ3 (Lm_D), so the
+	 * comparison is against what retail actually stored, not against an
+	 * unclamped ideal that would show a fake error at both extremes. */
+	if (ours < 0) { ours = 0; }
+	if (ours > 65535) { ours = 65535; }
+
+	err = ours - retail;
+
+	if (s_trkChkSamples == 0)
+	{
+		s_trkChkOursLo = ours;
+		s_trkChkOursHi = ours;
+		s_trkChkRetailLo = retail;
+		s_trkChkRetailHi = retail;
+		s_trkChkMinErr = err;
+		s_trkChkMaxErr = err;
+	}
+	else
+	{
+		if (ours < s_trkChkOursLo) { s_trkChkOursLo = ours; }
+		if (ours > s_trkChkOursHi) { s_trkChkOursHi = ours; }
+		if (retail < s_trkChkRetailLo) { s_trkChkRetailLo = retail; }
+		if (retail > s_trkChkRetailHi) { s_trkChkRetailHi = retail; }
+		if (err < s_trkChkMinErr) { s_trkChkMinErr = err; }
+		if (err > s_trkChkMaxErr) { s_trkChkMaxErr = err; }
+	}
+
+	s_trkChkSamples++;
+	{
+		s32 absErr = (err < 0) ? -err : err;
+
+		s_trkChkSumAbsErr += (double)absErr;
+		if (absErr > s_trkChkMaxAbsErr) { s_trkChkMaxAbsErr = absErr; }
+		if (absErr > 1) { s_trkChkOver1++; }
+	}
+
+	if (s_trkChkSamples >= 200000u)
+	{
+		/* err is printed SIGNED and as a range, not just as a magnitude: the
+		 * sign is the whole answer. Ours consistently BELOW retail means the
+		 * road reads nearer than it should, which is the sink; consistently
+		 * above means the opposite. A magnitude alone would hide that. */
+		Platform_LogInstrument("[TRKDEPTHCHK] lvl=%d n=%lu maxAbsErr=%ld meanAbsErr=%.3f over1=%lu err=%ld..%ld ours=%ld..%ld retail=%ld..%ld\n",
+		                       NativePerf_CurrentLevelID(), (unsigned long)s_trkChkSamples, (long)s_trkChkMaxAbsErr,
+		                       s_trkChkSumAbsErr / (double)s_trkChkSamples, (unsigned long)s_trkChkOver1, (long)s_trkChkMinErr, (long)s_trkChkMaxErr,
+		                       (long)s_trkChkOursLo, (long)s_trkChkOursHi, (long)s_trkChkRetailLo, (long)s_trkChkRetailHi);
+
+		s_trkChkSamples = 0;
+		s_trkChkOver1 = 0;
+		s_trkChkSumAbsErr = 0.0;
+		s_trkChkMaxAbsErr = 0;
+	}
+}
+
+internal void NativeTrackFrame_NearCensus(const struct NativeTrackFrameSnapshot *snap)
+{
+	const struct NativeTrackVert *verts;
+	const u16 *indices;
+	unsigned vertCount, indexCount;
+	u32 i;
+
+	if ((g_dbg_trackNearCensus == 0) || (snap == NULL) || (snap->valid == 0) || (snap->leafCount == 0))
+	{
+		return;
+	}
+
+	if (--s_trkNearSampleCountdown != 0)
+	{
+		return;
+	}
+	s_trkNearSampleCountdown = 8;
+
+	verts = NativeTrackMesh_Verts();
+	indices = NativeTrackMesh_Indices();
+	vertCount = NativeTrackMesh_VertCount();
+	indexCount = NativeTrackMesh_IndexCount();
+
+	if ((verts == NULL) || (indices == NULL) || (vertCount == 0) || (indexCount < 3))
+	{
+		return;
+	}
+
+	s_trkNearFrames++;
+
+	for (i = 0; i < snap->leafCount; i++)
+	{
+		unsigned bspIndex, firstIndex, leafIndexCount, t;
+
+		if (!NativeTrackMesh_LeafAt(snap->leafSlot[i], &bspIndex, &firstIndex, &leafIndexCount))
+		{
+			continue;
+		}
+
+		if ((firstIndex >= indexCount) || ((firstIndex + leafIndexCount) > indexCount))
+		{
+			continue;
+		}
+
+		for (t = 0; (t + 3) <= leafIndexCount; t += 3)
+		{
+			int nBehind = 0;
+			int nClamped = 0;
+			int c;
+
+			for (c = 0; c < 3; c++)
+			{
+				u16 vi = indices[firstIndex + t + c];
+				const struct NativeTrackVert *vv;
+				s64 mac3;
+				s32 viewZ;
+
+				if (vi >= vertCount)
+				{
+					continue;
+				}
+				vv = &verts[vi];
+
+				/* Same arithmetic the shader does (viewZ = R2.v/4096 + TRZ),
+				 * in integer so the comparison against 0 and 256 is exact. */
+				mac3 = ((s64)snap->trans[2] * 4096) + ((s64)snap->rot[2][0] * vv->x) + ((s64)snap->rot[2][1] * vv->y) + ((s64)snap->rot[2][2] * vv->z);
+				viewZ = (s32)(mac3 >> 12);
+
+				if ((s_trkNearTris == 0) && (c == 0) && (t == 0) && (i == 0))
+				{
+					s_trkNearViewZLo = viewZ;
+					s_trkNearViewZHi = viewZ;
+				}
+				else
+				{
+					if (viewZ < s_trkNearViewZLo) { s_trkNearViewZLo = viewZ; }
+					if (viewZ > s_trkNearViewZHi) { s_trkNearViewZHi = viewZ; }
+				}
+
+				if (viewZ <= 0)
+				{
+					nBehind++;
+				}
+				else if (viewZ < 256)
+				{
+					nClamped++;
+				}
+			}
+
+			/*
+			 * drawOrder census. This is the LAST asymmetry between the road
+			 * and a racer once both depths are proven bit-exact against the
+			 * GTE ([TRKDEPTHCHK] err=0..0, [MDLDEPTH] maxErr=0): the track
+			 * shader adds `(drawOrder-128) * bucketToDepth` to its depth and
+			 * the model shader adds nothing, because packets carry no
+			 * drawOrder at all. bucketToDepth is 1.0, so this term IS a
+			 * per-face shift in view.z units, applied to the road and to
+			 * nothing else -- constant, and independent of camera distance and
+			 * angle, which is the shape the owner reported (sunk on aerial
+			 * sweeps too).
+			 *
+			 * It was dismissed twice by argument and never measured. s29 cut
+			 * the weight 64 -> 1 after it "buried the player kart to the neck"
+			 * and asserted 1 was "far too small to outrank a kart" -- an
+			 * assertion about magnitudes made without ever looking at the
+			 * VALUES. If real faces carry drawOrder of -20, the road is being
+			 * pulled 20 units toward the camera and nothing else is.
+			 *
+			 * Reported as a signed range plus the mean of the NEGATIVE side
+			 * specifically: only negative drawOrder pulls a face nearer, and
+			 * an average over both signs would cancel the very thing being
+			 * looked for.
+			 */
+			for (c = 0; c < 3; c++)
+			{
+				u16 vi = indices[firstIndex + t + c];
+
+				if (vi < vertCount)
+				{
+					int dord = (int)verts[vi].drawOrder;
+
+					if ((s_trkNearTris == 0) && (c == 0))
+					{
+						s_trkDordLo = dord;
+						s_trkDordHi = dord;
+					}
+					else
+					{
+						if (dord < s_trkDordLo) { s_trkDordLo = dord; }
+						if (dord > s_trkDordHi) { s_trkDordHi = dord; }
+					}
+
+					s_trkDordSamples++;
+					if (dord < 0)
+					{
+						s_trkDordNeg++;
+						s_trkDordNegSum += (double)(-dord);
+					}
+					else if (dord > 0)
+					{
+						s_trkDordPos++;
+					}
+				}
+			}
+
+			s_trkNearTris++;
+			if (nBehind == 3)
+			{
+				s_trkNearBehind++;
+			}
+			else if (nBehind > 0)
+			{
+				s_trkNearStraddle++;
+			}
+			else if (nClamped > 0)
+			{
+				s_trkNearClamped++;
+			}
+		}
+	}
+
+	if (s_trkNearFrames >= 8)
+	{
+		Platform_LogInstrument("[TRKNEAR] lvl=%d f=%lu tris/f=%lu behind/f=%lu straddle/f=%lu clamped/f=%lu viewZ=%ld..%ld\n", NativePerf_CurrentLevelID(),
+		                       (unsigned long)s_trkNearFrames, (unsigned long)(s_trkNearTris / s_trkNearFrames), (unsigned long)(s_trkNearBehind / s_trkNearFrames),
+		                       (unsigned long)(s_trkNearStraddle / s_trkNearFrames), (unsigned long)(s_trkNearClamped / s_trkNearFrames),
+		                       (long)s_trkNearViewZLo, (long)s_trkNearViewZHi);
+
+		Platform_LogInstrument("[TRKDORD] lvl=%d n=%lu range=%ld..%ld neg=%lu (%lu%%) pos=%lu meanNegShift=%.2f viewZunits\n", NativePerf_CurrentLevelID(),
+		                       (unsigned long)s_trkDordSamples, (long)s_trkDordLo, (long)s_trkDordHi, (unsigned long)s_trkDordNeg,
+		                       (s_trkDordSamples > 0) ? (unsigned long)((s_trkDordNeg * 100u) / s_trkDordSamples) : 0ul, (unsigned long)s_trkDordPos,
+		                       (s_trkDordNeg > 0) ? (s_trkDordNegSum / (double)s_trkDordNeg) : 0.0);
+
+		s_trkNearFrames = 0;
+		s_trkNearTris = 0;
+		s_trkNearBehind = 0;
+		s_trkNearStraddle = 0;
+		s_trkNearClamped = 0;
+		s_trkDordSamples = 0;
+		s_trkDordNeg = 0;
+		s_trkDordPos = 0;
+		s_trkDordNegSum = 0.0;
 	}
 }
 
@@ -270,6 +637,8 @@ void NativeTrackFrame_Record(struct GameTracker *gGT, struct mesh_info *mesh, st
 		Platform_Log("[TRKFRAME] toggle changed: %d -> %d\n", s_lastLoggedToggle, g_dbg_trackRender);
 		s_lastLoggedToggle = g_dbg_trackRender;
 	}
+
+	NativeTrackFrame_NearCensus(dst);
 
 	if (g_dbg_trackRender != 0)
 	{
@@ -568,7 +937,7 @@ void NativeTrackDraw_IssueForWalk(void)
 	static u32 s_invalidLogCountdown = 64;
 	static u32 s_zeroHWarned = 0;
 	static u32 s_totalSkippedOrdinal = 0;
-	u32 drawsIssued = 0, leavesSkippedOrdinal = 0, indicesDrawn = 0;
+	u32 drawsIssued = 0, leavesSkippedOrdinal = 0, indicesDrawn = 0, blendDrawsIssued = 0;
 	float qx[4], qy[4], qw[4];
 	float h, ofx, ofy;
 
@@ -690,6 +1059,29 @@ void NativeTrackDraw_IssueForWalk(void)
 	float dbgLeaf0OrdinalLo = 0.0f, dbgLeaf0OrdinalHi = 0.0f;
 	float dbgLeaf0ViewZLo = 0.0f, dbgLeaf0ViewZHi = 0.0f;
 
+	/*
+	 * TWO PASSES, opaque then blended (docs/TRANSPARENCY_DESIGN.md 4).
+	 *
+	 * pass 0 draws every range whose bin is opaque, with depth writes on, exactly
+	 * as this loop always has. pass 1 draws the semi-transparent ranges, with
+	 * blending on and depth writes off (both asserted inside N3DS_TrackDraw_Leaf,
+	 * which is where the GPU state lives).
+	 *
+	 * The split has to be global, not per leaf: a blended surface must be
+	 * composited over everything opaque BEHIND it, and "behind" spans leaves. Two
+	 * passes over the visible set is the whole ordering mechanism -- there is no
+	 * sort, because with depth writes off and the test on, the depth buffer built
+	 * by pass 0 already resolves blended-vs-opaque correctly, and blended-vs-
+	 * blended resolves in walk order, which is retail's own back-to-front order
+	 * for the render-list slots this content lives in.
+	 *
+	 * Cost of the second pass over leaves that have nothing blended: one accessor
+	 * call and a compare. The per-leaf depth-range math -- the expensive part --
+	 * is skipped by the `continue` below before it runs. Measured content share is
+	 * ~4% of vertices, so pass 1 issues a handful of draws.
+	 */
+	for (int pass = 0; pass < 2; pass++)
+	{
 	for (u32 i = 0; i < snap->leafCount; i++)
 	{
 		unsigned bspIndex, firstIndex, indexCount;
@@ -698,6 +1090,42 @@ void NativeTrackDraw_IssueForWalk(void)
 		float otIndexLo, ordinalLo, ordinalSpan, invIndexSpan;
 		float otIndexHi, ordinalHi, viewZLo, viewZHi; /* diagnostic-only outputs */
 		u32 walkOtCount;                              /* diagnostic-only output */
+		unsigned leafBlend = NativeTrackMesh_LeafBlend(snap->leafSlot[i]);
+		int leafIsBlended = (leafBlend != 3);
+		int uvDx = 0, uvDy = 0;
+		int drawBlend;
+
+		/*
+		 * A semi-transparent range is drawn TWICE, because that is what PS1
+		 * textured semi-transparency IS: only the texels whose sampled colour has
+		 * the STP bit set are blended, and the rest stay opaque. Pass 0 draws its
+		 * PASS1 half (the opaque body, from the PRIMARY placement, so uvOffset
+		 * stays 0 and blending stays off); pass 1 draws its PASS2 half (the
+		 * translucent texels, from the second placement, blended).
+		 *
+		 * So pass 0 draws EVERY range and only pass 1 filters. The first cut of
+		 * this skipped blended ranges in pass 0 -- which uploaded a PASS1 view at
+		 * level load and then never sampled it, leaving Crash Cove's waterfalls
+		 * showing their translucent texels with the solid part of the sheet
+		 * missing. It reads as "transparent" at a glance, which is exactly why it
+		 * needed the log rather than an eyeball to catch. The same mistake was
+		 * made and caught independently in the model path
+		 * (NativeModelDraw_IssueForWalk); the note there is the same note.
+		 */
+		if ((pass == 1) && !leafIsBlended)
+		{
+			continue;
+		}
+
+		if (leafIsBlended && (pass == 1))
+		{
+			NativeTrackMesh_LeafUvOffset(snap->leafSlot[i], &uvDx, &uvDy);
+			drawBlend = (int)leafBlend;
+		}
+		else
+		{
+			drawBlend = 3; /* opaque: pass 0 for everything, blended or not */
+		}
 
 		if (!NativeTrackMesh_LeafAt(snap->leafSlot[i], &bspIndex, &firstIndex, &indexCount))
 		{
@@ -761,9 +1189,15 @@ void NativeTrackDraw_IssueForWalk(void)
 		}
 
 		N3DS_TrackDraw_Leaf((int)firstIndex, (int)indexCount, otIndexLo, ordinalLo, ordinalSpan, invIndexSpan,
-		                    (int)NativeTrackMesh_LeafAtlasBin(snap->leafSlot[i]));
+		                    (int)NativeTrackMesh_LeafAtlasBin(snap->leafSlot[i], pass == 1), drawBlend, uvDx, uvDy);
 		drawsIssued++;
 		indicesDrawn += indexCount;
+
+		if (leafIsBlended && (pass == 1))
+		{
+			blendDrawsIssued++;
+		}
+	}
 	}
 
 	N3DS_TrackDraw_End();
@@ -773,8 +1207,14 @@ void NativeTrackDraw_IssueForWalk(void)
 	if (--s_logCountdown == 0)
 	{
 		s_logCountdown = 512;
-		Platform_Log("[TRKDRAW] toggle=%d draws=%u leaves=%u skippedOrdinal=%u skippedOrdinalTotal=%u idx=%u degraded=%d\n", g_dbg_trackRender, drawsIssued,
-		             snap->leafCount, leavesSkippedOrdinal, s_totalSkippedOrdinal, indicesDrawn, snap->degraded);
+		/* blendDraws= is how many of this frame's draws were the semi-transparent
+		 * pass. Zero on a track with no blended content is correct and expected;
+		 * zero on Crash Cove or N. Gin Labs means the feature is not reaching the
+		 * screen, and separates "the blend pass never ran" from "it ran and looks
+		 * wrong" without a hardware capture. */
+		Platform_Log("[TRKDRAW] toggle=%d draws=%u blendDraws=%u leaves=%u skippedOrdinal=%u skippedOrdinalTotal=%u idx=%u degraded=%d\n",
+		             g_dbg_trackRender, drawsIssued, blendDrawsIssued, snap->leafCount, leavesSkippedOrdinal, s_totalSkippedOrdinal, indicesDrawn,
+		             snap->degraded);
 
 	}
 }

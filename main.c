@@ -114,6 +114,10 @@
 #include "platform/native_model_mesh.c"
 #include "platform/native_model_census.c"
 #include "platform/native_model_frame.c"
+// Per-frame model triangle capture (s32 rung 1, docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+// After the two above only for readability -- it shares no symbols with them,
+// unlike the track pair below.
+#include "platform/native_model_emit.c"
 #include "platform/native_track_mesh.c"
 // Per-frame camera/visibility snapshot recorder (rung 3a step 1) -- after
 // native_track_mesh.c so it can call the mesh accessors (NativeTrackMesh_*)
@@ -315,6 +319,12 @@ int main(int argc, char *argv[])
 	// NativePlatform_TrackRenderConfigureFromArgs for why this is what makes
 	// rung 3a step 1 verifiable at all. F13 steps the same toggle mid-run.
 	NativePlatform_TrackRenderConfigureFromArgs(argc, argv);
+#endif
+
+#if defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	// --model-render N (0/1/2): the PC surface for the model capture's runtime
+	// toggle. Rung 1 is verified here, so this is what makes it drivable.
+	NativePlatform_ModelRenderConfigureFromArgs(argc, argv);
 #endif
 
 #if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE

@@ -175,6 +175,18 @@ void MainFrame_ResetDB(struct GameTracker *gGT)
 	}
 #endif
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
+	// PICA-native model renderer (s32 rung 1): the model capture's snapshot
+	// takes the same reset boundary, for the same reason the track's does --
+	// a frame that publishes without capturing must not re-expose the last
+	// race frame's models as still valid. Implementation:
+	// platform/native_model_emit.c.
+	{
+		extern void NativeModelEmit_Clear(void);
+		NativeModelEmit_Clear();
+	}
+#endif
+
 	CTR_EmptyFunc_MainFrame_ResetDB();
 	DecalGlobal_EmptyFunc_MainFrame_ResetDB();
 

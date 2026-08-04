@@ -1062,7 +1062,15 @@ internal u16 NativeGpu_NextDepthStamp(void)
  *
  * Declared here, above NativeGpu_StampEmitOrdinal, because that is the consumer.
  */
-int g_dbg_packetDepth = 0;
+/* Boot default; see CTR_NATIVE_RENDERER_DEFAULT_ON in CMakeLists.txt. This one
+ * toggle drives BOTH sides of the shared depth axis (packets stamp sz3, and the
+ * track shader's selector reads it in n3ds_backend.c) -- flipping only one puts
+ * the geometry sources on different axes, which is worse than either alone. */
+#ifndef CTR_NATIVE_RENDERER_DEFAULT_ON
+#define CTR_NATIVE_RENDERER_DEFAULT_ON 0
+#endif
+
+int g_dbg_packetDepth = CTR_NATIVE_RENDERER_DEFAULT_ON;
 
 /* ONE AXIS, FOUR CASES. Every stamp below is "nearer = larger", and every one
  * of them must land on the SAME numeric scale, because the depth test cannot
@@ -1112,7 +1120,9 @@ global_variable int s_pendingDepthValid;
  * max. These keep them. Max 4: every caller's xs/ys arrays are [4] (tri, quad,
  * line, point), which PacketDepth_ResolveXY now enforces rather than assumes.
  */
-global_variable u16 s_pendingDepthPerVert[4];
+/* 6, not 4: TriangulateQuad expands a 4-corner face into 6 vertices and
+ * expands this array alongside it, in place. See its comment. */
+global_variable u16 s_pendingDepthPerVert[6];
 global_variable int s_pendingDepthCount;
 
 /* s29 per-vertex-vs-flat accounting -- see NativeGpu_StampEmitOrdinal. */
@@ -2427,6 +2437,50 @@ void TriangulateQuad()
 	s_gpu.vertexBuffer[s_gpu.vertexIndex + 5] = s_gpu.vertexBuffer[s_gpu.vertexIndex + 2];
 	s_gpu.vertexBuffer[s_gpu.vertexIndex + 2] = s_gpu.vertexBuffer[s_gpu.vertexIndex + 3];
 	s_gpu.vertexBuffer[s_gpu.vertexIndex + 3] = s_gpu.vertexBuffer[s_gpu.vertexIndex + 1];
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/*
+	 * s32: expand the pending PER-VERTEX depths through the identical
+	 * permutation, so a 4-corner face keeps its corners' own depths instead of
+	 * silently collapsing onto the flat far-corner stamp.
+	 *
+	 * This was NOT a hypothetical. s29 wrote the suspicion into
+	 * NativeGpu_StampEmitOrdinal's fallback comment -- "a 4-sided face resolves
+	 * 4 vertices but is drawn as two triangles = 6 appended, so 6 != 4 and
+	 * every quad silently takes the flat maximum" -- and then nobody measured
+	 * it. The counter it left behind says `appended=6 resolved=4` with
+	 * **94% of parse-path primitives flat**, i.e. the guard was rejecting
+	 * essentially all quad content, which on a PS1 model set is most of it.
+	 * A primitive flattened onto its farthest corner sits as far away as its
+	 * own back edge and loses to any surface it rests on -- at every camera
+	 * distance and angle, which is what makes it survive an aerial shot.
+	 *
+	 * Written as the SAME four statements in the SAME order rather than as a
+	 * lookup table of indices. That is the point: the permutation cannot drift
+	 * from the vertex expansion it has to match, because it IS the expansion,
+	 * with `d` substituted for the vertex buffer. A table would have to be
+	 * re-derived by hand every time the triangulation above is touched, and
+	 * pairing a vertex with a stranger's depth reads as subtle z-fighting
+	 * rather than as an obvious break -- exactly why StampEmitOrdinal's guard
+	 * was written to reject a mismatch instead of guessing at one.
+	 *
+	 * Count 4 exactly: the line path also lands here (MakeLineArray builds a
+	 * degenerate quad) but resolves 2, and 2 != 4 leaves it on today's flat
+	 * stamp untouched. Triangles never reach this function at all.
+	 */
+	if (s_pendingDepthCount == 4)
+	{
+		u16 *d = s_pendingDepthPerVert;
+
+		d[4] = d[3];
+
+		d[5] = d[2];
+		d[2] = d[3];
+		d[3] = d[1];
+
+		s_pendingDepthCount = 6;
+	}
+#endif
 }
 
 //------------------------------------------------------------------------------------------------------------------------
