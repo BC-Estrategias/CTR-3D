@@ -1190,6 +1190,100 @@ global_variable struct
 	u16 uiMin, uiMax;
 } s_pktDepth;
 
+/*
+ * s32 PROVENANCE SPLIT -- [PKTDEPTH2].
+ *
+ * The counters above are frame-wide totals, and a frame-wide total cannot
+ * answer the only question left about the sinking racers: is it the ROAD or the
+ * KART that is getting the wrong distance? Owner measurement (s32.5) put the
+ * defect inside this feature and nowhere else -- the sink reproduces with the
+ * retail track path AND the retail model path drawing everything, so neither
+ * native renderer is involved. Two mechanisms survive, and they are told apart
+ * by splitting these counts by which object a resolved depth came from:
+ *
+ *   1. EVICTION. The capture table is one entry per screen coordinate, last
+ *      writer wins. A kart vertex and the road vertex under it share a screen
+ *      coordinate by construction, so one overwrites the other and the loser
+ *      reads back a depth belonging to something else. Signature here: 'mixed'
+ *      non-zero (a primitive whose own vertices resolve to two different
+ *      objects), plus a non-zero evict census from the capture side.
+ *
+ *   2. FALLBACK QUANTISATION. On a miss the whole primitive takes
+ *      0xFFFF - (otSlotIdx << 6), and >>6 is retail's rule for TRACK geometry
+ *      (maxDepth >> 6). Retail bins model instances by MAC0 >> 17 -- a
+ *      different scale -- so a kart that misses gets a distance reconstructed
+ *      with the road's ruler. Signature here: mdlFellBack large.
+ *
+ * Provenance comes from the matrix-state id the capture stored: the frame's
+ * dominant matrix is the camera (world/track geometry), anything else is a
+ * per-object instance (karts, crates, pickups). Refreshed once per presented
+ * frame -- per primitive would mean walking the 64-entry census in the hottest
+ * loop in the renderer.
+ */
+global_variable u8 s_pktDepthDomMtx;
+
+global_variable struct
+{
+	u32 wldReal, wldFellBack;   /* resolved / missed, camera-matrix provenance */
+	u32 mdlReal, mdlFellBack;   /* resolved / missed, instance-matrix provenance */
+	u32 unkFellBack;            /* missed on vertex 0: no provenance evidence at all */
+	u32 mixed;                  /* vertices of one primitive owned by two objects */
+	u32 strictMissed;           /* 'mixed' primitives demoted to a miss by strictmtx */
+	/* Per-vertex vs flat-at-farthest-corner, split the same way. The existing
+	 * [PKTDEPTH] perVert/flat pair is frame-wide and therefore cannot say
+	 * whether a kart is in the flat group -- which is the only question left. */
+	u32 mdlPerVert, mdlFlat;
+	u32 wldPerVert, wldFlat;
+	u32 mdlFlatMaxSpread;       /* worst (maxSz3-minSz3) a flat model prim ate */
+	int mdlFlatLastAppended;    /* the count mismatch that sent it there, sampled */
+	int mdlFlatLastResolved;
+	/*
+	 * SZ3 EXTENTS PER POPULATION -- in the same view.z units [TRKDEPTHCHK]
+	 * prints, so the kart's depth and the road's depth can finally be read off
+	 * one line and compared. [PKTDEPTHZ] gives the whole packet population's
+	 * range, which mixes karts with scenery and has therefore never answered
+	 * "is the kart at the same distance as the ground under it".
+	 */
+	u32 mdlSzLo, mdlSzHi;
+	u32 wldSzLo, wldSzHi;
+} s_pktDepth2;
+
+global_variable int s_pktDepth2Seeded;
+
+/* Reset helper: the two lo fields need a sentinel a real sz3 can beat, which a
+ * plain memset cannot provide. Every reset site must go through this. */
+internal void PacketDepth2_Reset(void)
+{
+	memset(&s_pktDepth2, 0, sizeof(s_pktDepth2));
+	s_pktDepth2.mdlSzLo = 0xFFFFFFFFu;
+	s_pktDepth2.wldSzLo = 0xFFFFFFFFu;
+}
+
+/* Provenance and depth spread of the primitive currently in the pending slot,
+ * carried from PacketDepth_ResolveXY to NativeGpu_StampEmitOrdinal because the
+ * per-vertex/flat decision is made there and has no other way to know what it
+ * is looking at. Consumed alongside s_pendingDepthValid. */
+global_variable int s_pendingDepthIsModel;
+global_variable u32 s_pendingDepthSpread;
+
+/*
+ * s32 A/B switches, both default OFF so the first thing on screen is today's
+ * behaviour. Neither is a proposed fix; each removes one suspect so the owner
+ * can say whether the karts come out of the road.
+ *
+ * strictmtx  -- treat a 'mixed' primitive as a miss. Restores this subsystem's
+ *               own stated rule ("a miss is always a miss, never a wrong
+ *               value"), which eviction is the sole violator of.
+ * missordinal-- on a miss, keep the emit ordinal instead of reconstructing from
+ *               the OT bucket. KNOWN LOUD SIDE EFFECT: this is the s29 defect
+ *               deliberately reintroduced -- geometry that never GTE-projects
+ *               (AnimateWater, so the waterfalls and lava) lands on the ordinal
+ *               axis and draws over everything including the HUD. Expected, not
+ *               a new bug; what matters is only whether the KARTS move.
+ */
+int g_dbg_pktDepthStrictMtx = 0;
+int g_dbg_pktDepthMissOrdinal = 0;
+
 internal void PacketDepth_NoteExtent(u16 stamp, u16 *lo, u16 *hi)
 {
 	if ((*lo == 0) && (*hi == 0))
@@ -1222,7 +1316,17 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 {
 	u16 sz3s[4];
 	u16 maxSz3 = 0;
+	u16 minSz3 = 0xFFFFu;
 	int i;
+	/* s32 provenance: gathered as the loop runs rather than in a second pass,
+	 * because a miss exits early and the vertices resolved BEFORE it are the
+	 * only evidence of who the primitive belonged to. Scalars on purpose -- an
+	 * array indexed by i would need its own bound, and n is only guaranteed
+	 * <= 4 on the perVert path. */
+	u8 firstMtx = 0;
+	int hits = 0;
+	int mixed = 0;
+	int missed = 0;
 
 	if (!g_dbg_packetDepth)
 	{
@@ -1245,6 +1349,8 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		*out = (u16)(PKTDEPTH_UI_BASE + (s_gpu.emitOrdinal & (PKTDEPTH_UI_BAND - 1)));
 		PacketDepth_NoteExtent(*out, &s_pktDepth.uiMin, &s_pktDepth.uiMax);
 		s_pktDepth.suppressed2d++;
+		s_pendingDepthIsModel = 0;
+		s_pendingDepthSpread = 0;
 		/* 2D has no per-vertex depth by definition -- flat is correct here. */
 		if (perVert)
 		{
@@ -1259,39 +1365,23 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 	for (i = 0; i < n; i++)
 	{
 		u16 sz3;
+		u8 thisMtx;
 
-		if (!GTECapture_LookupDepth(xs[i], ys[i], &sz3))
+		if (!GTECapture_LookupDepthEx(xs[i], ys[i], &sz3, &thisMtx))
 		{
-			/* Whole primitive falls back (design 3.2) -- but onto the SAME
-			 * axis (design 3.3), never onto the ordinal. The OT bucket the
-			 * walk is currently parsing IS a quantisation of this same view
-			 * depth (retail builds it as maxDepth >> 6), so shifting it back
-			 * up recovers a coarse but correctly-scaled depth. Without this
-			 * the miss population lands at an arbitrary point on the scale --
-			 * which is what put the waterfalls through the HUD. */
-			s_pktDepth.fellBack++;
-			if (s_gpu.otCurrentSlotIdx == NATIVE_GPU_NO_CONTENT_BUCKET)
-			{
-				/* No bucket to derive from (outside a walk). Keeping the
-				 * caller's ordinal is the lesser evil: it is at least the
-				 * behaviour this content had before the feature existed. */
-				return 0;
-			}
-			*out = PacketDepth_ClampWorld(0xFFFFu - (s_gpu.otCurrentSlotIdx << PKTDEPTH_OT_SHIFT));
-			PacketDepth_NoteExtent(*out, &s_pktDepth.backMin, &s_pktDepth.backMax);
-			/* Bucket-derived depth is primitive-wide -- there is no per-vertex
-			 * information to recover, so the whole primitive stays flat. */
-			if (perVert)
-			{
-				int k;
-
-				for (k = 0; k < n; k++)
-				{
-					perVert[k] = *out;
-				}
-			}
-			return 1;
+			missed = 1;
+			break;
 		}
+
+		if (hits == 0)
+		{
+			firstMtx = thisMtx;
+		}
+		else if (thisMtx != firstMtx)
+		{
+			mixed = 1;
+		}
+		hits++;
 
 		if (perVert)
 		{
@@ -1301,11 +1391,114 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		{
 			maxSz3 = sz3;
 		}
+		if (sz3 < minSz3)
+		{
+			minSz3 = sz3;
+		}
 	}
+
+	/* Mechanism 1's signature, and its A/B. A primitive cannot legitimately
+	 * span two matrix states -- one face is projected under one matrix -- so
+	 * every 'mixed' is an eviction that has already handed at least one vertex
+	 * a stranger's depth. */
+	if (mixed)
+	{
+		s_pktDepth2.mixed++;
+		if (g_dbg_pktDepthStrictMtx)
+		{
+			s_pktDepth2.strictMissed++;
+			missed = 1;
+		}
+	}
+
+	if (missed)
+	{
+		/* Whole primitive falls back (design 3.2) -- but onto the SAME
+		 * axis (design 3.3), never onto the ordinal. The OT bucket the
+		 * walk is currently parsing IS a quantisation of this same view
+		 * depth (retail builds it as maxDepth >> 6), so shifting it back
+		 * up recovers a coarse but correctly-scaled depth. Without this
+		 * the miss population lands at an arbitrary point on the scale --
+		 * which is what put the waterfalls through the HUD. */
+		s_pktDepth.fellBack++;
+		/* Stale provenance must not leak into the stamper's accounting: a
+		 * bucket-derived stamp is flat by construction, so its spread is zero
+		 * and its population is whatever evidence the hits gave us. */
+		s_pendingDepthIsModel = (hits > 0) && (firstMtx != s_pktDepthDomMtx);
+		s_pendingDepthSpread = 0;
+		if (hits == 0)
+		{
+			s_pktDepth2.unkFellBack++;
+		}
+		else if (firstMtx == s_pktDepthDomMtx)
+		{
+			s_pktDepth2.wldFellBack++;
+		}
+		else
+		{
+			s_pktDepth2.mdlFellBack++;
+		}
+
+		if (s_gpu.otCurrentSlotIdx == NATIVE_GPU_NO_CONTENT_BUCKET)
+		{
+			/*
+			 * MEASURED s32: this branch is not rare. [PKTDEPTHZ] reported
+			 * backZ=0..0 through entire races -- meaning the bucket-derived
+			 * fallback below never ran and EVERY miss came out here, tens of
+			 * thousands of primitives per 256 frames.
+			 *
+			 * "Keeping the caller's ordinal" was written as the conservative
+			 * choice, and on a build with no depth test it was: keeping the
+			 * caller's ordinal is at least the behaviour this content had
+			 * before the feature existed. */
+			return 0;
+		}
+		if (g_dbg_pktDepthMissOrdinal)
+		{
+			/* Mechanism 2's A/B -- see the switch's own comment for the side
+			 * effect this is expected to produce. */
+			return 0;
+		}
+		*out = PacketDepth_ClampWorld(0xFFFFu - (s_gpu.otCurrentSlotIdx << PKTDEPTH_OT_SHIFT));
+		PacketDepth_NoteExtent(*out, &s_pktDepth.backMin, &s_pktDepth.backMax);
+		/* Bucket-derived depth is primitive-wide -- there is no per-vertex
+		 * information to recover, so the whole primitive stays flat. */
+		if (perVert)
+		{
+			int k;
+
+			for (k = 0; k < n; k++)
+			{
+				perVert[k] = *out;
+			}
+		}
+		return 1;
+	}
+
+	s_pendingDepthIsModel = (firstMtx != s_pktDepthDomMtx);
 
 	*out = PacketDepth_ClampWorld(0xFFFFu - maxSz3); /* see SENSE INVERSION above */
 	PacketDepth_NoteExtent(*out, &s_pktDepth.realMin, &s_pktDepth.realMax);
 	s_pktDepth.real++;
+	s_pendingDepthSpread = (maxSz3 >= minSz3) ? (u32)(maxSz3 - minSz3) : 0u;
+	if (s_pendingDepthIsModel)
+	{
+		s_pktDepth2.mdlReal++;
+	}
+	else
+	{
+		s_pktDepth2.wldReal++;
+	}
+	{
+		u32 *lo = s_pendingDepthIsModel ? &s_pktDepth2.mdlSzLo : &s_pktDepth2.wldSzLo;
+		u32 *hi = s_pendingDepthIsModel ? &s_pktDepth2.mdlSzHi : &s_pktDepth2.wldSzHi;
+
+		/* lo starts at the sentinel below rather than 0, because sz3 0 is a
+		 * legal value (geometry at the eye) and seeding on it would peg the
+		 * low end forever. Each population seeds independently. */
+		if ((u32)minSz3 < *lo) { *lo = minSz3; }
+		if ((u32)maxSz3 > *hi) { *hi = maxSz3; }
+	}
 	/*
 	 * The whole point (s29): every vertex keeps its OWN depth instead of
 	 * inheriting the primitive's farthest corner, so the GPU interpolates
@@ -1391,6 +1584,14 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 			}
 			s_pendingDepthCount = 0;
 			s_pktDepthPerVertHits++;
+			if (s_pendingDepthIsModel)
+			{
+				s_pktDepth2.mdlPerVert++;
+			}
+			else
+			{
+				s_pktDepth2.wldPerVert++;
+			}
 			s_gpu.emitOrdinal++;
 			return;
 		}
@@ -1417,6 +1618,35 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 		s_pktDepthLastAppended = s_gpu.vertexIndex - firstVertex;
 		s_pktDepthLastResolved = s_pendingDepthCount;
 		s_pendingDepthCount = 0;
+
+		/*
+		 * s32: which POPULATION lands here, and how much it costs them.
+		 *
+		 * The flat stamp is the primitive's farthest vertex, so the damage it
+		 * does is exactly the primitive's own depth SPREAD -- a flat-stamped
+		 * face is pushed back by (maxSz3 - minSz3) view.z units relative to
+		 * where its near edge really is. A kart-sized spread on a kart is the
+		 * reported sink; the same spread on a road quad running away from the
+		 * camera is huge and harmless, because nothing is trying to stand on
+		 * its near edge. Counting the two together is what has kept this
+		 * ambiguous for three sessions, so they are counted apart, and the
+		 * worst model spread is carried so the error has a magnitude and not
+		 * just a rate.
+		 */
+		if (s_pendingDepthIsModel)
+		{
+			s_pktDepth2.mdlFlat++;
+			if (s_pendingDepthSpread > s_pktDepth2.mdlFlatMaxSpread)
+			{
+				s_pktDepth2.mdlFlatMaxSpread = s_pendingDepthSpread;
+			}
+			s_pktDepth2.mdlFlatLastAppended = s_pktDepthLastAppended;
+			s_pktDepth2.mdlFlatLastResolved = s_pktDepthLastResolved;
+		}
+		else
+		{
+			s_pktDepth2.wldFlat++;
+		}
 	}
 #endif
 
@@ -1615,6 +1845,25 @@ void NativeGpu_ResetEmitOrdinal(void)
 	else
 	{
 		const u32 prims = s_pktDepth.real + s_pktDepth.fellBack;
+		u8 domId = 0;
+		u32 idsUsed = 0;
+
+		/* s32: refresh the provenance reference once per presented frame. In
+		 * race content the dominant matrix is the camera every frame, so a
+		 * one-frame lag here would be harmless anyway -- but this hook fires
+		 * after the walk that consumed it, so the value the resolver used was
+		 * this frame's. */
+		(void)GTECapture_ReadMatrixCensus(&domId, &idsUsed);
+		s_pktDepthDomMtx = domId;
+
+		/* First window needs the same sentinel seeding every later reset does;
+		 * the struct's zero-initialisation would otherwise pin both lo fields
+		 * at 0 and report a range starting at the eye. */
+		if (!s_pktDepth2Seeded)
+		{
+			s_pktDepth2Seeded = 1;
+			PacketDepth2_Reset();
+		}
 
 		s_pktDepth.frames++;
 		if (s_pktDepth.frames >= 256)
@@ -1633,6 +1882,47 @@ void NativeGpu_ResetEmitOrdinal(void)
 			             (unsigned long)s_pktDepth.frames, (unsigned long)prims, (unsigned long)s_pktDepth.real,
 			             (unsigned long)s_pktDepth.fellBack, (unsigned long)(prims ? ((s_pktDepth.real * 100u) / prims) : 0u),
 			             (unsigned long)s_pktDepth.suppressed2d, (unsigned long)s_pktDepthStamps, (long)((long)s_pktDepthStamps - (long)seen));
+			{
+				/* s32 sinking racers. READ IT LIKE THIS:
+				 *   mdlFell large      -> mechanism 2 (karts reconstructed with
+				 *                         the track's >>6 ruler)
+				 *   mixed/evict large  -> mechanism 1 (karts wearing the road's
+				 *                         depth); evictDz is how big the lie is,
+				 *                         in the same units as the stamps
+				 *   both ~0            -> BOTH mechanisms are dead and the sink
+				 *                         is somewhere this instrument cannot
+				 *                         see. Say so; do not reach for a third
+				 *                         theory without a third measurement.
+				 * mdlReal being 0 would mean no instance geometry resolved at
+				 * all this window -- check that before reading anything else,
+				 * because every other split would then be meaningless. */
+				u32 evictSame = 0, evictDz = 0;
+				const u32 evictDiff = GTECapture_ReadEvictCensus(&evictSame, &evictDz);
+
+				Platform_LogInstrument("[PKTDEPTH2] dom=%u wld=%lu/%lu mdl=%lu/%lu unkFell=%lu mixed=%lu strictMiss=%lu evict=%lu/%lu evictDz=%lu\n",
+				                       (unsigned)s_pktDepthDomMtx, (unsigned long)s_pktDepth2.wldReal, (unsigned long)s_pktDepth2.wldFellBack,
+				                       (unsigned long)s_pktDepth2.mdlReal, (unsigned long)s_pktDepth2.mdlFellBack, (unsigned long)s_pktDepth2.unkFellBack,
+				                       (unsigned long)s_pktDepth2.mixed, (unsigned long)s_pktDepth2.strictMissed, (unsigned long)evictDiff,
+				                       (unsigned long)evictSame, (unsigned long)evictDz);
+				/* THE LINE THIS BUILD EXISTS FOR. mdlFlat is the count of model
+				 * primitives stamped at their own farthest corner; spread is how
+				 * far back that pushes the worst of them, in the same view.z
+				 * units the stamps use. mdlFlat ~0 kills the theory outright. */
+				Platform_LogInstrument("[PKTDEPTH3] mdl perVert=%lu flat=%lu | wld perVert=%lu flat=%lu | mdlFlatSpread=%lu lastMismatch=%d/%d\n",
+				                       (unsigned long)s_pktDepth2.mdlPerVert, (unsigned long)s_pktDepth2.mdlFlat,
+				                       (unsigned long)s_pktDepth2.wldPerVert, (unsigned long)s_pktDepth2.wldFlat,
+				                       (unsigned long)s_pktDepth2.mdlFlatMaxSpread, s_pktDepth2.mdlFlatLastAppended,
+				                       s_pktDepth2.mdlFlatLastResolved);
+				/* THE COMPARISON. Same units as [TRKDEPTHCHK]'s ours=/retail=,
+				 * so the kart's distance and the road's distance can be read
+				 * against each other directly for the first time. */
+				Platform_LogInstrument("[PKTDEPTHSZ] mdlSz=%lu..%lu wldSz=%lu..%lu (view.z units, larger = farther)\n",
+				                       (unsigned long)(s_pktDepth2.mdlSzLo == 0xFFFFFFFFu ? 0u : s_pktDepth2.mdlSzLo),
+				                       (unsigned long)s_pktDepth2.mdlSzHi,
+				                       (unsigned long)(s_pktDepth2.wldSzLo == 0xFFFFFFFFu ? 0u : s_pktDepth2.wldSzLo),
+				                       (unsigned long)s_pktDepth2.wldSzHi);
+				PacketDepth2_Reset();
+			}
 			memset(&s_pktDepth, 0, sizeof(s_pktDepth));
 			s_pktDepthStamps = 0;
 		}

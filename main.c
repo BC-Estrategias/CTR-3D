@@ -235,6 +235,24 @@ int main(int argc, char *argv[])
 	N3DS_DebugLog("[CTR-3DS] assets init ok");
 	N3DS_DebugLog(NativeAssets_GetBaseDir());
 	N3DS_DebugLog(NativeAssets_GetAssetDir());
+
+	/*
+	 * Stamp the build's identity into BOTH SD logs at boot.
+	 *
+	 * The printf below carries this already, but on 3DS stdout goes nowhere --
+	 * so every hardware log ever pulled off this console has been anonymous. A
+	 * day of "is this the fixed build or the one from an hour ago?" is what this
+	 * one line answers, and it answers it retroactively: a log harvested next
+	 * week still says which commit produced it. CTR_NATIVE_BUILD_ID is the git
+	 * hash plus -dirty-<timestamp> for an unclean tree, so it distinguishes two
+	 * builds from the same commit as well as two commits.
+	 *
+	 * Both sinks deliberately -- Platform_Log and Platform_LogInstrument write to
+	 * different files ("Crash Team Racing.log" and ctr3ds.log), and whichever one
+	 * gets read first should identify itself without needing the other.
+	 */
+	Platform_Log("[BUILD] %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
+	Platform_LogInstrument("[BUILD] %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
 #endif
 
 	printf("[CTR Native] Version: %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);

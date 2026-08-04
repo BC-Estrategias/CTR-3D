@@ -385,6 +385,7 @@ static DVLB_s *s_shaderDvlb = NULL;
 static shaderProgram_s s_shaderProgram;
 static int s_uLocProjection = -1;
 static C3D_RenderTarget *s_renderTarget = NULL;
+
 static C3D_Mtx s_projection;
 static void *s_vertexBufferMem = NULL;
 static int s_vertexCursor = 0;
@@ -912,8 +913,6 @@ int g_dbg_depthTest = 0;
  * behind-eye vertices to maximally-near) but off, and no longer allowed to
  * ride along in a build where something else is being judged.
  */
-int g_dbg_trackNearFar = 0; /* retained name; now the additive road depth bias, view.z units */
-
 /*
  * Preset ladder for the packet depth bias (see g_dbg_pktDepthBias, native_gpu.c).
  * Values are view.z units pulled toward the camera. Deliberately coarse and
@@ -1650,7 +1649,8 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 		 * it is a mid-race hardware A/B (SELECT+D-UP / dumpreq `nearfar`);
 		 * the sink has to be judged by eye on the thing that shows it, and a
 		 * rebuild between legs is how a confounded comparison happens. */
-		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, selTrueDepth, 1.0f - selTrueDepth, (float)g_dbg_trackNearFar);
+		/* hParam.w unused (was a depth bias/scale lever, removed). */
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, selTrueDepth, 1.0f - selTrueDepth, 0.0f);
 
 		/* Prove the selector actually REACHES the shader. Every depth number
 		 * logged so far is CPU-side arithmetic showing what the value would be,
@@ -1818,6 +1818,11 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	 * per-program handles -- the s29 projection collision was exactly that
 	 * mistake and it destroyed every packet drawn after a track draw.
 	 */
+	/* .z carries the behind-eye depth kick's runtime gate (see the BEHIND-EYE
+	 * DEPTH KICK block in ctr_track.v.pica). It rides a spare component of a
+	 * uniform this path already writes every draw rather than claiming a new
+	 * register, for exactly the reason the paragraph above gives. .z/.w unused
+	 * (was a behind-eye depth-kick lever, removed). */
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocUvOffset, (float)(uvDx * 2), (float)(uvDy * 2), 0.0f, 0.0f);
 
 	/*
@@ -2024,6 +2029,9 @@ void N3DS_ModelDraw_Instance(const float *qx, const float *qy, const float *qw, 
 	/* Only .x is read by the shader; the other three are written because
 	 * leaving uniform components unset means "whatever the last program that
 	 * used this register put there". */
+	/* .y carries the instance depth bias (see the INSTANCE DEPTH BIAS block in
+	 * ctr_model.v.pica). Negated here so the dumpreq argument reads the same
+	 * hParam.y/z/w unused (was an instance depth-bias lever, removed). */
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_modelULocH, h, 0.0f, 0.0f, 0.0f);
 }
 
@@ -2194,6 +2202,19 @@ void N3DS_ModelDraw_End(void)
  * glBlendFuncSeparate): the framebuffer alpha carries nothing this renderer
  * reads, and blending it with the RGB factors could only corrupt it.
  */
+/* Depth-WRITE only; the test itself stays LEQUAL so translucent content is
+ * still correctly hidden by anything in front of it. Callers memoize (see
+ * N3DS_MergeEmit), so this is not gated again here. Under a build without
+ * OT_DEPTH there is no depth buffer to mask and this is a no-op. */
+void N3DS_C3DSetDepthWrite(int enable)
+{
+#ifdef CTR_NATIVE_OT_DEPTH
+	C3D_DepthTest(true, GPU_LEQUAL, enable ? GPU_WRITE_ALL : GPU_WRITE_COLOR);
+#else
+	(void)enable;
+#endif
+}
+
 void N3DS_C3DSetBlendMode(int blendMode)
 {
 	static int lastMode = -1;
@@ -2333,6 +2354,14 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  1=full 2=store-only(no matrix note) 0=ablated, to price
 	 *                  the capture subsystem and its matrix probe separately.
 	 *                  Bare token cycles 1->2->0. Hardware button: SELECT+D-UP.
+	 *   strictmtx   -- toggle g_dbg_pktDepthStrictMtx (s32): a primitive whose
+	 *                  vertices resolve to two different matrix states is
+	 *                  treated as a miss instead of trusting a foreign depth.
+	 *   missordinal -- toggle g_dbg_pktDepthMissOrdinal (s32): on a capture
+	 *                  miss keep the emit ordinal instead of deriving depth
+	 *                  from the OT bucket. Expect animated water over the HUD.
+	 *   noevict     -- toggle g_dbg_gteNoEvict (s32): a capture store may not
+	 *                  overwrite a live entry owned by a different matrix.
 	 *   depthtest [N] -- g_dbg_depthTest, the s29 occlusion split: 0=normal
 	 *                  1=no depth test (painter's order) 2=track tests but
 	 *                  does not write depth. Bare token cycles 0->1->2->0.
@@ -2517,20 +2546,49 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] packet depth bias: %d (units nearer)", g_dbg_pktDepthBias);
 					N3DS_DebugLog(msg);
 				}
-				else if (strncmp(word, "trkbias", 7) == 0)
+				else if (strncmp(word, "trkchk", 6) == 0)
 				{
-					/* s32 sinking-kart A/B -- see the NEAR-BAND POLARITY block
-					 * in ctr_track.v.pica. OFF is today's build bit-for-bit. */
-					/* 'trkbias N' sets the road depth bias in view.z units;
-					 * positive pushes the road AWAY from the camera. */
-					char biasMsg[96];
+					/* s32: runs BOTH depth formulas -- the integer one this
+					 * project has been validating, and the composed-row float24
+					 * one the GPU actually runs -- against retail's GTE for the
+					 * same vertex. Taxed (three calls per retail track triangle),
+					 * so it is a toggle, not a default. Read [TRKDEPTHCHK] and
+					 * [TRKDEPTHSH] together; the gap between them is the point. */
+					extern int g_dbg_trackDepthCheck;
 
-					if (word[7] == ' ')
-					{
-						g_dbg_trackNearFar = atoi(&word[8]);
-					}
-					snprintf(biasMsg, sizeof(biasMsg), "[CTR-3DS] track depth bias: %d (view.z units, + = road farther)", g_dbg_trackNearFar);
-					N3DS_DebugLog(biasMsg);
+					g_dbg_trackDepthCheck ^= 1;
+					N3DS_DebugLog(g_dbg_trackDepthCheck ? "[CTR-3DS] track depth check: ON (integer + shader arms)"
+					                                    : "[CTR-3DS] track depth check: off");
+				}
+				else if (strncmp(word, "nofx", 4) == 0)
+				{
+					extern int g_dbg_noFx;
+
+					g_dbg_noFx ^= 1;
+					N3DS_DebugLog(g_dbg_noFx ? "[CTR-3DS] blended packet effects: DROPPED (judging aid)"
+					                         : "[CTR-3DS] blended packet effects: drawn");
+				}
+				else if (strncmp(word, "fxdepth", 7) == 0)
+				{
+					extern int g_dbg_fxNoDepthWrite;
+
+					g_dbg_fxNoDepthWrite ^= 1;
+					N3DS_DebugLog(g_dbg_fxNoDepthWrite ? "[CTR-3DS] blended packets: depth TEST only (default, matches model/track)"
+					                                   : "[CTR-3DS] blended packets: also WRITE depth (old behaviour)");
+				}
+				else if (strncmp(word, "trknear", 7) == 0)
+				{
+					/* s32: [TRKNEAR] walks OUR OWN resident mesh and reports its
+					 * viewZ range. [TRKDEPTHCHK] cannot answer this -- it only
+					 * ever sees vertices RETAIL projects, which is a different
+					 * (and possibly much farther) set than the mesh the track
+					 * shader actually draws. Read [TRKNEAR] viewZ against
+					 * [PKTDEPTHSZ] mdlSz: that pair is the kart's distance and
+					 * the road's distance, from the two things that really draw. */
+					extern int g_dbg_trackNearCensus;
+
+					g_dbg_trackNearCensus ^= 1;
+					N3DS_DebugLog(g_dbg_trackNearCensus ? "[CTR-3DS] track near census: ON" : "[CTR-3DS] track near census: off");
 				}
 				else if (strncmp(word, "trackafter", 10) == 0)
 				{
@@ -2612,6 +2670,63 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] model render: %s", names[g_dbg_modelRender]);
 					N3DS_DebugLog(msg);
 				}
+				else if (strncmp(word, "axisfix", 7) == 0)
+				{
+					extern int g_dbg_modelAxisFix;
+
+					/* s33 sink fix A/B: near-regime instances' mvp depth is 4x the
+					 * track's view.z axis (measured, [AXISCHK]); ON divides it back
+					 * out per instance. 'axisfix N' sets, bare token flips. */
+					if (word[7] == ' ')
+					{
+						g_dbg_modelAxisFix = (atoi(&word[8]) != 0);
+					}
+					else
+					{
+						g_dbg_modelAxisFix ^= 1;
+					}
+					N3DS_DebugLog(g_dbg_modelAxisFix ? "[CTR-3DS] instance depth axis fix: ON (regime unscale)" : "[CTR-3DS] instance depth axis fix: off (raw mvp axis = the sink)");
+				}
+				else if (strncmp(word, "modelfade", 9) == 0)
+				{
+					extern int g_dbg_modelFade;
+
+					/* Rung 3: replay of the normal writer's gte_dpct (instance
+					 * fade/tint) on captured colours. 'modelfade N' sets, bare
+					 * token flips. OFF = fading instances draw full-bright. */
+					if (word[9] == ' ')
+					{
+						g_dbg_modelFade = (atoi(&word[10]) != 0);
+					}
+					else
+					{
+						g_dbg_modelFade ^= 1;
+					}
+					N3DS_DebugLog(g_dbg_modelFade ? "[CTR-3DS] model fade replay: ON" : "[CTR-3DS] model fade replay: off (captured colours stay pre-dpct)");
+				}
+#endif
+#ifdef CTR_NATIVE_TRACK_RENDERER
+				else if (strncmp(word, "leafkeep", 8) == 0)
+				{
+					extern int g_dbg_trackLeafKeep;
+					char msg[64];
+
+					/* s33 drift-holes fix: frames a leaf survives past its last
+					 * visible-list appearance. 'leafkeep N' sets (0 = off,
+					 * capped 255), bare token flips 0 <-> 15. */
+					if (word[8] == ' ')
+					{
+						int n = atoi(&word[9]);
+
+						g_dbg_trackLeafKeep = (n < 0) ? 0 : (n > 255) ? 255 : n;
+					}
+					else
+					{
+						g_dbg_trackLeafKeep = (g_dbg_trackLeafKeep != 0) ? 0 : 15;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] leaf keep-alive: %d frames%s", g_dbg_trackLeafKeep, g_dbg_trackLeafKeep ? "" : " (off)");
+					N3DS_DebugLog(msg);
+				}
 #endif
 #if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
 				else if (strncmp(word, "packetdepth", 11) == 0)
@@ -2640,6 +2755,37 @@ unsigned int N3DS_ReadButtons(void)
 					}
 					snprintf(msg, sizeof(msg), "[CTR-3DS] gte capture: %s", names[g_dbg_gteCapture]);
 					N3DS_DebugLog(msg);
+				}
+				/* s32 sinking-racers A/B trio. All three default off, so the
+				 * first thing on screen is today's behaviour, and each removes
+				 * exactly one suspect -- see their definitions in native_gpu.c
+				 * and native_gte_capture.c. Read [PKTDEPTH2] alongside. */
+				else if (strncmp(word, "strictmtx", 9) == 0)
+				{
+					extern int g_dbg_pktDepthStrictMtx;
+
+					g_dbg_pktDepthStrictMtx ^= 1;
+					N3DS_DebugLog(g_dbg_pktDepthStrictMtx ? "[CTR-3DS] strict matrix: ON (mixed-provenance prim = miss)"
+					                                     : "[CTR-3DS] strict matrix: off");
+				}
+				else if (strncmp(word, "missordinal", 11) == 0)
+				{
+					extern int g_dbg_pktDepthMissOrdinal;
+
+					g_dbg_pktDepthMissOrdinal ^= 1;
+					/* The waterfall/HUD artefact this reintroduces is expected
+					 * and is not the thing being judged -- said here so the log
+					 * carries the caveat next to the toggle that caused it. */
+					N3DS_DebugLog(g_dbg_pktDepthMissOrdinal ? "[CTR-3DS] miss->ordinal: ON (expect animated water over everything)"
+					                                        : "[CTR-3DS] miss->ordinal: off (bucket-derived depth)");
+				}
+				else if (strncmp(word, "noevict", 7) == 0)
+				{
+					extern int g_dbg_gteNoEvict;
+
+					g_dbg_gteNoEvict ^= 1;
+					N3DS_DebugLog(g_dbg_gteNoEvict ? "[CTR-3DS] capture evict: REFUSED across matrix states"
+					                               : "[CTR-3DS] capture evict: normal (last writer wins)");
 				}
 #endif
 				else

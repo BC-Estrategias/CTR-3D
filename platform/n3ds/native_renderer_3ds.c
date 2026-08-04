@@ -241,6 +241,7 @@ global_variable int s_runBlendMode = 0;
 typedef struct
 {
 	u8 blendMode; /* BlendMode as int; BM_NONE for opaque spills */
+	/* (see N3DS_MergeEmit for the two globals and the state below) */
 	u8 doubling;  /* TEV color doubling to set for this draw */
 	u8 atlas;
 	int baseVertex; /* already appended to the frame VBO */
@@ -2172,12 +2173,54 @@ internal void N3DS_MergeFlush(void);
  * blend mode ACTUALLY set so the non-merge entry guard's change-gating stays
  * truthful if the toggle flips next frame.
  */
+/* Translucent packet effects (smoke, sparks, shadows) must not write depth --
+ * see N3DS_MergeEmit. ON by default: it matches the model and track paths.
+ * s_mergeDepthWriteState is the memo; -1 forces the first draw to assert. */
+int g_dbg_fxNoDepthWrite = 1;
+int g_dbg_noFx;
+global_variable int s_mergeDepthWriteState = -1;
+
 internal void N3DS_MergeEmit(int blendMode, int doubling, int atlas, int baseVertex, int vertCount, int *lastDoubling)
 {
+	/*
+	 * Owner-found, s32: exhaust smoke was cutting a hole through the player and
+	 * making him look see-through. A blended packet is translucent -- it must
+	 * TEST depth so things in front still hide it, but it must not WRITE depth,
+	 * or every pixel it covers becomes opaque to whatever is drawn afterwards.
+	 *
+	 * This is not a new rule. Both other geometry sources already follow it:
+	 * N3DS_ModelDraw_Run (n3ds_backend.c, "a blended run ... must not WRITE
+	 * depth") and the track's blended ranges. The merge path -- which carries
+	 * every packet-sourced effect: smoke, sparks, shadows -- was the one that
+	 * never got it, because it was written before depth existed at all.
+	 *
+	 * g_dbg_fxNoDepthWrite defaults ON because matching the other two paths is
+	 * the correct behaviour, not an experiment; the toggle exists so it can be
+	 * A/B'd against the old look without a rebuild (dumpreq `fxdepth`).
+	 * g_dbg_noFx drops blended packets entirely -- a judging aid, so effects
+	 * cannot obscure what is being looked at while something else is tuned.
+	 */
+	if ((blendMode != 0) && g_dbg_noFx)
+	{
+		return;
+	}
+
 	if (*lastDoubling != doubling)
 	{
 		N3DS_C3DSetColorDoubling(doubling);
 		*lastDoubling = doubling;
+	}
+	{
+		/* Memoized here rather than in the backend so a frame of all-opaque
+		 * merge segments costs zero extra GPU state changes, matching what the
+		 * doubling tracker above already does. */
+		const int wantWrite = ((blendMode != 0) && g_dbg_fxNoDepthWrite) ? 0 : 1;
+
+		if (wantWrite != s_mergeDepthWriteState)
+		{
+			s_mergeDepthWriteState = wantWrite;
+			N3DS_C3DSetDepthWrite(wantWrite);
+		}
 	}
 	N3DS_C3DSetBlendMode(blendMode);
 	s_runBlendMode = blendMode;

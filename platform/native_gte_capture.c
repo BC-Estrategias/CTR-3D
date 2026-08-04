@@ -113,6 +113,13 @@ global_variable u32 s_gteMtxShadow[8];
 global_variable int s_gteMtxShadowValid;
 global_variable u32 s_gteMtxCurId;
 
+/* s33 instance depth-axis bracket -- full block sits above GTECapture_Store;
+ * these exist because Clear (the frame boundary) runs their window flush. */
+void GTECapture_EndInstanceDepth(void);
+internal void GTECapture_InstanceAxisFlush(void);
+extern int g_dbg_modelDepthCheck;
+global_variable u32 s_instAxisFrames;
+
 void GTECapture_Clear(void)
 {
 	GTECaptureBuffer *buf;
@@ -134,6 +141,16 @@ void GTECapture_Clear(void)
 	buf->mtxUsed = 0;
 	s_gteMtxShadowValid = 0;
 	s_gteMtxCurId = 0;
+
+	/* [PKTAXIS] window boundary (s33 instance-axis bracket, below). Also the
+	 * belt-and-braces close of a bracket a mid-frame early-out left open --
+	 * the same leak the model capture closes in its EndFrame. */
+	GTECapture_EndInstanceDepth();
+	if (g_dbg_modelDepthCheck && (++s_instAxisFrames >= 256))
+	{
+		s_instAxisFrames = 0;
+		GTECapture_InstanceAxisFlush();
+	}
 }
 
 // Called by GTE_RotTransPers with the 8 contiguous CP2C words holding
@@ -214,6 +231,237 @@ void GTECapture_SetStoreSuppressed(int suppressed)
 	s_gteCaptureStoreSuppressed = suppressed;
 }
 
+/*
+ * s32 EVICTION CENSUS -- header comment on GTECapture_ReadEvictCensus has the
+ * argument. Counted at the one place a slot can change owner. The extra branch
+ * costs nothing measurable: the entry line is already being fetched for the
+ * write on the very next instructions.
+ */
+int g_dbg_gteNoEvict;
+
+global_variable struct
+{
+	u32 diffMtx;  /* same pixel, different object -- the harmful population */
+	u32 sameMtx;  /* same pixel, same object: a real self-overwrite, benign */
+	u32 maxDz;    /* biggest sz3 delta a harmful overwrite introduced */
+	u32 refused;  /* overwrites declined while g_dbg_gteNoEvict is on */
+} s_gteEvict;
+
+u32 GTECapture_ReadEvictCensus(u32 *outSameMtx, u32 *outMaxDz)
+{
+	u32 diff = s_gteEvict.diffMtx;
+
+	*outSameMtx = s_gteEvict.sameMtx;
+	*outMaxDz = s_gteEvict.maxDz;
+	s_gteEvict.diffMtx = 0;
+	s_gteEvict.sameMtx = 0;
+	s_gteEvict.maxDz = 0;
+	s_gteEvict.refused = 0;
+	return diff;
+}
+
+/*
+ * ================== s33: INSTANCE DEPTH-AXIS BRACKET ==================
+ *
+ * The packet-side half of the s33 sink fix. Retail's instance pipeline is
+ * regime-scaled (RenderBucket_AdjustViewPositionForMvp: MVP translation <<2
+ * under 0x1000 view units, DRAW_HUGE >>2), so every SZ3 an instance's own
+ * projection produces is on a 4x / 1x / quarter axis relative to the track's
+ * view.z. The native model path corrects this per instance
+ * (native_model_emit.c, NativeModelEmitInstance.depthShift -- keep the two
+ * classifiers in sync); instance content still drawn as PACKETS (the split /
+ * special / reflection draw funcs, models-retail configs) stores its scaled
+ * SZ3 into THIS table, and a table hit is what buries it: the resolve-miss
+ * fallback derives depth from the OT bucket, which retail builds from the
+ * UNSHIFTED view z (native_gpu.c PacketDepth_ResolveXY), so misses were
+ * always roughly right and hits were 4x wrong. The owner-visible form is the
+ * kart vanishing in the stretch just after an ice pond (Blizzard Bluff /
+ * Polar Pass): the zone flags put the kart on DrawFunc_Special there, off
+ * the fixed native path.
+ *
+ * So the correction happens AT THE STORE, inside a bracket the RenderBucket
+ * dispatch opens around each instance's draw func. Classification is
+ * self-calibrating, same doctrine as the native fix: NORMAL/NORMAL_ALT pass
+ * mvp.t[2] and classify exactly; the split/special/reflection funcs carry a
+ * VIEW or IDENTITY matrix in mvp (RenderBucket_StoreViewMatrixForSplit, the
+ * :1593 identity store), so they classify from the FIRST SZ3 the bracket
+ * sees instead -- the candidates sit a factor of 4 apart and a kart's own
+ * extent is far smaller, so the nearest-candidate test cannot confuse them
+ * for content beyond ~128 view units, and inside 128 units the scale error
+ * is smaller than the near-band floor anyway (shift forced to 0 there).
+ *
+ * Known, accepted residual: the QUEUE-phase bbox projections (8 corners per
+ * instance, RenderBucket_PrepareDrawContext) run outside this bracket and
+ * still store scaled depths. Eight vertices against hundreds, at screen
+ * coordinates the body immediately restores -- measure before caring.
+ */
+
+/* dumpreq 'pktaxisfix'. Default ON: OFF is the ice-pond vanish. */
+int g_dbg_pktAxisFix = 1;
+
+#define GTE_INSTAXIS_UNRESOLVED 99
+#define GTE_INSTAXIS_MTX_NONE 0xFFFFFFFFu
+
+global_variable int s_instAxisActive;
+global_variable int s_instAxisShift = GTE_INSTAXIS_UNRESOLVED;
+global_variable s64 s_instAxisTrueZ;
+global_variable int s_instAxisFunc;
+/* Matrix state the current shift was classified under. The split/reflection
+ * writers project the BODY and the MIRRORED copy under different GTE
+ * matrices within one bracket, and the two passes need not share a regime --
+ * owner-observed as the reflection showing through the ground and the body
+ * flickering around ice (Bluff, s33). Classification therefore re-runs at
+ * every matrix change inside the bracket. Depends on NoteMatrix's change
+ * detector (g_dbg_gteCapture == 1); capture state 2 skips NoteMatrix and
+ * degrades to one shift per instance. The mirror pass classifies against the
+ * BODY origin's trueZ -- an approximation (the mirrored point sits deeper by
+ * twice its height above the plane), but the candidates are a factor of 4
+ * apart and a kart rides close to the surface it reflects in, so the
+ * nearest-candidate test has margin. */
+global_variable u32 s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
+
+/* [PKTAXIS] window accumulators, per draw func (0=normal 1=normalAlt 2=split
+ * 3=special 4=reflection). Stats gated behind g_dbg_modelDepthCheck -- the
+ * axis-investigation flag -- but classification and the fix itself are not. */
+extern int g_dbg_modelDepthCheck;
+global_variable u32 s_instAxisInstN[5];
+global_variable u32 s_instAxisShiftN[5][3]; /* [func][0]=shift2 [1]=shift0 [2]=shift-2 */
+global_variable u32 s_instAxisUnresolvedN[5];
+global_variable u32 s_instAxisReclassN[5]; /* matrix-change re-classifications (mirror passes) */
+global_variable u32 s_instAxisStoreN[5];
+global_variable double s_instAxisRatioSum[5];
+global_variable double s_instAxisRatioMin[5];
+global_variable double s_instAxisRatioMax[5];
+/* s_instAxisFrames is declared above GTECapture_Clear, which drives the flush. */
+
+/* Nearest of {4x, 1x, 1/4x}: which regime this mvp-axis depth actually is,
+ * measured against the track-axis view.z of the same point. MUST stay in
+ * lockstep with the classifier in NativeModelEmit_BeginInstance. */
+internal int GTECapture_ClassifyShift(s64 mvpAxisZ, s64 trueZ)
+{
+	s64 eNear = mvpAxisZ - (trueZ << 2);
+	s64 eFar = mvpAxisZ - trueZ;
+	s64 eHuge = (mvpAxisZ << 2) - trueZ;
+
+	if (eNear < 0) { eNear = -eNear; }
+	if (eFar < 0) { eFar = -eFar; }
+	if (eHuge < 0) { eHuge = -eHuge; }
+
+	return (eNear <= eFar) ? ((eNear <= eHuge) ? 2 : -2) : ((eFar <= eHuge) ? 0 : -2);
+}
+
+void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct PushBuffer *pb, s32 mvpZIfNormal, int funcKind)
+{
+	s64 trueZ;
+
+	if ((inst == NULL) || (pb == NULL))
+	{
+		return;
+	}
+
+	/* Track-axis view.z of the instance origin -- same integer arithmetic as
+	 * RenderBucket_GetViewPosition's GTE path and the native classifier's. */
+	if ((inst->flags & SCREENSPACE_INSTANCE) != 0)
+	{
+		trueZ = (s64)inst->matrix.t[2];
+	}
+	else
+	{
+		s64 dx = (s64)inst->matrix.t[0] - (s64)pb->pos.x;
+		s64 dy = (s64)inst->matrix.t[1] - (s64)pb->pos.y;
+		s64 dz = (s64)inst->matrix.t[2] - (s64)pb->pos.z;
+
+		trueZ = ((s64)pb->matrix_ViewProj.m[2][0] * dx + (s64)pb->matrix_ViewProj.m[2][1] * dy + (s64)pb->matrix_ViewProj.m[2][2] * dz) >> 12;
+	}
+
+	s_instAxisActive = 1;
+	s_instAxisTrueZ = trueZ;
+	s_instAxisFunc = ((funcKind >= 0) && (funcKind < 5)) ? funcKind : 0;
+	s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
+
+	if (trueZ < 128)
+	{
+		/* Too near (or behind) for the nearest-candidate test to be safe,
+		 * and a 3z scale error under 128 units is inside the shared 256-unit
+		 * near-band floor. Store untouched. */
+		s_instAxisShift = 0;
+	}
+	else if (mvpZIfNormal > 0)
+	{
+		s_instAxisShift = GTECapture_ClassifyShift((s64)mvpZIfNormal, trueZ);
+	}
+	else
+	{
+		s_instAxisShift = GTE_INSTAXIS_UNRESOLVED; /* classify on first store */
+	}
+}
+
+void GTECapture_EndInstanceDepth(void)
+{
+	if (!s_instAxisActive)
+	{
+		return;
+	}
+
+	if (g_dbg_modelDepthCheck)
+	{
+		s_instAxisInstN[s_instAxisFunc]++;
+		if (s_instAxisShift == 2)
+		{
+			s_instAxisShiftN[s_instAxisFunc][0]++;
+		}
+		else if (s_instAxisShift == 0)
+		{
+			s_instAxisShiftN[s_instAxisFunc][1]++;
+		}
+		else if (s_instAxisShift == -2)
+		{
+			s_instAxisShiftN[s_instAxisFunc][2]++;
+		}
+		else
+		{
+			/* Ended without a single store to classify from -- the draw func
+			 * rejected every triangle. Nothing was scaled, nothing was wrong. */
+			s_instAxisUnresolvedN[s_instAxisFunc]++;
+		}
+	}
+
+	s_instAxisActive = 0;
+	s_instAxisShift = GTE_INSTAXIS_UNRESOLVED;
+	s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
+}
+
+/* Per-frame window flush, driven by GTECapture_Clear below. 256 content-ish
+ * frames per line keeps it to a few lines a minute at 30fps. */
+internal void GTECapture_InstanceAxisFlush(void)
+{
+	static const char *const funcName[5] = {"normal", "normalAlt", "split", "special", "reflection"};
+	int f;
+
+	for (f = 0; f < 5; f++)
+	{
+		if ((s_instAxisInstN[f] == 0) && (s_instAxisStoreN[f] == 0))
+		{
+			continue;
+		}
+		Platform_LogInstrument("[PKTAXIS] func=%s inst=%lu shift4x=%lu shift1x=%lu shiftQ=%lu unresolved=%lu reclass=%lu stores=%lu ratio=%.3f (%.3f..%.3f)\n",
+		                       funcName[f], (unsigned long)s_instAxisInstN[f], (unsigned long)s_instAxisShiftN[f][0], (unsigned long)s_instAxisShiftN[f][1],
+		                       (unsigned long)s_instAxisShiftN[f][2], (unsigned long)s_instAxisUnresolvedN[f], (unsigned long)s_instAxisReclassN[f],
+		                       (unsigned long)s_instAxisStoreN[f], s_instAxisStoreN[f] ? (s_instAxisRatioSum[f] / (double)s_instAxisStoreN[f]) : 0.0,
+		                       s_instAxisRatioMin[f], s_instAxisRatioMax[f]);
+		s_instAxisReclassN[f] = 0;
+		s_instAxisInstN[f] = 0;
+		s_instAxisShiftN[f][0] = 0;
+		s_instAxisShiftN[f][1] = 0;
+		s_instAxisShiftN[f][2] = 0;
+		s_instAxisUnresolvedN[f] = 0;
+		s_instAxisStoreN[f] = 0;
+		s_instAxisRatioSum[f] = 0.0;
+		s_instAxisRatioMin[f] = 0.0;
+		s_instAxisRatioMax[f] = 0.0;
+	}
+}
+
 void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3, s16 vx, s16 vy, s16 vz)
 {
 	GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureWriteIdx];
@@ -227,6 +475,103 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 	if (s_gteCaptureStoreSuppressed)
 	{
 		return;
+	}
+
+	/* Instance depth-axis bracket (s33, block comment above): put this store
+	 * on the track's view.z axis before ANYTHING sees it -- including the
+	 * eviction census a few lines down, whose dz would otherwise mix units. */
+	if (s_instAxisActive)
+	{
+		/* Per-matrix re-classification -- see s_instAxisMtxAtClassify. The
+		 * first matrix state adopts Begin's exact mvp-based shift; each later
+		 * state inside the bracket (the mirror pass) re-classifies from its
+		 * own first store. */
+		if (s_instAxisMtxAtClassify == GTE_INSTAXIS_MTX_NONE)
+		{
+			s_instAxisMtxAtClassify = s_gteMtxCurId;
+		}
+		else if (s_gteMtxCurId != s_instAxisMtxAtClassify)
+		{
+			s_instAxisMtxAtClassify = s_gteMtxCurId;
+			if (s_instAxisTrueZ >= 128)
+			{
+				s_instAxisShift = GTECapture_ClassifyShift((s64)sz3, s_instAxisTrueZ);
+			}
+			if (g_dbg_modelDepthCheck)
+			{
+				s_instAxisReclassN[s_instAxisFunc]++;
+			}
+		}
+
+		if (s_instAxisShift == GTE_INSTAXIS_UNRESOLVED)
+		{
+			/* First store of a split/special/reflection instance: SZ3 is
+			 * TRZ plus a model-extent term, and the candidates are 4x apart,
+			 * so nearest-candidate on the raw SZ3 names the regime. */
+			s_instAxisShift = GTECapture_ClassifyShift((s64)sz3, s_instAxisTrueZ);
+		}
+
+		if (g_dbg_modelDepthCheck && (s_instAxisTrueZ >= 128))
+		{
+			double ratio = (double)sz3 / (double)s_instAxisTrueZ;
+			int f = s_instAxisFunc;
+
+			if (s_instAxisStoreN[f] == 0)
+			{
+				s_instAxisRatioMin[f] = ratio;
+				s_instAxisRatioMax[f] = ratio;
+			}
+			else
+			{
+				if (ratio < s_instAxisRatioMin[f]) { s_instAxisRatioMin[f] = ratio; }
+				if (ratio > s_instAxisRatioMax[f]) { s_instAxisRatioMax[f] = ratio; }
+			}
+			s_instAxisStoreN[f]++;
+			s_instAxisRatioSum[f] += ratio;
+		}
+
+		if (g_dbg_pktAxisFix)
+		{
+			if (s_instAxisShift == 2)
+			{
+				u32 t = (u32)sz3 >> 2;
+
+				sz3 = (u16)((t != 0) ? t : 1); /* keep a hit distinguishable from empty */
+			}
+			else if (s_instAxisShift == -2)
+			{
+				u32 t = (u32)sz3 << 2;
+
+				sz3 = (t > 0xFFFFu) ? (u16)0xFFFFu : (u16)t;
+			}
+		}
+	}
+
+	/* Same key AND live generation means this slot already holds a projection
+	 * of THIS SAME screen coordinate from earlier in the frame -- not a hash
+	 * collision (different key), which the lookup's key check already turns
+	 * into a clean miss. Whoever wrote it is about to lose their depth. */
+	if ((entry->generation == buf->generation) && (entry->key == key))
+	{
+		if (entry->mtxId != (u8)s_gteMtxCurId)
+		{
+			u32 dz = (entry->sz3 > sz3) ? (u32)(entry->sz3 - sz3) : (u32)(sz3 - entry->sz3);
+
+			s_gteEvict.diffMtx++;
+			if (dz > s_gteEvict.maxDz)
+			{
+				s_gteEvict.maxDz = dz;
+			}
+			if (g_dbg_gteNoEvict)
+			{
+				s_gteEvict.refused++;
+				return;
+			}
+		}
+		else
+		{
+			s_gteEvict.sameMtx++;
+		}
 	}
 
 	entry->key = key;
@@ -299,6 +644,26 @@ int GTECapture_LookupDepth(s16 sx, s16 sy, u16 *outSz3)
 	}
 
 	*outSz3 = entry->sz3;
+	return 1;
+}
+
+// Provenance variant -- see the header. Deliberately a separate entry point
+// rather than an out-param bolted onto the above, so the existing consumers'
+// generated code is unchanged and any behaviour difference this session sees is
+// attributable to the new path alone.
+int GTECapture_LookupDepthEx(s16 sx, s16 sy, u16 *outSz3, u8 *outMtxId)
+{
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
+	u32 key = GTECapture_PackKey(sx, sy);
+	const GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
+
+	if ((entry->generation != buf->generation) || (entry->key != key))
+	{
+		return 0;
+	}
+
+	*outSz3 = entry->sz3;
+	*outMtxId = entry->mtxId;
 	return 1;
 }
 

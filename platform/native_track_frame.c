@@ -56,6 +56,17 @@ global_variable u32 s_trackFrameSeq;
 global_variable u32 s_trackFrameDroppedTotal;
 global_variable int s_trackFrameDroppedWarned;
 
+/* s33 leaf keep-alive (see the block in NativeTrackFrame_Record). Frames a
+ * leaf survives past its last appearance in the visible lists; 0 disables.
+ * dumpreq 'leafkeep N'. Default 15 (~half a second at 30fps) -- enough to
+ * cover a drift swing, small enough that the extra draws stay bounded. */
+int g_dbg_trackLeafKeep = 15;
+
+#define TRACKFRAME_KEEP_MAX_SLOTS 4096
+global_variable u16 s_leafKeepStamp[TRACKFRAME_KEEP_MAX_SLOTS];
+global_variable u16 s_leafKeepNow;
+global_variable const struct mesh_info *s_leafKeepMesh;
+
 /*
  * Walk one DrawLevelOvr1PRenderListSlot's linked list of visible BSP leaves,
  * appending every one that has a resident mesh range to dst->leafSlot.
@@ -256,6 +267,53 @@ global_variable s32 s_trkChkOursHi;
 global_variable s32 s_trkChkRetailLo;
 global_variable s32 s_trkChkRetailHi;
 
+/*
+ * s32 SHADER-FORMULA ARM. The check above computes the depth the way this FILE
+ * would in integers -- and it reports err=0..0, which is why three sessions
+ * concluded "the road's depth is not a wrong number".
+ *
+ * It is not the arithmetic that ships. The GPU recomputes depth from the
+ * COMPOSED rows (see the qw composition further down this file) as
+ *
+ *     w      = qw . (px, py, pz, 1)      where qw = [r20/h, r21/h, r22/h, trz/h]
+ *     viewZ  = w * h
+ *
+ * which is algebraically the same expression and numerically a different one:
+ * it divides by h, sums four terms that can be large and nearly cancelling, and
+ * multiplies back -- all in PICA200 float24 (1 sign, 7 exponent, 16 mantissa).
+ * A bias sweep put the road several hundred view.z units too near with a
+ * plateau from ~400 to 1400+, which no rounding error explains but which a
+ * checked-the-wrong-formula bug explains completely.
+ *
+ * So: same vertex, same frame, both formulas, both compared against retail's
+ * GTE. If the integer arm stays at 0 and this one does not, the gap between
+ * them IS the sink.
+ */
+global_variable u32 s_trkChkShSamples;
+global_variable s32 s_trkChkShMinErr;
+global_variable s32 s_trkChkShMaxErr;
+global_variable s32 s_trkChkShMaxAbsErr;
+global_variable double s_trkChkShSumAbsErr;
+global_variable float s_trkChkWLo;
+global_variable float s_trkChkWHi;
+
+/* Round a host float to what a PICA200 float24 register can hold: same sign and
+ * exponent fields, mantissa truncated from 23 bits to 16. Truncation rather
+ * than round-to-nearest because that is what dropping the low bits does, and
+ * this is meant to bound the hardware's error, not to flatter it. */
+internal float NativeTrackFrame_F24(float v)
+{
+	union
+	{
+		float f;
+		u32 u;
+	} x;
+
+	x.f = v;
+	x.u &= 0xFFFFFF80u;
+	return x.f;
+}
+
 void NativeTrackFrame_NoteRetailVertexDepth(const s16 *pos, u32 retailDepth)
 {
 	const struct NativeTrackFrameSnapshot *snap = &s_trackFrameBuf[s_trackFrameWriteIdx];
@@ -299,6 +357,59 @@ void NativeTrackFrame_NoteRetailVertexDepth(const s16 *pos, u32 retailDepth)
 		if (err > s_trkChkMaxErr) { s_trkChkMaxErr = err; }
 	}
 
+	/* Shader arm: reproduce the composed-row path term for term, rounding to
+	 * float24 at every step the GPU would. h comes from the same snapshot the
+	 * draw uses, so this is the number the PICA actually works with. */
+	if (snap->h != 0)
+	{
+		const float h = (float)snap->h;
+		const float qw0 = NativeTrackFrame_F24(NativeTrackFrame_F24((float)snap->rot[2][0] * (1.0f / 4096.0f)) / h);
+		const float qw1 = NativeTrackFrame_F24(NativeTrackFrame_F24((float)snap->rot[2][1] * (1.0f / 4096.0f)) / h);
+		const float qw2 = NativeTrackFrame_F24(NativeTrackFrame_F24((float)snap->rot[2][2] * (1.0f / 4096.0f)) / h);
+		const float qw3 = NativeTrackFrame_F24((float)snap->trans[2] / h);
+		float w = NativeTrackFrame_F24(qw0 * (float)pos[0]);
+		float viewZ;
+		s32 shOurs;
+		s32 shErr;
+		s32 shAbs;
+
+		w = NativeTrackFrame_F24(w + NativeTrackFrame_F24(qw1 * (float)pos[1]));
+		w = NativeTrackFrame_F24(w + NativeTrackFrame_F24(qw2 * (float)pos[2]));
+		w = NativeTrackFrame_F24(w + qw3);
+		viewZ = NativeTrackFrame_F24(w * h);
+
+		if (s_trkChkShSamples == 0)
+		{
+			s_trkChkWLo = w;
+			s_trkChkWHi = w;
+		}
+		else
+		{
+			if (w < s_trkChkWLo) { s_trkChkWLo = w; }
+			if (w > s_trkChkWHi) { s_trkChkWHi = w; }
+		}
+
+		shOurs = (s32)viewZ;
+		if (shOurs < 0) { shOurs = 0; }
+		if (shOurs > 65535) { shOurs = 65535; }
+		shErr = shOurs - retail;
+		shAbs = (shErr < 0) ? -shErr : shErr;
+
+		if (s_trkChkShSamples == 0)
+		{
+			s_trkChkShMinErr = shErr;
+			s_trkChkShMaxErr = shErr;
+		}
+		else
+		{
+			if (shErr < s_trkChkShMinErr) { s_trkChkShMinErr = shErr; }
+			if (shErr > s_trkChkShMaxErr) { s_trkChkShMaxErr = shErr; }
+		}
+		if (shAbs > s_trkChkShMaxAbsErr) { s_trkChkShMaxAbsErr = shAbs; }
+		s_trkChkShSumAbsErr += (double)shAbs;
+		s_trkChkShSamples++;
+	}
+
 	s_trkChkSamples++;
 	{
 		s32 absErr = (err < 0) ? -err : err;
@@ -318,6 +429,20 @@ void NativeTrackFrame_NoteRetailVertexDepth(const s16 *pos, u32 retailDepth)
 		                       NativePerf_CurrentLevelID(), (unsigned long)s_trkChkSamples, (long)s_trkChkMaxAbsErr,
 		                       s_trkChkSumAbsErr / (double)s_trkChkSamples, (unsigned long)s_trkChkOver1, (long)s_trkChkMinErr, (long)s_trkChkMaxErr,
 		                       (long)s_trkChkOursLo, (long)s_trkChkOursHi, (long)s_trkChkRetailLo, (long)s_trkChkRetailHi);
+
+		/* The two arms side by side. If shErr is a few hundred while err is 0,
+		 * the composed-row/float24 path is the sink and the integer check was
+		 * validating arithmetic the GPU never runs. w= is the intermediate the
+		 * dp4 produces before the multiply back by h: a range that straddles
+		 * zero, or one whose magnitude dwarfs viewZ/h, is cancellation. */
+		Platform_LogInstrument("[TRKDEPTHSH] n=%lu shErr=%ld..%ld shMaxAbs=%ld shMeanAbs=%.3f h=%d trz=%ld w=%.4f..%.4f\n",
+		                       (unsigned long)s_trkChkShSamples, (long)s_trkChkShMinErr, (long)s_trkChkShMaxErr,
+		                       (long)s_trkChkShMaxAbsErr, s_trkChkShSamples ? (s_trkChkShSumAbsErr / (double)s_trkChkShSamples) : 0.0,
+		                       (int)snap->h, (long)snap->trans[2], (double)s_trkChkWLo, (double)s_trkChkWHi);
+
+		s_trkChkShSamples = 0;
+		s_trkChkShMaxAbsErr = 0;
+		s_trkChkShSumAbsErr = 0.0;
 
 		s_trkChkSamples = 0;
 		s_trkChkOver1 = 0;
@@ -593,6 +718,66 @@ void NativeTrackFrame_Record(struct GameTracker *gGT, struct mesh_info *mesh, st
 		 * old wording would conclude a whole render-list slot was dead.
 		 */
 		NativeTrackFrame_WalkList(bspListBase, renderList->bspListStart_FullDynamic, dst, nodeCap);
+
+		/*
+		 * s33 leaf keep-alive -- the drift-corruption fix. Owner diagnosed the
+		 * artifact as HOLES (geometry missing behind the kart mid-drift), which
+		 * convicts the visibility list lagging fast camera swings, not the
+		 * behind-eye clamp class. A leaf therefore stays in the draw set for
+		 * g_dbg_trackLeafKeep frames after it last appeared in retail's own
+		 * visible lists ("visible union recently-visible"), which covers the
+		 * swing-behind-you case for a bounded cost instead of drawing the whole
+		 * level. Appended AFTER the real walks so visible leaves always win the
+		 * cap, and NEVER through the droppedLeaves/degraded path: stale leaves
+		 * are garnish, and running out of room for them must not blank the
+		 * frame the way a real visible-leaf drop does. Stamp 0 means "never
+		 * seen"; the counter skips 0 on wrap (one leaf mis-aged every ~36
+		 * minutes at 30fps is the accepted cost of a u16 stamp).
+		 */
+		if (g_dbg_trackLeafKeep > 0)
+		{
+			unsigned totalSlots = NativeTrackMesh_LeafCount();
+			unsigned slot;
+			u32 i;
+
+			if (totalSlots > TRACKFRAME_KEEP_MAX_SLOTS)
+			{
+				totalSlots = TRACKFRAME_KEEP_MAX_SLOTS;
+			}
+
+			/* New level = new slot numbering; stale stamps would keep the
+			 * wrong leaves for keepN frames. Mesh identity is the pointer the
+			 * build was verified against (NativeTrackMesh_IsBuiltFor above). */
+			if (mesh != s_leafKeepMesh)
+			{
+				memset(s_leafKeepStamp, 0, sizeof(s_leafKeepStamp));
+				s_leafKeepMesh = mesh;
+				s_leafKeepNow = 0;
+			}
+
+			if (++s_leafKeepNow == 0)
+			{
+				s_leafKeepNow = 1;
+			}
+
+			for (i = 0; i < dst->leafCount; i++)
+			{
+				if (dst->leafSlot[i] < TRACKFRAME_KEEP_MAX_SLOTS)
+				{
+					s_leafKeepStamp[dst->leafSlot[i]] = s_leafKeepNow;
+				}
+			}
+
+			for (slot = 0; (slot < totalSlots) && (dst->leafCount < NATIVE_TRACK_FRAME_MAX_LEAVES); slot++)
+			{
+				u16 stamp = s_leafKeepStamp[slot];
+
+				if ((stamp != 0) && (stamp != s_leafKeepNow) && ((u16)(s_leafKeepNow - stamp) <= (u16)g_dbg_trackLeafKeep))
+				{
+					dst->leafSlot[dst->leafCount++] = (u16)slot;
+				}
+			}
+		}
 
 		if (dst->droppedLeaves > 0)
 		{

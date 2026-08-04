@@ -29,8 +29,12 @@
 struct InstDrawPerPlayer;
 struct PushBuffer;
 struct TextureLayout;
-extern int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb);
+extern int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *inst);
 extern int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex);
+/* s33 instance depth-axis bracket -- same local-extern convention as
+ * DrawSky.c's suppression calls; platform/native_gte_capture.c. */
+extern void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct PushBuffer *pb, s32 mvpZIfNormal, int funcKind);
+extern void GTECapture_EndInstanceDepth(void);
 extern void NativeModelEmit_EndInstance(void);
 extern int NativeModelEmit_SkipRetailDraw(void);
 #endif
@@ -4415,7 +4419,17 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 	// is the A/B baseline every fps claim is measured against, so it has to be
 	// indistinguishable from a build with the feature compiled out.
 	// Implementation: platform/native_model_emit.c.
-	const int mdlCapture = NativeModelEmit_BeginInstance(ctx->idpp, ctx->pb);
+	/* Which primitive WRITER this instance uses decides whether its triangles are
+	 * semi-transparent regardless of their textures. GHOST and DEPTH_FADE write
+	 * the semi-transparent code 0x36 unconditionally (see their AtRange bodies
+	 * and their split twins); every other writer classifies by tpage, which the
+	 * capture can work out for itself. Computed here rather than passed as a raw
+	 * selector so the RB_RETAIL_INST_PRIM_* identifiers stay in game/.
+	 *
+	 * Missing this is what drew N. Tropy's Time Trial ghost solid. */
+	const u32 mdlPrimWriter = (u32)(uintptr_t)ctx->inst->funcPtr[1];
+	const int mdlForceBlend = (mdlPrimWriter == RB_RETAIL_INST_PRIM_GHOST) || (mdlPrimWriter == RB_RETAIL_INST_PRIM_DEPTH_FADE);
+	const int mdlCapture = NativeModelEmit_BeginInstance(ctx->idpp, ctx->pb, mdlForceBlend, ctx->inst);
 	/* State 1 means the native path REPLACES this one, so the packet write
 	 * below is skipped and what reaches the screen is unambiguously ours.
 	 * Evaluated once per instance, not per triangle, and only meaningful when
@@ -5270,33 +5284,92 @@ static void RenderBucket_DispatchDrawFunc(struct RenderBucketDrawContext *ctx)
 		return;
 	}
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s33 instance depth-axis bracket (native_gte_capture.c has the story):
+	 * every GTE store this instance's draw func produces is unscaled from
+	 * retail's regime axis onto the track's view.z axis. mvp.t[2] is the
+	 * adjusted view position for EVERY func -- RenderBucket_StoreMatrixWords
+	 * writes only the five packed rotation words, so the split/special
+	 * matrix swaps never touch the translation StoreMvpTranslation wrote.
+	 * The funcKind map lives here so RB_RETAIL_DRAWFUNC_* stays in game/. */
+	{
+		int axisFunc;
+
+		switch ((u32)ctx->idpp->unkEC)
+		{
+		case RB_RETAIL_DRAWFUNC_NORMAL:
+		{
+			axisFunc = 0;
+			break;
+		}
+		case RB_RETAIL_DRAWFUNC_NORMAL_ALT:
+		{
+			axisFunc = 1;
+			break;
+		}
+		case RB_RETAIL_DRAWFUNC_SPLIT:
+		{
+			axisFunc = 2;
+			break;
+		}
+		case RB_RETAIL_DRAWFUNC_SPECIAL:
+		{
+			axisFunc = 3;
+			break;
+		}
+		default:
+		{
+			axisFunc = 4;
+			break;
+		}
+		}
+		GTECapture_BeginInstanceDepth(ctx->inst, ctx->pb, ctx->idpp->mvp.t[2], axisFunc);
+	}
+#endif
+
 	switch ((u32)ctx->idpp->unkEC)
 	{
 	case RB_RETAIL_DRAWFUNC_NORMAL:
+	{
 		RenderBucket_DrawFunc_Normal(ctx);
-		return;
+		break;
+	}
 
 	case RB_RETAIL_DRAWFUNC_NORMAL_ALT:
+	{
 		RenderBucket_DrawFunc_NormalAlt(ctx);
-		return;
+		break;
+	}
 
 	case RB_RETAIL_DRAWFUNC_SPLIT:
+	{
 		RenderBucket_DrawFunc_Split(ctx);
-		return;
+		break;
+	}
 
 	case RB_RETAIL_DRAWFUNC_SPECIAL:
+	{
 		RenderBucket_DrawFunc_Special(ctx);
-		return;
+		break;
+	}
 
 	case RB_RETAIL_DRAWFUNC_REFLECTION:
+	{
 		RenderBucket_DrawFunc_Reflection(ctx);
-		return;
+		break;
+	}
 
 	default:
+	{
 		// TODO(aalhendi): Port any newly observed draw handlers.
 		// Do not fall through to normal draw; that masks live retail handler rows.
-		return;
+		break;
 	}
+	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	GTECapture_EndInstanceDepth();
+#endif
 }
 
 static int RenderBucket_PrepareDrawContext(struct RenderBucketDrawContext *ctx, struct Instance *inst, struct Instance *instPlayerBase, struct PrimMem *primMem)

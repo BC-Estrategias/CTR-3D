@@ -28,6 +28,7 @@
 // about fifteen lines earlier in the same function.
 
 struct InstDrawPerPlayer;
+struct Instance;
 struct PushBuffer;
 struct TextureLayout;
 
@@ -45,7 +46,19 @@ extern int g_dbg_modelRender;
 // camera terms the projection needs. Returns 0 when capture is inactive (toggle
 // off, snapshot full, feature compiled out) -- callers use it to skip the
 // per-triangle calls entirely rather than paying a test per triangle.
-int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb);
+//
+// forceSemiTrans: this instance's primitive WRITER emits semi-transparent
+// primitives unconditionally, ignoring its textures (the ghost and depth-fade
+// writers do; the normal one classifies by tpage like everything else). The
+// caller computes it because the writer identifiers live in game/. Getting it
+// wrong in the 0 direction is what made N. Tropy's ghost draw solid.
+//
+// inst: the instance being drawn, for the [AXISCHK] cross-class depth-axis
+// check (its world translation is pushed through matrix_ViewProj -- the TRACK
+// renderer's axis -- and compared against mvp.t[2], the axis every per-prim SZ
+// this path and the packet stamps inherit). Only read under
+// --model-depth-check; may be NULL, which skips the check for this instance.
+int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *inst);
 
 // One triangle, in the exact form the software GTE was about to consume:
 // packedXY3[i] is that corner's GTE VXY register (VX in the low halfword, VY in

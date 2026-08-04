@@ -322,6 +322,11 @@ void N3DS_C3DSetColorDoubling(int enable);
  * takes effect at the next recorded draw. */
 void N3DS_C3DSetBlendMode(int blendMode);
 
+/* Depth-WRITE mask only (the LEQUAL test stays on). Translucent content must
+ * test but not write; see N3DS_MergeEmit in native_renderer_3ds.c. NOT deduped
+ * internally -- the caller memoizes, unlike the blend setter above. */
+void N3DS_C3DSetDepthWrite(int enable);
+
 /* ------------------------------------------------------ VRAM display --- */
 /* Dedicated (not atlas-shared) textures backing NativeRenderer_PresentVRAMRect/
  * PresentVRAMDisplay -- the boot-time SCEA/copyright VRAM-mirror blit. This

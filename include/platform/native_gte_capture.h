@@ -30,6 +30,13 @@ int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8);
 // True view-space depth (SZ3) for a packet's screen coordinate -- the shared
 // depth axis the track renderer already uses. docs/PACKET_DEPTH_DESIGN.md.
 int GTECapture_LookupDepth(s16 sx, s16 sy, u16 *outSz3);
+// Same, plus the matrix-state id the stored projection ran under (s32 sinking
+// racers). The packet-depth path uses it as PROVENANCE: an entry stored under
+// the frame's dominant matrix came from camera-space world geometry (track,
+// scenery), one stored under any other came from a per-object instance (karts,
+// crates). A kart primitive whose vertices come back carrying the camera's id
+// is reading a depth that belongs to the road it is standing on.
+int GTECapture_LookupDepthEx(s16 sx, s16 sy, u16 *outSz3, u8 *outMtxId);
 int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3]);
 // Model vector plus the frame-scoped matrix-state id the projection ran
 // under (s26 matrix-class probe; the retained full form's matrix classes).
@@ -38,6 +45,49 @@ int GTECapture_LookupModelEx(s16 sx, s16 sy, s16 outV[3], u8 *outMtxId);
 void GTECapture_NoteMatrix(const void *words8);
 // Read-buffer census: returns dominant-id Store share in percent.
 u32 GTECapture_ReadMatrixCensus(u8 *outDomId, u32 *outIdsUsed);
+
+// s32 EVICTION CENSUS -- the direct measurement of the failure this file
+// already documents for the skybox (see GTECapture_SetStoreSuppressed): the
+// table holds one entry per screen coordinate, last writer wins, so a vertex
+// can overwrite ANOTHER OBJECT's depth at the same pixel and every later lookup
+// there returns a foreign value. A kart's wheels and the road beneath them
+// occupy the same screen coordinates by construction, which makes this the
+// leading candidate for the sinking racers.
+//
+// Counts same-key, same-generation overwrites, split by whether the incoming
+// store's matrix state differs from the resident entry's. Returns the
+// different-matrix count (the harmful population) and clears the accumulator;
+// *outSameMtx is the benign self-overwrite count, *outMaxDz the largest sz3
+// difference any harmful overwrite introduced -- i.e. how big the lie is, in
+// the same view.z units the stamps use.
+u32 GTECapture_ReadEvictCensus(u32 *outSameMtx, u32 *outMaxDz);
+
+// s32 mechanism-1 A/B. 1 = a store may not overwrite a live entry belonging to
+// a DIFFERENT matrix state (first writer keeps the slot). Not a proposed fix --
+// first-writer-wins is as arbitrary as last-writer-wins -- but if the sink
+// responds to it at all, eviction is in the causal chain.
+extern int g_dbg_gteNoEvict;
+
+// s33 instance depth-axis bracket: retail projects RenderBucket instances on
+// a regime-scaled depth axis (x4 nearer than 0x1000 view units, /4 for far
+// DRAW_HUGE), so their SZ3 stores were 4x wrong on the shared axis and a
+// table HIT buried the instance (the miss fallback is OT-bucket-derived and
+// was always roughly right). The bracket wraps one instance's draw-func
+// execution; stores inside it are classified {4x,1x,1/4x} against the
+// instance origin's track-axis view.z and unscaled before anything reads
+// them. mvpZIfNormal: idpp->mvp.t[2] for the NORMAL/NORMAL_ALT funcs (exact
+// classification), or -1 for split/special/reflection (mvp holds a view or
+// identity matrix there; classification then uses the first stored SZ3).
+// funcKind: 0=normal 1=normalAlt 2=split 3=special 4=reflection.
+// Implementation comment in native_gte_capture.c has the full story.
+struct Instance;
+struct PushBuffer;
+void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct PushBuffer *pb, s32 mvpZIfNormal, int funcKind);
+void GTECapture_EndInstanceDepth(void);
+// Runtime A/B for the unscale (dumpreq 'pktaxisfix'); default ON, OFF is the
+// ice-pond vanish. The [PKTAXIS] instrument rides --model-depth-check.
+extern int g_dbg_pktAxisFix;
+
 void GTECapture_Clear(void);
 // Double-buffer publish (s26): called by the DrawOTag facade on the game
 // thread, before the walk is posted (3DS worker) or run (PC sync) -- the walk

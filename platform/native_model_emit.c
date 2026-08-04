@@ -115,6 +115,80 @@ struct NativeModelEmitInstance
 	s32 trans[3];
 	s32 h;
 	s32 ofx, ofy;
+	/*
+	 * This instance's primitive WRITER forces semi-transparency regardless of
+	 * what its textures say.
+	 *
+	 * Found by N. Tropy's ghost coming out solid. Classifying by the texture
+	 * page's ABR field is correct for the normal writer -- RenderBucket's own
+	 * selection (`(texWord1 & 0x00600000) == 0x00600000 ? 0x34 : 0x36`,
+	 * QueueExecute:2928/3534) is the same rule and the same polarity as the
+	 * track's -- but models have SEVEN primitive writers, and two of them never
+	 * consult the texture at all: RB_RETAIL_INST_PRIM_GHOST and
+	 * RB_RETAIL_INST_PRIM_DEPTH_FADE write the semi-transparent code 0x36
+	 * unconditionally (:3141/:3365 and their split twins :3683/:3770).
+	 *
+	 * So this is not "which texture", it is "which writer", and the writer is an
+	 * instance property (`inst->funcPtr[1]`, the DispatchDrawInstPrim switch at
+	 * :3419) -- hence a per-instance flag rather than anything per face. The
+	 * game side computes the boolean so the RB_RETAIL_INST_PRIM_* constants stay
+	 * in game/ where they belong.
+	 */
+	u8 forceSemiTrans;
+
+	/*
+	 * Depth-axis regime of this instance's mvp, the s33 sink fix.
+	 *
+	 * Retail's instance pipeline is regime-scaled: RenderBucket_
+	 * AdjustViewPositionForMvp shifts the MVP translation <<2 when the
+	 * instance origin is nearer than 0x1000 view units ("to match the
+	 * full-scale model matrix"; RenderBucket_BuildM3x3's depthShift applies
+	 * the matching scale to the rotation), and DRAW_HUGE shifts >>2. So the
+	 * SZ axis this capture inherits is view.z TIMES 4 for near instances --
+	 * measured, not inferred: [AXISCHK] reads ratio 4.0000 exactly below
+	 * 4096 and 1.0000 exactly above, hundreds of samples per window. Retail
+	 * never notices because instances are OT-placed by the queue-phase depth
+	 * bin (unshifted), never by per-prim SZ -- a painter's algorithm is blind
+	 * to a class-wide monotone scale. A z-buffer is not: this is what buried
+	 * every near kart under the road (the s32 sink).
+	 *
+	 * trueViewZ = mvpViewZ >> depthShift. 2 = near regime (mvp is 4x), 0 =
+	 * far regime (mvp is true), -2 = far DRAW_HUGE (mvp is true/4). The draw
+	 * side divides hParam.x by the factor, which corrects depth WITHOUT
+	 * touching screen position -- the model shader uses hParam.x only to
+	 * recover view.z; screen x/y come from the qx/qy dp4s and the divide.
+	 */
+	s8 depthShift;
+
+	/*
+	 * Instance fade inputs, the rung-3 colour gap (s33).
+	 *
+	 * The design doc's ladder calls this rung "fog", and it is not distance
+	 * fog: RenderBucket_LoadPrimColors loads IR0 from idpp->alphaScale -- NOT
+	 * from the projection's depth-cue -- and gte_dpct interpolates the three
+	 * primitive colours toward the FAR COLOUR the instance's setup callback
+	 * put in RFC/GFC/BFC. It is the per-INSTANCE fade/tint mechanism (spawn
+	 * fade-ins, fade-outs, tinted sections), constant across the instance's
+	 * primitives. Captured colours are pre-dpct, so without a replay the
+	 * native draw shows a fading instance at full brightness.
+	 *
+	 * Both inputs are captured at BeginInstance time, which runs after
+	 * RenderBucket_RunInstanceSetupCallback in the dispatch order -- so
+	 * whatever the callback loaded is what we read, with no re-derivation of
+	 * the callback zoo. alphaScale == 0 means the writer skips dpct entirely
+	 * (its own gate), so 0 doubles as this struct's "no fade" state.
+	 *
+	 * Residual, deliberate: the writer's second gate bit (the OT-entry
+	 * address test in RenderBucket_OTEntryPassesDpctGate) is per prim and per
+	 * depth bin, and the capture runs before the OT entry exists. That test
+	 * exists to reject sentinel OT addresses, which real drawn content never
+	 * is, so the replay treats it as always-pass. The ghost and depth-fade
+	 * WRITERS (gte_dpcs per prim) are a different mechanism and are NOT
+	 * replayed here -- their content is forceSemiTrans, bounded, and listed
+	 * as a known gap in the design doc.
+	 */
+	s16 alphaScale;
+	s32 fcR, fcG, fcB;
 };
 
 struct NativeModelEmitSnapshot
@@ -190,7 +264,91 @@ global_variable int s_modelEmitDropWarned;
 /* Not `global_variable` (= static): --model-depth-check sets this from
  * native_platform.c, which precedes this file in the unity TU. */
 int g_dbg_modelDepthCheck;
+
+/* The s33 sink fix (see NativeModelEmitInstance.depthShift). Not static: the
+ * 3DS dumpreq handler ('axisfix', n3ds_backend.c -- a separate TU) flips it
+ * for the hardware A/B. Default ON because OFF is the sink. */
+int g_dbg_modelAxisFix = 1;
+
+/* Rung 3: replay the normal writer's gte_dpct on captured colours (see
+ * NativeModelEmitInstance.alphaScale). Same cross-TU story as axisfix;
+ * dumpreq 'modelfade'. Default ON: OFF shows fading instances at full
+ * brightness on the native path. */
+int g_dbg_modelFade = 1;
+
+/*
+ * One DPCS component, mirroring native_gte_core.c's case 0x2a EXACTLY
+ * (gte_dpct is op 0x0F8002A: sf=1 so A() is >>12, lm=0 so Lm_B clamps to
+ * full s16). Kept as integer arithmetic, not float: the writer's packet
+ * colours come from the real GTE core, and the state-2 overlay is only an
+ * A/B if the two paths round identically.
+ *
+ *   t   = Lm_B(((FC << 12) - (C << 16)) >> 12)      clamp -32768..32767
+ *   mac = ((C << 16) + IR0 * t) >> 12
+ *   out = Lm_C(mac >> 4)                            clamp 0..255
+ */
+internal u8 NativeModelEmit_FadeComponent(int col, s32 farCol, int ir0)
+{
+	s64 t64 = (((s64)farCol << 12) - ((s64)col << 16)) >> 12;
+	s32 t = (t64 > 32767) ? 32767 : (t64 < -32768) ? -32768 : (s32)t64;
+	s64 mac = (((s64)col << 16) + ((s64)ir0 * t)) >> 12;
+	s32 out = (s32)(mac >> 4);
+
+	if (out < 0)
+	{
+		out = 0;
+	}
+	if (out > 255)
+	{
+		out = 255;
+	}
+	return (u8)out;
+}
 global_variable u32 s_modelDepthSamples;
+
+/*
+ * ---------------------------------------------------------------- [AXISCHK]
+ *
+ * Cross-CLASS depth-axis check, and the one comparison no earlier instrument
+ * ever made. [MDLDEPTH] proves our instance depth equals the GTE's SZ for the
+ * instance's own projection; [TRKDEPTHCHK] proves the road's equals the GTE's
+ * for the road's. Both pass at once even if the two GTE runs are in DIFFERENT
+ * UNITS -- retail never compares them either (instances are OT-placed by the
+ * queue-phase depth bin computed from the UNSHIFTED view position, never by
+ * per-prim SZ), so a class-wide unit mismatch is invisible on PS1 by
+ * construction and only surfaces under a real z-buffer (dmodel).
+ *
+ * Retail is explicit that the instance pipeline is regime-scaled:
+ * RenderBucket_AdjustViewPositionForMvp shifts the MVP translation <<2 when
+ * viewPos->vz < 0x1000 ("to match the full-scale model matrix"), and
+ * RenderBucket_BuildM3x3's depthShift applies the matching >>2 to the model
+ * scale in the far regime. So mvp.t[2] -- the axis every SZ this capture
+ * records AND every packet stamp inherits -- is NOT self-evidently the axis
+ * matrix_ViewProj puts the track on.
+ *
+ * This measures exactly that: the instance ORIGIN's view.z computed the
+ * track's way (matrix_ViewProj rotation row 2 against the camera-relative
+ * world position, integer, mirroring RenderBucket_GetViewPosition) against
+ * mvp.t[2]. Ratio per distance band; a ratio of 1.0 everywhere kills the
+ * theory, 4.0 (or a regime-split 4/1) names the sink's mechanism and its
+ * un-scale is the fix.
+ */
+global_variable u32 s_axisChkN[4];        /* bands by trueZ: <1024, <4096, <16384, rest */
+global_variable double s_axisChkSum[4];   /* sum of mvpZ/trueZ per band */
+global_variable double s_axisChkMin[4];
+global_variable double s_axisChkMax[4];
+global_variable u32 s_axisChkHuge;        /* DRAW_HUGE instances seen (they carry their own >>2) */
+global_variable u32 s_axisChkBehind;      /* trueZ < 128: too near/behind to ratio meaningfully */
+global_variable s32 s_axisChkRawTrue[4];  /* first raw pairs of the window, for exact numbers */
+global_variable s32 s_axisChkRawMvp[4];
+global_variable u32 s_axisChkRawN;
+global_variable u32 s_axisChkMaxResid;    /* worst |unscaled mvp - trueZ|, in true view.z units */
+
+/* Classified regime for the instance BeginInstance is currently opening --
+ * bridged into the snapshot slot at the field-store site because the slot is
+ * only allocated after the capacity check. Game-thread only, like the rest of
+ * the capture. */
+global_variable s8 s_modelEmitPendingDepthShift;
 global_variable u32 s_modelDepthOver1;
 global_variable double s_modelDepthSumAbsErr;
 global_variable s32 s_modelDepthMaxAbsErr;
@@ -243,7 +401,7 @@ internal int NativeModelEmit_TexIsSemiTrans(const struct TextureLayout *tex)
 	return (((CTR_ReadU16LE(&tex->tpage) >> 5) & 3) != 3);
 }
 
-int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb)
+int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *worldInst)
 {
 	struct NativeModelEmitSnapshot *dst = &s_modelEmitBuf[s_modelEmitWriteIdx];
 	struct NativeModelEmitInstance *inst;
@@ -252,6 +410,115 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 	if ((g_dbg_modelRender == 0) || (idpp == NULL) || (pb == NULL))
 	{
 		return 0;
+	}
+
+	/*
+	 * Depth-axis regime classification (see the depthShift field comment) --
+	 * runs for every captured instance, because the draw side needs the
+	 * shift to put this instance's depth on the track's axis.
+	 *
+	 * Self-calibrating rather than re-deriving retail's near/huge branches:
+	 * compute the instance origin's TRUE view.z on the track's axis, then
+	 * pick whichever of {4x, 1x, 1/4x} mvp.t[2] actually is. That measures
+	 * what retail's regime logic DID for this instance instead of predicting
+	 * what it should have done, so a rounding disagreement at the 0x1000
+	 * boundary cannot misclassify -- the candidates are a factor of 4 apart
+	 * and the residual is a handful of units.
+	 *
+	 * trueZ: matrix_ViewProj row 2 against the camera-relative world
+	 * position, >>12 -- the same integer arithmetic RenderBucket_
+	 * GetViewPosition runs through the GTE light matrix (MVMVA adds no
+	 * translation; retail subtracts the camera position explicitly first,
+	 * so this does too). SCREENSPACE_INSTANCE bypasses that transform in
+	 * retail (its matrix.t IS the view position), so it does here too --
+	 * the main-menu character is one of these, and it sinks like the rest.
+	 */
+	{
+		s8 shift = 0;
+
+		if (worldInst != NULL)
+		{
+			s64 trueZ;
+			s64 mvpZ = (s64)idpp->mvp.t[2];
+
+			if ((worldInst->flags & SCREENSPACE_INSTANCE) != 0)
+			{
+				trueZ = (s64)worldInst->matrix.t[2];
+			}
+			else
+			{
+				s64 dx = (s64)worldInst->matrix.t[0] - (s64)pb->pos.x;
+				s64 dy = (s64)worldInst->matrix.t[1] - (s64)pb->pos.y;
+				s64 dz = (s64)worldInst->matrix.t[2] - (s64)pb->pos.z;
+
+				trueZ = ((s64)pb->matrix_ViewProj.m[2][0] * dx + (s64)pb->matrix_ViewProj.m[2][1] * dy + (s64)pb->matrix_ViewProj.m[2][2] * dz) >> 12;
+			}
+
+			if (trueZ > 0)
+			{
+				s64 eNear = mvpZ - (trueZ << 2); /* near regime: mvp = 4x true */
+				s64 eFar = mvpZ - trueZ;         /* far regime: mvp = true */
+				s64 eHuge = (mvpZ << 2) - trueZ; /* far DRAW_HUGE: mvp = true/4 */
+
+				if (eNear < 0) { eNear = -eNear; }
+				if (eFar < 0) { eFar = -eFar; }
+				if (eHuge < 0) { eHuge = -eHuge; }
+
+				shift = (eNear <= eFar) ? ((eNear <= eHuge) ? 2 : -2) : ((eFar <= eHuge) ? 0 : -2);
+			}
+
+			/* [AXISCHK] -- the measurement that found the regime scale. Kept
+			 * as the fix's own verifier: resid is |unscaled mvp - trueZ| in
+			 * true view.z units, so a nonzero window names a content class
+			 * the classification above got wrong. */
+			if (g_dbg_modelDepthCheck && (trueZ >= 128))
+			{
+				double ratio = (double)mvpZ / (double)trueZ;
+				s64 unscaled = (shift == 2) ? (mvpZ >> 2) : (shift == -2) ? (mvpZ << 2) : mvpZ;
+				s64 resid = unscaled - trueZ;
+				int band = (trueZ < 1024) ? 0 : (trueZ < 4096) ? 1 : (trueZ < 16384) ? 2 : 3;
+
+				if (resid < 0)
+				{
+					resid = -resid;
+				}
+				if ((u32)resid > s_axisChkMaxResid)
+				{
+					s_axisChkMaxResid = (u32)resid;
+				}
+
+				if (s_axisChkN[band] == 0)
+				{
+					s_axisChkMin[band] = ratio;
+					s_axisChkMax[band] = ratio;
+				}
+				else
+				{
+					if (ratio < s_axisChkMin[band]) { s_axisChkMin[band] = ratio; }
+					if (ratio > s_axisChkMax[band]) { s_axisChkMax[band] = ratio; }
+				}
+				s_axisChkN[band]++;
+				s_axisChkSum[band] += ratio;
+
+				if ((worldInst->flags & DRAW_HUGE) != 0)
+				{
+					s_axisChkHuge++;
+				}
+
+				if (s_axisChkRawN < 4)
+				{
+					s_axisChkRawTrue[s_axisChkRawN] = (s32)trueZ;
+					s_axisChkRawMvp[s_axisChkRawN] = (s32)mvpZ;
+					s_axisChkRawN++;
+				}
+			}
+			else if (g_dbg_modelDepthCheck)
+			{
+				s_axisChkBehind++;
+			}
+		}
+
+		s_modelEmitPendingDepthShift = shift;
 	}
 
 	if (dst->instCount >= MODELEMIT_MAX_INSTANCES)
@@ -265,6 +532,18 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 	inst = &dst->insts[dst->instCount];
 	inst->firstTri = dst->triCount;
 	inst->triCount = 0;
+	inst->forceSemiTrans = (u8)(forceSemiTrans ? 1 : 0);
+	inst->depthShift = s_modelEmitPendingDepthShift;
+
+	/* Fade inputs (see the field comment). BeginInstance runs after the
+	 * instance setup callback in RenderBucket_DispatchDrawFunc's order, so
+	 * the far-colour registers hold exactly what the writer's gte_dpct will
+	 * read for this instance. CFC2 is the facade's own control-reg read --
+	 * a read, not a GTE op; nothing here perturbs writer-visible state. */
+	inst->alphaScale = idpp->alphaScale;
+	inst->fcR = (s32)CFC2(21);
+	inst->fcG = (s32)CFC2(22);
+	inst->fcB = (s32)CFC2(23);
 
 	for (r = 0; r < 3; r++)
 	{
@@ -440,6 +719,8 @@ int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const in
 		face->_pad[1] = 0;
 		face->_pad[2] = 0;
 
+		const struct NativeModelEmitInstance *mi = &dst->insts[s_modelEmitCurInst];
+
 		for (i = 0; i < 3; i++)
 		{
 			NativeModelEmit_UnpackVertex(packedXY3[i], packedZ3[i], &v[i].x, &v[i].y, &v[i].z);
@@ -454,17 +735,34 @@ int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const in
 			 * leaves its result in GTE registers and never touches
 			 * ctx->tempColor).
 			 *
-			 * Harmless at this rung (nothing draws from the snapshot) and
-			 * fixable without the GTE at rung 3: DPCT reads only IR0
-			 * (= idpp->alphaScale) and the far-colour registers, never any
-			 * projection state, so it is an ordinary lerp the emit side can do
-			 * in C. Recorded here so the first rung-2 screenshot showing
-			 * unfogged models is recognised as this and not as a shader bug.
+			 * Rung 3 (s33): the dpct is now replayed here in C, exactly as the
+			 * rung-1 comment predicted it could be -- IR0 is idpp->alphaScale
+			 * and FC is whatever the instance's setup callback loaded, both
+			 * captured at BeginInstance. The stored colour is therefore
+			 * POST-fade, matching the packet the writer is about to build, and
+			 * the draw side needs no new state. alphaScale == 0 mirrors the
+			 * writer's own skip gate.
 			 */
 			v[i].r = (u8)(u32)(color3[i] & 0xff);
 			v[i].g = (u8)(((u32)color3[i] >> 8) & 0xff);
 			v[i].b = (u8)(((u32)color3[i] >> 16) & 0xff);
 			v[i]._pad = 0;
+
+			/* forceSemiTrans excluded: the GHOST and DEPTH_FADE writers never
+			 * run LoadPrimColors' dpct -- they do their own per-prim gte_dpcs
+			 * -- so replaying the NORMAL writer's fade on their content is
+			 * applying a colour transform retail never applies. Shipping
+			 * without this test made TT ghosts nearly invisible and put an
+			 * unintended tint on Hot Air Skyway's depth-fade barriers
+			 * (owner-reported, s33). Their own dpcs replay is the known gap
+			 * recorded in the field comment above; until it lands, their
+			 * captured colours stay pre-fade, which is yesterday's behaviour. */
+			if (g_dbg_modelFade && (mi->alphaScale != 0) && !mi->forceSemiTrans)
+			{
+				v[i].r = NativeModelEmit_FadeComponent(v[i].r, mi->fcR, mi->alphaScale);
+				v[i].g = NativeModelEmit_FadeComponent(v[i].g, mi->fcG, mi->alphaScale);
+				v[i].b = NativeModelEmit_FadeComponent(v[i].b, mi->fcB, mi->alphaScale);
+			}
 		}
 	}
 
@@ -545,6 +843,90 @@ void NativeModelEmit_EndInstance(void)
 	s_modelEmitCurInst = -1;
 }
 
+/*
+ * [FADESELFTEST] -- proves NativeModelEmit_FadeComponent mirrors the real GTE
+ * core, by running the core. One shot, gated behind --model-depth-check, and
+ * placed at EndFrame: the frame's writers are done with the GTE, and the next
+ * frame reloads everything it reads before reading it. Every register this
+ * touches (colour FIFO, IR0-3, far colour) is saved and restored anyway, so
+ * even that ordering argument is belt-and-braces.
+ *
+ * Sweeps IR0 through the fade range including both clamp directions and FC
+ * through per-channel-distinct values, so a channel swap or a missed clamp in
+ * the C mirror cannot pass. mismatches=0 is the pass; any other number means
+ * the replay diverges from what the writer's own dpct produces.
+ */
+internal void NativeModelEmit_FadeSelfTest(void)
+{
+	static const int irs[] = {1, 37, 128, 1024, 2048, 4095, 4096, 8191};
+	static const int cols[] = {0, 1, 127, 200, 255};
+	static const s32 fcs[] = {0, 16, 255, 1200, 4080};
+	u32 savedRgb[3], savedIr[4];
+	s32 savedFc[3];
+	u32 n = 0, bad = 0;
+	int i, c, f, k;
+
+	savedRgb[0] = MFC2(20);
+	savedRgb[1] = MFC2(21);
+	savedRgb[2] = MFC2(22);
+	for (k = 0; k < 4; k++)
+	{
+		savedIr[k] = MFC2(8 + k);
+	}
+	savedFc[0] = (s32)CFC2(21);
+	savedFc[1] = (s32)CFC2(22);
+	savedFc[2] = (s32)CFC2(23);
+
+	for (i = 0; i < (int)(sizeof(irs) / sizeof(irs[0])); i++)
+	{
+		for (c = 0; c < (int)(sizeof(cols) / sizeof(cols[0])); c++)
+		{
+			for (f = 0; f < (int)(sizeof(fcs) / sizeof(fcs[0])); f++)
+			{
+				/* Distinct per channel: R gets cols[c]/fcs[f], G the next
+				 * entry of each, B the one after -- wraps within the table. */
+				const int cr = cols[c], cg = cols[(c + 1) % 5], cb = cols[(c + 2) % 5];
+				const s32 fr = fcs[f], fg = fcs[(f + 1) % 5], fb = fcs[(f + 2) % 5];
+				const u32 packed = (u32)cr | ((u32)cg << 8) | ((u32)cb << 16);
+				u32 out;
+
+				CTC2((u32)fr, 21);
+				CTC2((u32)fg, 22);
+				CTC2((u32)fb, 23);
+				MTC2(packed, 20);
+				MTC2(packed, 21);
+				MTC2(packed, 22);
+				MTC2((u32)irs[i], 8);
+				doCOP2(0x0F8002A); /* gte_dpct, the writer's own op word */
+
+				for (k = 0; k < 3; k++)
+				{
+					out = MFC2(20 + k);
+					n++;
+					if (((out & 0xff) != NativeModelEmit_FadeComponent(cr, fr, irs[i])) || (((out >> 8) & 0xff) != NativeModelEmit_FadeComponent(cg, fg, irs[i])) ||
+					    (((out >> 16) & 0xff) != NativeModelEmit_FadeComponent(cb, fb, irs[i])))
+					{
+						bad++;
+					}
+				}
+			}
+		}
+	}
+
+	MTC2(savedRgb[0], 20);
+	MTC2(savedRgb[1], 21);
+	MTC2(savedRgb[2], 22);
+	for (k = 0; k < 4; k++)
+	{
+		MTC2(savedIr[k], (s32)(8 + k));
+	}
+	CTC2((u32)savedFc[0], 21);
+	CTC2((u32)savedFc[1], 22);
+	CTC2((u32)savedFc[2], 23);
+
+	Platform_LogInstrument("[FADESELFTEST] n=%lu mismatches=%lu\n", (unsigned long)n, (unsigned long)bad);
+}
+
 void NativeModelEmit_EndFrame(void)
 {
 	struct NativeModelEmitSnapshot *dst = &s_modelEmitBuf[s_modelEmitWriteIdx];
@@ -563,6 +945,17 @@ void NativeModelEmit_EndFrame(void)
 	if (g_dbg_modelRender == 0)
 	{
 		return;
+	}
+
+	if (g_dbg_modelDepthCheck)
+	{
+		static int s_fadeSelfTestDone;
+
+		if (!s_fadeSelfTestDone)
+		{
+			s_fadeSelfTestDone = 1;
+			NativeModelEmit_FadeSelfTest();
+		}
 	}
 
 	dst->frameSeq = ++s_modelEmitSeq;
@@ -637,6 +1030,39 @@ void NativeModelEmit_EndFrame(void)
 			s_modelDepthOver1 = 0;
 			s_modelDepthSumAbsErr = 0.0;
 			s_modelDepthMaxAbsErr = 0;
+		}
+
+		/* [AXISCHK] window flush -- same boundary as [MDLDEPTH] so the two
+		 * lines describe the same stretch of play. One line per distance band
+		 * with samples; ratio = mvp.t[2] / trueZ-on-the-track-axis. */
+		if (g_dbg_modelDepthCheck)
+		{
+			static const char *bandName[4] = {"<1k", "1k-4k", "4k-16k", ">=16k"};
+			int b;
+			u32 total = s_axisChkN[0] + s_axisChkN[1] + s_axisChkN[2] + s_axisChkN[3];
+
+			if (total > 0)
+			{
+				for (b = 0; b < 4; b++)
+				{
+					if (s_axisChkN[b] == 0)
+					{
+						continue;
+					}
+					Platform_LogInstrument("[AXISCHK] lvl=%d band=%s n=%lu ratio=%.4f (%.4f..%.4f)\n", NativePerf_CurrentLevelID(), bandName[b],
+					                       (unsigned long)s_axisChkN[b], s_axisChkSum[b] / (double)s_axisChkN[b], s_axisChkMin[b], s_axisChkMax[b]);
+					s_axisChkN[b] = 0;
+					s_axisChkSum[b] = 0.0;
+				}
+				Platform_LogInstrument("[AXISCHK] lvl=%d huge=%lu behind=%lu maxResid=%lu raw: (%ld,%ld) (%ld,%ld) (%ld,%ld) (%ld,%ld)\n", NativePerf_CurrentLevelID(),
+				                       (unsigned long)s_axisChkHuge, (unsigned long)s_axisChkBehind, (unsigned long)s_axisChkMaxResid, (long)s_axisChkRawTrue[0],
+				                       (long)s_axisChkRawMvp[0], (long)s_axisChkRawTrue[1], (long)s_axisChkRawMvp[1], (long)s_axisChkRawTrue[2],
+				                       (long)s_axisChkRawMvp[2], (long)s_axisChkRawTrue[3], (long)s_axisChkRawMvp[3]);
+				s_axisChkHuge = 0;
+				s_axisChkBehind = 0;
+				s_axisChkMaxResid = 0;
+				s_axisChkRawN = 0;
+			}
 		}
 	}
 
@@ -773,6 +1199,31 @@ internal void NativeModelDraw_ComposeRows(const struct NativeModelEmitInstance *
 	qw[1] = r21 / h;
 	qw[2] = r22 / h;
 	qw[3] = trz / h;
+
+	/*
+	 * Depth-axis correction (the s33 sink fix -- see the depthShift field
+	 * comment). The shader recovers depth as viewZ = hParam.x * dp4(qw, v),
+	 * and hParam.x is used for NOTHING else -- screen x/y come from the
+	 * qx/qy dp4s and the GPU's divide, whose w is dp4(qw, v) alone. So
+	 * handing the draw side h scaled by the inverse regime factor puts this
+	 * instance's depth on the track's view.z axis while leaving its screen
+	 * position bit-identical. qx/qy/qw stay composed with the UNSCALED h:
+	 * they encode retail's own projection and must keep doing so.
+	 *
+	 * Toggle for the hardware A/B (dumpreq `axisfix`); default ON because
+	 * OFF is the sink.
+	 */
+	if (g_dbg_modelAxisFix)
+	{
+		if (inst->depthShift > 0)
+		{
+			*outH = h / (float)(1 << inst->depthShift);
+		}
+		else if (inst->depthShift < 0)
+		{
+			*outH = h * (float)(1 << -inst->depthShift);
+		}
+	}
 }
 
 /* Open run of triangles sharing one atlas + textured state. Runs never span
@@ -816,14 +1267,36 @@ internal void NativeModelDraw_FlushRun(struct NativeModelDrawRun *run, u32 *draw
  * needs the capture to carry the writer's primitive code, which is a rung 3
  * change to the hook, not to this function.
  */
-internal int NativeModelDraw_FaceBlend(const struct NativeModelEmitFace *face)
+internal int NativeModelDraw_FaceBlend(const struct NativeModelEmitFace *face, const struct NativeModelEmitInstance *inst)
 {
-	if (!face->textured)
+	/*
+	 * Returns a BlendMode directly (0 = opaque, else PSX ABR + 1, matching
+	 * native_gpu.c:49's GET_TPAGE_BLEND) rather than an ABR, because "ABR 3"
+	 * and "opaque" are NOT the same thing once a writer can force blending:
+	 * a forced face whose page carries ABR 3 blends as B+F/4
+	 * (BM_ADD_QUATER_SOURCE), it does not become opaque. The earlier version of
+	 * this function returned an ABR and used 3 as its opaque sentinel, which
+	 * made that state impossible to express.
+	 */
+	if (inst->forceSemiTrans)
 	{
-		return 3;
+		/* The writer decided ABE; the tpage still decides HOW. An untextured
+		 * ghost face has tpage 0, giving ABR 0 = B/2 + F/2 -- the ordinary
+		 * half-and-half blend, which is what a ghost should look like. */
+		return (int)((face->tpage >> 5) & 3) + 1;
 	}
 
-	return (int)((face->tpage >> 5) & 3);
+	if (!face->textured)
+	{
+		return 0;
+	}
+
+	{
+		const int abr = (int)((face->tpage >> 5) & 3);
+
+		/* ABR 3 is CTR's "this page is opaque" sentinel for the normal writer. */
+		return (abr == 3) ? 0 : (abr + 1);
+	}
 }
 
 void NativeModelDraw_IssueForWalk(void)
@@ -897,8 +1370,8 @@ void NativeModelDraw_IssueForWalk(void)
 			const u32 triIndex = inst->firstTri + t;
 			const struct NativeModelEmitFace *face = &snap->faces[triIndex];
 			const struct NativeModelEmitVert *src = &snap->verts[triIndex * 3];
-			const int faceAbr = NativeModelDraw_FaceBlend(face);
-			const int faceIsBlended = (faceAbr != 3);
+			const int faceBlendMode = NativeModelDraw_FaceBlend(face, inst);
+			const int faceIsBlended = (faceBlendMode != 0);
 			N3DS_Vertex out[3];
 			int atlasIdx = -1, pixelBaseU = 0, pixelBaseV = 0, originU = 0, originV = 0;
 			int textured = face->textured;
@@ -935,11 +1408,7 @@ void NativeModelDraw_IssueForWalk(void)
 			else
 			{
 				view = N3DS_TEXVIEW_PASS2;
-				/* ABR -> BlendMode is +1: native_gpu.c:49's GET_TPAGE_BLEND is
-				 * literally ((tpage >> 5) & 3) + 1, so track, packet and model
-				 * content all reach identical GPU blend state from identical
-				 * source data. */
-				runBlend = faceAbr + 1;
+				runBlend = faceBlendMode; /* already a BlendMode, see FaceBlend */
 			}
 
 			/* Deferred until a triangle actually survives the pass filter, so a
@@ -1083,10 +1552,12 @@ void NativeModelDraw_IssueForWalk(void)
 
 int g_dbg_modelRender = 0;
 
-int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb)
+int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *worldInst)
 {
 	(void)idpp;
 	(void)pb;
+	(void)forceSemiTrans;
+	(void)worldInst;
 	return 0;
 }
 
