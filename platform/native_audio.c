@@ -3431,17 +3431,21 @@ internal int NativeAudio_XAStreamCountAudioSectors(struct NativeAudioXaSource *s
  * not XA), the XA MUSIC files are 26 MiB, and the count memo below still
  * removes their repeat whole-file scans after the first open of each track.
  */
-#define NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES (16u * 1024u * 1024u)
+#define NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES (32u * 1024u * 1024u)
 #define NATIVE_AUDIO_XA_TRACK_INDEX_MAX       512
 #define NATIVE_AUDIO_XA_CATEGORY_MUSIC        0
 #define NATIVE_AUDIO_XA_CATEGORY_EXTRA        1
 #define NATIVE_AUDIO_XA_CATEGORY_GAME         2
-/* The only EXTRA tracks that can fire during racing (HOWL_Voiceline.c
- * Voiceline_Update: the wrong-way bark, good-guy/bad-guy variants). Mask
- * hints and the N.Tropy lines are hub/results-screen speech; a streaming
- * stall there costs nothing a racer can feel. */
-#define NATIVE_AUDIO_XA_EXTRA_WRONG_WAY_GOOD 0x1e
-#define NATIVE_AUDIO_XA_EXTRA_WRONG_WAY_BAD  0x3d
+/* All of EXTRA is cached. 0..0x3d is the Aku/Uka speech table (hint IDs
+ * 0..0x1d in Aku's voice, the same rows at +ADV_MASK_HINT_UKA_UKA_XA_OFFSET
+ * in Uka's, the wrong-way barks as the last row of each half) -- hints fire
+ * while DRIVING the adventure hubs and the barks mid-race, 13.0 MiB
+ * measured. The rest (narration, N.Tropy lines, 4.8 MiB) rode along after
+ * hardware showed the intro narration popping against boot's SD contention
+ * (4.2s of reads, worst call 41ms on the slow card) -- owner asked for it
+ * cached. The one EXTRA play that still streams is MainMain's boot-time
+ * XAPlay(EXTRA, 0x50): it fires before the first loading screen, so the
+ * cache does not exist yet. */
 
 struct NativeAudioXaVoiceCacheTrack
 {
@@ -3496,8 +3500,8 @@ internal int NativeAudio_XAVoiceCacheWantsTrack(int categoryID, int xaID)
 	{
 		return 1;
 	}
-	return (categoryID == NATIVE_AUDIO_XA_CATEGORY_EXTRA) &&
-	       ((xaID == NATIVE_AUDIO_XA_EXTRA_WRONG_WAY_GOOD) || (xaID == NATIVE_AUDIO_XA_EXTRA_WRONG_WAY_BAD));
+	(void)xaID;
+	return categoryID == NATIVE_AUDIO_XA_CATEGORY_EXTRA;
 }
 
 /* Open `source` RAM-backed from the cache. Caller must have cleared the
