@@ -10,16 +10,47 @@
 ; normalize GPU_SHORT/GPU_UNSIGNED_BYTE, so the raw integers must be scaled
 ; here, not on the CPU). No page/clut reaches the GPU at all -- texture
 ; resolution happens on the CPU before binding (see
-; docs/CITRO3D_RENDERER_DESIGN.md, sections 1 and 6). No blending, no stereo
-; eye offset yet -- both staged for later phases in the same doc.
+; docs/CITRO3D_RENDERER_DESIGN.md, sections 1 and 6). No blending.
+;
+; STEREO (the "later phase" the original header deferred): each eye adds a
+; per-vertex horizontal parallax p = k - kC/d, where d is the vertex's depth
+; on the shared view.z axis. Packets recover d from their own depth stamp:
+; z = 32767 - sz3 when the s29 packet-depth model is on (g_dbg_packetDepth,
+; native_gpu.c), so d = 32767 - z IS sz3. When packet depth is OFF the stamp
+; is an emit ordinal and d would be nonsense -- the CPU side handles that by
+; sending a zero `stereo` uniform (N3DS_StereoEyeVec, n3ds_backend.c), which
+; makes p identically 0 rather than gating in the shader. The near band
+; (stamps 0xFF00..0xFFFF = 2D/UI content, d < 256) always takes p = 0 via
+; the mask below: HUD/menus sit at screen depth, which is both correct and
+; the M2 3D-Classics convention.
 
 ; Uniforms
 .fvec projection[4]
+; Per-eye parallax, computed CPU-side per frame (n3ds_backend.c
+; N3DS_StereoEyeVec): x = k (full shift at infinite depth, PSX px, signed
+; per eye), y = k*convergence, z/w = clamp lo/hi for p. All zeros when the
+; slider is down, the right target failed, or packet depth stamping is off.
+; f4 -- and BOTH sibling programs park other uniforms on f4 (ctr_model's qx,
+; ctr_track's projection row 1), so this must be re-uploaded on every return
+; to packet state: N3DS_BindPacketDrawState does, same discipline as the
+; projection rows above it (the s29 register-collision lesson).
+.fvec stereo
 
 ; Constants
 .constf constants(0.0, 1.0, -1.0, 0.0)
 .alias  zeros constants.xxxx
 .alias  ones  constants.yyyy
+.alias  negOnes constants.zzzz
+
+; Stereo constants. x = 32767 (depth stamp -> view.z axis: d = 32767 - z, the
+; exact inverse of the packet side's z = 32767 - sz3 stamp). y = 255.5 -- the
+; UI-band edge, strictly between the band's deepest world stamp (d = 256) and
+; the band's own values (d <= 255); the slt against it is the "world content
+; only" mask. Half-integer on purpose: both neighbours are exactly
+; representable in float24 and neither can land ON the threshold.
+.constf stereoConst(32767.0, 255.5, 0.0, 0.0)
+.alias  stereoBias stereoConst.xxxx
+.alias  uiBandEdge stereoConst.yyyy
 
 ; texcoordScale is 1/2048, NOT 1/N3DS_ATLAS_DIM: vertex UVs arrive as
 ; texel-CENTER numerators (2*texel + 1, see DrawTriangles) so the sampled
@@ -51,6 +82,26 @@
 	; enabled and this value is inert. w=1.
 	mov r0.xyz, inpos.xyz
 	mov r0.w,  ones
+
+	; ---- STEREO parallax (header comment) --------------------------------
+	; d = 32767 - z, clamped to >= 1 BEFORE the rcp: d can be exactly 0 (a
+	; stamp of 0xFFFF), rcp(0) is inf, and inf * 0 from the mask multiply is
+	; NaN -- which poisons the position instead of zeroing the shift. The
+	; mask itself uses the UNCLAMPED d so the clamp cannot promote a UI
+	; vertex into the world band. All uniform/constant operands ride src1
+	; (PICA200's src2 cannot address the constant bank -- see the mul below).
+	mul r1.x, negOnes, r0.z             ; -z
+	add r1.x, stereoBias, r1.x          ; d = 32767 - z
+	slt r1.y, uiBandEdge, r1.x          ; mask = (d > 255.5) ? 1 : 0
+	max r1.x, ones, r1.x                ; d >= 1, rcp stays finite
+	rcp r1.z, r1.x                      ; 1/d
+	mul r1.w, stereo.yyyy, r1.z         ; kC/d
+	mul r1.w, negOnes, r1.w             ; -kC/d (no SUB opcode)
+	add r1.w, stereo.xxxx, r1.w         ; p = k - kC/d
+	max r1.w, stereo.zzzz, r1.w         ; p >= lo (pop-out clamp)
+	min r1.w, stereo.wwww, r1.w         ; p <= hi
+	mul r1.w, r1.y, r1.w                ; UI band: p = 0
+	add r0.x, r0.x, r1.w                ; shifted screen X (both temps)
 
 	dp4 outpos.x, projection[0], r0
 	dp4 outpos.y, projection[1], r0

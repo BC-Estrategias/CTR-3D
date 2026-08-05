@@ -131,6 +131,37 @@ void N3DS_C3DSetProjection(float left, float right, float bottom);
 void N3DS_C3DBeginFrame(void);
 void N3DS_C3DEndFrame(void);
 
+/* ------------------------------------------------------------- stereo 3D --- */
+/*
+ * Depth-layered stereoscopic 3D (PORT_FEASIBILITY_3DS.md "Stereoscopic 3D",
+ * Option A grown into per-vertex parallax): the physical 3D slider drives a
+ * per-eye horizontal shift computed in all three vertex programs from the
+ * shared view.z depth axis the s28-s33 depth campaign built. The left eye is
+ * the ordinary frame (drawn with the left eye's negative parallax when the
+ * slider is up, zero when it is down); the right eye is a REPLAY of the same
+ * frame's already-recorded draws -- merge-bin emits by (baseVertex, count)
+ * into the same persistent frame VBO, track leaves from the resident mesh,
+ * model runs from their already-appended vertices -- against a second render
+ * target, with only the parallax uniform flipped. No game code runs twice,
+ * no vertices are re-appended, no textures re-resolve.
+ *
+ * N3DS_C3DBeginFrame latches the slider for the whole frame (journal reset,
+ * eye = left); the backend's Track/Model brackets and the renderer's merge
+ * emit record into the journal only while a stereo frame is active, so a
+ * slider at zero costs nothing over today's frame. The renderer calls
+ * N3DS_StereoRenderRightEye once per frame from EndScene, just before
+ * N3DS_C3DEndFrame; it no-ops in mono. Right-eye draws are NOT counted in
+ * s_drawCallCount / [PERF] draw stats -- those remain per-eye numbers.
+ *
+ * Record hooks exposed to the renderer TU (both no-op when not recording):
+ * RecordPacket mirrors one N3DS_MergeEmit (state resolved, not policy);
+ * RecordVram mirrors one PresentVRAM chunk quad (its texture slot contents
+ * persist to frame end, so the replay samples this frame's own pixels).
+ */
+void N3DS_StereoRecordPacket(int blendMode, int doubling, int depthWrite, int atlas, int baseVertex, int vertCount);
+void N3DS_StereoRecordVram(int slot, int baseVertex);
+void N3DS_StereoRenderRightEye(void);
+
 /*
  * One real vertex buffer per FRAME, not per draw. C3D_DrawArrays only
  * appends GPU commands to a command list; the GPU doesn't actually read any

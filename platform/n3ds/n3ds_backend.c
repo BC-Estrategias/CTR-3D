@@ -292,6 +292,16 @@ void N3DS_GfxInit(void)
 	gfxInitDefault();
 
 	/*
+	 * Stereoscopic 3D: double-buffer the top screen's RIGHT framebuffer too.
+	 * Costs ~576KB of linear heap up front; with the physical slider at zero
+	 * the parallax barrier is off, the right buffer is never presented, and
+	 * the render path draws one eye exactly as before (N3DS_StereoLatchFrame).
+	 * Called here, before any framebuffer is fetched, because gfxSet3D
+	 * reallocates the top screen's buffers.
+	 */
+	gfxSet3D(true);
+
+	/*
 	 * The debug/stats console lives on the bottom screen now that citro3d
 	 * (N3DS_C3DInit, below) owns the top screen's render target. The two
 	 * coexist because they drive different physical screens through
@@ -384,6 +394,7 @@ int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH)
 static DVLB_s *s_shaderDvlb = NULL;
 static shaderProgram_s s_shaderProgram;
 static int s_uLocProjection = -1;
+static int s_uLocStereo = -1;
 static C3D_RenderTarget *s_renderTarget = NULL;
 
 static C3D_Mtx s_projection;
@@ -420,7 +431,7 @@ static int s_trackAtlasUnitsAllocated = 0;
 static DVLB_s *s_modelShaderDvlb = NULL;
 static shaderProgram_s s_modelShaderProgram;
 static int s_modelULocQx = -1, s_modelULocQy = -1, s_modelULocQw = -1;
-static int s_modelULocProjection = -1, s_modelULocH = -1;
+static int s_modelULocProjection = -1, s_modelULocH = -1, s_modelULocStereo = -1;
 /* Texenv memo, same idea and lifetime rule as s_trackTexturedState: reset by
  * N3DS_ModelDraw_Begin because the packet path owns texenv 0 between model
  * frames. -1 = unknown, so the first Run after a Begin always emits. */
@@ -447,7 +458,7 @@ static DVLB_s *s_trackShaderDvlb = NULL;
 static shaderProgram_s s_trackShaderProgram;
 static int s_trackULocQx = -1, s_trackULocQy = -1, s_trackULocQw = -1;
 static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange = -1;
-static int s_trackULocUvOffset = -1;
+static int s_trackULocUvOffset = -1, s_trackULocStereo = -1;
 /* Memo for the blend pass's depth-write state, so a frame with no semi-
  * transparent content pays nothing and a frame with some flips the pair exactly
  * twice. -1 = unknown/not set this bracket, forcing the first draw to assert. */
@@ -481,6 +492,255 @@ static int s_trackGeomVertStride = 0;
  * any Begin/Leaf/End call-order mistake upstream). */
 static int s_trackDrawActive = 0;
 #endif /* CTR_NATIVE_TRACK_RENDERER */
+
+/* ------------------------------------------------------------- stereo 3D --- */
+/*
+ * See n3ds_backend.h's stereo block for the design. State here, in the order
+ * it is used: master toggle and tuning (dumpreq `stereo`/`stereosep`/
+ * `stereoconv`), the per-frame latch, the per-eye parallax vectors, and the
+ * draw journal the right eye replays.
+ *
+ * The parallax model is p = k * (1 - convergence/depth) in PSX screen pixels,
+ * on the shared view.z axis all three geometry sources sit on since s33.
+ * Content AT the convergence depth has zero disparity (screen plane), farther
+ * content goes into the screen (up to k px per eye at infinity), nearer
+ * content pops out (clamped, see N3DS_StereoEyeVec). The physical slider
+ * scales k continuously, so the slider IS the runtime control -- the dumpreq
+ * tokens only tune the endpoints.
+ *
+ * Sign derivation (not a guess): an object behind the screen plane, viewed
+ * from the right eye at +e/2, projects onto the screen at +x -- far content
+ * shifts RIGHT in the right eye. p = k*(1 - C/d) with k > 0 for the right
+ * eye gives exactly that. If hardware disagrees, `stereosep -12` is the A/B.
+ */
+int g_dbg_stereo = 1; /* master enable; the slider still gates frame by frame */
+/*
+ * WINDOW MODE (owner-diagnosed, s34 night 2): with pop-out allowed, the
+ * clamp band turns the near ground into a constant-disparity sheet -- a
+ * horizontal crease where graded road meets clamped road, which the owner
+ * perceived as the ground "folding down" as it passes the kart. Window mode
+ * forbids crossed disparity entirely: the clamp band's pop-out side becomes
+ * 0, so the world starts AT the screen surface and only recedes. The flat
+ * zone still exists but now coincides with the physical screen, which the
+ * eye accepts as "the window frame" -- the standard comfortable-3DS
+ * convention. Default ON; dumpreq `stereowindow` flips back for the A/B.
+ */
+int g_dbg_stereoWindow = 1;
+static C3D_RenderTarget *s_renderTargetRight = NULL;
+static float s_stereoSep = 12.0f;    /* k*2 at full slider: total left/right disparity at infinite depth, PSX px */
+static float s_stereoConv = 1200.0f; /* view.z units at screen depth (just beyond the player kart's ~256..2278 band) */
+static int s_stereoFrameActive = 0;  /* latched once per frame in N3DS_C3DBeginFrame */
+static int s_stereoRecording = 0;    /* journal writes enabled: active frame, and cleared for
+                                      * the replay so re-entered functions cannot re-record */
+static int s_stereoEye = 0; /* 0 = left (and mono), 1 = right */
+static float s_stereoVecWorld[2][4]; /* [eye][k, k*conv, clampLo, clampHi] -- track/model programs */
+static float s_stereoVecPkt[2][4];   /* packet program: zeroed unless packet depth stamping is live */
+
+/*
+ * The journal: one entry per draw-affecting call of the left-eye frame, in
+ * call order. Replay re-invokes the same public functions (track/model), or
+ * re-issues the resolved state + draw inline (packet/VRAM quads), against the
+ * right target with the right eye's parallax uniform. Sized for the observed
+ * shape of a frame (post-merge packet emits ~20-40, track leaf draws ~50-200,
+ * model instances+runs ~100) with generous slack; overflow drops the tail of
+ * the RIGHT eye only, loudly, never the left.
+ */
+enum
+{
+	N3DS_STEREO_OP_PKT = 0,
+	N3DS_STEREO_OP_VRAM,
+	N3DS_STEREO_OP_TRACK_BEGIN,
+	N3DS_STEREO_OP_TRACK_LEAF,
+	N3DS_STEREO_OP_TRACK_END,
+	N3DS_STEREO_OP_MODEL_BEGIN,
+	N3DS_STEREO_OP_MODEL_INSTANCE,
+	N3DS_STEREO_OP_MODEL_RUN,
+	N3DS_STEREO_OP_MODEL_END
+};
+
+typedef struct N3DS_StereoOp
+{
+	u8 kind;
+	union
+	{
+		struct
+		{
+			u8 blend, doubling, depthWrite, atlas;
+			s32 baseVertex, vertCount;
+		} pkt; /* PKT; VRAM reuses atlas=slot, baseVertex */
+		struct
+		{
+			float qx[4], qy[4], qw[4], h;
+		} mtx; /* TRACK_BEGIN, MODEL_INSTANCE */
+		struct
+		{
+			s32 firstIndex, indexCount;
+			float otIndexLo, ordinalLo, ordinalSpan, invIndexSpan;
+			s32 atlasBin, blend, uvDx, uvDy;
+		} leaf; /* TRACK_LEAF */
+		struct
+		{
+			s32 startVertex, triCount, atlas, textured, blend;
+		} mrun; /* MODEL_RUN */
+	} u;
+} N3DS_StereoOp;
+
+#define N3DS_STEREO_MAX_OPS 1536
+static N3DS_StereoOp s_stereoOps[N3DS_STEREO_MAX_OPS];
+static int s_stereoOpCount = 0;
+static int s_stereoOverflow = 0;
+
+static N3DS_StereoOp *N3DS_StereoRecord(int kind)
+{
+	N3DS_StereoOp *op;
+
+	if (!s_stereoRecording)
+	{
+		return NULL;
+	}
+	if (s_stereoOpCount >= N3DS_STEREO_MAX_OPS)
+	{
+		s_stereoOverflow = 1;
+		return NULL;
+	}
+	op = &s_stereoOps[s_stereoOpCount++];
+	op->kind = (u8)kind;
+	return op;
+}
+
+/* Whether packet depth stamps currently carry real view.z (s29 packet-depth
+ * model) rather than emit ordinals. Same compile/runtime pair
+ * N3DS_TrackDraw_Begin keys its own axis selector off, deliberately: parallax
+ * from an ordinal stamp would be depth-shaped noise, so ordinal-stamped
+ * builds/frames get a zero packet vector (flat packets at screen depth)
+ * while track/model content -- whose depth is computed, not read from a
+ * stamp -- still gets real parallax. */
+static int N3DS_StereoPacketDepthActive(void)
+{
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+	extern int g_dbg_packetDepth;
+
+	return (g_dbg_packetDepth != 0);
+#else
+	return 0;
+#endif
+}
+
+/* Fills one eye's (k, k*conv, clampLo, clampHi). The clamp band is
+ * asymmetric on purpose: pop-out (disparity crossed in front of the screen)
+ * is allowed up to 2x the at-infinity shift, then stops -- unbounded pop-out
+ * from very-near content (behind-eye track clamped to depth 256, exhaust in
+ * the camera) is the classic eye-stabbing failure of layered stereo. */
+static void N3DS_StereoEyeVec(float k, float *out4)
+{
+	const float absK = (k < 0.0f) ? -k : k;
+	/* Window mode zeroes the crossed-disparity (pop-out) side of the clamp
+	 * band; content nearer than the convergence depth pins to the screen
+	 * plane instead of popping out and folding (see g_dbg_stereoWindow). */
+	const float popOut = g_dbg_stereoWindow ? 0.0f : (2.0f * absK);
+
+	out4[0] = k;
+	out4[1] = k * s_stereoConv;
+	if (k >= 0.0f)
+	{
+		out4[2] = -popOut; /* right eye: near content shifts left */
+		out4[3] = absK;
+	}
+	else
+	{
+		out4[2] = -absK;
+		out4[3] = popOut;
+	}
+}
+
+/* Once per frame, from N3DS_C3DBeginFrame: read the physical slider, decide
+ * whether this frame is stereo, reset the journal, compute both eyes'
+ * vectors. Logs only on the active/inactive TRANSITION -- the slider is an
+ * analog input and per-frame logging would grind the SD card (s31 lesson). */
+static void N3DS_StereoLatchFrame(void)
+{
+	static int s_wasActive = -1;
+	float slider = 0.0f;
+
+	s_stereoOpCount = 0;
+	s_stereoOverflow = 0;
+	s_stereoEye = 0;
+	s_stereoFrameActive = 0;
+
+	if (g_dbg_stereo && (s_renderTargetRight != NULL))
+	{
+		slider = osGet3DSliderState();
+		if (slider > 0.01f)
+		{
+			s_stereoFrameActive = 1;
+		}
+	}
+	s_stereoRecording = s_stereoFrameActive;
+
+	{
+		const float mag = s_stereoFrameActive ? (slider * s_stereoSep * 0.5f) : 0.0f;
+		const int pktLive = s_stereoFrameActive && N3DS_StereoPacketDepthActive();
+		int eye;
+
+		for (eye = 0; eye < 2; eye++)
+		{
+			const float k = (eye == 1) ? mag : -mag;
+
+			N3DS_StereoEyeVec(k, s_stereoVecWorld[eye]);
+			N3DS_StereoEyeVec(pktLive ? k : 0.0f, s_stereoVecPkt[eye]);
+		}
+	}
+
+	if (s_stereoFrameActive != s_wasActive)
+	{
+		char msg[96];
+
+		snprintf(msg, sizeof(msg), s_stereoFrameActive ? "[CTR-3DS] stereo: ACTIVE (slider=%d%% sep=%d conv=%d pktdepth=%d)" : "[CTR-3DS] stereo: inactive (slider down)",
+		         (int)(slider * 100.0f), (int)s_stereoSep, (int)s_stereoConv, N3DS_StereoPacketDepthActive());
+		N3DS_DebugLog(msg);
+		s_wasActive = s_stereoFrameActive;
+	}
+}
+
+/* Upload the current eye's parallax vector to one program's `stereo`
+ * uniform. Guarded on the location like every other upload: -1 means the
+ * lookup failed at init and writing would land on register 0. */
+static void N3DS_StereoUploadUniform(int uLoc, const float (*table)[4])
+{
+	if (uLoc >= 0)
+	{
+		const float *v = table[s_stereoEye];
+
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, uLoc, v[0], v[1], v[2], v[3]);
+	}
+}
+
+void N3DS_StereoRecordPacket(int blendMode, int doubling, int depthWrite, int atlas, int baseVertex, int vertCount)
+{
+	N3DS_StereoOp *op = N3DS_StereoRecord(N3DS_STEREO_OP_PKT);
+
+	if (op != NULL)
+	{
+		op->u.pkt.blend = (u8)blendMode;
+		op->u.pkt.doubling = (u8)doubling;
+		op->u.pkt.depthWrite = (u8)depthWrite;
+		op->u.pkt.atlas = (u8)atlas;
+		op->u.pkt.baseVertex = baseVertex;
+		op->u.pkt.vertCount = vertCount;
+	}
+}
+
+void N3DS_StereoRecordVram(int slot, int baseVertex)
+{
+	N3DS_StereoOp *op = N3DS_StereoRecord(N3DS_STEREO_OP_VRAM);
+
+	if (op != NULL)
+	{
+		op->u.pkt.atlas = (u8)slot;
+		op->u.pkt.baseVertex = baseVertex;
+		op->u.pkt.vertCount = 6;
+	}
+}
 
 void N3DS_C3DSetProjection(float left, float right, float bottom)
 {
@@ -587,6 +847,12 @@ static void N3DS_BindPacketDrawState(void)
 	{
 		C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
 	}
+
+	/* The stereo vector rides f4, which BOTH sibling programs also use
+	 * (ctr_model's qx, ctr_track's projection row 1) -- so it is packet
+	 * state exactly like the projection rows above, re-asserted on every
+	 * return to packet drawing for the identical s29 reason. */
+	N3DS_StereoUploadUniform(s_uLocStereo, (const float(*)[4])s_stereoVecPkt);
 }
 
 int N3DS_C3DInit(void)
@@ -611,6 +877,24 @@ int N3DS_C3DInit(void)
 	}
 	C3D_RenderTargetSetOutput(s_renderTarget, GFX_TOP, GFX_LEFT, N3DS_DISPLAY_TRANSFER_FLAGS);
 
+	/*
+	 * Right-eye target, same shape as the left (another ~768KB of VRAM; the
+	 * decode-cache atlases live in linear memory, so VRAM holds only these
+	 * two targets and has room to spare). DELIBERATELY non-fatal on failure:
+	 * a console that cannot allocate it boots mono with 3D permanently off
+	 * and says so once, rather than refusing to boot over an optional
+	 * feature. Every stereo path is gated on this pointer being non-NULL.
+	 */
+	s_renderTargetRight = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+	if (s_renderTargetRight != NULL)
+	{
+		C3D_RenderTargetSetOutput(s_renderTargetRight, GFX_TOP, GFX_RIGHT, N3DS_DISPLAY_TRANSFER_FLAGS);
+	}
+	else
+	{
+		N3DS_DebugLog("[CTR-3DS] stereo: right-eye render target FAILED to allocate, 3D disabled");
+	}
+
 	s_shaderDvlb = DVLB_ParseFile((u32 *)ctr_shbin, ctr_shbin_size);
 	if (s_shaderDvlb == NULL)
 	{
@@ -620,6 +904,7 @@ int N3DS_C3DInit(void)
 	shaderProgramSetVsh(&s_shaderProgram, &s_shaderDvlb->DVLE[0]);
 	C3D_BindProgram(&s_shaderProgram);
 	s_uLocProjection = shaderInstanceGetUniformLocation(s_shaderProgram.vertexShader, "projection");
+	s_uLocStereo = shaderInstanceGetUniformLocation(s_shaderProgram.vertexShader, "stereo");
 
 	/*
 	 * Placeholder until the first N3DS_C3DSetProjection call, which derives
@@ -754,6 +1039,7 @@ int N3DS_C3DInit(void)
 	s_trackULocH = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "hParam");
 	s_trackULocDepthRange = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "depthRange");
 	s_trackULocUvOffset = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "uvOffset");
+	s_trackULocStereo = shaderInstanceGetUniformLocation(s_trackShaderProgram.vertexShader, "stereo");
 
 	/* Fixed attribute layout for N3DS_TrackVertex -- does not depend on any
 	 * per-level allocation (unlike s_trackBufInfo, built in
@@ -790,6 +1076,7 @@ int N3DS_C3DInit(void)
 	s_modelULocQy = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "qy");
 	s_modelULocQw = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "qw");
 	s_modelULocH = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "hParam");
+	s_modelULocStereo = shaderInstanceGetUniformLocation(s_modelShaderProgram.vertexShader, "stereo");
 #endif /* CTR_NATIVE_MODEL_RENDERER */
 
 	return 1;
@@ -940,6 +1227,13 @@ static int N3DS_NextPktBias(int cur)
 
 void N3DS_C3DBeginFrame(void)
 {
+	/* Latch the physical 3D slider for the whole frame BEFORE anything is
+	 * cleared or uploaded: the latch decides whether the right target gets
+	 * cleared, which parallax the left eye's own uniforms carry, and whether
+	 * the draw journal records. Pure CPU, so it sits ahead of the SYNCDRAW
+	 * wait rather than inside the frame bracket. */
+	N3DS_StereoLatchFrame();
+
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: enter (SYNCDRAW wait)");
 	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: returned");
@@ -947,6 +1241,13 @@ void N3DS_C3DBeginFrame(void)
 	 * stored depth (verified empirically, see below), so far = max. Harmless
 	 * when CTR_NATIVE_OT_DEPTH is off (depth buffer unused). */
 	C3D_RenderTargetClear(s_renderTarget, C3D_CLEAR_ALL, 0x000000FF, 0x00FFFFFF);
+	if (s_stereoFrameActive)
+	{
+		/* Only on stereo frames: a cleared-but-never-drawn right target
+		 * would still cost the clear, and with the barrier off nothing
+		 * presents it anyway. */
+		C3D_RenderTargetClear(s_renderTargetRight, C3D_CLEAR_ALL, 0x000000FF, 0x00FFFFFF);
+	}
 	C3D_FrameDrawOn(s_renderTarget);
 
 #ifdef CTR_NATIVE_OT_DEPTH
@@ -1001,6 +1302,9 @@ void N3DS_C3DBeginFrame(void)
 	C3D_SetViewport(0, N3DS_TOP_CONTENT_X, 240, N3DS_TOP_CONTENT_W);
 
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
+	/* Left eye's parallax (zero in mono) -- rides beside the projection for
+	 * the same reason it does in N3DS_BindPacketDrawState. */
+	N3DS_StereoUploadUniform(s_uLocStereo, (const float(*)[4])s_stereoVecPkt);
 
 	/* Every draw this frame appends into the SAME persistent buffer at a
 	 * fresh offset (see the header comment on N3DS_C3DAppendVertices) --
@@ -1565,6 +1869,23 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 {
 	C3D_TexEnv *env;
 
+	/* Stereo journal: recorded at the TOP, mirroring the call itself rather
+	 * than its effect -- the replay re-invokes this function, whose own
+	 * guards and global reads (geomReady, selTrueDepth, depthTest state)
+	 * re-evaluate identically within the same frame. Same pattern for every
+	 * recorded call below. */
+	{
+		N3DS_StereoOp *op = N3DS_StereoRecord(N3DS_STEREO_OP_TRACK_BEGIN);
+
+		if (op != NULL)
+		{
+			memcpy(op->u.mtx.qx, qx, sizeof(op->u.mtx.qx));
+			memcpy(op->u.mtx.qy, qy, sizeof(op->u.mtx.qy));
+			memcpy(op->u.mtx.qw, qw, sizeof(op->u.mtx.qw));
+			op->u.mtx.h = h;
+		}
+	}
+
 	s_trackDrawActive = 0;
 
 	if (!s_trackGeomReady)
@@ -1678,6 +1999,10 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	 * header comment for the row3/outpos.w reasoning this depends on). */
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_trackULocProjection, &s_projection);
 
+	/* Current eye's parallax (zero in mono). Per bracket, not per frame:
+	 * the right-eye replay re-enters this function with s_stereoEye = 1. */
+	N3DS_StereoUploadUniform(s_trackULocStereo, (const float(*)[4])s_stereoVecWorld);
+
 	/*
 	 * Vertex-color-only output: 3a is untextured (color_hi is already baked
 	 * per vertex -- the familiar "textureless mode" look). Deliberately NOT
@@ -1752,6 +2077,24 @@ static void N3DS_TrackDraw_SetTextured(int textured)
 void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin, int blend, int uvDx, int uvDy)
 {
 	const u16 *indexBase;
+
+	{
+		N3DS_StereoOp *op = N3DS_StereoRecord(N3DS_STEREO_OP_TRACK_LEAF);
+
+		if (op != NULL)
+		{
+			op->u.leaf.firstIndex = firstIndex;
+			op->u.leaf.indexCount = indexCount;
+			op->u.leaf.otIndexLo = otIndexLo;
+			op->u.leaf.ordinalLo = ordinalLo;
+			op->u.leaf.ordinalSpan = ordinalSpan;
+			op->u.leaf.invIndexSpan = invIndexSpan;
+			op->u.leaf.atlasBin = atlasBin;
+			op->u.leaf.blend = blend;
+			op->u.leaf.uvDx = uvDx;
+			op->u.leaf.uvDy = uvDy;
+		}
+	}
 
 	if (!s_trackDrawActive || (indexCount <= 0) || (firstIndex < 0))
 	{
@@ -1875,6 +2218,8 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 
 void N3DS_TrackDraw_End(void)
 {
+	N3DS_StereoRecord(N3DS_STEREO_OP_TRACK_END);
+
 	/* Program + attribute layout + vertex buffer + texture-modulate combiner
 	 * -- N3DS_BindPacketDrawState's own body covers all four (it is the same
 	 * function N3DS_C3DInit uses to build this state the first time), which
@@ -1985,6 +2330,8 @@ void N3DS_ModelDraw_Begin(void)
 	 * shared per-frame buffer), so this is not a lazy shortcut -- it is the
 	 * only way to be sure the layout matches what wrote the data.
 	 */
+	N3DS_StereoRecord(N3DS_STEREO_OP_MODEL_BEGIN);
+
 	N3DS_BindPacketDrawState();
 	C3D_BindProgram(&s_modelShaderProgram);
 
@@ -1997,6 +2344,12 @@ void N3DS_ModelDraw_Begin(void)
 	 * of assumption that produced the s29 uniform-collision bug.
 	 */
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_modelULocProjection, &s_projection);
+
+	/* Current eye's parallax (zero in mono). The model program's `stereo`
+	 * register (f8) is ctr_track's depthRange, clobbered every track leaf --
+	 * this bracket always opens after the track bracket closed, so this
+	 * per-bracket upload is exactly what makes that safe. */
+	N3DS_StereoUploadUniform(s_modelULocStereo, (const float(*)[4])s_stereoVecWorld);
 
 	/*
 	 * Assert opaque blending, for the reason spelled out at length in
@@ -2017,6 +2370,18 @@ void N3DS_ModelDraw_Begin(void)
 
 void N3DS_ModelDraw_Instance(const float *qx, const float *qy, const float *qw, float h)
 {
+	{
+		N3DS_StereoOp *op = N3DS_StereoRecord(N3DS_STEREO_OP_MODEL_INSTANCE);
+
+		if (op != NULL)
+		{
+			memcpy(op->u.mtx.qx, qx, sizeof(op->u.mtx.qx));
+			memcpy(op->u.mtx.qy, qy, sizeof(op->u.mtx.qy));
+			memcpy(op->u.mtx.qw, qw, sizeof(op->u.mtx.qw));
+			op->u.mtx.h = h;
+		}
+	}
+
 	if (!s_modelDrawActive)
 	{
 		return;
@@ -2072,6 +2437,19 @@ static void N3DS_ModelDraw_SetTextured(int textured)
 
 void N3DS_ModelDraw_Run(int startVertex, int triangleCount, int atlasIndex, int textured, int blend)
 {
+	{
+		N3DS_StereoOp *op = N3DS_StereoRecord(N3DS_STEREO_OP_MODEL_RUN);
+
+		if (op != NULL)
+		{
+			op->u.mrun.startVertex = startVertex;
+			op->u.mrun.triCount = triangleCount;
+			op->u.mrun.atlas = atlasIndex;
+			op->u.mrun.textured = textured;
+			op->u.mrun.blend = blend;
+		}
+	}
+
 	if (!s_modelDrawActive || (triangleCount <= 0) || (startVertex < 0))
 	{
 		return;
@@ -2128,6 +2506,8 @@ void N3DS_ModelDraw_Run(int startVertex, int triangleCount, int atlasIndex, int 
 
 void N3DS_ModelDraw_End(void)
 {
+	N3DS_StereoRecord(N3DS_STEREO_OP_MODEL_END);
+
 	/* Restores program, attribute layout, buffer binding and the modulate
 	 * combiner -- the full set this bracket touched. Unconditional for the
 	 * same reason N3DS_TrackDraw_End is: cheap, idempotent, and it cannot
@@ -2202,6 +2582,177 @@ void N3DS_ModelDraw_End(void)
  * glBlendFuncSeparate): the framebuffer alpha carries nothing this renderer
  * reads, and blending it with the RGB factors could only corrupt it.
  */
+/*
+ * The right eye: replay the frame's journal against the right target with the
+ * right eye's parallax vectors. Called by NativeRenderer_EndScene after every
+ * left-eye draw (including the debug atlas inspector, which deliberately
+ * stays left-eye-only) and immediately before N3DS_C3DEndFrame submits the
+ * whole two-eye command list. No-op in mono.
+ *
+ * Track/model ops re-enter the same public functions, whose own guards,
+ * memos and global reads re-evaluate identically within the frame -- the
+ * only thing that differs is s_stereoEye, which their Begin uploads read.
+ * Packet/VRAM ops re-issue resolved state inline: doubling and depth-write
+ * were resolved at record time (policy ran once, on the left eye), so the
+ * replay is policy-free. Both are draws from (baseVertex, count) into the
+ * SAME persistent frame VBO the left eye drew from -- nothing is
+ * re-appended, so the vertex budget is untouched.
+ *
+ * On journal overflow the tail is dropped from the RIGHT eye only, loudly;
+ * the defensive re-assert at the bottom covers a prefix that ends inside a
+ * track/model bracket.
+ */
+void N3DS_StereoRenderRightEye(void)
+{
+	int i;
+	int lastDoubling = -1;
+	int lastDepthWrite = 1;
+
+	if (!s_stereoFrameActive || (s_renderTargetRight == NULL))
+	{
+		return;
+	}
+
+	s_stereoRecording = 0;
+	s_stereoEye = 1;
+
+	C3D_FrameDrawOn(s_renderTargetRight);
+	/* Same pillarbox crop as N3DS_C3DBeginFrame -- viewport state does not
+	 * automatically follow the framebuffer binding. */
+	C3D_SetViewport(0, N3DS_TOP_CONTENT_X, 240, N3DS_TOP_CONTENT_W);
+#ifdef CTR_NATIVE_OT_DEPTH
+	/* Frame-wide depth pair, mirroring BeginFrame's policy exactly --
+	 * whatever state the left eye's last draw left behind is not it. */
+	if (g_dbg_depthTest == 1)
+	{
+		C3D_DepthTest(true, GPU_ALWAYS, GPU_WRITE_ALL);
+	}
+	else
+	{
+		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+	}
+#endif
+	/* Packet program + layout + buffer + combiner + projection + the RIGHT
+	 * eye's packet parallax (s_stereoEye is 1 now, so the upload inside
+	 * picks the right vector). */
+	N3DS_BindPacketDrawState();
+
+	if (s_stereoOverflow)
+	{
+		static int s_overflowLogged = 0;
+
+		if (!s_overflowLogged)
+		{
+			s_overflowLogged = 1;
+			N3DS_DebugLog("[CTR-3DS] stereo: journal OVERFLOW, right eye truncated (raise N3DS_STEREO_MAX_OPS)");
+		}
+	}
+
+	for (i = 0; i < s_stereoOpCount; i++)
+	{
+		const N3DS_StereoOp *op = &s_stereoOps[i];
+
+		switch (op->kind)
+		{
+		case N3DS_STEREO_OP_PKT:
+		{
+			if ((int)op->u.pkt.doubling != lastDoubling)
+			{
+				N3DS_C3DSetColorDoubling((int)op->u.pkt.doubling);
+				lastDoubling = (int)op->u.pkt.doubling;
+			}
+			if ((int)op->u.pkt.depthWrite != lastDepthWrite)
+			{
+				N3DS_C3DSetDepthWrite((int)op->u.pkt.depthWrite);
+				lastDepthWrite = (int)op->u.pkt.depthWrite;
+			}
+			N3DS_C3DSetBlendMode((int)op->u.pkt.blend);
+			N3DS_C3DBindAtlas((int)op->u.pkt.atlas);
+			C3D_DrawArrays(GPU_TRIANGLES, op->u.pkt.baseVertex, op->u.pkt.vertCount);
+			break;
+		}
+		case N3DS_STEREO_OP_VRAM:
+		{
+			/* Mirrors PresentVRAMRect's own draw: doubling off, dedicated
+			 * texture, quad at N3DS_DEPTH_TOPMOST (zero parallax via the
+			 * shader's UI-band mask, so both eyes see it at screen depth).
+			 * The slot's texels persist to frame end -- see the header. */
+			if (lastDoubling != 0)
+			{
+				N3DS_C3DSetColorDoubling(0);
+				lastDoubling = 0;
+			}
+			N3DS_C3DBindVramDisplayTex((int)op->u.pkt.atlas);
+			C3D_DrawArrays(GPU_TRIANGLES, op->u.pkt.baseVertex, op->u.pkt.vertCount);
+			break;
+		}
+		case N3DS_STEREO_OP_TRACK_BEGIN:
+		{
+			N3DS_TrackDraw_Begin(op->u.mtx.qx, op->u.mtx.qy, op->u.mtx.qw, op->u.mtx.h);
+			lastDoubling = -1; /* the bracket owns doubling/blend/depth-write */
+			break;
+		}
+		case N3DS_STEREO_OP_TRACK_LEAF:
+		{
+			N3DS_TrackDraw_Leaf(op->u.leaf.firstIndex, op->u.leaf.indexCount, op->u.leaf.otIndexLo, op->u.leaf.ordinalLo, op->u.leaf.ordinalSpan,
+			                    op->u.leaf.invIndexSpan, op->u.leaf.atlasBin, op->u.leaf.blend, op->u.leaf.uvDx, op->u.leaf.uvDy);
+			break;
+		}
+		case N3DS_STEREO_OP_TRACK_END:
+		{
+			N3DS_TrackDraw_End();
+			lastDoubling = -1;
+			lastDepthWrite = 1; /* End restores the frame-wide WRITE_ALL pair */
+			break;
+		}
+		case N3DS_STEREO_OP_MODEL_BEGIN:
+		{
+			N3DS_ModelDraw_Begin();
+			lastDoubling = -1;
+			break;
+		}
+		case N3DS_STEREO_OP_MODEL_INSTANCE:
+		{
+			N3DS_ModelDraw_Instance(op->u.mtx.qx, op->u.mtx.qy, op->u.mtx.qw, op->u.mtx.h);
+			break;
+		}
+		case N3DS_STEREO_OP_MODEL_RUN:
+		{
+			N3DS_ModelDraw_Run(op->u.mrun.startVertex, op->u.mrun.triCount, op->u.mrun.atlas, op->u.mrun.textured, op->u.mrun.blend);
+			break;
+		}
+		case N3DS_STEREO_OP_MODEL_END:
+		{
+			N3DS_ModelDraw_End();
+			lastDoubling = -1;
+			lastDepthWrite = 1;
+			break;
+		}
+		default:
+		{
+			break;
+		}
+		}
+	}
+
+	/* Defensive: a truncated journal can end inside a bracket, leaving the
+	 * track/model program bound. Cheap, idempotent, and the next BeginFrame
+	 * re-asserts the rest of the frame-wide state regardless. */
+	if (s_stereoOverflow)
+	{
+		N3DS_BindPacketDrawState();
+#ifdef CTR_NATIVE_OT_DEPTH
+		if (g_dbg_depthTest != 1)
+		{
+			C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+		}
+#endif
+	}
+
+	/* s_stereoEye stays 1 until the next frame's latch resets it -- nothing
+	 * else draws between here and N3DS_C3DEndFrame. */
+}
+
 /* Depth-WRITE only; the test itself stays LEQUAL so translucent content is
  * still correctly hidden by anything in front of it. Callers memoize (see
  * N3DS_MergeEmit), so this is not gated again here. Under a build without
@@ -2362,7 +2913,15 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  from the OT bucket. Expect animated water over the HUD.
 	 *   noevict     -- toggle g_dbg_gteNoEvict (s32): a capture store may not
 	 *                  overwrite a live entry owned by a different matrix.
-	 *   depthtest [N] -- g_dbg_depthTest, the s29 occlusion split: 0=normal
+	 *   stereo      -- toggle g_dbg_stereo (master 3D enable; the physical slider
+ *                  still gates frame by frame, this just forces mono)
+ *   stereowindow -- toggle window mode (default ON: no pop-out, the world
+ *                  starts at the screen; OFF restores clamped pop-out)
+ *   stereosep [N] -- full-slider disparity at infinite depth, PSX px
+ *                  (default 12; negative swaps the eyes; bare resets)
+ *   stereoconv [N] -- screen-plane depth, view.z units (default 1200;
+ *                  bare resets)
+ *   depthtest [N] -- g_dbg_depthTest, the s29 occlusion split: 0=normal
 	 *                  1=no depth test (painter's order) 2=track tests but
 	 *                  does not write depth. Bare token cycles 0->1->2->0.
 	 *                  Hardware button: SELECT+ZL.
@@ -2380,7 +2939,9 @@ unsigned int N3DS_ReadButtons(void)
 			{
 				extern int g_dbg_disableSubPage;
 				extern int g_dbg_forceSingleTexture;
-				char word[16];
+				/* 24, was 16: "stereoconv 12000" (16 chars) no longer fits a
+				 * 15-char payload. Everything else is unchanged. */
+				char word[24];
 				size_t got = fread(word, 1, sizeof(word) - 1, req);
 
 				word[got] = '\0';
@@ -2596,6 +3157,62 @@ unsigned int N3DS_ReadButtons(void)
 
 					g_dbg_trackAfterMerge ^= 1;
 					N3DS_DebugLog(g_dbg_trackAfterMerge ? "[CTR-3DS] track draw: AFTER merge flush" : "[CTR-3DS] track draw: before merge flush (default)");
+				}
+				/* Stereo tokens. ORDER MATTERS within this family: "stereo" is
+				 * a prefix of all the others, so the longer tokens must be
+				 * tested first or `stereosep 8` would just flip the master
+				 * toggle. */
+				else if (strncmp(word, "stereowindow", 12) == 0)
+				{
+					g_dbg_stereoWindow ^= 1;
+					N3DS_DebugLog(g_dbg_stereoWindow ? "[CTR-3DS] stereo window mode: ON (no pop-out, world starts at the screen)"
+					                                 : "[CTR-3DS] stereo window mode: off (pop-out allowed, clamped)");
+				}
+				else if (strncmp(word, "stereosep", 9) == 0)
+				{
+					char msg[64];
+
+					/* 'stereosep N' sets the full-slider disparity at infinity
+					 * (PSX px). Negative flips the eyes -- the cheap A/B if the
+					 * depth sense ever reads inverted on hardware. Bare token
+					 * resets the default. */
+					if (word[9] == ' ')
+					{
+						int n = atoi(&word[10]);
+
+						s_stereoSep = (float)((n < -64) ? -64 : (n > 64) ? 64 : n);
+					}
+					else
+					{
+						s_stereoSep = 12.0f;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] stereo separation: %d px @ full slider", (int)s_stereoSep);
+					N3DS_DebugLog(msg);
+				}
+				else if (strncmp(word, "stereoconv", 10) == 0)
+				{
+					char msg[64];
+
+					/* 'stereoconv N' sets the screen-plane depth in view.z
+					 * units; nearer content pops out, farther recedes. Bare
+					 * token resets the default. */
+					if (word[10] == ' ')
+					{
+						int n = atoi(&word[11]);
+
+						s_stereoConv = (float)((n < 64) ? 64 : (n > 60000) ? 60000 : n);
+					}
+					else
+					{
+						s_stereoConv = 1200.0f;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] stereo convergence: %d view.z units", (int)s_stereoConv);
+					N3DS_DebugLog(msg);
+				}
+				else if (strncmp(word, "stereo", 6) == 0)
+				{
+					g_dbg_stereo ^= 1;
+					N3DS_DebugLog(g_dbg_stereo ? "[CTR-3DS] stereo: enabled (slider gates per frame)" : "[CTR-3DS] stereo: FORCED OFF");
 				}
 				else if (strncmp(word, "depthtest", 9) == 0)
 				{
@@ -2963,6 +3580,31 @@ unsigned int N3DS_ReadButtons(void)
 		g_dbg_trackRender = (g_dbg_trackRender == 0) ? 1 : 0;
 		snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
 		N3DS_DebugLog(msg);
+	}
+#endif
+
+#if defined(CTR_NATIVE_TRACK_RENDERER) && defined(CTR_NATIVE_MODEL_RENDERER) && defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+	/* SELECT held + START: the owner's "our config" combo (requested s34) --
+	 * track renderer + native models + packet depth all flip together, because
+	 * reaching the target config from a clean boot cost three chords every
+	 * boot. Two states: everything native (1,1,1) or everything retail
+	 * (0,0,0); a mixed state goes native first, so one press from clean boot
+	 * lands on the config being targeted. START still reaches the game, so
+	 * in-race this also opens the pause menu -- acceptable, documented, and
+	 * the only chord left (every other SELECT combo is taken; see the family
+	 * above). The individual toggles below remain for isolating one variable. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_START))
+	{
+		extern int g_dbg_trackRender;
+		extern int g_dbg_modelRender;
+		extern int g_dbg_packetDepth;
+		const int allOn = (g_dbg_trackRender != 0) && (g_dbg_modelRender != 0) && (g_dbg_packetDepth != 0);
+		const int target = allOn ? 0 : 1;
+
+		g_dbg_trackRender = target;
+		g_dbg_modelRender = target;
+		g_dbg_packetDepth = target;
+		N3DS_DebugLog(target ? "[CTR-3DS] OUR CONFIG: track+models+dmodel all ON" : "[CTR-3DS] our config: all off (full retail)");
 	}
 #endif
 

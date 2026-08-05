@@ -1551,6 +1551,13 @@ void NativeModelDraw_IssueForWalk(void)
 #else
 
 int g_dbg_modelRender = 0;
+/* Referenced by native_gte_capture.c's s33 instance-depth bracket, which is
+ * gated on GTE_CAPTURE, not MODEL_RENDERER -- so the definition must exist in
+ * a capture-on/model-off build (the PC golden config). Found in s34: that
+ * combination had never been compiled between s33 and the piranha-plant hunt,
+ * and it failed at link. Stays 0 here; the --model-depth-check arg that sets
+ * it lives with the real implementation above. */
+int g_dbg_modelDepthCheck = 0;
 
 int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *worldInst)
 {

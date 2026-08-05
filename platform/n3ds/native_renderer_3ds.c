@@ -2228,6 +2228,14 @@ internal void N3DS_MergeEmit(int blendMode, int doubling, int atlas, int baseVer
 	N3DS_C3DDrawTriangles(baseVertex, vertCount / 3);
 	s_drawCallCount++;
 	s_frameAtlasMask |= (1u << (atlas & 31));
+
+	/* Stereo journal (n3ds_backend.h): one entry per emit that actually drew,
+	 * with doubling and depth-write RESOLVED -- the g_dbg_noFx and
+	 * fxNoDepthWrite policy above ran once, here, and the right-eye replay
+	 * re-issues the outcome. vertCount is raw vertices, same as this call's
+	 * own parameter (the replay's C3D_DrawArrays takes vertices directly).
+	 * No-op unless this frame latched stereo. */
+	N3DS_StereoRecordPacket(blendMode, doubling, ((blendMode != 0) && g_dbg_fxNoDepthWrite) ? 0 : 1, atlas, baseVertex, vertCount);
 }
 
 /*
@@ -3065,6 +3073,31 @@ void NativeRenderer_EndScene(void)
 			N3DS_C3DBindAtlas(atlasIndex);
 			N3DS_C3DDrawTriangles(baseVertex, 2);
 		}
+	}
+#endif
+
+	/*
+	 * Stereoscopic right eye (n3ds_backend.h's stereo block): replay this
+	 * frame's recorded draws against the right target with the right eye's
+	 * parallax. LAST, after every left-eye draw including the atlas
+	 * inspector above (which intentionally stays left-eye-only -- it is a
+	 * debug screen takeover, not content), and before FrameEnd submits both
+	 * eyes as one command list. No-op when the slider is down, so the mono
+	 * frame -- every fps baseline -- is bit-for-bit today's. Right-eye
+	 * draws are not counted in s_drawCallCount: [PERF] draw counts stay
+	 * per-eye numbers.
+	 *
+	 * Gated on the merge path being live: with `drawmerge` toggled off (or a
+	 * build without it) packet content draws immediately during the walk and
+	 * never reaches the journal, so a replay would show the right eye a
+	 * world with no karts/UI. Skipping instead leaves the right framebuffer
+	 * holding its last stereo frame while that diagnostic combo is active --
+	 * defined, visible-as-what-it-is, and gone the moment merge is back on.
+	 */
+#ifdef CTR_NATIVE_DRAW_MERGE
+	if (s_mergeActive)
+	{
+		N3DS_StereoRenderRightEye();
 	}
 #endif
 
@@ -3957,6 +3990,14 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 			if (baseVertex >= 0)
 			{
 				N3DS_C3DDrawTriangles(baseVertex, 2);
+				/* Stereo journal: the right eye redraws this chunk from the
+				 * same slot -- whose texels persist until the next
+				 * PresentVRAMRect call, i.e. past frame end -- at
+				 * N3DS_DEPTH_TOPMOST, which the shader's UI-band mask pins
+				 * to screen depth in both eyes. Without this, a splash/
+				 * loading frame with the slider up would show content to one
+				 * eye only. */
+				N3DS_StereoRecordVram(slot, baseVertex);
 			}
 		}
 	}

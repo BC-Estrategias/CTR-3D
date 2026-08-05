@@ -80,6 +80,12 @@
 .fvec qy            ; f5 -- composed instance row: dp4(qy, v) = w*screenY
 .fvec qw            ; f6 -- composed instance row: dp4(qw, v) = w = view.z/H
 .fvec hParam        ; f7 -- x = H (distanceToScreen_PREV); y/z/w unused
+; STEREO: per-eye parallax vector, same semantics as the other two programs'
+; `stereo` (x = k, y = k*convergence, z/w = clamp lo/hi; zeros in mono).
+; Uploaded by N3DS_ModelDraw_Begin. f8 -- which is ctr_track's depthRange
+; register, so a track bracket clobbers it; ModelDraw_Begin always runs after
+; the track bracket has ended and re-uploads, same discipline as projection.
+.fvec stereo        ; f8
 
 ; Constants
 .constf constants(0.0, 1.0, -1.0, 0.0)
@@ -143,6 +149,19 @@
 	min r2.y, depthMax, r2.y
 	mul r2.z, negOne, r2.y              ; -depth (no SUB opcode)
 	add r2.w, zOrdFromDepth, r2.z       ; zOrd
+
+	; ---- STEREO parallax (same form as ctr_track.v.pica's block) ---------
+	; p = k - kC/depth; a += w*p shifts post-divide screen X by p pixels.
+	; r2.y is the clamped [256, 65535] depth from just above, so the rcp is
+	; always finite. r5: r0-r4 are all live through the S assembly below.
+	rcp r5.x, r2.y                      ; 1/depth
+	mul r5.y, stereo.yyyy, r5.x         ; kC/depth
+	mul r5.y, negOne, r5.y              ; -kC/depth (no SUB opcode)
+	add r5.y, stereo.xxxx, r5.y         ; p = k - kC/depth
+	max r5.y, stereo.zzzz, r5.y         ; p >= lo
+	min r5.y, stereo.wwww, r5.y         ; p <= hi
+	mul r5.z, r1.z, r5.y                ; w*p (both temps, order-free)
+	add r1.x, r1.x, r5.z                ; a += w*p
 
 	; S = (a, b, w*zOrd, w). Assembled component-by-component: a single mov
 	; reads ONE source register, so gathering four components from three temps

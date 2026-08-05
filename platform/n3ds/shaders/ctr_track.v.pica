@@ -130,6 +130,13 @@
 ; use that physical register left there, which is exactly the class of bug the
 ; s29 projection-register collision was.
 .fvec uvOffset
+; STEREO: per-eye parallax vector, same semantics as ctr.v.pica's `stereo`
+; (x = k, y = k*convergence, z/w = clamp lo/hi; all zeros in mono). Uploaded
+; by N3DS_TrackDraw_Begin from the backend's current-eye state. Unlike the
+; packet path this needs no UI-band mask -- everything here is world content
+; on the real view.z axis -- and no CPU gating on g_dbg_packetDepth, because
+; this depth is computed from the camera, not read from a stamp.
+.fvec stereo
 
 ; Constants
 .constf constants(0.0, 1.0, -1.0, 0.0)
@@ -363,6 +370,23 @@
 	max r7.y, zeros, r7.y               ; in-range vertices contribute exactly 0
 	mul r7.z, nearKick, r7.y
 	add r4.x, r4.x, r7.z                ; in range: unchanged. Too near: clipped away.
+
+	; ---- STEREO parallax --------------------------------------------------
+	; p = k - kC/depth on the composed a = w*screenX: a += w*p shifts the
+	; post-divide screen X by exactly p pixels. Depth source is r4.z -- the
+	; TRUE-DEPTH path's clamped [256, 65535] value, which is computed above
+	; regardless of which depth axis the hParam selector blends, so the rcp
+	; is always finite and behind-eye vertices (clamped to 256) take the
+	; bounded near-limit shift instead of an unbounded one. r9: r5-r8 are
+	; taken below/above, and the S vector must not be disturbed.
+	rcp r9.x, r4.z                      ; 1/depth
+	mul r9.y, stereo.yyyy, r9.x         ; kC/depth
+	mul r9.y, negOne, r9.y              ; -kC/depth (no SUB opcode)
+	add r9.y, stereo.xxxx, r9.y         ; p = k - kC/depth
+	max r9.y, stereo.zzzz, r9.y         ; p >= lo
+	min r9.y, stereo.wwww, r9.y         ; p <= hi
+	mul r9.z, r1.z, r9.y                ; w*p (both temps, order-free)
+	add r1.x, r1.x, r9.z                ; a += w*p
 
 	; S = (a, b, w*zOrd, w) -- assembled component-by-component: a single mov
 	; can only read ONE source register (with swizzle), so gathering four

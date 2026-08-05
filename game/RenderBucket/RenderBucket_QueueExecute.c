@@ -31,12 +31,21 @@ struct PushBuffer;
 struct TextureLayout;
 extern int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *inst);
 extern int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex);
-/* s33 instance depth-axis bracket -- same local-extern convention as
- * DrawSky.c's suppression calls; platform/native_gte_capture.c. */
-extern void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct PushBuffer *pb, s32 mvpZIfNormal, int funcKind);
-extern void GTECapture_EndInstanceDepth(void);
 extern void NativeModelEmit_EndInstance(void);
 extern int NativeModelEmit_SkipRetailDraw(void);
+#endif
+
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+/* s33 instance depth-axis bracket -- same local-extern convention as
+ * DrawSky.c's suppression calls; platform/native_gte_capture.c. Guarded by
+ * GTE_CAPTURE to MATCH THE CALL SITES below, not by MODEL_RENDERER like the
+ * hooks above: capture-on/model-off is a real config (the PC golden runs
+ * with capture enabled), and it failed to compile from s33 until s34 found
+ * it during the piranha-plant hunt -- the declarations were model-gated
+ * while the calls were capture-gated, and no build had ever combined them. */
+struct PushBuffer;
+extern void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct PushBuffer *pb, s32 mvpZIfNormal, int funcKind);
+extern void GTECapture_EndInstanceDepth(void);
 #endif
 
 struct RenderBucketEntry

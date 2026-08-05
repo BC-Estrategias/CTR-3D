@@ -44,41 +44,41 @@ extern s32 doCOP2(s32 op);
 // ctc2 21-23
 #define gte_ldfc(r0)                               \
 	{                                              \
-		CTC2(*(uint32_t *)((char *)(r0) + 0), 21); \
-		CTC2(*(uint32_t *)((char *)(r0) + 4), 22); \
-		CTC2(*(uint32_t *)((char *)(r0) + 8), 23); \
+		CTC2(CTR_ReadU32LE((char *)(r0) + 0), 21); \
+		CTC2(CTR_ReadU32LE((char *)(r0) + 4), 22); \
+		CTC2(CTR_ReadU32LE((char *)(r0) + 8), 23); \
 	}
 
 // mtc2 0-1
 #define gte_ldv0(r0)                              \
 	{                                             \
-		MTC2(*(uint32_t *)((char *)(r0) + 0), 0); \
-		MTC2(*(uint32_t *)((char *)(r0) + 4), 1); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 0), 0); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 4), 1); \
 	}
 
 // mtc2 2-3
 #define gte_ldv1(r0)                              \
 	{                                             \
-		MTC2(*(uint32_t *)((char *)(r0) + 0), 2); \
-		MTC2(*(uint32_t *)((char *)(r0) + 4), 3); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 0), 2); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 4), 3); \
 	}
 
 // mtc2 4-5
 #define gte_ldv2(r0)                              \
 	{                                             \
-		MTC2(*(uint32_t *)((char *)(r0) + 0), 4); \
-		MTC2(*(uint32_t *)((char *)(r0) + 4), 5); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 0), 4); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 4), 5); \
 	}
 
 // mtc2 0-5
 #define gte_ldv3(r0, r1, r2)                      \
 	{                                             \
-		MTC2(*(uint32_t *)((char *)(r0) + 0), 0); \
-		MTC2(*(uint32_t *)((char *)(r0) + 4), 1); \
-		MTC2(*(uint32_t *)((char *)(r1) + 0), 2); \
-		MTC2(*(uint32_t *)((char *)(r1) + 4), 3); \
-		MTC2(*(uint32_t *)((char *)(r2) + 0), 4); \
-		MTC2(*(uint32_t *)((char *)(r2) + 4), 5); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 0), 0); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 4), 1); \
+		MTC2(CTR_ReadU32LE((char *)(r1) + 0), 2); \
+		MTC2(CTR_ReadU32LE((char *)(r1) + 4), 3); \
+		MTC2(CTR_ReadU32LE((char *)(r2) + 0), 4); \
+		MTC2(CTR_ReadU32LE((char *)(r2) + 4), 5); \
 	}
 
 // load mtc2 9,10,11
@@ -92,9 +92,9 @@ extern s32 doCOP2(s32 op);
 // lwc2 9-11
 #define gte_ldlvl(r0)                              \
 	{                                              \
-		MTC2(*(uint32_t *)((char *)(r0)), 9);      \
-		MTC2(*(uint32_t *)((char *)(r0) + 4), 10); \
-		MTC2(*(uint32_t *)((char *)(r0) + 8), 11); \
+		MTC2(CTR_ReadU32LE((char *)(r0)), 9);      \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 4), 10); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 8), 11); \
 	}
 
 // mtc2 9,10,11
@@ -123,16 +123,16 @@ extern s32 doCOP2(s32 op);
 // lwc2 6
 #define gte_ldrgb(r0)                         \
 	{                                         \
-		MTC2(*(uint32_t *)((char *)(r0)), 6); \
+		MTC2(CTR_ReadU32LE((char *)(r0)), 6); \
 	}
 
 // lwc2 6,20,21,22
 #define gte_ldrgb3(r0, r1, r2)                 \
 	{                                          \
-		MTC2(*(uint32_t *)((char *)(r0)), 20); \
-		MTC2(*(uint32_t *)((char *)(r1)), 21); \
-		MTC2(*(uint32_t *)((char *)(r2)), 22); \
-		MTC2(*(uint32_t *)((char *)(r2)), 6);  \
+		MTC2(CTR_ReadU32LE((char *)(r0)), 20); \
+		MTC2(CTR_ReadU32LE((char *)(r1)), 21); \
+		MTC2(CTR_ReadU32LE((char *)(r2)), 22); \
+		MTC2(CTR_ReadU32LE((char *)(r2)), 6);  \
 	}
 
 // mtc2 12, lwc2 1
@@ -145,7 +145,7 @@ extern s32 doCOP2(s32 op);
 // mtc2 8
 #define gte_lddp(r0)                \
 	{                               \
-		MTC2(*(uint32_t *)(r0), 8); \
+		MTC2(CTR_ReadU32LE(r0), 8); \
 	}
 
 // ctc2 13 14 15
@@ -159,50 +159,50 @@ extern s32 doCOP2(s32 op);
 // mtc2 12,13,14
 #define gte_ldsxy3(r0, r1, r2)       \
 	{                                \
-		MTC2(*(uint32_t *)(r0), 12); \
-		MTC2(*(uint32_t *)(r2), 14); \
-		MTC2(*(uint32_t *)(r1), 13); \
+		MTC2(CTR_ReadU32LE(r0), 12); \
+		MTC2(CTR_ReadU32LE(r2), 14); \
+		MTC2(CTR_ReadU32LE(r1), 13); \
 	}
 
 // mtc2 12,13,14
 #define gte_ldsxy3c(r0)                            \
 	{                                              \
-		MTC2(*(uint32_t *)((char *)(r0) + 0), 12); \
-		MTC2(*(uint32_t *)((char *)(r0) + 4), 13); \
-		MTC2(*(uint32_t *)((char *)(r0) + 8), 14); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 0), 12); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 4), 13); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 8), 14); \
 	}
 
 // mtc2 17,18,19
 #define gte_ldsz3(r0, r1, r2)                  \
 	{                                          \
-		MTC2(*(uint32_t *)((char *)(r0)), 17); \
-		MTC2(*(uint32_t *)((char *)(r1)), 18); \
-		MTC2(*(uint32_t *)((char *)(r2)), 19); \
+		MTC2(CTR_ReadU32LE((char *)(r0)), 17); \
+		MTC2(CTR_ReadU32LE((char *)(r1)), 18); \
+		MTC2(CTR_ReadU32LE((char *)(r2)), 19); \
 	}
 
 // mtc2 16,17,18,19
 #define gte_ldsz4(r0, r1, r2, r3)              \
 	{                                          \
-		MTC2(*(uint32_t *)((char *)(r0)), 16); \
-		MTC2(*(uint32_t *)((char *)(r1)), 17); \
-		MTC2(*(uint32_t *)((char *)(r2)), 18); \
-		MTC2(*(uint32_t *)((char *)(r3)), 19); \
+		MTC2(CTR_ReadU32LE((char *)(r0)), 16); \
+		MTC2(CTR_ReadU32LE((char *)(r1)), 17); \
+		MTC2(CTR_ReadU32LE((char *)(r2)), 18); \
+		MTC2(CTR_ReadU32LE((char *)(r3)), 19); \
 	}
 
 // ctc2 0,2,4
 #define gte_ldopv1(r0)                            \
 	{                                             \
-		CTC2(*(uint32_t *)((char *)(r0)), 0);     \
-		CTC2(*(uint32_t *)((char *)(r0) + 4), 2); \
-		CTC2(*(uint32_t*)((char*)(r0 +8), 4);     \
+		CTC2(CTR_ReadU32LE((char *)(r0)), 0);     \
+		CTC2(CTR_ReadU32LE((char *)(r0) + 4), 2); \
+		CTC2(CTR_ReadU32LE((char *)(r0) + 8), 4); \
 	}
 
 // lwc2 9,10,11
 #define gte_ldopv2(r0)                             \
 	{                                              \
-		MTC2(*(uint32_t *)((char *)(r0)), 9);      \
-		MTC2(*(uint32_t *)((char *)(r0) + 4), 10); \
-		MTC2(*(uint32_t *)((char *)(r0) + 8), 11); \
+		MTC2(CTR_ReadU32LE((char *)(r0)), 9);      \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 4), 10); \
+		MTC2(CTR_ReadU32LE((char *)(r0) + 8), 11); \
 	}
 
 // ctc2 26
