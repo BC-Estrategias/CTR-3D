@@ -10,6 +10,7 @@
 #include "n3ds/n3ds_audio_thread.h"
 #endif
 #include <limits.h>
+#include <stdarg.h> /* NativeAudio_XAVoiceCacheLog (3DS SD-log sink) */
 #include <stddef.h> /* offsetof -- NativeAudio_XAStreamSwap's partial swap */
 #include <stdio.h>
 #include <stdlib.h>
@@ -383,6 +384,13 @@ struct NativeAudioXaSource
 	struct NativeDiscImageFile discFile;   // valid iff useDiscImage; via NativeDiscImage_FindFile
 	struct NativeAssetsHostRange hostFile; // valid iff !useDiscImage
 	int sectorSize, sectorBase, totalSectors, channelFilter;
+#if defined(__3DS__)
+	/* Voice-cache RAM backing (see the XA voice cache section). Non-NULL wins
+	 * over both file backends: every sector read is a memcpy from this blob,
+	 * indexed 0..totalSectors-1 at sectorSize stride. The blob is immutable
+	 * after build, so the worker pump reads it without locking. */
+	const u8 *ramSectors;
+#endif
 };
 
 // NOTE(aalhendi): Fixed-size streaming ring for one XA track's decoded PCM.
@@ -504,6 +512,7 @@ struct NativeAudioXaTrackInfo
 	int fileNumber;
 	int channelFilter;
 	int numSectors;
+	int entryIndex; // XNF-global track index (firstSongIndex[category] + xaID); keys the voice cache + count memo
 };
 
 struct NativeAudioVoiceState
@@ -1877,6 +1886,49 @@ internal void NativeAudio_FreeByteBuffer(struct NativeAudioByteBuffer *bytes)
 	bytes->size = 0;
 }
 
+#if defined(__3DS__)
+/* XA/ENG.XNF is ~1.8KB and immutable, but NativeAudio_LookupXATrackInfo used
+ * to re-read it from the SD card on EVERY call -- and one voice line makes TWO
+ * such calls (CDSYS_XAPlay + CDSYS_XAGetTrackLength's cooldown math), each a
+ * ~26ms fixed-cost SD read on the main thread, mid-race. Cache the raw bytes
+ * once; a failed first read stays failed for the session (same net behavior
+ * as failing every call, without re-paying the SD probe). */
+internal struct NativeAudioByteBuffer s_xnfFileCache;
+internal b32 s_xnfFileCacheTried;
+#endif
+
+/* Read XA/ENG.XNF into a heap buffer the caller owns and frees -- on 3DS from
+ * the one-shot RAM cache above, elsewhere straight from the asset layer. The
+ * caller-owns-a-copy contract keeps every early return in the XNF parser
+ * untouched. */
+internal int NativeAudio_ReadXnfBytes(struct NativeAudioByteBuffer *bytes)
+{
+#if defined(__3DS__)
+	if (!s_xnfFileCacheTried)
+	{
+		s_xnfFileCacheTried = 1;
+		NativeAudio_ReadFileBytes("XA/ENG.XNF", &s_xnfFileCache);
+	}
+	if ((s_xnfFileCache.data == NULL) || (s_xnfFileCache.size <= 0))
+	{
+		bytes->data = NULL;
+		bytes->size = 0;
+		return 0;
+	}
+	bytes->data = malloc((size_t)s_xnfFileCache.size);
+	if (bytes->data == NULL)
+	{
+		bytes->size = 0;
+		return 0;
+	}
+	memcpy(bytes->data, s_xnfFileCache.data, (size_t)s_xnfFileCache.size);
+	bytes->size = s_xnfFileCache.size;
+	return 1;
+#else
+	return NativeAudio_ReadFileBytes("XA/ENG.XNF", bytes);
+#endif
+}
+
 internal int NativeAudio_PcmReserve(struct NativeAudioPcmBuffer *pcm, int extra)
 {
 	int target;
@@ -2772,7 +2824,7 @@ internal int NativeAudio_LookupXATrackInfo(int categoryID, int xaID, struct Nati
 		return 0;
 	}
 
-	if (!NativeAudio_ReadFileBytes("XA/ENG.XNF", &xnf))
+	if (!NativeAudio_ReadXnfBytes(&xnf))
 	{
 		return 0;
 	}
@@ -2831,6 +2883,7 @@ internal int NativeAudio_LookupXATrackInfo(int categoryID, int xaID, struct Nati
 	info->channelFilter = entry[0];
 	info->fileNumber = entry[1];
 	info->numSectors = NativeAudio_ReadLE16Signed(entry + 2);
+	info->entryIndex = entryIndex;
 
 	NativeAudio_FreeByteBuffer(&xnf);
 	return info->numSectors > 0;
@@ -3155,6 +3208,17 @@ internal int NativeAudio_XASourceReadSector(struct NativeAudioXaSource *source, 
 		return 0;
 	}
 
+#if defined(__3DS__)
+	if (source->ramSectors != NULL)
+	{
+		/* Above the [DISCIO] counter on purpose: a RAM hit is not an SD call,
+		 * and the whole point of the voice cache is that this line reads 0
+		 * mid-race. */
+		memcpy(dst, source->ramSectors + (size_t)sectorIndex * (size_t)source->sectorSize, (size_t)source->sectorSize);
+		return 1;
+	}
+#endif
+
 	if (source->useDiscImage)
 	{
 #if CTR_NATIVE_DISC_IO_PROFILE
@@ -3195,6 +3259,14 @@ internal int NativeAudio_XASourceReadSectors(struct NativeAudioXaSource *source,
 		return 0;
 	}
 
+#if defined(__3DS__)
+	if (source->ramSectors != NULL)
+	{
+		memcpy(dst, source->ramSectors + (size_t)firstSector * (size_t)source->sectorSize, (size_t)count * (size_t)source->sectorSize);
+		return 1;
+	}
+#endif
+
 	if (source->useDiscImage)
 	{
 		return NativeDiscImage_ReadRawSectorsScratch(&source->discFile, (u32)firstSector, (u32)count, dst, scratch);
@@ -3228,6 +3300,13 @@ internal int NativeAudio_XAStreamReadSectorBuffered(struct NativeAudioXaStream *
 {
 	struct NativeAudioXaSource *source = &stream->source;
 
+	if (source->ramSectors != NULL)
+	{
+		/* RAM-backed voice-cache source: the span cache would only add a
+		 * second memcpy. Straight through to the RAM branch. */
+		return NativeAudio_XASourceReadSector(source, sectorIndex, dst, stream->discScratch);
+	}
+
 	if ((stream->spanBuf == NULL) || (stream->discScratch == NULL) || (source->sectorSize <= 0) || (source->sectorSize > XA_FULL_SECTOR_SIZE))
 	{
 		return NativeAudio_XASourceReadSector(source, sectorIndex, dst, stream->discScratch);
@@ -3257,6 +3336,14 @@ internal int NativeAudio_XAStreamReadSectorBuffered(struct NativeAudioXaStream *
 
 internal void NativeAudio_XASourceClose(struct NativeAudioXaSource *source)
 {
+#if defined(__3DS__)
+	if (source->ramSectors != NULL)
+	{
+		/* Nothing to close: the blob outlives every stream. */
+		memset(source, 0, sizeof(*source));
+		return;
+	}
+#endif
 	if (!source->useDiscImage)
 	{
 		NativeAssets_CloseHostRange(&source->hostFile);
@@ -3321,6 +3408,318 @@ internal int NativeAudio_XAStreamCountAudioSectors(struct NativeAudioXaSource *s
 	}
 
 	return count;
+}
+
+#if defined(__3DS__)
+/*
+ * XA voice cache (session 35, the audio preloader). Mid-race character voice
+ * lines, announcer calls, and the wrong-way barks are CD-XA streams opened
+ * per PLAY, and every open cost two XNF reads, a whole-file channel scan, and
+ * a prime read -- ~26ms fixed per SD call, synchronously on the main thread
+ * (the [DISCIO] hardware verdict; ADPCM decode was innocent). SFX and engine
+ * audio never touch the disc mid-race (SPU-resident banks with a silent no-op
+ * guard), so this cache IS the whole preloader: at the level loading screen,
+ * read every GAME-category track plus the two EXTRA wrong-way barks into RAM
+ * once per boot (~11.6 MiB -- measured off the retail disc: GAME is 5004
+ * matching sectors across 21 files) and serve every later open AND the whole
+ * pump lifetime from memory. Tracks are stored as verbatim physical sectors
+ * (subheader included, source stride), so the decode path is untouched: a
+ * RAM source is just a source whose every physical sector happens to match
+ * the channel filter.
+ *
+ * MUSIC stays on the SD path deliberately: race music is CSEQ (sequenced SPU,
+ * not XA), the XA MUSIC files are 26 MiB, and the count memo below still
+ * removes their repeat whole-file scans after the first open of each track.
+ */
+#define NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES (16u * 1024u * 1024u)
+#define NATIVE_AUDIO_XA_TRACK_INDEX_MAX       512
+#define NATIVE_AUDIO_XA_CATEGORY_MUSIC        0
+#define NATIVE_AUDIO_XA_CATEGORY_EXTRA        1
+#define NATIVE_AUDIO_XA_CATEGORY_GAME         2
+/* The only EXTRA tracks that can fire during racing (HOWL_Voiceline.c
+ * Voiceline_Update: the wrong-way bark, good-guy/bad-guy variants). Mask
+ * hints and the N.Tropy lines are hub/results-screen speech; a streaming
+ * stall there costs nothing a racer can feel. */
+#define NATIVE_AUDIO_XA_EXTRA_WRONG_WAY_GOOD 0x1e
+#define NATIVE_AUDIO_XA_EXTRA_WRONG_WAY_BAD  0x3d
+
+struct NativeAudioXaVoiceCacheTrack
+{
+	u32 byteOffset;  // into the blob
+	s32 sectorCount; // 0 = not cached
+	s16 sectorSize;  // stored stride = the build-time source's stride
+	s16 sectorBase;  // subheader offset within a stored sector
+};
+
+struct NativeAudioXaVoiceCache
+{
+	b32 built; // build ran (only then is a lookup miss an alarm worth logging)
+	u8 *blob;
+	u32 blobUsed;
+	struct NativeAudioXaVoiceCacheTrack tracks[NATIVE_AUDIO_XA_TRACK_INDEX_MAX]; // by XNF entryIndex
+};
+
+internal struct NativeAudioXaVoiceCache s_xaVoiceCache;
+
+/* Audio-sector counts by XNF entryIndex, 0 = unknown. Filled by the cache
+ * build and memoized from every full CountAudioSectors run, so an uncached
+ * track (MUSIC, cutscene EXTRA) pays its whole-file scan once per boot, not
+ * once per play. */
+internal s32 s_xaAudioSectorCountMemo[NATIVE_AUDIO_XA_TRACK_INDEX_MAX];
+
+/* Build scratch: wanted tracks of the category being built. Static because
+ * 512 entries is stack-hostile on the 3DS main thread. Only touched inside
+ * NativeAudio_XAVoiceCacheBuild (main thread, once). */
+internal struct
+{
+	s32 xaID;
+	struct NativeAudioXaTrackInfo info;
+} s_xaVoiceCacheScratch[NATIVE_AUDIO_XA_TRACK_INDEX_MAX];
+
+/* To sdmc:/ctr3ds.log via the backend logger -- Platform_Log/stdout are
+ * invisible there (stdout is the bottom-screen console, and an unpositioned
+ * line scrolls the stats block; see NativeAudio_GetOutputStats). */
+__attribute__((format(printf, 1, 2))) internal void NativeAudio_XAVoiceCacheLog(const char *fmt, ...)
+{
+	char line[160];
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(line, sizeof(line), fmt, args);
+	va_end(args);
+	N3DS_DebugLog(line);
+}
+
+internal int NativeAudio_XAVoiceCacheWantsTrack(int categoryID, int xaID)
+{
+	if (categoryID == NATIVE_AUDIO_XA_CATEGORY_GAME)
+	{
+		return 1;
+	}
+	return (categoryID == NATIVE_AUDIO_XA_CATEGORY_EXTRA) &&
+	       ((xaID == NATIVE_AUDIO_XA_EXTRA_WRONG_WAY_GOOD) || (xaID == NATIVE_AUDIO_XA_EXTRA_WRONG_WAY_BAD));
+}
+
+/* Open `source` RAM-backed from the cache. Caller must have cleared the
+ * stream already (the source is rebuilt from scratch here). */
+internal int NativeAudio_XAVoiceCacheOpen(struct NativeAudioXaSource *source, const struct NativeAudioXaTrackInfo *info)
+{
+	const struct NativeAudioXaVoiceCacheTrack *track;
+
+	if (!s_xaVoiceCache.built || (s_xaVoiceCache.blob == NULL) || (info->entryIndex < 0) || (info->entryIndex >= NATIVE_AUDIO_XA_TRACK_INDEX_MAX))
+	{
+		return 0;
+	}
+
+	track = &s_xaVoiceCache.tracks[info->entryIndex];
+	if (track->sectorCount <= 0)
+	{
+		return 0;
+	}
+
+	memset(source, 0, sizeof(*source));
+	source->ramSectors = s_xaVoiceCache.blob + track->byteOffset;
+	source->sectorSize = track->sectorSize;
+	source->sectorBase = track->sectorBase;
+	source->totalSectors = track->sectorCount;
+	source->channelFilter = info->channelFilter;
+	return 1;
+}
+
+/* One category's build pass: group wanted tracks by physical file, read each
+ * file's needed span ONCE (chunked, sequential -- per-CALL SD cost is the
+ * whole reason this runs at the loading screen), then de-interleave every
+ * wanted track's matching sectors into the blob. */
+internal void NativeAudio_XAVoiceCacheBuildCategory(int categoryID, int *tracksOut, int *sectorsOut)
+{
+	int numWanted = 0;
+	u32 filesWanted = 0;
+	int xaID;
+	int fileNumber;
+
+	for (xaID = 0; xaID < NATIVE_AUDIO_XA_TRACK_INDEX_MAX; xaID++)
+	{
+		struct NativeAudioXaTrackInfo info;
+
+		if (!NativeAudio_XAVoiceCacheWantsTrack(categoryID, xaID) || !NativeAudio_LookupXATrackInfo(categoryID, xaID, &info))
+		{
+			continue;
+		}
+		if ((info.fileNumber < 0) || (info.fileNumber >= 32) || (info.entryIndex >= NATIVE_AUDIO_XA_TRACK_INDEX_MAX))
+		{
+			continue;
+		}
+		s_xaVoiceCacheScratch[numWanted].xaID = xaID;
+		s_xaVoiceCacheScratch[numWanted].info = info;
+		numWanted++;
+		filesWanted |= 1u << info.fileNumber;
+	}
+
+	for (fileNumber = 0; fileNumber < 32; fileNumber++)
+	{
+		struct NativeAudioXaSource src;
+		char path[128];
+		u8 *fileBuf;
+		int span = 0;
+		int pos;
+		int i;
+
+		if ((filesWanted & (1u << fileNumber)) == 0)
+		{
+			continue;
+		}
+		if (!NativeAudio_BuildXAPath(path, sizeof(path), categoryID, fileNumber) || !NativeAudio_XASourceOpen(&src, path, 0))
+		{
+			NativeAudio_XAVoiceCacheLog("[XAPRELOAD] cannot open %s -- its tracks stay on the SD path", path);
+			continue;
+		}
+
+		for (i = 0; i < numWanted; i++)
+		{
+			if (s_xaVoiceCacheScratch[i].info.fileNumber == fileNumber)
+			{
+				int trackSpan = s_xaVoiceCacheScratch[i].info.numSectors;
+
+				if (trackSpan > src.totalSectors)
+				{
+					trackSpan = src.totalSectors;
+				}
+				if (trackSpan > span)
+				{
+					span = trackSpan;
+				}
+			}
+		}
+
+		fileBuf = (span > 0) ? (u8 *)malloc((size_t)span * (size_t)src.sectorSize) : NULL;
+		if (fileBuf == NULL)
+		{
+			NativeAudio_XAVoiceCacheLog("[XAPRELOAD] no %d KiB scratch for %s -- its tracks stay on the SD path", (span * src.sectorSize) >> 10, path);
+			NativeAudio_XASourceClose(&src);
+			continue;
+		}
+
+		for (pos = 0; pos < span;)
+		{
+			int chunk = span - pos;
+
+			if (chunk > NATIVE_DISC_IMAGE_CHUNK_SECTORS)
+			{
+				chunk = NATIVE_DISC_IMAGE_CHUNK_SECTORS;
+			}
+			if (!NativeAudio_XASourceReadSectors(&src, pos, chunk, fileBuf + (size_t)pos * (size_t)src.sectorSize, &s_xaDiscScratchPending))
+			{
+				break;
+			}
+			pos += chunk;
+		}
+		if (pos < span)
+		{
+			NativeAudio_XAVoiceCacheLog("[XAPRELOAD] short read on %s (%d of %d sectors) -- its tracks stay on the SD path", path, pos, span);
+			free(fileBuf);
+			NativeAudio_XASourceClose(&src);
+			continue;
+		}
+
+		for (i = 0; i < numWanted; i++)
+		{
+			const struct NativeAudioXaTrackInfo *info = &s_xaVoiceCacheScratch[i].info;
+			struct NativeAudioXaVoiceCacheTrack *track;
+			int trackSpan;
+			int matched = 0;
+			int s;
+
+			if (info->fileNumber != fileNumber)
+			{
+				continue;
+			}
+
+			trackSpan = (info->numSectors > src.totalSectors) ? src.totalSectors : info->numSectors;
+			for (s = 0; s < trackSpan; s++)
+			{
+				if (NativeAudio_IsXAAudioSector(fileBuf + (size_t)s * (size_t)src.sectorSize, src.sectorBase, info->channelFilter))
+				{
+					matched++;
+				}
+			}
+			if (matched <= 0)
+			{
+				continue;
+			}
+
+			s_xaAudioSectorCountMemo[info->entryIndex] = matched;
+
+			if (s_xaVoiceCache.blobUsed + (u32)matched * (u32)src.sectorSize > NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES)
+			{
+				NativeAudio_XAVoiceCacheLog("[XAPRELOAD] budget full at cat=%d xa=%d (%u KiB) -- track stays on the SD path", categoryID,
+				                            (int)s_xaVoiceCacheScratch[i].xaID, (unsigned)(s_xaVoiceCache.blobUsed >> 10));
+				continue;
+			}
+
+			track = &s_xaVoiceCache.tracks[info->entryIndex];
+			track->byteOffset = s_xaVoiceCache.blobUsed;
+			track->sectorSize = (s16)src.sectorSize;
+			track->sectorBase = (s16)src.sectorBase;
+			for (s = 0; s < trackSpan; s++)
+			{
+				const u8 *sec = fileBuf + (size_t)s * (size_t)src.sectorSize;
+
+				if (NativeAudio_IsXAAudioSector(sec, src.sectorBase, info->channelFilter))
+				{
+					memcpy(s_xaVoiceCache.blob + s_xaVoiceCache.blobUsed, sec, (size_t)src.sectorSize);
+					s_xaVoiceCache.blobUsed += (u32)src.sectorSize;
+				}
+			}
+			track->sectorCount = matched;
+			*tracksOut += 1;
+			*sectorsOut += matched;
+		}
+
+		free(fileBuf);
+		NativeAudio_XASourceClose(&src);
+	}
+}
+#endif /* __3DS__ */
+
+void NativeAudio_VoiceCacheEnsure(void)
+{
+#if defined(__3DS__)
+	local_persist b32 s_voiceCacheTried;
+	int tracks = 0;
+	int sectors = 0;
+
+	if (s_voiceCacheTried)
+	{
+		return;
+	}
+	s_voiceCacheTried = 1;
+
+	s_xaVoiceCache.blob = (u8 *)malloc(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES);
+	if (s_xaVoiceCache.blob == NULL)
+	{
+		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] no %u KiB for the voice cache -- voice lines stay on the SD path",
+		                            (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
+		return;
+	}
+
+	NativeAudio_XAVoiceCacheBuildCategory(NATIVE_AUDIO_XA_CATEGORY_GAME, &tracks, &sectors);
+	NativeAudio_XAVoiceCacheBuildCategory(NATIVE_AUDIO_XA_CATEGORY_EXTRA, &tracks, &sectors);
+
+	if (tracks <= 0)
+	{
+		/* Nothing landed (unreadable XNF, all files failed): give the 16 MiB
+		 * back and leave `built` unset so opens fall through silently instead
+		 * of logging a per-play miss for a cache that never existed. */
+		free(s_xaVoiceCache.blob);
+		s_xaVoiceCache.blob = NULL;
+		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] build produced no tracks -- voice lines stay on the SD path");
+		return;
+	}
+	s_xaVoiceCache.built = 1;
+
+	NativeAudio_XAVoiceCacheLog("[XAPRELOAD] voice cache built: %d tracks, %d sectors, %u KiB of %u KiB budget", tracks, sectors,
+	                            (unsigned)(s_xaVoiceCache.blobUsed >> 10), (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
+#endif
 }
 
 // Core streaming primitive: reads and decodes exactly one more matching XA
@@ -3644,6 +4043,7 @@ internal int NativeAudio_XAStreamOpenTrack(struct NativeAudioXaStream *stream, i
 	struct NativeAudioXaTrackInfo info;
 	char path[128];
 	int audioSectors;
+	int fromCache; /* 3DS voice cache hit; constant 0 elsewhere */
 	int i;
 
 	*frameCountOut = 0;
@@ -3661,30 +4061,70 @@ internal int NativeAudio_XAStreamOpenTrack(struct NativeAudioXaStream *stream, i
 	NativeAudio_XAStreamInitRingBackingIfNeeded();
 	NativeAudio_XAStreamClearNoLock(stream);
 
-	if (!NativeAudio_XASourceOpen(&stream->source, path, info.channelFilter))
+	fromCache = 0;
+#if defined(__3DS__)
+	if (NativeAudio_XAVoiceCacheOpen(&stream->source, &info))
 	{
-		return 0;
+		/* Preloaded at the loading screen: every stored sector matches the
+		 * filter by construction, so the count IS the sector total and the
+		 * whole open (and the pump after it) does zero disc reads. */
+		fromCache = 1;
+		audioSectors = stream->source.totalSectors;
 	}
-	if ((info.numSectors > 0) && (info.numSectors < stream->source.totalSectors))
+	else if (s_xaVoiceCache.built && NativeAudio_XAVoiceCacheWantsTrack(categoryID, xaID))
 	{
-		stream->source.totalSectors = info.numSectors;
+		/* A track the preloader should own is falling back to SD. This line
+		 * is the preloader spec's regression alarm -- it should never print
+		 * mid-race. */
+		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] miss cat=%d xa=%d -- streaming from SD", categoryID, xaID);
 	}
+#endif
 
-	// NOTE(aalhendi): info.numSectors (just clamped above) bounds the
-	// PHYSICAL scan range, but some categories share one physical file across
-	// many xaIDs, interleaved by channel (e.g. CDSYS_XA_TYPE_EXTRA voice
-	// lines) -- exactly like MM_Scrapbook.c's TEST.STR case below, just
-	// reached through the XNF/category path instead of an explicit path.
-	// Measured case: a boot voice line's file scanned 827 physical sectors
-	// for only 51 actual channelFilter matches. Assuming every scanned
-	// sector is audio (frameCount = totalSectors * framesPerSector) made the
-	// track appear ~16x longer than its real content, so once the true 51
-	// sectors were exhausted the ring sat on endOfStream while outputFrame
-	// climbed toward a frameCount that was never going to be reached on any
-	// reasonable timescale -- indistinguishable from a hang in
-	// deterministicRenderMode. Count real audio sectors instead, exactly
-	// like NativeAudio_XAStreamOpenFile already does.
-	audioSectors = NativeAudio_XAStreamCountAudioSectors(&stream->source);
+	if (!fromCache)
+	{
+		if (!NativeAudio_XASourceOpen(&stream->source, path, info.channelFilter))
+		{
+			return 0;
+		}
+		if ((info.numSectors > 0) && (info.numSectors < stream->source.totalSectors))
+		{
+			stream->source.totalSectors = info.numSectors;
+		}
+
+		// NOTE(aalhendi): info.numSectors (just clamped above) bounds the
+		// PHYSICAL scan range, but some categories share one physical file across
+		// many xaIDs, interleaved by channel (e.g. CDSYS_XA_TYPE_EXTRA voice
+		// lines) -- exactly like MM_Scrapbook.c's TEST.STR case below, just
+		// reached through the XNF/category path instead of an explicit path.
+		// Measured case: a boot voice line's file scanned 827 physical sectors
+		// for only 51 actual channelFilter matches. Assuming every scanned
+		// sector is audio (frameCount = totalSectors * framesPerSector) made the
+		// track appear ~16x longer than its real content, so once the true 51
+		// sectors were exhausted the ring sat on endOfStream while outputFrame
+		// climbed toward a frameCount that was never going to be reached on any
+		// reasonable timescale -- indistinguishable from a hang in
+		// deterministicRenderMode. Count real audio sectors instead, exactly
+		// like NativeAudio_XAStreamOpenFile already does.
+#if defined(__3DS__)
+		if ((info.entryIndex >= 0) && (info.entryIndex < NATIVE_AUDIO_XA_TRACK_INDEX_MAX) && (s_xaAudioSectorCountMemo[info.entryIndex] > 0))
+		{
+			/* Same scan, same source, same bound -- the count cannot change
+			 * within a boot, and for MUSIC-sized files re-walking the whole
+			 * file per open was multi-second SD work. */
+			audioSectors = s_xaAudioSectorCountMemo[info.entryIndex];
+		}
+		else
+#endif
+		{
+			audioSectors = NativeAudio_XAStreamCountAudioSectors(&stream->source);
+#if defined(__3DS__)
+			if ((audioSectors > 0) && (info.entryIndex >= 0) && (info.entryIndex < NATIVE_AUDIO_XA_TRACK_INDEX_MAX))
+			{
+				s_xaAudioSectorCountMemo[info.entryIndex] = audioSectors;
+			}
+#endif
+		}
+	}
 	if (audioSectors <= 0)
 	{
 		NativeAudio_XASourceClose(&stream->source);

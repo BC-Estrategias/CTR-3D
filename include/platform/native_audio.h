@@ -19,6 +19,11 @@ void NativeAudio_SpuSetCommonCDVolume(s16 left, s16 right);
 void NativeAudio_SpuSetCommonCDReverb(s32 enabled);
 
 int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volumeRight);
+// One-time (per boot) XA voice-line preload: reads every GAME-category track
+// plus the wrong-way EXTRA barks into RAM so mid-race voice-line opens do zero
+// disc reads. Called from the level loading screen; self-gates after the first
+// call. No-op off the 3DS (PC disk reads never stalled a frame).
+void NativeAudio_VoiceCacheEnsure(void);
 int NativeAudio_PlayXAFile(const char *relativePath, int channelFilter, int volumeLeft, int volumeRight);
 int NativeAudio_GetXATrackLength(int categoryID, int xaID);
 int NativeAudio_IsXAPlaying(void);

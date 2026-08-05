@@ -3,6 +3,8 @@
 void (*mainMenuInit[])() = {MM_JumpTo_Title_FirstTime, MM_JumpTo_Characters, MM_JumpTo_TrackSelect, MM_JumpTo_BattleSetup, CS_Garage_Init, MM_JumpTo_Scrapbook};
 
 #ifdef CTR_NATIVE
+#include <platform/native_audio.h>
+
 enum
 {
 	LOAD_NATIVE_NDBOX_INTRO_SONG_SYNC_TIME = 0x11c0,
@@ -420,6 +422,13 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
 			CseqMusic_StopAll();
 			Music_LoadBanks();
 		}
+
+#ifdef CTR_NATIVE
+		// s35 audio preloader: one-time (per boot) XA voice-line cache build.
+		// Batched SD reads belong on this loading screen, not mid-race --
+		// self-gates to a no-op after the first level load (and on PC).
+		NativeAudio_VoiceCacheEnsure();
+#endif
 
 		break;
 	}
