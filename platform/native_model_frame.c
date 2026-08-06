@@ -73,9 +73,9 @@ struct NativeModelFrameCounters
 	u32 unscanned;
 };
 
-static struct NativeModelFrameCounters s_frame;
-static struct NativeModelFrameCounters s_window;
-static u32 s_windowFrames;
+static struct NativeModelFrameCounters s_mfFrame;
+static struct NativeModelFrameCounters s_mfWindow;
+static u32 s_mfWindowFrames;
 
 static void NativeModelFrame_Fold(struct NativeModelFrameCounters *dst, const struct NativeModelFrameCounters *src)
 {
@@ -139,37 +139,37 @@ void NativeModelFrame_Sample(const struct Instance *inst, const struct ModelHead
 
 	if (scan == NULL)
 	{
-		s_frame.instances++;
-		s_frame.unscanned++;
+		s_mfFrame.instances++;
+		s_mfFrame.unscanned++;
 		return;
 	}
 
-	s_frame.instances++;
-	s_frame.verts += scan->verts;
-	s_frame.tris += scan->tris;
-	s_frame.texPages += scan->texPages;
+	s_mfFrame.instances++;
+	s_mfFrame.verts += scan->verts;
+	s_mfFrame.tris += scan->tris;
+	s_mfFrame.texPages += scan->texPages;
 
 	if ((scan->flags & NATIVE_MODEL_SCAN_STATIC) != 0)
 	{
-		s_frame.staticInstances++;
-		s_frame.staticTris += scan->tris;
+		s_mfFrame.staticInstances++;
+		s_mfFrame.staticTris += scan->tris;
 	}
 	else
 	{
-		s_frame.animInstances++;
-		s_frame.animTris += scan->tris;
+		s_mfFrame.animInstances++;
+		s_mfFrame.animTris += scan->tris;
 	}
 
 	if ((lodIndex >= 0) && (lodIndex < MODELFRAME_MAX_RUNGS))
 	{
-		s_frame.rung[lodIndex]++;
+		s_mfFrame.rung[lodIndex]++;
 	}
 	else
 	{
-		s_frame.rungBeyond++;
+		s_mfFrame.rungBeyond++;
 	}
 
-	s_frame.nextRungTris += NativeModelFrame_NextRungTris(inst, lodIndex, scan->tris);
+	s_mfFrame.nextRungTris += NativeModelFrame_NextRungTris(inst, lodIndex, scan->tris);
 }
 
 void NativeModelFrame_EndFrame(void)
@@ -181,39 +181,39 @@ void NativeModelFrame_EndFrame(void)
 	 * different stretches of track. Empty frames are dropped from the window
 	 * rather than folded in.
 	 */
-	if (s_frame.instances == 0)
+	if (s_mfFrame.instances == 0)
 	{
 		return;
 	}
 
-	NativeModelFrame_Fold(&s_window, &s_frame);
-	memset(&s_frame, 0, sizeof(s_frame));
-	s_windowFrames++;
+	NativeModelFrame_Fold(&s_mfWindow, &s_mfFrame);
+	memset(&s_mfFrame, 0, sizeof(s_mfFrame));
+	s_mfWindowFrames++;
 
-	if (s_windowFrames < MODELFRAME_WINDOW_FRAMES)
+	if (s_mfWindowFrames < MODELFRAME_WINDOW_FRAMES)
 	{
 		return;
 	}
 
 	{
-		u32 f = s_windowFrames;
+		u32 f = s_mfWindowFrames;
 
 		Platform_LogInstrument("[MODELFRAME] lvl=%d f=%lu inst/f=%lu tris/f=%lu verts/f=%lu pages/f=%lu unscanned=%lu\n", NativePerf_CurrentLevelID(),
-		             (unsigned long)f, (unsigned long)(s_window.instances / f), (unsigned long)(s_window.tris / f), (unsigned long)(s_window.verts / f),
-		             (unsigned long)(s_window.texPages / f), (unsigned long)s_window.unscanned);
+		             (unsigned long)f, (unsigned long)(s_mfWindow.instances / f), (unsigned long)(s_mfWindow.tris / f), (unsigned long)(s_mfWindow.verts / f),
+		             (unsigned long)(s_mfWindow.texPages / f), (unsigned long)s_mfWindow.unscanned);
 
 		Platform_LogInstrument("[MODELFRAME] lvl=%d static inst/f=%lu tris/f=%lu | anim inst/f=%lu tris/f=%lu | rung+1 tris/f=%lu (%lu%% of now)\n",
-		             NativePerf_CurrentLevelID(), (unsigned long)(s_window.staticInstances / f), (unsigned long)(s_window.staticTris / f),
-		             (unsigned long)(s_window.animInstances / f), (unsigned long)(s_window.animTris / f), (unsigned long)(s_window.nextRungTris / f),
-		             (s_window.tris > 0) ? (unsigned long)((s_window.nextRungTris * 100u) / s_window.tris) : 0ul);
+		             NativePerf_CurrentLevelID(), (unsigned long)(s_mfWindow.staticInstances / f), (unsigned long)(s_mfWindow.staticTris / f),
+		             (unsigned long)(s_mfWindow.animInstances / f), (unsigned long)(s_mfWindow.animTris / f), (unsigned long)(s_mfWindow.nextRungTris / f),
+		             (s_mfWindow.tris > 0) ? (unsigned long)((s_mfWindow.nextRungTris * 100u) / s_mfWindow.tris) : 0ul);
 
-		Platform_LogInstrument("[MODELFRAME] lvl=%d rungs/f: 0=%lu 1=%lu 2=%lu 3=%lu beyond=%lu\n", NativePerf_CurrentLevelID(), (unsigned long)(s_window.rung[0] / f),
-		             (unsigned long)(s_window.rung[1] / f), (unsigned long)(s_window.rung[2] / f), (unsigned long)(s_window.rung[3] / f),
-		             (unsigned long)(s_window.rungBeyond / f));
+		Platform_LogInstrument("[MODELFRAME] lvl=%d rungs/f: 0=%lu 1=%lu 2=%lu 3=%lu beyond=%lu\n", NativePerf_CurrentLevelID(), (unsigned long)(s_mfWindow.rung[0] / f),
+		             (unsigned long)(s_mfWindow.rung[1] / f), (unsigned long)(s_mfWindow.rung[2] / f), (unsigned long)(s_mfWindow.rung[3] / f),
+		             (unsigned long)(s_mfWindow.rungBeyond / f));
 	}
 
-	memset(&s_window, 0, sizeof(s_window));
-	s_windowFrames = 0;
+	memset(&s_mfWindow, 0, sizeof(s_mfWindow));
+	s_mfWindowFrames = 0;
 }
 
 #else

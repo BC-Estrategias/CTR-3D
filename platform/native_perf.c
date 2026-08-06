@@ -175,6 +175,14 @@ global_variable char s_summaryPath[NATIVE_PERF_PATH_MAX];
 global_variable struct NativePerfWorstFrame s_worstFrames[NATIVE_PERF_TOP_FRAME_COUNT];
 global_variable s32 s_worstFrameCount;
 #if defined(__3DS__)
+/*
+ * s36: this variable's name is part of its correctness. A same-named
+ * uninitialized file-scope static in another unity-TU file silently MERGES
+ * with this one (C tentative definitions) -- native_model_frame.c's window
+ * counter did exactly that, and its worker-side reset starved every [PERF]
+ * report during model-visible gameplay from s30 until 2026-08-05. Keep
+ * cross-file static names unique; see CLAUDE.md.
+ */
 global_variable u32 s_windowFrames;
 global_variable f64 s_windowTotalMs;
 global_variable f64 s_windowWorkMs;

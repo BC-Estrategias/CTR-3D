@@ -3263,8 +3263,10 @@ void NativeRenderer_SwapWindow(void)
 			const unsigned long missesWindow = (unsigned long)(s_decodeCacheMisses - s_lastStatCacheMisses);
 			const unsigned long evictionsWindow = (unsigned long)(s_decodeCacheEvictions - s_lastStatCacheEvictions);
 			const unsigned long drawsWindow = (unsigned long)(s_drawCallCount - s_lastStatDrawCallCount);
-			/* Report interval is always exactly 32 frames -- the (s_frameCounter & 31) gate above. */
-			const unsigned long drawsPerFrameAvgX10 = (drawsWindow * 10UL) / 32UL;
+			/* Report interval is always exactly 64 frames -- the (s_frameCounter & 63)
+			 * gate above. This divided by 32 until s36 (a leftover from when the gate
+			 * really was & 31), which overstated draws/frame 2x on the bottom screen. */
+			const unsigned long drawsPerFrameAvgX10 = (drawsWindow * 10UL) / 64UL;
 			char cacheLine[128];
 
 			const unsigned long staleWindow = (unsigned long)(s_decodeCacheStaleMisses - s_lastStatStaleMisses);
