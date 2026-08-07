@@ -35,6 +35,20 @@ extern void NativeModelEmit_EndInstance(void);
 extern int NativeModelEmit_SkipRetailDraw(void);
 #endif
 
+#ifdef CTR_NATIVE
+/* s37 widescreen: extra screen-X acceptance (PSX px per side) for the
+ * projected-bounds cull, so instances keep drawing into the wide-FOV
+ * margins instead of popping at the old 4:3 edge. 0 everywhere except a
+ * 3DS build with the REAL-wide window active, so retail math is untouched.
+ * Same local-extern convention as the hook block above; the definition
+ * lives in platform/native_gpu.c (always compiled), shared with DrawSky's
+ * margin test. NativeWide_MarginClassOn = the strips-hunt kill-switch mask
+ * (dumpreq `widemask N`): bit 1 gates the instance bbox margin, bit 2 the
+ * per-triangle margin. */
+extern int NativeWide_CullMarginX(int rectW);
+extern int NativeWide_MarginClassOn(int bit);
+#endif
+
 #if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
 /* s33 instance depth-axis bracket -- same local-extern convention as
  * DrawSky.c's suppression calls; platform/native_gte_capture.c. Guarded by
@@ -1186,9 +1200,19 @@ static void RenderBucket_ProjectFrameBounds(struct ModelFrame *frame, struct Mod
 
 static int RenderBucket_AcceptProjectedBounds(const struct RenderBucketBounds *bounds, struct PushBuffer *pb, int geomScreenHalf)
 {
+#ifdef CTR_NATIVE
+	/* s37: X-only widening of the acceptance window, matching the wide-FOV
+	 * ortho extension exactly (rectW/8 per side = the -64..576 window at the
+	 * 512-wide DISPENV). 0 whenever the wide window is off, restoring the
+	 * retail comparisons verbatim. Y is never widened. */
+	const int marginX = NativeWide_MarginClassOn(1) ? NativeWide_CullMarginX((u16)pb->rect.w) : 0;
+#else
+	const int marginX = 0;
+#endif
+
 	// NOTE(aalhendi): Retail performs these viewport/depth rejects only after the
 	// PUSHBUFFER_EXISTS metadata path at 0x80071164-0x800711c8.
-	if (bounds->maxX < 0)
+	if (bounds->maxX < -marginX)
 	{
 		return 0;
 	}
@@ -1203,7 +1227,7 @@ static int RenderBucket_AcceptProjectedBounds(const struct RenderBucketBounds *b
 		return 0;
 	}
 
-	if (RenderBucket_MipsSub(bounds->minX, (u16)pb->rect.w) > 0)
+	if (RenderBucket_MipsSub(bounds->minX, (u16)pb->rect.w) > marginX)
 	{
 		return 0;
 	}
@@ -2239,6 +2263,13 @@ void *RenderBucket_QueueLevInstances(struct CameraDC *cDC, struct OTMem *otState
 			continue;
 		}
 
+		/* s37 widescreen note: a full-instance-list bypass of the PVS list
+		 * was tried here and REVERTED same session -- it force-queued
+		 * instance classes the PVS deliberately excludes (screen-space and
+		 * special instances) and put garbage quads on screen, and it was
+		 * solving the wrong gate anyway: the seal-class cutoff was the
+		 * per-triangle screen window in RenderBucket_TriangleInScreenWindow,
+		 * which now carries the wide margin itself. */
 		for (; *visInstSrc != 0; visInstSrc++)
 		{
 			entry = RenderBucket_QueueDraw(*visInstSrc, entry, player, lodMask, gameMode1, &queueState);
@@ -2651,6 +2682,74 @@ static uint32_t *RenderBucket_GetClampedOTEntry(struct RenderBucketDrawContext *
 	return (uint32_t *)activeRange + depthBin;
 }
 
+#ifdef CTR_NATIVE
+/* s37 widescreen: second-chance for triangles the retail screen-window test
+ * rejected -- same shape as DrawSky_IsVisibleWideMargin (DrawSky.c), plain
+ * s16 unpack with the X sides widened by the shared NativeWide_CullMarginX
+ * margin, Y exactly retail's. Only ever ACCEPTS triangles retail rejected,
+ * and only while the wide window is live, so retail/PC output is untouched.
+ * This is the gate that actually cut the seal class at the 4:3 edge: it runs
+ * per triangle on the Execute walk, AFTER the (already-widened) instance
+ * bbox cull, and the resident dmodel capture only sees triangles that
+ * survive it -- so widening here feeds retail packets and the PICA-native
+ * model path alike. Reads the SXY FIFO only; no GTE ops, so the
+ * avsz3->stopz bracket in CheckProjectedPrim is undisturbed. */
+static int RenderBucket_TriangleInWideMargin(struct RenderBucketDrawContext *ctx)
+{
+	int w = (u16)ctx->pb->rect.w;
+	int h = (u16)ctx->pb->rect.h;
+	int margin = NativeWide_MarginClassOn(2) ? NativeWide_CullMarginX(w) : 0;
+	u32 sxy0 = MFC2(12);
+	u32 sxy1 = MFC2(13);
+	u32 sxy2 = MFC2(14);
+	s16 x0, x1, x2, y0, y1, y2;
+
+	if (margin == 0)
+	{
+		return 0;
+	}
+
+	x0 = (s16)(sxy0 & 0xffff);
+	y0 = (s16)(sxy0 >> 16);
+	x1 = (s16)(sxy1 & 0xffff);
+	y1 = (s16)(sxy1 >> 16);
+	x2 = (s16)(sxy2 & 0xffff);
+	y2 = (s16)(sxy2 >> 16);
+
+	if ((x0 < -margin) && (x1 < -margin) && (x2 < -margin))
+	{
+		return 0;
+	}
+	if ((x0 > w + margin) && (x1 > w + margin) && (x2 > w + margin))
+	{
+		return 0;
+	}
+	if ((y0 < 0) && (y1 < 0) && (y2 < 0))
+	{
+		return 0;
+	}
+	if ((y0 > h) && (y1 > h) && (y2 > h))
+	{
+		return 0;
+	}
+
+	/* Wrap guard, same reasoning as DrawSky_IsVisibleWideMargin's: verts
+	 * pinned on BOTH GTE clamp rails = wrapped projection = giant garbage
+	 * triangle; one rail = legitimate edge-spanner, keep it. */
+	{
+		int minX = (x0 < x1) ? ((x0 < x2) ? x0 : x2) : ((x1 < x2) ? x1 : x2);
+		int maxX = (x0 > x1) ? ((x0 > x2) ? x0 : x2) : ((x1 > x2) ? x1 : x2);
+
+		if ((minX <= -1024) && (maxX >= 1023))
+		{
+			return 0;
+		}
+	}
+
+	return 1;
+}
+#endif
+
 static int RenderBucket_TriangleInScreenWindow(struct RenderBucketDrawContext *ctx)
 {
 	u32 screen = RenderBucket_PackXY(ctx->pb->rect.w, ctx->pb->rect.h);
@@ -2663,12 +2762,20 @@ static int RenderBucket_TriangleInScreenWindow(struct RenderBucketDrawContext *c
 
 	if ((s32)reject < 0)
 	{
+#ifdef CTR_NATIVE
+		return RenderBucket_TriangleInWideMargin(ctx);
+#else
 		return 0;
+#endif
 	}
 
 	if ((s32)(reject << 16) < 0)
 	{
+#ifdef CTR_NATIVE
+		return RenderBucket_TriangleInWideMargin(ctx);
+#else
 		return 0;
+#endif
 	}
 
 	return 1;

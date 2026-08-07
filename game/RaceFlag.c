@@ -488,6 +488,60 @@ void RaceFlag_DrawLoadingString(void)
 	return;
 }
 
+#ifdef CTR_NATIVE
+/* Defined platform-side (native_gpu.c) -- file scope, not the block-local
+ * idiom used for NativeWide_CullMarginX below, because the use site is deep
+ * inside RaceFlag_DrawSelf's nested loops and a block-scoped declaration
+ * would not be visible there. */
+extern int g_dbg_flagRainbow;
+
+/*
+ * Pride-flag stripe colours, top to bottom (the six-colour flag). Used when
+ * g_dbg_flagRainbow is on -- see the pattern block in RaceFlag_DrawSelf.
+ *
+ * These are TINTS, not final colours: each is modulated by the same per-quad
+ * wave lighting the checkers use, so a stripe runs from roughly half to full
+ * intensity across the cloth. That is deliberate and it is the whole trick --
+ * flat-filled bands read as a scrolling texture, while the shaded ones read as
+ * a waving flag, which is the effect the mesh already earns and the stereo
+ * depth now sells.
+ */
+static const u8 s_rfStripeRGB[6][3] = {
+    {0xE4, 0x03, 0x03}, /* red */
+    {0xFF, 0x8C, 0x00}, /* orange */
+    {0xFF, 0xED, 0x00}, /* yellow */
+    {0x00, 0x80, 0x26}, /* green */
+    {0x00, 0x4D, 0xFF}, /* blue */
+    {0x75, 0x07, 0x87}, /* violet */
+};
+
+/* Vertical quad index -> stripe, for the 29-quad-tall mesh. (i * 6) / 29 lays
+ * the six bands out 5,5,5,5,5,4 quads deep -- even to within a single quad,
+ * which is the finest the mesh can express (checker/stripe edges snap to quad
+ * boundaries; see RACE_FLAG_SCREEN_ROWS/POINTS_PER_ROW).
+ *
+ * INVERTED on purpose. `i` counts quads in the order the mesh is built, which
+ * runs UP the screen, not down: data.matrixTitleFlag flips the model-space vy
+ * axis the row loop steps along. MEASURED, not assumed -- the first build put
+ * red at the bottom and violet at the top, which is upside down for a flag
+ * whose stripe order is the point. Indexing from the end puts red on top. */
+#define RACE_FLAG_STRIPE_QUADS_TALL 29u
+#define RACE_FLAG_STRIPE_INDEX(quadY) (5u - (((u32)(quadY)*6u) / RACE_FLAG_STRIPE_QUADS_TALL))
+
+/*
+ * Quads per checker square. Retail is 4 -- the original `>> 2` on both axes --
+ * and the port uses 3 (owner request, "a little smaller"). The only deliberate
+ * departure from retail's flag appearance; everything else about the mesh, the
+ * wave and the lighting is untouched.
+ *
+ * A constant divisor, not a shift, so non-power-of-two sizes are available: gcc
+ * turns `/ 3` into a multiply-high, so this costs no more than the shift did
+ * and never reaches ARM11's missing hardware divide. Any integer >= 1 works; 1
+ * is the finest the mesh can express, since squares snap to quad boundaries.
+ */
+#define RACE_FLAG_CHECKER_QUADS 3u
+#endif
+
 force_inline char RaceFlag_CalculateBrightness(u32 sine, u8 darkTile)
 {
 	if (darkTile)
@@ -545,6 +599,9 @@ void RaceFlag_DrawSelf()
 	struct RaceFlagScratch *scratch;
 	s32 local[5];
 	SVECTOR pos[3] = {0};
+#ifdef CTR_NATIVE
+	int flagWide = 0;
+#endif
 
 	if (sdata->RaceFlag_CanDraw == 0)
 	{
@@ -574,7 +631,49 @@ SKIP_LOADING_TEXT:
 	gte_SetRotMatrix(&data.matrixTitleFlag);
 	gte_SetTransMatrix(&data.matrixTitleFlag);
 	gte_SetGeomOffset(0x100, 0x78);
+#ifdef CTR_NATIVE
+	/* s37 widescreen: the flag mesh only spans the 4:3 window -- the
+	 * geometry past the old edges simply doesn't exist (owner call:
+	 * "stretch the flag", refined to a FLAT ZOOM). gte_SetGeomScreen is
+	 * this block's own projection distance, so raising it is a uniform
+	 * zoom about the projection centre: squares stay square, and 3/2
+	 * (0x180) covers the wide window with enough overshoot to keep the
+	 * mesh's ragged wavy border off-screen in every pose (loading AND
+	 * menus). Earlier matrix-row X stretch superseded: anamorphic, and
+	 * it under-covered the menu pose. Retail 0x100 whenever wide is off,
+	 * including all of PC.
+	 *
+	 * flagWide also feeds two more wide adaptations below: the
+	 * quad-granular screen cull bypass (the packed 512x216 test culls
+	 * whole quads that now land in the margins -- the owner's "jaggy
+	 * edges") and the depth-capture suppression bracket (Crash in front
+	 * of the flag, DrawSky's exact pattern). */
+	{
+		extern int NativeWide_CullMarginX(int rectW);
+
+		flagWide = (NativeWide_CullMarginX(512) != 0);
+	}
+	gte_SetGeomScreen(flagWide ? 0x180 : 0x100);
+#else
 	gte_SetGeomScreen(0x100);
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s39 REAL FLAG DEPTH (owner design). This used to be the DrawSky-style
+	 * suppression bracket: the wave's true GTE depths cross a menu model's
+	 * band (Crash interpenetrated the flag, owner-reported), so stores were
+	 * dropped and the packets fell back to flat OT-bucket depth -- which
+	 * fixed the layering but turned the wave into cardboard in stereo. The
+	 * remap keeps the wave: each stored SZ3 is compressed to ~1/4 relief
+	 * and re-anchored just BEHIND the stereo convergence plane, so the flag
+	 * ripples at/behind the physical screen while menu models pop out in
+	 * front -- the bands cannot cross, the painter's guarantee survives,
+	 * and there is no pose conditional (the flag is one continuous
+	 * animation across loading, menu and wipe roles; a role-keyed depth
+	 * jump would be visible). Constants, bounds and the accepted wipe
+	 * caveat: GTECapture_SetStoreDepthRemap (native_gte_capture.c). */
+	GTECapture_SetStoreDepthRemap(1);
+#endif
 
 	p = (POLY_G4 *)gGT->backBuffer->primMem.cursor;
 
@@ -767,11 +866,55 @@ SKIP_LOADING_TEXT:
 				u32 write0 = writeScreen->xy[pointIndex];
 				u32 write1 = writeScreen->xy[pointIndex + 1];
 
-				if (((read0 & read1 & write0 & write1 & screenlimit) == 0) &&
-				    (((dimensions - read0) & (dimensions - read1) & (dimensions - write0) & (dimensions - write1) & screenlimit) == 0))
+				int quadVisible = (((read0 & read1 & write0 & write1 & screenlimit) == 0) &&
+				                   (((dimensions - read0) & (dimensions - read1) & (dimensions - write0) & (dimensions - write1) & screenlimit) == 0));
+
+#ifdef CTR_NATIVE
+				/* s37 widescreen: this packed test culls whole QUADS
+				 * against the 4:3 512x216 window -- in the wide window
+				 * that eats every quad fully inside the margins and
+				 * stair-steps the flag's edge at checker granularity
+				 * (the owner's "jaggy edges"). While wide, draw
+				 * everything and let the GPU clip; the full mesh is
+				 * ~360 quads, noise. */
+				if (flagWide)
 				{
+					quadVisible = 1;
+				}
+#endif
+				if (quadVisible)
+				{
+#ifdef CTR_NATIVE
+					/* Rainbow stripes (g_dbg_flagRainbow, native_gpu.c). The
+					 * checker below is a 2D parity test over BOTH quad axes;
+					 * a stripe is a 1D band over the vertical axis alone, so
+					 * the only structural change is dropping `column` from the
+					 * pattern. Lighting, mesh, wave and geometry are identical
+					 * to retail's -- only the colour written into the same two
+					 * gouraud corners differs. */
+					if (g_dbg_flagRainbow)
+					{
+						const u8 *tint = s_rfStripeRGB[RACE_FLAG_STRIPE_INDEX(i)];
+						/* Lighting with the LIGHT-tile curve for every stripe:
+						 * the two curves exist to separate the checker's own
+						 * two tones, which a coloured stripe does not need, and
+						 * the light curve carries the wider range (the fuller
+						 * shading). */
+						u8 lumR = RaceFlag_CalculateBrightness(lightR, 0);
+						u8 lumL = RaceFlag_CalculateBrightness(lightL, 0);
+
+						setRGB0(p, (u8)((lumR * tint[0]) >> 8), (u8)((lumR * tint[1]) >> 8), (u8)((lumR * tint[2]) >> 8));
+						CTR_WriteU32LE(&p->r2, CTR_ReadU32LE(&p->r0));
+
+						setRGB1(p, (u8)((lumL * tint[0]) >> 8), (u8)((lumL * tint[1]) >> 8), (u8)((lumL * tint[2]) >> 8));
+						CTR_WriteU32LE(&p->r3, CTR_ReadU32LE(&p->r1));
+					}
+					else
+#endif
+					{
 					// TRUE for gray, FALSE for white
-					u8 boolDark = ((((column >> 2) + (i >> 2)) & 1U) != 0);
+					// (retail: (column >> 2) + (i >> 2) -- see RACE_FLAG_CHECKER_QUADS)
+					u8 boolDark = (((((u32)column / RACE_FLAG_CHECKER_QUADS) + ((u32)i / RACE_FLAG_CHECKER_QUADS)) & 1U) != 0);
 
 					u8 colorR = RaceFlag_CalculateBrightness(lightR, boolDark);
 					setRGB0(p, colorR, colorR, colorR);
@@ -780,6 +923,7 @@ SKIP_LOADING_TEXT:
 					u8 colorL = RaceFlag_CalculateBrightness(lightL, boolDark);
 					setRGB1(p, colorL, colorL, colorL);
 					CTR_WriteU32LE(&p->r3, CTR_ReadU32LE(&p->r1));
+					}
 
 					// positions
 					CtrGpu_WritePackedXY(&p->x0, read0);
@@ -802,6 +946,21 @@ SKIP_LOADING_TEXT:
 
 		lightR = lightL;
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* Cleared inside the same draw that set it, after the last projected
+	 * quad -- same discipline as DrawSky_Full's bracket. The exempt range
+	 * is the remap's walk-side half: it tells the resolver which packets
+	 * take their STEREO depth from these (remapped) captures while their
+	 * OCCLUSION depth comes from retail's OT layering like it always did
+	 * -- flag over everything mid-wipe, behind the models in menus. See
+	 * GTECapture_NodeExempt and docs/FLAG_SPLIT_CHANNEL_SPEC.md for the
+	 * two-channel contract. primMem.cursor still holds this draw's first
+	 * prim here (it advances only below), so [cursor, p) is the flag's
+	 * packets and nothing else. */
+	GTECapture_SetStoreDepthRemap(0);
+	GTECapture_SetUIBandExemptRange(gGT->backBuffer->primMem.cursor, p);
+#endif
 
 	gGT->backBuffer->primMem.cursor = p;
 	sdata->RaceFlag_ElapsedTime += gGT->elapsedTimeMS * 100;

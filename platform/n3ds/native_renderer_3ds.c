@@ -1262,6 +1262,10 @@ global_variable u32 s_drawTrianglesCalls = 0;
 /* Last DISPENV the projection was built for; -1 forces it on the first frame. */
 global_variable int s_projectionDispW = -1;
 global_variable int s_projectionDispH = -1;
+/* Widescreen mode the projection was built for -- mode 2 (REAL) changes the
+ * ortho window inside N3DS_C3DSetProjection, so a toggle must rebuild even
+ * though the DISPENV didn't move. */
+global_variable int s_projectionWideMode = -1;
 global_variable u32 s_lastStatDrawCallCount = 0;
 
 /* Scratch for one decoded+tiled page; reused every decode, never persisted.
@@ -2473,11 +2477,33 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
 		 * all the headroom above it, which is what made textured surfaces
 		 * render darker than PC. See N3DS_C3DSetColorDoubling. */
 
-		dst->x = (s16)src->x;
+		{
+			/* s37 widescreen UI relocation: UI-band verts (raw stamp
+			 * 0xFFC0.. = the same d <= 63 band the stereo mask flattens)
+			 * get their X remapped toward the wide window edges -- see
+			 * NativeWide_UiShiftX (native_gpu.c) for the ramp and why it
+			 * cannot crack sprites. Gated on packet depth being live:
+			 * with it off the stamp is an emit ordinal, not a depth, and
+			 * the band test would misfire. No-op whenever wide is off. */
+			extern int NativeWide_UiShiftX(int x);
+			extern int g_dbg_packetDepth;
+			s16 sx = (s16)src->x;
+
+			if (g_dbg_packetDepth && (src->emitOrdinal >= 0xFFC0u))
+			{
+				sx = (s16)NativeWide_UiShiftX((int)sx);
+			}
+			dst->x = sx;
+		}
 		dst->y = (s16)src->y;
 		/* Emit-ordinal depth substrate, biased into s16 (see
 		 * n3ds_backend.h). Later-parsed prims get larger z. */
 		dst->z = (s16)((int)src->emitOrdinal - 32768);
+		/* Parallax channel, biased identically (s40b channel split). Equal to
+		 * z for everything except the checkered flag, whose stereo depth is
+		 * deliberately not the depth it occludes by --
+		 * docs/FLAG_SPLIT_CHANNEL_SPEC.md. Read by ctr.v.pica as inpos.w. */
+		dst->w = (s16)((int)src->parallaxOrdinal - 32768);
 
 		/* Offset into the resolved region of the atlas, not the whole
 		 * atlas. Untextured uses the fixed white cell's centre
@@ -2868,18 +2894,24 @@ void NativeRenderer_BeginScene(void)
 	 * integer compares a frame.
 	 */
 	{
+		extern int g_dbg_widescreen;
 		const int dispW = (activeDispEnv.disp.w > 0) ? activeDispEnv.disp.w : 512;
 		const int dispH = (activeDispEnv.disp.h > 0) ? activeDispEnv.disp.h : 216;
 
-		if ((dispW != s_projectionDispW) || (dispH != s_projectionDispH))
+		if ((dispW != s_projectionDispW) || (dispH != s_projectionDispH) || (g_dbg_widescreen != s_projectionWideMode))
 		{
+			/* Mirrors the extension N3DS_C3DSetProjection applies in mode 2,
+			 * so the log states the window the GPU actually got. */
+			const int extra = (g_dbg_widescreen == 2) ? (dispW * (400 - N3DS_TOP_CONTENT_W)) / (2 * N3DS_TOP_CONTENT_W) : 0;
 			char line[96];
 
 			s_projectionDispW = dispW;
 			s_projectionDispH = dispH;
+			s_projectionWideMode = g_dbg_widescreen;
 			N3DS_C3DSetProjection(0.0f, (float)dispW, (float)dispH);
 
-			snprintf(line, sizeof(line), "[CTR-3DS] projection: disp %dx%d -> ortho 0..%d x 0..%d (4:3, viewport-cropped)", dispW, dispH, dispW, dispH);
+			snprintf(line, sizeof(line), "[CTR-3DS] projection: disp %dx%d -> ortho %d..%d x 0..%d (%s)", dispW, dispH, -extra, dispW + extra, dispH,
+			         (g_dbg_widescreen == 2) ? "REAL wide FOV" : (g_dbg_widescreen == 1) ? "STRETCH, no crop" : "4:3, viewport-cropped");
 			N3DS_DebugLog(line);
 		}
 	}
@@ -3059,6 +3091,10 @@ void NativeRenderer_EndScene(void)
 		for (i = 0; i < 6; i++)
 		{
 			quad[i].z = N3DS_DEPTH_TOPMOST;
+			/* Overlay quads carry no stereo depth: parallax = z puts them in
+			 * the near band the shader's mask flattens to zero shift, which
+			 * is what a debug overlay wants. */
+			quad[i].w = N3DS_DEPTH_TOPMOST;
 			quad[i].r = 255;
 			quad[i].g = 255;
 			quad[i].b = 255;
@@ -3217,30 +3253,30 @@ void NativeRenderer_SwapWindow(void)
 		 * indistinguishable from a renderer bug when read off a photo.
 		 */
 		{
-			extern int g_dbg_depthTest;
 			extern int g_dbg_packetDepth;
 			extern int g_dbg_trackRender;
-			extern volatile int gCtrDebugSkipInstances;
-			extern volatile int gCtrDebugSkipEffects;
-			extern volatile int gCtrDebugSkipHUD;
-			extern int g_dbg_vsyncCredit;
-			extern int g_dbg_trackGapFill;
+			extern int g_dbg_modelRender;
+			extern int g_dbg_widescreen;
 			static const char *const trackNames[3] = {"retail", "OURS", "both"};
-			static const char *const depthNames[3] = {"norm", "NOTEST", "TRACK-RO"};
 			int tr = g_dbg_trackRender;
-			int dt = g_dbg_depthTest;
 
 			/* The console is 40 columns. Every line here is written to fit
 			 * inside that WITHOUT wrapping -- a wrapped line costs two rows and
 			 * reads as garbage in a photo, which is how this screen actually
-			 * gets used on hardware. */
-			printf("\n>> track %-6s dmodel %-3s\n", trackNames[(tr >= 0 && tr <= 2) ? tr : 0], g_dbg_packetDepth ? "ON" : "off");
-			printf(">> ztest %-8s sweep %-8s\n", depthNames[(dt >= 0 && dt <= 2) ? dt : 0],
-			       g_dbg_sweep ? s_sweepConfigs[s_sweepIndex].name : "off");
-			printf(">> skip  %-4s %-4s %-4s  vbl %-3s\n", gCtrDebugSkipInstances ? "inst" : "-", gCtrDebugSkipEffects ? "fx" : "-",
-			       gCtrDebugSkipHUD ? "hud" : "-", g_dbg_vsyncCredit ? "ON" : "off");
-			printf(">> gapfill %-3s                     \n", g_dbg_trackGapFill ? "ON" : "off");
-			printf(">> ZR=trk L=dmodel ZL=ztest B=sweep\n\n");
+			 * gets used on hardware.
+			 *
+			 * s36 declutter (owner request): just the SELECT+START master
+			 * switch and the three renderers it drives. Every other chord
+			 * still works; it's only the hints that are gone. */
+			printf("\n>> SEL+START = ours <-> retail\n");
+			printf(">> track %-6s models %-3s dmodel %-3s\n", trackNames[(tr >= 0 && tr <= 2) ? tr : 0], g_dbg_modelRender ? "ON" : "off",
+			       g_dbg_packetDepth ? "ON" : "off");
+			{
+				static const char *const wideNames[3] = {"off", "strch", "REAL"};
+				int wm = g_dbg_widescreen;
+
+				printf(">> wide  %-5s\n\n", wideNames[(wm >= 0 && wm <= 2) ? wm : 0]);
+			}
 		}
 
 		snprintf(line, sizeof(line),
@@ -3969,6 +4005,10 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 				 * struct field: the shader supplies a constant 1.0 for it
 				 * instead (design doc finding 3). */
 				verts[i].z = N3DS_DEPTH_TOPMOST;
+				/* Parallax = z: the VRAM/splash present quad sits flat at
+				 * screen depth in stereo (near-band mask), same as the atlas
+				 * inspector's overlay. */
+				verts[i].w = N3DS_DEPTH_TOPMOST;
 				verts[i].r = 255;
 				verts[i].g = 255;
 				verts[i].b = 255;

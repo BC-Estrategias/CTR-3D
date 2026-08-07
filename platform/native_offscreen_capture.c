@@ -12,8 +12,12 @@
 #define OFSCAP_MAGIC          0x474F5443u /* 'CTOG' little-endian */
 /* v2: GrVertex grew emitOrdinal (depth substrate), so raw vertex records are
  * 22 bytes now. The header always recorded sizeof(GrVertex), so readers can
- * self-adjust; the bump is so a v1 capture is rejected rather than misread. */
-#define OFSCAP_VERSION        2u
+ * self-adjust; the bump is so a v1 capture is rejected rather than misread.
+ * v3: GrVertex grew parallaxOrdinal (occlusion/parallax depth split, see
+ * docs/FLAG_SPLIT_CHANNEL_SPEC.md) -- 24 bytes. Same bump for the same
+ * reason: a v2 reader would walk this file's vertex array off by 2 bytes
+ * per record, which is silent corruption rather than an error. */
+#define OFSCAP_VERSION        3u
 #define OFSCAP_TAG_BEGIN      1u
 #define OFSCAP_TAG_SPLIT      2u
 #define OFSCAP_TAG_END        3u
@@ -21,7 +25,7 @@
 #define OFSCAP_PER_RECT_CAP   6
 #define OFSCAP_DETAIL_LOG_CAP OFSCAP_PER_RECT_CAP
 
-typedef char OfscapGrVertexSizeCheck[(sizeof(GrVertex) == 22) ? 1 : -1];
+typedef char OfscapGrVertexSizeCheck[(sizeof(GrVertex) == 24) ? 1 : -1];
 
 typedef struct
 {

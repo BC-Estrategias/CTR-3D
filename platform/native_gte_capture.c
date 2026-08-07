@@ -69,6 +69,14 @@ typedef struct
 	// behind the game thread's current SetUIBand call.
 	const void *bandStart;
 	const void *bandEnd;
+	// UI-band EXEMPTION (s39 flag depth): the one prim range inside the band
+	// that is world content -- the checkered flag's packets, which retail
+	// links into the swapchain OT's entry 0 during transitions. Travels with
+	// the buffer for the same frame-behind reason as the band itself; cleared
+	// every frame by Clear (unlike the band, which ResetDB re-sets), so it is
+	// only ever live for a frame whose RaceFlag_DrawSelf registered it.
+	const void *exemptStart;
+	const void *exemptEnd;
 	// Per-frame matrix census (reset by Clear): Store count per matrix id,
 	// and how many ids this frame actually used.
 	u32 mtxStores[GTE_CAPTURE_MTX_IDS];
@@ -85,7 +93,7 @@ typedef struct
 // evictions already take.
 int g_dbg_gteCapture = 1;
 
-global_variable GTECaptureBuffer s_gteCaptureBuf[2] = {{{{0}}, 1, NULL, NULL}, {{{0}}, 1, NULL, NULL}};
+global_variable GTECaptureBuffer s_gteCaptureBuf[2] = {{{{0}}, 1, NULL, NULL, NULL, NULL}, {{{0}}, 1, NULL, NULL, NULL, NULL}};
 // Game-thread cursor: which buffer Store/SetUIBand/Clear touch.
 global_variable int s_gteCaptureWriteIdx;
 // Walk cursor: which buffer Lookup*/MarkOTNode read. Written only by
@@ -139,6 +147,8 @@ void GTECapture_Clear(void)
 
 	memset(buf->mtxStores, 0, sizeof(buf->mtxStores));
 	buf->mtxUsed = 0;
+	buf->exemptStart = NULL;
+	buf->exemptEnd = NULL;
 	s_gteMtxShadowValid = 0;
 	s_gteMtxCurId = 0;
 
@@ -232,6 +242,72 @@ void GTECapture_SetStoreSuppressed(int suppressed)
 }
 
 /*
+ * Affine depth-remap bracket (s39, the menu/loading checkered flag). Same
+ * ownership and same one-producer discipline as the suppression flag above;
+ * RaceFlag_DrawSelf is the only client.
+ *
+ * The flag used to take the suppression bracket: its waving surface genuinely
+ * crosses a menu model's depth band (Crash interpenetrated the flag), so its
+ * stores were dropped and the packets fell back to flat OT-bucket depth. That
+ * fixed the layering and flattened the wave -- in stereo the flag became a
+ * cardboard sheet. Owner design, refined from an earlier bias-to-background
+ * idea specifically to avoid ANY pose-conditional depth switch (the flag is
+ * one continuous animation across its loading, menu and wipe roles): keep the
+ * stores, but remap them affinely so the wave's TRUE relief survives at
+ * reduced amplitude in a band that cannot collide with anything.
+ *
+ *   out = OUT_NEAR + ((sz3 - RAW_NEAR) >> SHIFT)
+ *
+ * Measured raw band under data.matrixTitleFlag: sz3 ~ 61069..65471 (relief
+ * ~ +/-2200 view units about ~63270). SHIFT 2 compresses that to ~ +/-550;
+ * OUT_NEAR re-anchors the compressed band's near edge just BEHIND the stereo
+ * convergence plane (s_stereoConv = 1200 view.z units, n3ds_backend.c -- the
+ * physical screen surface). Remapped band for the measured content:
+ * ~1267..2367. So the flag ripples at/just behind the screen while menu
+ * models (which sit nearer than convergence) pop out in front -- the two
+ * bands cannot cross by construction, which is what preserves the painter's
+ * guarantee the suppression used to buy, without any role conditionals.
+ *
+ * Bounds are structural, not runtime-checked: the anchor keeps every remapped
+ * value far above PKTDEPTH_UI_BAND (64), so the stamp 0xFFFF - out always
+ * lands inside the world band (< PKTDEPTH_UI_BASE, native_gpu.c); the top is
+ * OUT_NEAR + ((0xFFFF - RAW_NEAR) >> SHIFT) = 2383, nowhere near u16 range.
+ * Raw values that dip under RAW_NEAR (the guard margin below the measured
+ * minimum) pin to the anchor -- a flat crest just behind the screen, never a
+ * crossing. Baked constants on purpose: the capture side cannot see
+ * s_stereoConv (backend TU boundary), and the anchor only needs to be
+ * "behind the default screen plane", not track a dumpreq retune.
+ *
+ * Known accepted caveat (owner, to verify by eye): during screen-covering
+ * wipe transitions, content nearer than the flag's band -- popped-out menu
+ * models, the near track during race exits -- now depth-tests IN FRONT of
+ * the sweeping flag, a departure from retail's flag-over-everything. If it
+ * reads wrong on hardware, the documented fallback is flat-front only while
+ * the transition is in flight (RaceFlag_IsFullyOnScreen /
+ * RaceFlag_DrawOrder), but the pure no-switch form ships first.
+ *
+ * PC: default builds compile none of this (CTR_NATIVE_GTE_CAPTURE off). On a
+ * capture-enabled PC build the extra stores are inert for output --
+ * g_dbg_packetDepth stays 0 there -- except under VERTEX_DESNAP, where flag
+ * vertices (formerly suppressed) become desnap-eligible like any other
+ * geometry. That is the desnap feature working, not a parity break, and no
+ * golden gate runs that configuration.
+ */
+enum
+{
+	GTE_FLAGREMAP_RAW_NEAR = 60928, /* measured min 61069 minus guard margin */
+	GTE_FLAGREMAP_SHIFT = 2,        /* relief compressed to 1/4 */
+	GTE_FLAGREMAP_OUT_NEAR = 1232   /* 32 view units behind s_stereoConv 1200 */
+};
+
+global_variable int s_gteCaptureDepthRemap;
+
+void GTECapture_SetStoreDepthRemap(int active)
+{
+	s_gteCaptureDepthRemap = active;
+}
+
+/*
  * s32 EVICTION CENSUS -- header comment on GTECapture_ReadEvictCensus has the
  * argument. Counted at the one place a slot can change owner. The extra branch
  * costs nothing measurable: the entry line is already being fetched for the
@@ -298,11 +374,18 @@ u32 GTECapture_ReadEvictCensus(u32 *outSameMtx, u32 *outMaxDz)
 
 /* dumpreq 'pktaxisfix'. Default ON: OFF is the ice-pond vanish. */
 int g_dbg_pktAxisFix = 1;
+/* s41: the ground-decal (shadows/skids/tires) fixed-shift unscale. Its own
+ * switch rather than a share of g_dbg_pktAxisFix, so an A/B moves one thing. */
+int g_dbg_decalAxisFix = 1;
 
 #define GTE_INSTAXIS_UNRESOLVED 99
 #define GTE_INSTAXIS_MTX_NONE 0xFFFFFFFFu
 
 global_variable int s_instAxisActive;
+/* s41: set by GTECapture_BeginFixedDepthShift -- the shift is known from source
+ * rather than measured, so the store skips classify/reclassify/stats and only
+ * applies it. See the block in GTECapture_Store. */
+global_variable int s_instAxisFixed;
 global_variable int s_instAxisShift = GTE_INSTAXIS_UNRESOLVED;
 global_variable s64 s_instAxisTrueZ;
 global_variable int s_instAxisFunc;
@@ -396,10 +479,47 @@ void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct Pus
 	}
 }
 
+/*
+ * s41: open a bracket whose regime shift is KNOWN, not measured. `shift` uses
+ * the same encoding as s_instAxisShift (2 = stored SZ3 is 4x the track axis,
+ * divide it down; -2 = quarter axis; 0 = already correct). Closed by
+ * GTECapture_EndInstanceDepth like the instance bracket -- and, like it, by
+ * GTECapture_Clear at the frame edge, so a mid-frame early-out cannot leak the
+ * shift into unrelated content.
+ *
+ * Never nests with the instance bracket: its three callers (VehGroundShadow,
+ * VehGroundSkids, DrawTires) all run outside the RenderBucket dispatch.
+ */
+void GTECapture_BeginFixedDepthShift(int shift)
+{
+	s_instAxisActive = 1;
+	s_instAxisFixed = 1;
+	/* Runtime A/B (dumpreq `decalaxis`): 0 leaves the stores exactly as they
+	 * were before s41, which is the leg this fix has to be judged against.
+	 * Separate from g_dbg_pktAxisFix on purpose -- that one also governs the
+	 * instance bracket, so sharing it would move two things at once. */
+	s_instAxisShift = (g_dbg_decalAxisFix != 0) ? shift : 0;
+	s_instAxisTrueZ = 0;
+	s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
+}
+
 void GTECapture_EndInstanceDepth(void)
 {
 	if (!s_instAxisActive)
 	{
+		return;
+	}
+
+	if (s_instAxisFixed)
+	{
+		/* Fixed brackets contribute no [PKTAXIS] statistics by construction --
+		 * there is nothing measured to report, and borrowing one of the five
+		 * func buckets would corrupt a line the instance work is still read
+		 * against. */
+		s_instAxisActive = 0;
+		s_instAxisFixed = 0;
+		s_instAxisShift = GTE_INSTAXIS_UNRESOLVED;
+		s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
 		return;
 	}
 
@@ -477,58 +597,100 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 		return;
 	}
 
+	/* Flag depth remap (s39, block above SetStoreDepthRemap). Applied before
+	 * anything else reads sz3 -- census, ratios, the entry itself -- so every
+	 * consumer sees one consistent axis, same placement rule as the instance
+	 * bracket below. The two brackets never nest: this one wraps
+	 * RaceFlag_DrawSelf, which runs outside the RenderBucket dispatch. */
+	if (s_gteCaptureDepthRemap)
+	{
+		u32 t = ((u32)sz3 > (u32)GTE_FLAGREMAP_RAW_NEAR) ? ((u32)GTE_FLAGREMAP_OUT_NEAR + (((u32)sz3 - (u32)GTE_FLAGREMAP_RAW_NEAR) >> GTE_FLAGREMAP_SHIFT))
+		                                                 : (u32)GTE_FLAGREMAP_OUT_NEAR;
+
+		sz3 = (u16)t;
+	}
+
 	/* Instance depth-axis bracket (s33, block comment above): put this store
 	 * on the track's view.z axis before ANYTHING sees it -- including the
 	 * eviction census a few lines down, whose dz would otherwise mix units. */
 	if (s_instAxisActive)
 	{
-		/* Per-matrix re-classification -- see s_instAxisMtxAtClassify. The
-		 * first matrix state adopts Begin's exact mvp-based shift; each later
-		 * state inside the bracket (the mirror pass) re-classifies from its
-		 * own first store. */
-		if (s_instAxisMtxAtClassify == GTE_INSTAXIS_MTX_NONE)
+		/*
+		 * s41 FIXED-SHIFT BRACKET -- the ground-decal producers.
+		 *
+		 * VehGroundShadow, VehGroundSkids and DrawTires each pre-multiply
+		 * their CAMERA-RELATIVE position by 4 before projecting (shadows
+		 * `* 4`, skids and tires `<< 2`) and project with a ZERO translation
+		 * vector, so every SZ3 they produce is 4x the track's view.z. That is
+		 * the same regime the instance bracket below corrects -- but these
+		 * three run outside RenderBucket entirely (straight from
+		 * MainFrame_RenderFrame), so the dispatch-site bracket never saw them
+		 * and their depth went into the table 4x too far. Owner-visible form:
+		 * skid marks that survive within about a tile of the camera and are
+		 * buried beyond it, because a 4x error grows with distance.
+		 *
+		 * No classifier here, unlike the instance path: RenderBucket's scale
+		 * is CONDITIONAL (AdjustViewPositionForMvp -- <<2 under 0x1000 view
+		 * units, DRAW_HUGE >>2), which is exactly why it has to measure. The
+		 * shift these three apply is unconditional and visible in the source,
+		 * so classifying it would be inventing uncertainty. Skipping the
+		 * classify/reclassify/stats work also keeps [PKTAXIS]'s five func
+		 * buckets meaning precisely what they have always meant.
+		 *
+		 * Everything from here to the shift application is instance-only; the
+		 * application itself is shared, which is the whole point of riding
+		 * this bracket rather than adding a second one.
+		 */
+		if (!s_instAxisFixed)
 		{
-			s_instAxisMtxAtClassify = s_gteMtxCurId;
-		}
-		else if (s_gteMtxCurId != s_instAxisMtxAtClassify)
-		{
-			s_instAxisMtxAtClassify = s_gteMtxCurId;
-			if (s_instAxisTrueZ >= 128)
+			/* Per-matrix re-classification -- see s_instAxisMtxAtClassify. The
+			 * first matrix state adopts Begin's exact mvp-based shift; each later
+			 * state inside the bracket (the mirror pass) re-classifies from its
+			 * own first store. */
+			if (s_instAxisMtxAtClassify == GTE_INSTAXIS_MTX_NONE)
 			{
+				s_instAxisMtxAtClassify = s_gteMtxCurId;
+			}
+			else if (s_gteMtxCurId != s_instAxisMtxAtClassify)
+			{
+				s_instAxisMtxAtClassify = s_gteMtxCurId;
+				if (s_instAxisTrueZ >= 128)
+				{
+					s_instAxisShift = GTECapture_ClassifyShift((s64)sz3, s_instAxisTrueZ);
+				}
+				if (g_dbg_modelDepthCheck)
+				{
+					s_instAxisReclassN[s_instAxisFunc]++;
+				}
+			}
+
+			if (s_instAxisShift == GTE_INSTAXIS_UNRESOLVED)
+			{
+				/* First store of a split/special/reflection instance: SZ3 is
+				 * TRZ plus a model-extent term, and the candidates are 4x apart,
+				 * so nearest-candidate on the raw SZ3 names the regime. */
 				s_instAxisShift = GTECapture_ClassifyShift((s64)sz3, s_instAxisTrueZ);
 			}
-			if (g_dbg_modelDepthCheck)
-			{
-				s_instAxisReclassN[s_instAxisFunc]++;
-			}
-		}
 
-		if (s_instAxisShift == GTE_INSTAXIS_UNRESOLVED)
-		{
-			/* First store of a split/special/reflection instance: SZ3 is
-			 * TRZ plus a model-extent term, and the candidates are 4x apart,
-			 * so nearest-candidate on the raw SZ3 names the regime. */
-			s_instAxisShift = GTECapture_ClassifyShift((s64)sz3, s_instAxisTrueZ);
-		}
-
-		if (g_dbg_modelDepthCheck && (s_instAxisTrueZ >= 128))
-		{
-			double ratio = (double)sz3 / (double)s_instAxisTrueZ;
-			int f = s_instAxisFunc;
-
-			if (s_instAxisStoreN[f] == 0)
+			if (g_dbg_modelDepthCheck && (s_instAxisTrueZ >= 128))
 			{
-				s_instAxisRatioMin[f] = ratio;
-				s_instAxisRatioMax[f] = ratio;
+				double ratio = (double)sz3 / (double)s_instAxisTrueZ;
+				int f = s_instAxisFunc;
+
+				if (s_instAxisStoreN[f] == 0)
+				{
+					s_instAxisRatioMin[f] = ratio;
+					s_instAxisRatioMax[f] = ratio;
+				}
+				else
+				{
+					if (ratio < s_instAxisRatioMin[f]) { s_instAxisRatioMin[f] = ratio; }
+					if (ratio > s_instAxisRatioMax[f]) { s_instAxisRatioMax[f] = ratio; }
+				}
+				s_instAxisStoreN[f]++;
+				s_instAxisRatioSum[f] += ratio;
 			}
-			else
-			{
-				if (ratio < s_instAxisRatioMin[f]) { s_instAxisRatioMin[f] = ratio; }
-				if (ratio > s_instAxisRatioMax[f]) { s_instAxisRatioMax[f] = ratio; }
-			}
-			s_instAxisStoreN[f]++;
-			s_instAxisRatioSum[f] += ratio;
-		}
+		} /* !s_instAxisFixed -- shared shift application follows */
 
 		if (g_dbg_pktAxisFix)
 		{
@@ -710,8 +872,11 @@ u32 GTECapture_ReadMatrixCensus(u8 *outDomId, u32 *outIdsUsed)
 
 // Walk-thread state: BeginOTWalk/MarkOTNode/LookupSuppressed all run on
 // whichever thread owns the walk (worker on 3DS, main on PC) -- one walk in
-// flight, so a single flag needs no buffering.
+// flight, so a single flag needs no buffering. s_gteCaptureExemptNode is
+// per-NODE, not sticky: it holds only while the walk is inside the flag's
+// registered prim range (s39, see the exempt fields on the buffer).
 global_variable int s_gteCaptureSuppress;
+global_variable int s_gteCaptureExemptNode;
 
 void GTECapture_SetUIBand(const void *start, const void *end)
 {
@@ -721,9 +886,18 @@ void GTECapture_SetUIBand(const void *start, const void *end)
 	buf->bandEnd = end;
 }
 
+void GTECapture_SetUIBandExemptRange(const void *start, const void *end)
+{
+	GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureWriteIdx];
+
+	buf->exemptStart = start;
+	buf->exemptEnd = end;
+}
+
 void GTECapture_BeginOTWalk(void)
 {
 	s_gteCaptureSuppress = 0;
+	s_gteCaptureExemptNode = 0;
 }
 
 void GTECapture_MarkOTNode(const void *node)
@@ -736,11 +910,44 @@ void GTECapture_MarkOTNode(const void *node)
 	{
 		s_gteCaptureSuppress = 1;
 	}
+	// Exemption is per NODE and evaluated on EVERY node, not only inside the
+	// UI band: since the channel split its consumer is the PARALLAX channel
+	// (native_gpu.c's resolver), and the flag needs its ripple in the menu
+	// pose too -- where its packets sit in an ordinary world bucket and the
+	// band was never entered. Two pointer compares per node against a range
+	// that is NULL/NULL on any frame RaceFlag_DrawSelf did not register.
+	s_gteCaptureExemptNode = ((node >= buf->exemptStart) && (node < buf->exemptEnd));
 }
 
 int GTECapture_LookupSuppressed(void)
 {
+	// Deliberately the RAW sticky flag. The flag-range exemption used to be
+	// subtracted here, which put flag packets on world OCCLUSION stamps; the
+	// channel split moved that job to the parallax channel and handed
+	// occlusion back to retail's own layering (see GTECapture_NodeExempt).
 	return s_gteCaptureSuppress;
+}
+
+/*
+ * Is the walk currently inside the registered flag prim range? (s40b channel
+ * split, docs/FLAG_SPLIT_CHANNEL_SPEC.md.)
+ *
+ * Read by PacketDepth_ResolveXY for TWO things, and the pairing is the whole
+ * design:
+ *   - OCCLUSION: an exempt primitive resolves exactly as if its stores had
+ *     been suppressed -- a miss. That is the pre-s40 behaviour, i.e. retail's
+ *     own painter's statement: the flag paints over everything during a
+ *     screen-covering wipe (its packets are in the UI band there) and sits
+ *     behind the menu models when parked (bucket-derived far depth). Pose
+ *     changes are retail draw order, not a stereo jump.
+ *   - PARALLAX: the same primitive's captures ARE read, and they carry the
+ *     compressed ripple band the store-side remap wrote, in every pose,
+ *     continuously. This is the channel the owner's no-pose-conditional rule
+ *     governs.
+ */
+int GTECapture_NodeExempt(void)
+{
+	return s_gteCaptureExemptNode;
 }
 
 #endif /* defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE */

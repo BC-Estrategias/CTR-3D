@@ -222,6 +222,10 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				u16 ordinal;
 				s16 z;
 				s16 zPerVert[4];
+				/* Parallax channel twin (s40b, docs/FLAG_SPLIT_CHANNEL_SPEC.md):
+				 * same indices, same validity flag -- the resolver fills both
+				 * or neither. */
+				s16 wPerVert[4];
 				int zPerVertValid;
 
 				/* Side effect order matches ProcessFlat/GouraudPoly: the
@@ -264,8 +268,9 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				{
 					u16 depthStamp;
 					u16 depthPerVert[4];
+					u16 depthPerVertPar[4];
 
-					if (PacketDepth_ResolvePacked(xy, numVerts, &depthStamp, depthPerVert))
+					if (PacketDepth_ResolvePacked(xy, numVerts, &depthStamp, depthPerVert, depthPerVertPar))
 					{
 						int v;
 
@@ -281,6 +286,7 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 						for (v = 0; v < numVerts && v < 4; v++)
 						{
 							zPerVert[v] = (s16)((int)depthPerVert[v] - 32768);
+							wPerVert[v] = (s16)((int)depthPerVertPar[v] - 32768);
 						}
 						zPerVertValid = 1;
 					}
@@ -341,10 +347,31 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 						{
 							const u32 xyWord = xy[idx[k]];
 							const u32 col = rgb[idx[k]];
+							s16 dx = (s16)((float)(s16)(xyWord & 0xFFFFu) + ofsX);
+							const s16 dz = zPerVertValid ? zPerVert[idx[k]] : z;
 
-							dst[k].x = (s16)((float)(s16)(xyWord & 0xFFFFu) + ofsX);
+							/* s37 widescreen UI relocation -- same rule as
+							 * N3DS_ConvertTriangleVerts's: UI-band stamps
+							 * (biased z >= 32704 = raw 0xFFC0) get the X
+							 * ramp (NativeWide_UiShiftX, native_gpu.c).
+							 * zPerVertValid doubles as the packet-depth-live
+							 * gate: an ordinal z cannot reach the band (no
+							 * frame emits 65472 prims). No-op with wide off,
+							 * so PC/[DEMIT] goldens are untouched. */
+							if (zPerVertValid && (dz >= 32704))
+							{
+								extern int NativeWide_UiShiftX(int x);
+
+								dx = (s16)NativeWide_UiShiftX((int)dx);
+							}
+							dst[k].x = dx;
 							dst[k].y = (s16)((float)(s16)(xyWord >> 16) + ofsY);
-							dst[k].z = zPerVertValid ? zPerVert[idx[k]] : z;
+							dst[k].z = dz;
+							/* Parallax channel (s40b): the resolver's second
+							 * output where it exists, otherwise the same value
+							 * as z -- an ordinal-stamped or unresolved prim has
+							 * no separate stereo depth to carry. */
+							dst[k].w = zPerVertValid ? wPerVert[idx[k]] : dz;
 							if (textured)
 							{
 								const int srcU = (int)(uvw[idx[k]] & 0xFFu);

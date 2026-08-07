@@ -250,6 +250,49 @@ endif()
 option(CTR_NATIVE_TRACK_RENDERER
     "Native track renderer: resident track meshes from level data (in progress)"
     OFF)
+
+# Bake-parity diff (s38, roadmap "track bake pre-export"): PC-only diagnostic
+# that verifies the resident track mesh against retail's own emitted packets
+# -- UV corner order (the sTrackUvPerm conviction instrument), vertex colors,
+# and positions -- via the GTE capture table. Implies its two substrates.
+# Zero behavior change: counters and [BAKEPAR] log lines only.
+option(CTR_NATIVE_BAKE_PARITY
+    "Bake-parity diff: verify the baked track mesh against retail packets (PC diagnostic)"
+    OFF)
+if(CTR_NATIVE_BAKE_PARITY)
+    if(NINTENDO_3DS)
+        message(FATAL_ERROR "CTR_NATIVE_BAKE_PARITY is a PC-only diagnostic (static tables sized for PC RAM; single-thread walk assumption)")
+    endif()
+    if(NOT CTR_NATIVE_TRACK_RENDERER)
+        message(STATUS "CTR_NATIVE_BAKE_PARITY implies CTR_NATIVE_TRACK_RENDERER; enabling it")
+        set(CTR_NATIVE_TRACK_RENDERER ON CACHE BOOL
+            "Native track renderer: resident track meshes from level data (in progress)" FORCE)
+    endif()
+    if(NOT CTR_NATIVE_GTE_CAPTURE)
+        message(STATUS "CTR_NATIVE_BAKE_PARITY implies CTR_NATIVE_GTE_CAPTURE; enabling it")
+        set(CTR_NATIVE_GTE_CAPTURE ON CACHE BOOL
+            "Populate the GTE sub-pixel capture side table" FORCE)
+    endif()
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_BAKE_PARITY=1)
+endif()
+
+# Track bake pre-export (s38): serialize the builder's latched output per
+# level to debug/trackbake_*.ctrbake (deterministic bytes, self-verifying
+# round-trip on every write). The exporter lives inside native_track_mesh.c
+# because it serializes that file's own state -- see the .ctrbake format
+# comment there. Loader lands separately.
+option(CTR_NATIVE_TRACK_BAKE_EXPORT
+    "Write each level's baked track mesh to a .ctrbake file (PC diagnostic)"
+    OFF)
+if(CTR_NATIVE_TRACK_BAKE_EXPORT)
+    if(NOT CTR_NATIVE_TRACK_RENDERER)
+        message(STATUS "CTR_NATIVE_TRACK_BAKE_EXPORT implies CTR_NATIVE_TRACK_RENDERER; enabling it")
+        set(CTR_NATIVE_TRACK_RENDERER ON CACHE BOOL
+            "Native track renderer: resident track meshes from level data (in progress)" FORCE)
+    endif()
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_TRACK_BAKE_EXPORT=1)
+endif()
+
 if(CTR_NATIVE_TRACK_RENDERER)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_TRACK_RENDERER=1)
 
@@ -312,9 +355,18 @@ endif()
 # those defaults are load-bearing for every measurement this project has taken,
 # and an "I'll change it back later" edit to them is exactly the kind of thing
 # that survives into a session where somebody quotes a baseline number off it.
+# DEFAULT ON since 2026-08-06 (owner: "make booting in widescreen with our
+# renderer the default"). Our renderer IS the port now, so it is what boots;
+# SEL+START still drops to full retail for A/B, and the individual toggles are
+# unchanged. Promoting this also closes a measurement hole: with it OFF, an
+# Azahar session that cannot press SEL+START was silently exercising the RETAIL
+# path, so every "verified in Azahar" claim about packet depth was vacuous --
+# g_dbg_packetDepth was 0 and the whole resolver early-returned. That is how the
+# s40b UI-band striping reached hardware unnoticed. See the 3DS defaults note in
+# docs/PORT_FEASIBILITY_3DS.md.
 option(CTR_NATIVE_RENDERER_DEFAULT_ON
-    "Boot the track/model/packet-depth toggles ON (demo + Azahar convenience; runtime toggles unchanged)"
-    OFF)
+    "Boot the track/model/packet-depth toggles ON (the port's real config; SEL+START still A/Bs to retail)"
+    ON)
 if(CTR_NATIVE_RENDERER_DEFAULT_ON)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_RENDERER_DEFAULT_ON=1)
 endif()

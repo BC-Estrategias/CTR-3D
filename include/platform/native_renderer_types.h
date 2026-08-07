@@ -40,8 +40,31 @@ typedef struct
 	 * layering, because depth = ordinal reproduces painter's order in the
 	 * depth buffer. Appended field: PC's GL attribute loaders address fields
 	 * by offset and never fetch it, so PC output is unaffected.
+	 *
+	 * OCCLUSION channel. Since the split below, this one and only this one
+	 * decides what covers what.
 	 */
 	u16 emitOrdinal;
+
+	/*
+	 * PARALLAX channel (docs/FLAG_SPLIT_CHANNEL_SPEC.md). Owner's framing:
+	 * "game world depth and 3d output depth don't need to be the same."
+	 *
+	 * Normally identical to emitOrdinal -- the depth a thing occludes at IS
+	 * the depth it should appear at in stereo. The menu/loading checkered
+	 * flag is the exception this exists for: retail's own layering wants it
+	 * painted over everything mid-wipe and behind the menu models when
+	 * parked (a per-pose OCCLUSION answer), while the stereo eye wants its
+	 * wave's true relief continuously, in every pose, with no jump (one
+	 * fixed PARALLAX band just behind the convergence plane). One depth
+	 * field cannot say both; two can.
+	 *
+	 * Same units and axis as emitOrdinal (nearer = larger), so 3DS biases
+	 * both into s16 identically and the vertex shader's d = 32767 - value
+	 * inverse works unchanged on it. Appended for the same reason and with
+	 * the same PC guarantee as emitOrdinal above: no GL loader fetches it.
+	 */
+	u16 parallaxOrdinal;
 } GrVertex;
 #pragma pack(pop)
 

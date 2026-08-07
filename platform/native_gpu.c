@@ -13,6 +13,7 @@
 #include <SDL3/SDL.h>
 #endif
 
+#include "platform/native_bake_parity.h"
 #include "platform/native_gte_capture.h"
 #include "platform/native_log.h"
 #include "platform/native_perf.h"
@@ -259,6 +260,24 @@ typedef struct
 } NativeGpuState;
 
 int g_dbg_otzWiden = 0;
+
+/*
+ * Rainbow-stripe checkered flag (owner request, 2026-08-06) -- the menu/loading
+ * flag drawn as horizontal pride stripes instead of grey checkers. Read by
+ * RaceFlag_DrawSelf (game/RaceFlag.c); the pattern rule and the colour table
+ * live there, this is only the switch.
+ *
+ * Lives on the platform side of the seam rather than in game/ because it is a
+ * native-only presentation choice: the flag mesh, its wave and its lighting are
+ * untouched retail behaviour either way, and PC compiles the same branch.
+ *
+ * DEFAULT OFF (owner ruling, 2026-08-06): the port's default look stays close to
+ * retail. Kept as an opt-in -- dumpreq `flagrainbow` -- and the owner's stated
+ * intent for it is a Pride Month easter egg (check the system date, enable it
+ * for June), which is why this is a plain int rather than a compile-time gate:
+ * a date check can simply write to it at startup.
+ */
+int g_dbg_flagRainbow = 0;
 
 /* See include/platform/native_gpu.h. Lives here, not in the 3DS renderer that
  * writes it, so the windowed instruments that READ it (native_perf.c, the
@@ -1092,17 +1111,121 @@ int g_dbg_packetDepth = CTR_NATIVE_RENDERER_DEFAULT_ON;
  *   feature off     : the emit ordinal, exactly as before
  *
  * The near band is reserved off the TOP of the range, so world content is
- * clamped to PKTDEPTH_WORLD_MAX. That costs the nearest 256 units of view.z,
- * which sit inside the near clip plane anyway -- geometry that close is already
- * not drawn. ctr_track.v.pica applies the identical clamp; if one side is
- * changed without the other, the two sources stop sharing the axis. */
+ * clamped to PKTDEPTH_WORLD_MAX. That costs the nearest PKTDEPTH_UI_BAND units
+ * of view.z -- and that cost is NOT free: at 256 it was inside the range the
+ * stopped-camera reaches, so everything nearer than 256 units flattened onto
+ * one depth plane and draw order decided (kart parts through the back of the
+ * driver's head, found 2026-08-06). 64 units is nearer than the camera ever
+ * sits. UI ordinals are packed 4-per-stamp (>> 2 below) so the band still
+ * orders 256 UI prims -- the same capacity and same wrap point as the old
+ * 256-wide band. ctr_track.v.pica and ctr_model.v.pica apply the identical
+ * world clamp; if one side is changed without the others, the sources stop
+ * sharing the axis (their headers say the same thing back). */
 enum
 {
-	PKTDEPTH_UI_BAND = 256,
-	PKTDEPTH_UI_BASE = 0xFFFF - PKTDEPTH_UI_BAND + 1, /* 0xFF00 */
-	PKTDEPTH_WORLD_MAX = PKTDEPTH_UI_BASE - 1,        /* 0xFEFF */
+	PKTDEPTH_UI_BAND = 64,
+	/*
+	 * 4 UI prims per stamp -> the band orders 64*4 = 256 primitives.
+	 *
+	 * DO NOT RAISE THIS TO BUY CAPACITY. It was tried (16/stamp, 1024 prims,
+	 * 2026-08-07) to stop the band overflowing once HUD models were routed
+	 * through it, and it made UI layering MUCH WORSE on hardware: the menu
+	 * glyph/panel ordering degraded further, the level-preview video was
+	 * covered by a black box, and character-select elements swapped order
+	 * frame to frame.
+	 *
+	 * WHY IT BACKFIRES, and the thing to understand before touching this
+	 * again: prims sharing a stamp TIE, and a tie is resolved by draw order --
+	 * but with CTR_NATIVE_DRAW_MERGE, opaque content is BINNED BY STATE and
+	 * replayed per bin, so submission order only holds WITHIN a bin. A glyph
+	 * and the panel behind it are different states, hence different bins, so
+	 * their tie resolves arbitrarily. At 4/stamp that collision is rare; at
+	 * 16/stamp it is constant. Coarser packing does not trade "a little
+	 * ordering precision" for capacity -- it trades CORRECTNESS for capacity,
+	 * and only for content whose neighbours differ in state, which is exactly
+	 * what UI is.
+	 *
+	 * The real fix for capacity is therefore NOT more packing and NOT a wider
+	 * band (s39 cut the band 256->64 view.z units because world content nearer
+	 * than the band flattens onto one plane -- the kart-through-head bug). It
+	 * is to stop UI depending on the depth test for its ordering at all: draw
+	 * UI in submission order outside the merge bins, the same shape the s41
+	 * ground-decal design proposes for decals. Queued, not attempted here.
+	 */
+	PKTDEPTH_UI_ORD_SHIFT = 2,                        /* 4 UI prims share a stamp */
+	PKTDEPTH_UI_BASE = 0xFFFF - PKTDEPTH_UI_BAND + 1, /* 0xFFC0 */
+	PKTDEPTH_WORLD_MAX = PKTDEPTH_UI_BASE - 1,        /* 0xFFBF */
 	PKTDEPTH_OT_SHIFT = 6                             /* retail's maxDepth >> 6 */
 };
+
+/*
+ * UI-BAND ORDINAL (s40c). Counts only primitives that actually land in the 2D/UI
+ * band, restarting each OT walk -- as opposed to s_gpu.emitOrdinal, which counts
+ * every primitive in the frame including all world geometry.
+ *
+ * WHY IT EXISTS. The band is 64 stamps packed 4 prims apiece, so it orders 256
+ * primitives before `& (PKTDEPTH_UI_BAND - 1)` wraps. Deriving its stamps from
+ * the global ordinal meant two things, both bad:
+ *
+ *   1. The wrap landed at an ARBITRARY PHASE -- wherever the frame's world prim
+ *      count happened to leave the counter. UI content straddling that boundary
+ *      inverts against itself, which is a plausible source of the owner's
+ *      long-standing "start-light/UI layering varies by race" report (not yet
+ *      confirmed; it is listed as an open item, and this may or may not be it).
+ *   2. The menu/loading flag, which retail links into the swapchain OT head
+ *      during a transition, put ~1000 primitives THROUGH the band -- lapping it
+ *      about four times. Owner-visible on hardware as the flag intersecting UI
+ *      "in stripes based on how the flag is waving": each lap is a vertical band
+ *      (~9 of the flag's 35 columns), and the boundaries slide as the wave's
+ *      off-screen quad cull changes which quads emit.
+ *
+ * With a dedicated counter the 256-prim capacity is real, the phase is fixed at
+ * zero every walk, and the flag consumes exactly ONE slot (below).
+ */
+global_variable u32 s_pktUiOrdinal;
+/* The flag's single UI stamp for this walk, latched at its first primitive. */
+global_variable u16 s_pktFlagUiStamp;
+global_variable int s_pktFlagUiStampValid;
+
+/* High-water UI primitives in a single walk, across the whole run. Reported by
+ * [PKTDEPTH] as uiMax. This is the number that says whether the band is near
+ * its 1024-prim capacity -- the question that had to be answered by a hardware
+ * symptom (pause-menu flicker) the first time, because nothing counted it. */
+global_variable u32 s_pktUiOrdinalMax;
+
+/* Per-walk reset. Called beside GTECapture_BeginOTWalk -- same instant, same
+ * reason: both describe state that is only meaningful within one walk. */
+internal void PacketDepth_BeginWalk(void)
+{
+	if (s_pktUiOrdinal > s_pktUiOrdinalMax)
+	{
+		s_pktUiOrdinalMax = s_pktUiOrdinal;
+	}
+	s_pktUiOrdinal = 0;
+	s_pktFlagUiStampValid = 0;
+}
+
+/*
+ * Stamp for the n'th UI primitive of this walk. SATURATES at the top of the
+ * band instead of wrapping.
+ *
+ * Wrapping is catastrophic and saturating is merely lossy: past capacity, a
+ * wrap sends the next primitive to the FAR end of the band, so late UI draws
+ * behind early UI and the layering inverts outright. Saturating ties the
+ * overflow at the nearest stamp, where submission order under LEQUAL resolves
+ * it -- the same tie-break the packing already depends on. Overflow should not
+ * happen now (1024 prims), but "should not" is what the 256-prim band said.
+ */
+internal u16 PacketDepth_UiStamp(u32 uiOrdinal)
+{
+	u32 slot = uiOrdinal >> PKTDEPTH_UI_ORD_SHIFT;
+
+	if (slot > (u32)(PKTDEPTH_UI_BAND - 1))
+	{
+		slot = (u32)(PKTDEPTH_UI_BAND - 1);
+	}
+	return (u16)(PKTDEPTH_UI_BASE + slot);
+}
 
 global_variable u16 s_pendingDepth;
 global_variable int s_pendingDepthValid;
@@ -1123,6 +1246,13 @@ global_variable int s_pendingDepthValid;
 /* 6, not 4: TriangulateQuad expands a 4-corner face into 6 vertices and
  * expands this array alongside it, in place. See its comment. */
 global_variable u16 s_pendingDepthPerVert[6];
+/* PARALLAX channel twin (docs/FLAG_SPLIT_CHANNEL_SPEC.md). Same length, same
+ * indices, same TriangulateQuad permutation -- it rides alongside the
+ * occlusion array everywhere rather than being derived from it, because for
+ * the flag the two genuinely differ and any "recompute it later" scheme would
+ * have to re-answer which pose it is in. Equal to s_pendingDepthPerVert for
+ * every other primitive in the game. */
+global_variable u16 s_pendingDepthPerVertParallax[6];
 global_variable int s_pendingDepthCount;
 
 /* s29 per-vertex-vs-flat accounting -- see NativeGpu_StampEmitOrdinal. */
@@ -1302,6 +1432,38 @@ internal void PacketDepth_NoteExtent(u16 stamp, u16 *lo, u16 *hi)
 	}
 }
 
+/*
+ * PARALLAX-channel fill for flag-range primitives (s40b channel split,
+ * docs/FLAG_SPLIT_CHANNEL_SPEC.md).
+ *
+ * These primitives resolved their OCCLUSION above as if their captures did not
+ * exist -- that is the point, it hands layering back to retail's OT order --
+ * so the stereo depth has to come from a second, independent read of the very
+ * entries the occlusion pass ignored. The values there are the store-side
+ * remap's output: the flag's true wave relief, compressed to ~1/4 and anchored
+ * just behind the convergence plane, identical in every pose.
+ *
+ * A miss leaves the caller's occlusion stamp in that slot. That is deliberate
+ * and it is the safe direction: one flat vertex inside an otherwise rippling
+ * face is invisible, whereas a fabricated depth for it would tear the face
+ * across two stereo planes -- the seam class s28 lost a session to.
+ */
+internal void PacketDepth_FillParallaxFromCapture(const s16 *xs, const s16 *ys, int n, u16 *perVertPar)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+	{
+		u16 sz3;
+		u8 mtxId;
+
+		if (GTECapture_LookupDepthEx(xs[i], ys[i], &sz3, &mtxId))
+		{
+			perVertPar[i] = PacketDepth_ClampWorld(0xFFFFu - sz3); /* same SENSE INVERSION as the occlusion path */
+		}
+	}
+}
+
 /* Shared core. BOTH emit paths must call this: the parse loop's MakeVertex*
  * sites AND native_direct_emit.c, which stamps its own z and handles most of a
  * heavy track's opaque content on 3DS. If only one of them resolves depth, the
@@ -1309,10 +1471,15 @@ internal void PacketDepth_NoteExtent(u16 stamp, u16 *lo, u16 *hi)
  * just split by code path instead of by content type, and therefore much harder
  * to see in a screenshot.
  *
+ * perVertPar is the PARALLAX channel (docs/FLAG_SPLIT_CHANNEL_SPEC.md): it
+ * receives a copy of the occlusion depths for every primitive in the game
+ * except the checkered flag's, which get their remapped ripple band instead.
+ * Callers that cannot carry a second channel pass NULL and lose nothing.
+ *
  * Returns 1 and writes *out whenever the feature is on (covered, miss and 2D
  * all produce a stamp); returns 0 only when the feature is off, which is the
  * caller's signal to keep its existing ordinal. */
-internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out, u16 *perVert)
+internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out, u16 *perVert, u16 *perVertPar)
 {
 	u16 sz3s[4];
 	u16 maxSz3 = 0;
@@ -1327,26 +1494,72 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 	int hits = 0;
 	int mixed = 0;
 	int missed = 0;
+	/* s40b: is this primitive part of the checkered flag's registered prim
+	 * range? Latched once here rather than re-queried per branch -- it decides
+	 * BOTH that the occlusion pass must ignore the captures and that the
+	 * parallax pass must read them. */
+	int exempt;
 
 	if (!g_dbg_packetDepth)
 	{
 		return 0;
 	}
 
+	exempt = GTECapture_NodeExempt();
+
 	/* perVert is only meaningful for the vertex counts the emit paths actually
 	 * append one-for-one; anything else falls back to the flat stamp rather
-	 * than writing past sz3s[]. */
+	 * than writing past sz3s[]. Both channels share the rule: they are indexed
+	 * in lockstep and a mismatch would pair a vertex with a stranger's depth. */
 	if (n > 4)
 	{
 		perVert = NULL;
+		perVertPar = NULL;
 	}
 
 	if (GTECapture_LookupSuppressed())
 	{
 		/* 2D in the UI band: no depth exists, and it must stay on top of every
 		 * world stamp. Ordinal ordering is preserved WITHIN the band so UI
-		 * layers among itself exactly as it does today. */
-		*out = (u16)(PKTDEPTH_UI_BASE + (s_gpu.emitOrdinal & (PKTDEPTH_UI_BAND - 1)));
+		 * layers among itself exactly as it does today -- packed 4 prims per
+		 * stamp so the 64-wide band still orders 256 of them. A same-stamp tie
+		 * (e.g. a glyph and its drop shadow, 1 ordinal apart) resolves by draw
+		 * order under LEQUAL, which is submission order within a merge bin --
+		 * and near-adjacent UI prims are near-adjacent state, so that is the
+		 * order they replay in. */
+		if (exempt)
+		{
+			/*
+			 * THE FLAG DURING A TRANSITION (s40c). One stamp for the whole
+			 * sheet, latched at its first primitive, instead of one per quad.
+			 *
+			 * Correct because the flag is a single non-self-overlapping
+			 * surface: it has no internal layering to preserve, so spending
+			 * ~250 of the band's 64 stamps on it bought nothing and cost
+			 * everything (the wrap above). Retail's own order is reproduced
+			 * exactly -- UI walked BEFORE the flag (the race HUD, at OT entry
+			 * 1) keeps lower stamps and stays behind it, and UI walked AFTER
+			 * (the LOADING glyphs, which share OT entry 0 and sit deeper in
+			 * its chain) gets higher stamps and draws over it. That is the
+			 * owner's requirement -- during the sweep the flag masks the
+			 * outgoing race's UI, characters and world alike -- without
+			 * burying the loading text that belongs on top of it.
+			 */
+			if (!s_pktFlagUiStampValid)
+			{
+				s_pktFlagUiStamp = PacketDepth_UiStamp(s_pktUiOrdinal);
+				s_pktFlagUiStampValid = 1;
+				/* Round up to the next stamp boundary so whatever the walk
+				 * reaches next is strictly nearer than the whole sheet. */
+				s_pktUiOrdinal = (s_pktUiOrdinal | ((1u << PKTDEPTH_UI_ORD_SHIFT) - 1u)) + 1u;
+			}
+			*out = s_pktFlagUiStamp;
+		}
+		else
+		{
+			*out = PacketDepth_UiStamp(s_pktUiOrdinal);
+			s_pktUiOrdinal++;
+		}
 		PacketDepth_NoteExtent(*out, &s_pktDepth.uiMin, &s_pktDepth.uiMax);
 		s_pktDepth.suppressed2d++;
 		s_pendingDepthIsModel = 0;
@@ -1359,10 +1572,55 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 				perVert[i] = *out;
 			}
 		}
+		/*
+		 * THE WIPE POSE (s40b). Genuine 2D gets parallax = its UI stamp, which
+		 * the shader's own band mask then flattens to zero shift -- unchanged.
+		 * The checkered flag, however, is linked into this same band during a
+		 * screen-covering transition (RaceFlag_GetOT -> swapchain OT entry 0),
+		 * and it is NOT 2D: it keeps the UI stamp above so it paints over the
+		 * whole world exactly as retail does, and takes its real rippling
+		 * depth on the parallax channel so the wave does not go flat for the
+		 * one second the wipe is on screen.
+		 */
+		if (perVertPar)
+		{
+			for (i = 0; i < n; i++)
+			{
+				perVertPar[i] = *out;
+			}
+			if (exempt)
+			{
+				PacketDepth_FillParallaxFromCapture(xs, ys, n, perVertPar);
+			}
+		}
 		return 1;
 	}
 
-	for (i = 0; i < n; i++)
+	if (exempt)
+	{
+		/*
+		 * THE MENU POSE (s40b). The flag's captures exist and are perfectly
+		 * good -- and the occlusion channel ignores them anyway, resolving as
+		 * a miss exactly like the pre-split suppression bracket did. The miss
+		 * path below then derives depth from the OT bucket retail put the flag
+		 * in, which IS retail's statement of where it belongs: behind the menu
+		 * models. The parallax channel reads those same captures a few lines
+		 * on, so the wave keeps rippling while the layering stays retail's.
+		 *
+		 * Skipping the loop rather than running it and discarding the result
+		 * is what makes "as if suppressed" exact: hits stays 0, so the
+		 * provenance accounting takes the same unkFellBack branch a genuinely
+		 * suppressed producer takes, and [PKTDEPTH2] keeps meaning what it
+		 * meant before the split.
+		 */
+		missed = 1;
+	}
+
+	/* `!missed` guard: an exempt primitive skips the lookups entirely rather
+	 * than running them and discarding -- see the block above for why hits
+	 * must stay 0. Identical to the old unconditional loop otherwise, since
+	 * missed can only be pre-set by that one branch. */
+	for (i = 0; !missed && (i < n); i++)
 	{
 		u16 sz3;
 		u8 thisMtx;
@@ -1472,6 +1730,26 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 				perVert[k] = *out;
 			}
 		}
+		/*
+		 * THE MENU POSE, parallax half (s40b). For a genuine miss there is
+		 * nothing to recover and both channels stay flat together. For the
+		 * flag -- which arrived here because `exempt` declared a miss, not
+		 * because its captures were absent -- this is where the wave comes
+		 * back: the same entries the occlusion pass just refused to read.
+		 */
+		if (perVertPar)
+		{
+			int k;
+
+			for (k = 0; k < n; k++)
+			{
+				perVertPar[k] = *out;
+			}
+			if (exempt)
+			{
+				PacketDepth_FillParallaxFromCapture(xs, ys, n, perVertPar);
+			}
+		}
 		return 1;
 	}
 
@@ -1513,6 +1791,17 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 			perVert[i] = PacketDepth_ClampWorld(0xFFFFu - sz3s[i]);
 		}
 	}
+	/* Everything that reaches here is ordinary world content -- an exempt
+	 * primitive was diverted to the miss path above and never arrives. The two
+	 * channels are therefore equal by construction, which is the invariant for
+	 * every primitive in the game except the flag's. */
+	if (perVertPar)
+	{
+		for (i = 0; i < n; i++)
+		{
+			perVertPar[i] = PacketDepth_ClampWorld(0xFFFFu - sz3s[i]);
+		}
+	}
 	return 1;
 }
 
@@ -1529,13 +1818,13 @@ internal void PacketDepth_ResolvePrim(VERTTYPE **srcs, int n)
 		ys[i] = (s16)srcs[i][1];
 	}
 
-	s_pendingDepthValid = PacketDepth_ResolveXY(xs, ys, n, &s_pendingDepth, s_pendingDepthPerVert);
+	s_pendingDepthValid = PacketDepth_ResolveXY(xs, ys, n, &s_pendingDepth, s_pendingDepthPerVert, s_pendingDepthPerVertParallax);
 	s_pendingDepthCount = s_pendingDepthValid ? n : 0;
 }
 
 /* Direct-emit wrapper: that path has packed XY words and writes its own z, so
  * it takes the stamp back directly instead of going through the pending slot. */
-internal int PacketDepth_ResolvePacked(const u32 *xyPacked, int n, u16 *out, u16 *perVert)
+internal int PacketDepth_ResolvePacked(const u32 *xyPacked, int n, u16 *out, u16 *perVert, u16 *perVertPar)
 {
 	s16 xs[4], ys[4];
 	int i;
@@ -1546,7 +1835,7 @@ internal int PacketDepth_ResolvePacked(const u32 *xyPacked, int n, u16 *out, u16
 		ys[i] = (s16)(xyPacked[i] >> 16);
 	}
 
-	return PacketDepth_ResolveXY(xs, ys, n, out, perVert);
+	return PacketDepth_ResolveXY(xs, ys, n, out, perVert, perVertPar);
 }
 #endif
 
@@ -1581,6 +1870,11 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 			for (k = 0; k < s_pendingDepthCount; k++)
 			{
 				s_gpu.vertexBuffer[firstVertex + k].emitOrdinal = s_pendingDepthPerVert[k];
+				/* Parallax channel rides the same guarded index (s40b): it is
+				 * only trustworthy under the exact one-appended-per-resolved
+				 * rule this branch just verified, same as the occlusion depth
+				 * beside it. */
+				s_gpu.vertexBuffer[firstVertex + k].parallaxOrdinal = s_pendingDepthPerVertParallax[k];
 			}
 			s_pendingDepthCount = 0;
 			s_pktDepthPerVertHits++;
@@ -1653,6 +1947,12 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 	for (int i = firstVertex; i < s_gpu.vertexIndex; i++)
 	{
 		s_gpu.vertexBuffer[i].emitOrdinal = stamp;
+		/* Flat path: both channels take the same value. The flag never lands
+		 * here -- its quads resolve 4 and append 6, which TriangulateQuad
+		 * expands in lockstep so the per-vertex branch above accepts them --
+		 * and if some future primitive of its did, the cost is one flat-rather
+		 * -than-rippling face, not a wrong depth. */
+		s_gpu.vertexBuffer[i].parallaxOrdinal = stamp;
 	}
 	s_gpu.emitOrdinal++;
 }
@@ -1878,10 +2178,14 @@ void NativeGpu_ResetEmitOrdinal(void)
 
 			Platform_Log("[PKTDEPTHZ] realZ=%u..%u backZ=%u..%u uiZ=%u..%u (larger = nearer)\n", s_pktDepth.realMin, s_pktDepth.realMax,
 			             s_pktDepth.backMin, s_pktDepth.backMax, s_pktDepth.uiMin, s_pktDepth.uiMax);
-			Platform_LogInstrument("[PKTDEPTH] frames=%lu prims=%lu real=%lu fellBack=%lu realPct=%lu ui2d=%lu stamps=%lu escaped=%ld\n",
+			Platform_LogInstrument("[PKTDEPTH] frames=%lu prims=%lu real=%lu fellBack=%lu realPct=%lu ui2d=%lu stamps=%lu escaped=%ld uiMax=%lu/%d\n",
 			             (unsigned long)s_pktDepth.frames, (unsigned long)prims, (unsigned long)s_pktDepth.real,
 			             (unsigned long)s_pktDepth.fellBack, (unsigned long)(prims ? ((s_pktDepth.real * 100u) / prims) : 0u),
-			             (unsigned long)s_pktDepth.suppressed2d, (unsigned long)s_pktDepthStamps, (long)((long)s_pktDepthStamps - (long)seen));
+			             (unsigned long)s_pktDepth.suppressed2d, (unsigned long)s_pktDepthStamps, (long)((long)s_pktDepthStamps - (long)seen),
+			             /* uiMax: worst single walk's UI prim count vs the band's
+			              * capacity. At or above capacity means overflow is being
+			              * saturated and UI layering is degrading. */
+			             (unsigned long)s_pktUiOrdinalMax, PKTDEPTH_UI_BAND << PKTDEPTH_UI_ORD_SHIFT);
 			{
 				/* s32 sinking racers. READ IT LIKE THIS:
 				 *   mdlFell large      -> mechanism 2 (karts reconstructed with
@@ -2141,7 +2445,7 @@ void MakeLineArray(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1)
 		s16 xs[2] = {(s16)p0[0], (s16)p1[0]};
 		s16 ys[2] = {(s16)p0[1], (s16)p1[1]};
 
-		s_pendingDepthValid = PacketDepth_ResolveXY(xs, ys, 2, &s_pendingDepth, s_pendingDepthPerVert);
+		s_pendingDepthValid = PacketDepth_ResolveXY(xs, ys, 2, &s_pendingDepth, s_pendingDepthPerVert, s_pendingDepthPerVertParallax);
 		s_pendingDepthCount = s_pendingDepthValid ? 2 : 0;
 	}
 #endif
@@ -2342,8 +2646,10 @@ void MakeVertexRect(GrVertex *vertex, VERTTYPE *p0, s16 w, s16 h)
 	{
 		s16 x = (s16)p0[0], y = (s16)p0[1];
 
-		/* n == 1: per-vertex and flat are the same value by construction. */
-		s_pendingDepthValid = PacketDepth_ResolveXY(&x, &y, 1, &s_pendingDepth, NULL);
+		/* n == 1: per-vertex and flat are the same value by construction, and
+		 * so is parallax -- both channel arrays are NULL and the flat stamp
+		 * below feeds z and w alike. Rects are never flag content. */
+		s_pendingDepthValid = PacketDepth_ResolveXY(&x, &y, 1, &s_pendingDepth, NULL, NULL);
 		s_pendingDepthCount = 0;
 	}
 #endif
@@ -2761,12 +3067,26 @@ void TriangulateQuad()
 	if (s_pendingDepthCount == 4)
 	{
 		u16 *d = s_pendingDepthPerVert;
+		/* s40b: the parallax channel is permuted by the SAME four statements
+		 * in the same order, for the reason spelled out above -- a table of
+		 * indices would have to be re-derived by hand whenever the expansion
+		 * changes, and a vertex paired with a stranger's parallax reads as a
+		 * face torn across two stereo planes. Written as a second copy of the
+		 * permutation rather than a loop over both arrays so the two stay
+		 * literally identical to the vertex expansion they mirror. */
+		u16 *p = s_pendingDepthPerVertParallax;
 
 		d[4] = d[3];
 
 		d[5] = d[2];
 		d[2] = d[3];
 		d[3] = d[1];
+
+		p[4] = p[3];
+
+		p[5] = p[2];
+		p[2] = p[3];
+		p[3] = p[1];
 
 		s_pendingDepthCount = 6;
 	}
@@ -3244,6 +3564,17 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 		 * consumer, starting with the stamp-time depth probe below, needs the
 		 * same band or it counts UI packets as world geometry. */
 		GTECapture_BeginOTWalk();
+		/* UI-band ordinal + the flag's latched stamp: same walk scope, same
+		 * instant. See PacketDepth_BeginWalk. */
+		PacketDepth_BeginWalk();
+#endif
+
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
+		/* Bake-parity: (re)index the latched track mesh and emit the periodic
+		 * [BAKEPAR] report. Same walk-side placement as the capture publish
+		 * above -- the taps in the poly cases below read the capture buffer
+		 * this walk was handed. */
+		BakeParity_BeginWalk();
 #endif
 
 		/*
@@ -3804,6 +4135,9 @@ internal int ProcessFlatPoly(P_TAG *polyTag)
 		// It is an official hack from SCE devs to not use DR_TPAGE and instead use null polygon
 		if (!IsNull(poly))
 		{
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
+			BakeParity_NotePolyFT3(poly);
+#endif
 			AddSplit(semiTrans, true, NativeGpu_TPageOverlapsActiveDrawPage(poly->tpage));
 
 			GrVertex *firstVertex = &s_gpu.vertexBuffer[s_gpu.vertexIndex];
@@ -3837,6 +4171,9 @@ internal int ProcessFlatPoly(P_TAG *polyTag)
 		POLY_FT4 *poly = (POLY_FT4 *)polyTag;
 		activeDrawEnv.tpage = poly->tpage;
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
+		BakeParity_NotePolyFT4(poly);
+#endif
 		AddSplit(semiTrans, true, NativeGpu_TPageOverlapsActiveDrawPage(poly->tpage));
 
 		GrVertex *firstVertex = &s_gpu.vertexBuffer[s_gpu.vertexIndex];
@@ -3883,6 +4220,9 @@ internal int ProcessGouraudPoly(P_TAG *polyTag)
 		POLY_GT3 *poly = (POLY_GT3 *)polyTag;
 		activeDrawEnv.tpage = poly->tpage;
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
+		BakeParity_NotePolyGT3(poly);
+#endif
 		AddSplit(semiTrans, true, NativeGpu_TPageOverlapsActiveDrawPage(poly->tpage));
 
 		GrVertex *firstVertex = &s_gpu.vertexBuffer[s_gpu.vertexIndex];
@@ -3916,6 +4256,9 @@ internal int ProcessGouraudPoly(P_TAG *polyTag)
 		POLY_GT4 *poly = (POLY_GT4 *)polyTag;
 		activeDrawEnv.tpage = poly->tpage;
 
+#if defined(CTR_NATIVE) && defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
+		BakeParity_NotePolyGT4(poly);
+#endif
 		AddSplit(semiTrans, true, NativeGpu_TPageOverlapsActiveDrawPage(poly->tpage));
 
 		GrVertex *firstVertex = &s_gpu.vertexBuffer[s_gpu.vertexIndex];
@@ -4385,4 +4728,89 @@ int ParseTaglessPrimitive(u32 *command)
 	}
 
 	return primLength;
+}
+
+/*
+ * s37 widescreen: how much wider (PSX px, per side) a game-side screen-bounds
+ * cull should accept than the retail viewport. Non-zero only while the 3DS
+ * REAL-wide ortho window is live, and exactly its extension -- rectW *
+ * (400-320)/(2*320) = rectW/8, the -64..576 window at rectW=512 -- so what
+ * the culls accept and what the window shows stay one number. Callers so far:
+ * RenderBucket_AcceptProjectedBounds (instance queue) and DrawSky's
+ * second-chance face test. Called on the game thread; the flag is a plain int
+ * flipped by the same thread's button/dumpreq poll. PC: always 0, every
+ * retail comparison is restored verbatim.
+ */
+int NativeWide_CullMarginX(int rectW)
+{
+#if defined(__3DS__)
+	extern int g_dbg_widescreen; /* n3ds_backend.c (separate TU, link-visible) */
+
+	if (g_dbg_widescreen == 2)
+	{
+		return rectW >> 3;
+	}
+#else
+	(void)rectW;
+#endif
+	return 0;
+}
+
+/*
+ * s37 strips hunt: per-mechanism kill switches for the widescreen margin
+ * machinery, so a live repro can bisect which mechanism draws garbage
+ * without rebuilding. Bits: 1 = instance bbox margin
+ * (RenderBucket_AcceptProjectedBounds), 2 = per-triangle margin
+ * (RenderBucket_TriangleInWideMargin), 4 = sky per-face margin
+ * (DrawSky_IsVisibleWideMargin), 8 = sky extra yaw sectors (DrawSky_Full).
+ * Default all-on. Set via dumpreq `widemask N` (n3ds_backend.c). Non-static:
+ * written by the backend TU's dumpreq poll, read here and by the game-side
+ * call sites.
+ */
+int g_dbg_wideMarginMask = 0xF;
+
+int NativeWide_MarginClassOn(int bit)
+{
+	return (g_dbg_wideMarginMask & bit) != 0;
+}
+
+/*
+ * s37 widescreen UI relocation (owner request): remap a UI-band vertex's
+ * screen X so the HUD occupies the wide window instead of floating at the
+ * old 4:3 edges. Piecewise-linear ramp about screen centre:
+ *
+ *   shift(x) = clamp((x - 256) / 3, -m, +m),  m = the wide margin (64)
+ *
+ * saturating at x <= 64 / x >= 448 -- so edge-anchored elements (timer,
+ * lap counter, minimap, portraits) translate RIGIDLY by the full margin
+ * with zero distortion, centre elements stay put, and anything in between
+ * moves proportionally (stretch bounded by width/3). Per-VERTEX and
+ * continuous, so shared vertices of adjacent triangles always agree -- no
+ * cracks inside sprites; full-width quads (menu backgrounds, pause dim)
+ * stretch to fill the window, which is the desired look for those.
+ * Returns x unchanged whenever the wide window is off, so PC and 4:3
+ * behavior are untouched. Callers gate on the UI-band depth stamp
+ * (raw >= 0xFFC0, the same d <= 63 band ctr.v.pica's stereo mask uses)
+ * and on packet depth being live (with it off, stamps are emit ordinals
+ * and the band test would be meaningless).
+ */
+int NativeWide_UiShiftX(int x)
+{
+	const int m = NativeWide_CullMarginX(512); /* 64 while REAL wide, else 0 */
+	int shift;
+
+	if (m == 0)
+	{
+		return x;
+	}
+	shift = (x - 256) / 3;
+	if (shift < -m)
+	{
+		shift = -m;
+	}
+	if (shift > m)
+	{
+		shift = m;
+	}
+	return x + shift;
 }

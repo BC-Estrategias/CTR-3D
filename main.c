@@ -123,6 +123,10 @@
 // native_track_mesh.c so it can call the mesh accessors (NativeTrackMesh_*)
 // directly, same include-order reasoning as the line above.
 #include "platform/native_track_frame.c"
+// Bake-parity diff (s38): after native_track_mesh.c because its perm report
+// reads that file's sTrackUvPerm table directly (same same-TU reasoning as
+// the frame recorder above). Whole body gated on CTR_NATIVE_BAKE_PARITY.
+#include "platform/native_bake_parity.c"
 #include "platform/native_savestate.c"
 #include "platform/native_state.c"
 #include "platform/native_str.c"

@@ -34,7 +34,7 @@
 ;
 ; ------------------------------------------------------------------- depth
 ;
-; depth = view.z, clamped to [256, 65535]; zOrd = 32767 - depth.
+; depth = view.z, clamped to [64, 65535]; zOrd = 32767 - depth.
 ;
 ; That expression is NOT a free choice and must not be "simplified". Packets
 ; stamp 0xFFFF - maxSz3 and N3DS_Vertex maps z = value - 32768, so a packet at
@@ -43,12 +43,16 @@
 ; sources sit on parallel-but-offset axes -- which looks correct while parked
 ; and wrong in motion, the failure mode that cost s28 and s29 a session each.
 ;
-; The 256 floor is the shared near band: native_gpu.c reserves stamps
-; 0xFF00..0xFFFF for depthless 2D/UI that must sit in front of all world
-; content, and clamps world content to 0xFEFF. 0xFEFF - 32768 = 32511 is the
-; nearest zOrd world geometry may produce, i.e. depth may not fall below 256.
+; The 64 floor is the shared near band: native_gpu.c reserves stamps
+; 0xFFC0..0xFFFF for depthless 2D/UI that must sit in front of all world
+; content, and clamps world content to 0xFFBF. 0xFFBF - 32768 = 32703 is the
+; nearest zOrd world geometry may produce, i.e. depth may not fall below 64.
 ; If PKTDEPTH_UI_BAND changes in native_gpu.c, this and ctr_track.v.pica must
-; both change with it.
+; both change with it. (The floor was 256 until 2026-08-06: the stopped camera
+; holds the player inside 256 view units, so the whole near half of the model
+; flattened onto one depth plane and draw order decided -- kart visible
+; through the back of the driver's head. Everything under the floor still
+; flattens; 64 units is nearer than the camera ever gets.)
 ;
 ; NO drawOrder term. drawOrder is a QuadBlock field; nothing under Vehicle/ has
 ; one, and packets carry none. The track shader keeps a 1.0-unit tie-break only
@@ -109,9 +113,9 @@
 .alias  depthMax      modelConst.zzzz
 .alias  negOne        modelConst.wwww
 
-; x = 256 -- the world near-band floor described above.
+; x = 64 -- the world near-band floor described above.
 ; y = 32767 -- zOrd = 32767 - depth.
-.constf depthConst(256.0, 32767.0, 0.0, 0.0)
+.constf depthConst(64.0, 32767.0, 0.0, 0.0)
 .alias  depthMinWorld depthConst.xxxx
 .alias  zOrdFromDepth depthConst.yyyy
 
@@ -144,7 +148,7 @@
 	; R2.v/4096 + TRZ, NOT a reciprocal depth (native_gte_core.c:319-328).
 	mul r2.x, hParam, r1.z
 
-	; depth = clamp(viewZ, 256, 65535); zOrd = 32767 - depth.
+	; depth = clamp(viewZ, 64, 65535); zOrd = 32767 - depth.
 	max r2.y, depthMinWorld, r2.x
 	min r2.y, depthMax, r2.y
 	mul r2.z, negOne, r2.y              ; -depth (no SUB opcode)
@@ -152,7 +156,7 @@
 
 	; ---- STEREO parallax (same form as ctr_track.v.pica's block) ---------
 	; p = k - kC/depth; a += w*p shifts post-divide screen X by p pixels.
-	; r2.y is the clamped [256, 65535] depth from just above, so the rcp is
+	; r2.y is the clamped [64, 65535] depth from just above, so the rcp is
 	; always finite. r5: r0-r4 are all live through the S assembly below.
 	rcp r5.x, r2.y                      ; 1/depth
 	mul r5.y, stereo.yyyy, r5.x         ; kC/depth

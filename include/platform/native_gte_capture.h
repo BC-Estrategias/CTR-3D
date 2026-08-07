@@ -83,6 +83,12 @@ extern int g_dbg_gteNoEvict;
 struct Instance;
 struct PushBuffer;
 void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct PushBuffer *pb, s32 mvpZIfNormal, int funcKind);
+/* s41: fixed-shift variant for producers whose regime is known from source
+ * rather than measured -- the ground-decal trio (shadows, skids, tires), which
+ * pre-multiply camera-relative position by 4 and run outside RenderBucket.
+ * Same shift encoding as the classifier (2 = divide the stored SZ3 by 4).
+ * Closed by GTECapture_EndInstanceDepth. */
+void GTECapture_BeginFixedDepthShift(int shift);
 void GTECapture_EndInstanceDepth(void);
 // Runtime A/B for the unscale (dumpreq 'pktaxisfix'); default ON, OFF is the
 // ice-pond vanish. The [PKTAXIS] instrument rides --model-depth-check.
@@ -120,5 +126,31 @@ int GTECapture_LookupSuppressed(void);
 // Game-thread only, same ownership as Store itself. Not a runtime toggle: the
 // suppressed population has no valid depth to capture in any configuration.
 void GTECapture_SetStoreSuppressed(int suppressed);
+
+// AFFINE DEPTH-REMAP bracket (s39, the menu/loading checkered flag). Where
+// suppression drops a producer's depths, this bracket KEEPS them, compressed
+// to ~1/4 relief and re-anchored just behind the stereo convergence plane --
+// the flag's wave stays 3D in stereo while its band can no longer cross a
+// menu model's. Same game-thread ownership and set-and-clear-in-one-producer
+// discipline as SetStoreSuppressed; constants and the full design rationale
+// sit on the definition (native_gte_capture.c).
+void GTECapture_SetStoreDepthRemap(int active);
+
+// Walk-side partner of the remap: the prim range of the flag's packets for
+// THIS frame, registered by RaceFlag_DrawSelf (double-buffered with the UI
+// band, cleared by Clear).
+//
+// Since the occlusion/parallax channel split (docs/FLAG_SPLIT_CHANNEL_SPEC.md)
+// this range no longer changes any OCCLUSION stamp -- it marks the primitives
+// whose PARALLAX depth must come from the (remapped) capture entries rather
+// than from the stamp they occlude by. The flag's screen coordinates DO come
+// from this frame's GTE writes, so the UI band's false-hit rationale never
+// applied to them; what did apply, and what the split fixes, is that retail
+// wants the flag's LAYERING to change with pose while the stereo eye wants
+// its wave to stay put.
+void GTECapture_SetUIBandExemptRange(const void *start, const void *end);
+// Walk-side query for the above -- see the definition for the two-channel
+// contract. Meaningful only while a walk is in progress.
+int GTECapture_NodeExempt(void);
 
 #endif

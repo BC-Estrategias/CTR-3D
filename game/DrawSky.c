@@ -56,6 +56,85 @@ static int DrawSky_IsVisible(u32 gteFlag, u32 sxy0, u32 sxy1, u32 sxy2, u32 scre
 	return (s32)(bounds << 16) >= 0;
 }
 
+#ifdef CTR_NATIVE
+/* s37 widescreen: second-chance visibility for faces the retail packed-SXY
+ * test rejected. The retail test culls a face when all three verts sit off
+ * the SAME side of the 4:3 rect; while the 3DS wide window is live
+ * (NativeWide_CullMarginX nonzero, platform/native_gpu.c) the X sides get
+ * the same rectW/8 margin the window gained, so the sky fills the margins
+ * instead of ending at the old edge. Plain s16 arithmetic instead of the
+ * packed borrow trick -- this path only ever ACCEPTS faces retail rejected,
+ * and only while wide, so retail/PC output is untouched by construction.
+ * GTE-flag rejects stay absolute (overflowed projections are garbage).
+ * NativeWide_MarginClassOn = the strips-hunt kill-switch mask (dumpreq
+ * `widemask N`): bit 4 gates this per-face test, bit 8 the extra yaw
+ * sectors in DrawSky_Full. */
+extern int NativeWide_CullMarginX(int rectW);
+extern int NativeWide_MarginClassOn(int bit);
+
+static int DrawSky_IsVisibleWideMargin(u32 gteFlag, u32 sxy0, u32 sxy1, u32 sxy2, u32 screenBounds)
+{
+	int w = (int)(screenBounds & 0xffff);
+	int h = (int)(screenBounds >> 16);
+	int margin = NativeWide_MarginClassOn(4) ? NativeWide_CullMarginX(w) : 0;
+	s16 x0, x1, x2, y0, y1, y2;
+
+	if (margin == 0)
+	{
+		return 0;
+	}
+
+	if (((gteFlag << 13) >> 29) != 0)
+	{
+		return 0;
+	}
+
+	x0 = (s16)(sxy0 & 0xffff);
+	y0 = (s16)(sxy0 >> 16);
+	x1 = (s16)(sxy1 & 0xffff);
+	y1 = (s16)(sxy1 >> 16);
+	x2 = (s16)(sxy2 & 0xffff);
+	y2 = (s16)(sxy2 >> 16);
+
+	if ((x0 < -margin) && (x1 < -margin) && (x2 < -margin))
+	{
+		return 0;
+	}
+	if ((x0 > w + margin) && (x1 > w + margin) && (x2 > w + margin))
+	{
+		return 0;
+	}
+	if ((y0 < 0) && (y1 < 0) && (y2 < 0))
+	{
+		return 0;
+	}
+	if ((y0 > h) && (y1 > h) && (y2 > h))
+	{
+		return 0;
+	}
+
+	/* Wrap guard: the GTE saturates screen coords at +/-1024(ish), so a
+	 * near-perpendicular face can come back with verts pinned on BOTH clamp
+	 * rails -- a wrapped projection that "spans" every side test above and
+	 * would draw as a giant garbage triangle (the owner's banded strips on
+	 * Polar). A face touching only ONE rail is a legitimate edge-spanner
+	 * (its visible part is real; the rasterizer clips the rest) -- rejecting
+	 * those would punch holes at the margins, so only the both-rails
+	 * signature dies here. */
+	{
+		int minX = (x0 < x1) ? ((x0 < x2) ? x0 : x2) : ((x1 < x2) ? x1 : x2);
+		int maxX = (x0 > x1) ? ((x0 > x2) ? x0 : x2) : ((x1 > x2) ? x1 : x2);
+
+		if ((minX <= -1024) && (maxX >= 1023))
+		{
+			return 0;
+		}
+	}
+
+	return 1;
+}
+#endif
+
 static void DrawSky_LoadFaceVertices(struct DrawSkyContext *ctx, const struct SkyboxFace *face)
 {
 	const char *verts = (const char *)ctx->verts;
@@ -118,7 +197,17 @@ static u32 *DrawSky_Piece(struct Skybox *skybox, struct DrawSkyContext *ctx, int
 		sxy1 = MFC2(13);
 		sxy2 = MFC2(14);
 
-		if (DrawSky_IsVisible(gteFlag, sxy0, sxy1, sxy2, ctx->screenBounds))
+		int visible = DrawSky_IsVisible(gteFlag, sxy0, sxy1, sxy2, ctx->screenBounds);
+
+#ifdef CTR_NATIVE
+		if (visible == 0)
+		{
+			/* Wide-margin second chance -- see DrawSky_IsVisibleWideMargin. */
+			visible = DrawSky_IsVisibleWideMargin(gteFlag, sxy0, sxy1, sxy2, ctx->screenBounds);
+		}
+#endif
+
+		if (visible != 0)
 		{
 			DrawSky_EmitPrimitive(&prim, ot);
 		}
@@ -198,6 +287,33 @@ void DrawSky_Full(void *skybox, struct PushBuffer *pb, struct PrimMem *primMem)
 		faceIndex = (int)(baseFaceOffset >> 2);
 		countIndex = (int)(baseCountOffset >> 1);
 		prim = DrawSky_Piece(sky, &ctx, faceIndex, countIndex, prim);
+
+#ifdef CTR_NATIVE
+		/* s37 widescreen: the retail 4-of-8 yaw-sector window (+1 back to -2
+		 * around the camera) has enough slack for the 4:3 FOV at any yaw
+		 * phase, but the wide window can poke past its thin side -- owner
+		 * saw the sky ending mid-margin on one edge only, which is exactly
+		 * a sector boundary, not a face cull. While wide is live, draw one
+		 * extra sector on each side (+2 and -3); DrawSky_IsVisibleWideMargin
+		 * still rejects their faces per-face, so the emitted extras are only
+		 * what the margins actually show. The 512 argument is nominal -- the
+		 * call is a mode probe (nonzero exactly when the wide window is
+		 * live). */
+		if (NativeWide_MarginClassOn(8) && (NativeWide_CullMarginX(512) != 0))
+		{
+			baseFaceOffset = (scratch->baseFaceOffset + 8) & 0x1c;
+			baseCountOffset = (scratch->baseCountOffset + 4) & 0xe;
+			faceIndex = (int)(baseFaceOffset >> 2);
+			countIndex = (int)(baseCountOffset >> 1);
+			prim = DrawSky_Piece(sky, &ctx, faceIndex, countIndex, prim);
+
+			baseFaceOffset = (scratch->baseFaceOffset - 12) & 0x1c;
+			baseCountOffset = (scratch->baseCountOffset - 6) & 0xe;
+			faceIndex = (int)(baseFaceOffset >> 2);
+			countIndex = (int)(baseCountOffset >> 1);
+			prim = DrawSky_Piece(sky, &ctx, faceIndex, countIndex, prim);
+		}
+#endif
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 		// Cleared inside the same `if (sky != NULL)` block that set it, and

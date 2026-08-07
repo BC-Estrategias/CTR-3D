@@ -1,5 +1,13 @@
 #include <common.h>
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+/* s41 depth-axis bracket -- declared by hand for the same reason
+ * MainFrame_RenderFrame.c and RenderBucket_QueueExecute.c do: game/ does not
+ * include platform/ headers. */
+extern void GTECapture_BeginFixedDepthShift(int shift);
+extern void GTECapture_EndInstanceDepth(void);
+#endif
+
 static inline u32 FLARE_PackXY(s16 x, s16 y)
 {
 	return (u16)x | ((u32)(u16)y << 16);
@@ -52,6 +60,18 @@ void FLARE_ThTick(struct Thread *th)
 	{
 		return;
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s41: the fourth ×4 producer. relX/Y/Z below are camera-relative shifted
+	 * left by 2, and they are loaded as the GTE TRANSLATION (regs 5-7) via the
+	 * llv0 above, so every SZ3 this draws is 4× the track's view.z -- same
+	 * regime as shadows/skids/tires, same reason (outside RenderBucket, so the
+	 * dispatch-site bracket never covered it). Opened after both early returns
+	 * so a rejected flare never leaves it dangling; GTECapture_Clear closes any
+	 * leak at the frame edge regardless.
+	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	GTECapture_BeginFixedDepthShift(2);
+#endif
 
 	PushBuffer_SetPsyqGeom(pb);
 	gte_SetLightMatrix(&pb->matrix_ViewProj);
@@ -178,6 +198,10 @@ void FLARE_ThTick(struct Thread *th)
 	*ot = CtrGpu_PrimToOTLink24(p0);
 
 	gGT->backBuffer->primMem.cursor = prim + 4;
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	GTECapture_EndInstanceDepth();
+#endif
 }
 
 

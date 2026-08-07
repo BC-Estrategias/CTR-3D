@@ -20,9 +20,18 @@
 ; is an emit ordinal and d would be nonsense -- the CPU side handles that by
 ; sending a zero `stereo` uniform (N3DS_StereoEyeVec, n3ds_backend.c), which
 ; makes p identically 0 rather than gating in the shader. The near band
-; (stamps 0xFF00..0xFFFF = 2D/UI content, d < 256) always takes p = 0 via
+; (stamps 0xFFC0..0xFFFF = 2D/UI content, d < 64) always takes p = 0 via
 ; the mask below: HUD/menus sit at screen depth, which is both correct and
 ; the M2 3D-Classics convention.
+;
+; CHANNEL SPLIT (docs/FLAG_SPLIT_CHANNEL_SPEC.md): parallax reads inpos.W,
+; not inpos.z. z is the OCCLUSION depth (what the PICA depth test compares);
+; w is the PARALLAX depth (where the eye should place it). They are equal for
+; all content except the menu/loading checkered flag, whose retail layering
+; wants a per-pose occlusion answer while its wave needs one continuous
+; stereo band -- one field could not say both. inpos.w is NOT a homogeneous
+; w: the position's own w is forced to the constant 1.0 below, before the
+; projection dp4s, so this value never divides anything.
 
 ; Uniforms
 .fvec projection[4]
@@ -43,12 +52,12 @@
 .alias  negOnes constants.zzzz
 
 ; Stereo constants. x = 32767 (depth stamp -> view.z axis: d = 32767 - z, the
-; exact inverse of the packet side's z = 32767 - sz3 stamp). y = 255.5 -- the
-; UI-band edge, strictly between the band's deepest world stamp (d = 256) and
-; the band's own values (d <= 255); the slt against it is the "world content
+; exact inverse of the packet side's z = 32767 - sz3 stamp). y = 63.5 -- the
+; UI-band edge, strictly between the band's deepest world stamp (d = 64) and
+; the band's own values (d <= 63); the slt against it is the "world content
 ; only" mask. Half-integer on purpose: both neighbours are exactly
 ; representable in float24 and neither can land ON the threshold.
-.constf stereoConst(32767.0, 255.5, 0.0, 0.0)
+.constf stereoConst(32767.0, 63.5, 0.0, 0.0)
 .alias  stereoBias stereoConst.xxxx
 .alias  uiBandEdge stereoConst.yyyy
 
@@ -70,7 +79,7 @@
 .out outclr color
 
 ; Inputs (regId order must match C3D_AttrInfo setup in native_renderer_3ds.c)
-.alias inpos v0 ; x, y, z (z = emit-ordinal depth substrate, biased s16)
+.alias inpos v0 ; x, y, z, w (z = occlusion depth substrate, w = parallax depth; both biased s16)
 .alias intc  v1 ; u, v
 .alias inclr v2 ; r, g, b, a
 
@@ -80,19 +89,27 @@
 	; n3ds_backend.h N3DS_Vertex) and the ortho matrix spans its full range,
 	; so nothing clips. With CTR_NATIVE_OT_DEPTH off the depth test is never
 	; enabled and this value is inert. w=1.
+	;
+	; .xyz only: inpos.w is the parallax channel, and letting it reach r0.w
+	; would feed it to the projection dp4s as a homogeneous divisor and warp
+	; every vertex. The constant 1.0 below is what the projection needs.
 	mov r0.xyz, inpos.xyz
 	mov r0.w,  ones
 
 	; ---- STEREO parallax (header comment) --------------------------------
-	; d = 32767 - z, clamped to >= 1 BEFORE the rcp: d can be exactly 0 (a
-	; stamp of 0xFFFF), rcp(0) is inf, and inf * 0 from the mask multiply is
-	; NaN -- which poisons the position instead of zeroing the shift. The
-	; mask itself uses the UNCLAMPED d so the clamp cannot promote a UI
-	; vertex into the world band. All uniform/constant operands ride src1
-	; (PICA200's src2 cannot address the constant bank -- see the mul below).
-	mul r1.x, negOnes, r0.z             ; -z
-	add r1.x, stereoBias, r1.x          ; d = 32767 - z
-	slt r1.y, uiBandEdge, r1.x          ; mask = (d > 255.5) ? 1 : 0
+	; d = 32767 - w (the PARALLAX channel, NOT r0.z -- see the channel-split
+	; block in the header), clamped to >= 1 BEFORE the rcp: d can be exactly
+	; 0 (a stamp of 0xFFFF), rcp(0) is inf, and inf * 0 from the mask
+	; multiply is NaN -- which poisons the position instead of zeroing the
+	; shift. The mask itself uses the UNCLAMPED d so the clamp cannot promote
+	; a UI vertex into the world band. All uniform/constant operands ride
+	; src1 (PICA200's src2 cannot address the constant bank -- see the mul
+	; below). Read straight from inpos.w: r0.w already holds the constant 1.0
+	; the projection needs, so the parallax depth is deliberately never
+	; copied into r0.
+	mul r1.x, negOnes, inpos.w          ; -w
+	add r1.x, stereoBias, r1.x          ; d = 32767 - w
+	slt r1.y, uiBandEdge, r1.x          ; mask = (d > 63.5) ? 1 : 0
 	max r1.x, ones, r1.x                ; d >= 1, rcp stays finite
 	rcp r1.z, r1.x                      ; 1/d
 	mul r1.w, stereo.yyyy, r1.z         ; kC/d

@@ -100,7 +100,9 @@
 .fvec qw           ; composed camera row: dp4(qw, v1) = w = view.z/H
 .fvec projection[4] ; SAME ortho matrix the packet path's ctr.v.pica uses
 .fvec hParam        ; x = H (distanceToScreen_PREV), y = selTrueDepth,
-                     ; z = selOrdinal (= 1 - y), w unused. y/z are the runtime
+                     ; z = selOrdinal (= 1 - y), w = drawOrder tie-break weight
+                     ; (s41, dumpreq `dorder N`; seeded from bucketToDepth's
+                     ; 1.0 -- see the depth-compose block). y/z are the runtime
                      ; A/B between the ordinal lerp and the true-depth axis
                      ; (docs/PACKET_DEPTH_DESIGN.md) -- see the TRUE DEPTH block
                      ; in main. Both paths are computed and blended rather than
@@ -191,22 +193,24 @@
 .alias  zOrdFromDepth  depthConst.zzzz
 .alias  negOne         depthConst.wwww
 
-; Near-band floor. native_gpu.c reserves the top 256 stamps (0xFF00..0xFFFF)
+; Near-band floor. native_gpu.c reserves the top 64 stamps (0xFFC0..0xFFFF)
 ; for 2D/UI content, which has no depth and must sit in front of every world
-; stamp, and clamps world content to 0xFEFF. The track is world content, so it
-; takes the identical clamp: 0xFEFF - 32768 = 32511 is the nearest zOrd it may
-; produce, i.e. depth may not fall below 256. That costs the nearest 256 units
-; of view.z, which are inside the near clip plane and never drawn anyway.
+; stamp, and clamps world content to 0xFFBF. The track is world content, so it
+; takes the identical clamp: 0xFFBF - 32768 = 32703 is the nearest zOrd it may
+; produce, i.e. depth may not fall below 64. (Was 256, and 256 was NOT "inside
+; the near clip plane and never drawn" as previously claimed here: the stopped
+; camera holds the player model inside 256 units, and the flatten it caused was
+; the kart-through-head bug, 2026-08-06.)
 ; If PKTDEPTH_UI_BAND changes in native_gpu.c, this MUST change with it --
 ; the two sides only share an axis while these agree.
 ; z = 0.0 disables the near-plane reject below (owner ruling, see the REVERTED
 ; block in main). 1000.0 re-enables it.
-.constf depthConst2(256.0, 0.0009765625, 0.0, 0.0)
+.constf depthConst2(64.0, 0.0009765625, 0.0, 0.0)
 .alias  depthMinWorld depthConst2.xxxx
 ; Near-plane reject kick (s29). Any positive multiple large enough that a
 ; violation of ONE view.z unit already pushes zOrd past the clip volume's
 ; 32767 end: 1 * 1000 does, and the deepest possible violation (viewZ = 0,
-; i.e. exactly at the eye) gives 256 * 1000 = 256000, which is still finite
+; i.e. exactly at the eye) gives 64 * 1000 = 64000, which is still finite
 ; and exactly representable in float24, so this can never produce a NaN that
 ; would poison the whole primitive rather than discard it.
 .alias  nearKick      depthConst2.zzzz
@@ -297,7 +301,20 @@
 	;
 	; depth = viewZ + (drawOrder-128)*64, clamped to [0, 65535].
 	; r2.z already holds (drawOrder - 128) from the otIndex math above.
-	mul r4.y, bucketToDepth, r2.z       ; drawOrder in view.z units
+	; s41 PHASE 0: weight moved from the `bucketToDepth` shader constant onto
+	; hParam.w so it is a runtime sweep (dumpreq `dorder N`) instead of a
+	; rebuild per leg. See GROUND_DECAL_PASS_DESIGN.md 3/4. The suspicion this
+	; measures: this term is added to TRACK faces only, and ground faces carry
+	; negative drawOrder, so the road is pulled toward the camera by
+	; (drawOrder * weight) view.z units while packet decals riding that same
+	; surface -- kart shadows, skid marks, tires -- have no drawOrder and no
+	; equivalent term, so they sit that far BEHIND the road and are buried.
+	; The header comment on this constant already predicted exactly this
+	; ("ANY nonzero weight here puts the two sources on parallel-but-offset
+	; axes"); it was kept at 1.0 reasoning it orders coplanar decals, which is
+	; true for track-BAKED road markings and backwards for PACKET decals.
+	; bucketToDepth is retained as the documented default the CPU seeds with.
+	mul r4.y, hParam.wwww, r2.z         ; drawOrder in view.z units (weight = hParam.w)
 	add r4.z, r2.x, r4.y                ; viewZ + tie-break (both temps, order-free)
 	max r4.z, depthMinWorld, r4.z       ; stay out of the 2D near band
 

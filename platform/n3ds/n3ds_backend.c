@@ -315,17 +315,57 @@ void N3DS_GfxExit(void)
 	gfxExit();
 }
 
+/*
+ * s36 present cost (measured 3.3ms/frame on the worker's critical path, the
+ * single largest bucket inside platform_end_scene). 1 = flush only the BOTTOM
+ * framebuffer; 0 = the old whole-system gfxFlushBuffers().
+ *
+ * gfxFlushBuffers cleans the data cache for top-left, top-right AND bottom
+ * (~806KB/frame with gfxSet3D on) via svcFlushProcessDataCache. libctru's own
+ * header says it "is only used during software rendering" and "has significant
+ * overhead" -- and our only software rendering is the bottom console, which
+ * redraws once every 64 frames. The two top framebuffers are written by the
+ * GPU (C3D_FrameEnd's display transfer), never by the CPU, so cleaning their
+ * cache lines is ~576KB of pure waste every frame.
+ *
+ * The one thing that ever READ them on the CPU is the pause freeze-frame
+ * (N3DS_CopyDisplayedTopFrame), which was silently relying on this flush for
+ * coherency -- it now does its own invalidate, which is where that belongs.
+ * Runtime A/B: SELECT+A on hardware, dumpreq `fastpresent` in Azahar.
+ */
+int g_dbg_fastPresent = 0;
+
 void N3DS_GfxPresent(void)
 {
 	/*
 	 * Only the bottom screen's console framebuffer goes through this path.
 	 * The generic gfxSwapBuffers() swaps every screen's buffers, which would
 	 * fight citro3d for ownership of the top screen -- C3D_FrameEnd (see
-	 * N3DS_C3DEndFrame) already presents that one. gfxFlushBuffers() is
-	 * still whole-system but harmless to call unconditionally: flushing a
-	 * buffer citro3d already manages is redundant, not wrong.
+	 * N3DS_C3DEndFrame) already presents that one.
 	 */
-	gfxFlushBuffers();
+	if (g_dbg_fastPresent)
+	{
+		u16 fbW = 0, fbH = 0;
+		u8 *fb = gfxGetFramebuffer(GFX_BOTTOM, GFX_LEFT, &fbW, &fbH);
+
+		/* The buffer this returns is the one the console just drew into and
+		 * the one the swap below is about to present -- flush exactly it.
+		 * Unconditional rather than dirty-tracked: console writes come from
+		 * ~90 printf sites (boot banners, the 64-frame stats block, the atlas
+		 * inspector), and a missed flush would silently blank text that is
+		 * the only readout hardware has. Bottom-only is already the bulk of
+		 * the win; skipping clean frames too can come later, with a hook that
+		 * can't miss a writer. */
+		if (fb != NULL)
+		{
+			GSPGPU_FlushDataCache(fb, (u32)fbW * (u32)fbH * 3U);
+		}
+	}
+	else
+	{
+		gfxFlushBuffers();
+	}
+
 	gfxScreenSwapBuffers(GFX_BOTTOM, false);
 }
 
@@ -360,6 +400,15 @@ int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH)
 	{
 		return 0;
 	}
+
+	/* This buffer is written by the GPU (C3D_FrameEnd's display transfer) and
+	 * read here by the CPU, so the CPU's cached view of it may be stale. Until
+	 * s36 that was covered by accident -- N3DS_GfxPresent's whole-system
+	 * gfxFlushBuffers cleaned and invalidated all three framebuffers every
+	 * frame. g_dbg_fastPresent stops paying that 3.3ms, so the one reader that
+	 * actually needed it asks for it directly, on pause entry rather than
+	 * 30 times a second. */
+	GSPGPU_InvalidateDataCache(fb, (u32)fbW * (u32)fbH * 3U);
 
 	for (y = 0; y < dstH; y++)
 	{
@@ -458,6 +507,25 @@ static DVLB_s *s_trackShaderDvlb = NULL;
 static shaderProgram_s s_trackShaderProgram;
 static int s_trackULocQx = -1, s_trackULocQy = -1, s_trackULocQw = -1;
 static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange = -1;
+
+/*
+ * s41 phase 0: the track's drawOrder tie-break weight, view.z units per
+ * drawOrder step, uploaded as hParam.w (see the uniform write for the full
+ * rationale and docs/GROUND_DECAL_PASS_DESIGN.md 3/4). 1.0 is the shipped
+ * value this replaced -- a shader constant until now; 0.0 removes the term.
+ *
+ * DEFAULT RESTORED TO 1.0 (s41, 2026-08-07): the phase-0 ablation this briefly
+ * defaulted to 0 for is DONE and REFUTED -- the owner drove it and the ground
+ * decals were still buried, so the drawOrder term is not the burial mechanism
+ * (docs/GROUND_DECAL_PASS_DESIGN.md 3). Leaving it at 0 would have shipped a
+ * pointless road-marking shimmer in every build made from this shared tree.
+ * The knob stays because it is now the cheapest way to size any decal-side
+ * offset that turns out to be needed. File-scope rather than a shared g_dbg_*
+ * because both readers (this uniform write and the dumpreq token) live in
+ * this TU -- and n3ds_backend.c is its own TU, so the unity-build
+ * tentative-definition collision hazard does not apply here.
+ */
+static float s_trackDrawOrderWeight = 1.0f;
 static int s_trackULocUvOffset = -1, s_trackULocStereo = -1;
 /* Memo for the blend pass's depth-write state, so a frame with no semi-
  * transparent content pays nothing and a frame with some flips the pair exactly
@@ -523,9 +591,13 @@ int g_dbg_stereo = 1; /* master enable; the slider still gates frame by frame */
  * 0, so the world starts AT the screen surface and only recedes. The flat
  * zone still exists but now coincides with the physical screen, which the
  * eye accepts as "the window frame" -- the standard comfortable-3DS
- * convention. Default ON; dumpreq `stereowindow` flips back for the A/B.
+ * convention.
+ *
+ * Default OFF (owner ruling, same night he asked for it: "it's less cool").
+ * Pop-out wins; the fold is the accepted price until a softer clamp knee
+ * exists. dumpreq `stereowindow` turns the tame mode on.
  */
-int g_dbg_stereoWindow = 1;
+int g_dbg_stereoWindow = 0;
 static C3D_RenderTarget *s_renderTargetRight = NULL;
 static float s_stereoSep = 12.0f;    /* k*2 at full slider: total left/right disparity at infinite depth, PSX px */
 static float s_stereoConv = 1200.0f; /* view.z units at screen depth (just beyond the player kart's ~256..2278 band) */
@@ -742,8 +814,47 @@ void N3DS_StereoRecordVram(int slot, int baseVertex)
 	}
 }
 
+/* Top-screen widescreen mode. 0 = off (4:3 pillarbox crop).
+ * 1 = STRETCH: lift the viewport crop only -- the ortho still maps the same
+ *     window, so the same picture shows at wider pixels (anamorphic; owner
+ *     rejected it on sight, s36 -- kept as a dumpreq curiosity).
+ * 2 = REAL: lift the crop AND extend the ortho window sideways by the same
+ *     320->400 ratio (below), keeping PSX-units-per-panel-pixel IDENTICAL to
+ *     4:3 mode. Perspective projection is planar, so content past the old
+ *     window edges already projects to x<0 / x>dispW -- widening the window
+ *     IS widening the FOV. The resident track/model renderers project on the
+ *     GPU with no screen clamp, so their content genuinely fills the extra
+ *     40 panel columns per side; anything CPU/retail-projected at 4:3
+ *     (packets, UI) just lands centered at correct aspect. The wall is
+ *     game-side 4:3 PVS/frustum culling: margins can show missing geometry
+ *     (the 2026-07-20 full-panel ortho experiment hit exactly that class).
+ * Non-static: the renderer TU's stats screen and projection-rebuild check
+ * read it across the plain-scalar TU boundary.
+ *
+ * DEFAULT 2 (REAL widescreen) since 2026-08-06, owner request: the port boots
+ * widescreen on our renderer, because that is the thing being built and the
+ * thing being judged. SELECT+D-DOWN still cycles off<->REAL, and dumpreq
+ * `wide`/`wide 1` still reach all three states including the rejected
+ * anamorphic stretch. The known-open margin classes (game-side 4:3 PVS/frustum
+ * culling holes, kart pop-in at the margin edges, full-screen fades not
+ * covering the margins) are unchanged by this -- promoting the default does not
+ * close them, it just stops hiding them behind a chord nobody presses. */
+int g_dbg_widescreen = 2;
+
 void N3DS_C3DSetProjection(float left, float right, float bottom)
 {
+	if (g_dbg_widescreen == 2)
+	{
+		/* REAL widescreen: grow the window by exactly the viewport's
+		 * 320->400 growth, split evenly, so 4:3 content keeps its position
+		 * and scale and the margins become new world. At dispW=512 this is
+		 * [-64, 576] -- 640 PSX columns across 400 panel px, the same 1.6
+		 * units/px the 4:3 crop shows. */
+		const float extra = (right - left) * ((400.0f - (float)N3DS_TOP_CONTENT_W) / (2.0f * (float)N3DS_TOP_CONTENT_W));
+
+		left -= extra;
+		right += extra;
+	}
 	/*
 	 * PSX screen space -> clip space. There is no camera: the GTE already
 	 * projected to 2D on the CPU, so this is a pure orthographic remap, and
@@ -790,7 +901,11 @@ static void N3DS_BindPacketDrawState(void)
 
 	attrInfo = C3D_GetAttrInfo();
 	AttrInfo_Init(attrInfo);
-	AttrInfo_AddLoader(attrInfo, 0, GPU_SHORT, 3);         /* v0 = position (x, y, z=emit-ordinal depth) */
+	/* v0 count is 4, not 3: x, y, z=occlusion depth, w=parallax depth (the
+	 * s40b channel split -- n3ds_backend.h's N3DS_Vertex comment). Must track
+	 * the struct's field count exactly; a mismatch is a hardware freeze class,
+	 * not a visual bug. */
+	AttrInfo_AddLoader(attrInfo, 0, GPU_SHORT, 4);         /* v0 = position (x, y, z=occlusion depth, w=parallax depth) */
 	AttrInfo_AddLoader(attrInfo, 1, GPU_SHORT, 2);         /* v1 = texcoord (u, v) */
 	AttrInfo_AddLoader(attrInfo, 2, GPU_UNSIGNED_BYTE, 3); /* v2 = color (r, g, b) -- alpha is a shader constant now, not fetched */
 
@@ -1225,6 +1340,25 @@ static int N3DS_NextPktBias(int cur)
 	return 0; /* off-ladder (set via 'pktbias N') rejoins at the bottom */
 }
 
+/*
+ * s36 frame pacing: C3D_FrameBegin(SYNCDRAW) aligns the START of every frame
+ * build to the 3DS hardware vblank. That alignment is native-only overhead,
+ * not pacing: the 30fps cap is enforced by the game itself (ReadyToFlip
+ * counts the EMULATED 60Hz clock, which is not phase-locked to the panel),
+ * and presentation is vblank-latched by GSP regardless, so nothing tears
+ * without it. Measured (s36 GPUTIME sitting): the wait is ~4ms avg of
+ * renderer_begin_scene on the worker's serialized path, and on Tubes-ours
+ * that path hovers right at the 2-vblank boundary -- the wait is plausibly
+ * the margin between a 33ms frame and a 50ms one. 1 = align (behavior of
+ * every build through s36), 0 = begin the moment the GPU is free.
+ * Runtime A/B: SELECT+B on hardware, dumpreq `framesync` in Azahar.
+ *
+ * DEFAULT 0 (owner-accepted on hardware 2026-08-06): Tubes mono 41->34.7ms,
+ * stereo 49->36.2ms -- most of s34's "+10ms stereo cost" was this wait
+ * rounding stereo frames up to the next vblank multiple, not render cost.
+ */
+int g_dbg_frameSync = 0;
+
 void N3DS_C3DBeginFrame(void)
 {
 	/* Latch the physical 3D slider for the whole frame BEFORE anything is
@@ -1235,7 +1369,7 @@ void N3DS_C3DBeginFrame(void)
 	N3DS_StereoLatchFrame();
 
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: enter (SYNCDRAW wait)");
-	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+	C3D_FrameBegin(g_dbg_frameSync ? C3D_FRAME_SYNCDRAW : 0);
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: returned");
 	/* Depth clears to FAR. Mtx_OrthoTilt maps LARGER vertex z to SMALLER
 	 * stored depth (verified empirically, see below), so far = max. Harmless
@@ -1298,8 +1432,16 @@ void N3DS_C3DBeginFrame(void)
 	 * (N3DS_CopyDisplayedTopFrame samples only the content region, else the
 	 * pause background re-ingests the black bars and shows them squeezed
 	 * inside the picture -- user-reported on hardware, session 18).
+	 *
+	 * s36: any nonzero g_dbg_widescreen lifts the crop. Mode 1 alone is an
+	 * anamorphic STRETCH; mode 2 (REAL) pairs the lift with the extended
+	 * ortho window in N3DS_C3DSetProjection -- see the flag's definition.
+	 * KNOWN while wide: the pause-background readback still samples the
+	 * 320-wide CONTENT region, so the paused backdrop is center-cropped;
+	 * and full-screen packet quads (fades, pause dim) cover only the
+	 * centered 4:3 band, leaving the margins undimmed.
 	 */
-	C3D_SetViewport(0, N3DS_TOP_CONTENT_X, 240, N3DS_TOP_CONTENT_W);
+	C3D_SetViewport(0, g_dbg_widescreen ? 0 : N3DS_TOP_CONTENT_X, 240, g_dbg_widescreen ? 400 : N3DS_TOP_CONTENT_W);
 
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
 	/* Left eye's parallax (zero in mono) -- rides beside the projection for
@@ -1312,11 +1454,40 @@ void N3DS_C3DBeginFrame(void)
 	s_vertexCursor = 0;
 }
 
+/* s36 GPU-time window accumulator (see n3ds_backend.h). Written on whichever
+ * thread ends frames (the render worker when the queue is live), fetched from
+ * the game thread once per [PERF] window -- a torn read costs one frame of a
+ * 64-frame average, so no lock. */
+static float s_gtCpuMs;
+static float s_gtGpuMs;
+static unsigned s_gtFrames;
+
 void N3DS_C3DEndFrame(void)
 {
 	N3DS_FrameTrace("[CTR-3DS] FrameEnd: enter (submit)");
 	C3D_FrameEnd(0);
 	N3DS_FrameTrace("[CTR-3DS] FrameEnd: returned");
+
+	/* Read here rather than in BeginFrame so the pair is sampled once per
+	 * real rendered frame. cpuTime is stamped inside C3D_FrameEnd for the
+	 * frame just submitted; gpuTime is stamped by the GX queue-finish
+	 * callback, so it belongs to the PREVIOUS completed frame -- a one-frame
+	 * skew that vanishes in a windowed average. */
+	s_gtCpuMs += C3D_GetProcessingTime();
+	s_gtGpuMs += C3D_GetDrawingTime();
+	s_gtFrames++;
+}
+
+void N3DS_C3DGpuTimeWindow(int *cpuUs, int *gpuUs, unsigned *frames)
+{
+	unsigned n = s_gtFrames;
+
+	*cpuUs = (n != 0) ? (int)((s_gtCpuMs * 1000.0f) / (float)n) : 0;
+	*gpuUs = (n != 0) ? (int)((s_gtGpuMs * 1000.0f) / (float)n) : 0;
+	*frames = n;
+	s_gtCpuMs = 0.0f;
+	s_gtGpuMs = 0.0f;
+	s_gtFrames = 0;
 }
 
 int N3DS_C3DAppendVertices(const N3DS_Vertex *vertices, int count)
@@ -1963,15 +2134,28 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 		}
 #endif
 
-		/* hParam.w: near-band polarity flip (s32, see the NEAR-BAND POLARITY
-		 * block in ctr_track.v.pica). 0 = today's behaviour bit-for-bit,
-		 * 1000 = vertices at or behind the eye go to the FAR end instead of
-		 * the near one. Carried on a uniform rather than a shader constant so
-		 * it is a mid-race hardware A/B (SELECT+D-UP / dumpreq `nearfar`);
-		 * the sink has to be judged by eye on the thing that shows it, and a
-		 * rebuild between legs is how a confounded comparison happens. */
-		/* hParam.w unused (was a depth bias/scale lever, removed). */
-		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, selTrueDepth, 1.0f - selTrueDepth, 0.0f);
+		/* hParam.w: drawOrder tie-break weight, in view.z units per drawOrder
+		 * step (s41 phase 0 -- docs/GROUND_DECAL_PASS_DESIGN.md 3/4). Was the
+		 * `bucketToDepth` shader constant at 1.0; moved onto the uniform so
+		 * the sweep is dumpreq `dorder N` instead of a rebuild per leg, for
+		 * the same reason the depth-axis selector above is a uniform: this
+		 * has to be judged by eye on the content that shows it, and a rebuild
+		 * between legs is how a confounded comparison happens.
+		 *
+		 * 1.0 restores the shipped behaviour exactly. 0.0 removes the term,
+		 * which is the phase-0 measurement: the weight is added to TRACK
+		 * faces only, so ground faces (negative drawOrder) are pulled toward
+		 * the camera while packet decals riding that same surface -- kart
+		 * shadows, skid marks, tires -- carry no drawOrder and no equivalent
+		 * term, and sit that far behind the road. If they reappear at 0, that
+		 * mechanism is confirmed and the fix is a decal-side offset, NOT
+		 * shipping 0 here (baked road markings may shimmer without it).
+		 *
+		 * That ablation RAN and came back negative (owner hardware, s41): the
+		 * decals stayed buried at 0, so this term is not the cause and the
+		 * default is back at the shipped 1.0. See GROUND_DECAL_PASS_DESIGN.md
+		 * 3 for what replaced it (the unbracketed ×4 regime axis). */
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocH, h, selTrueDepth, 1.0f - selTrueDepth, s_trackDrawOrderWeight);
 
 		/* Prove the selector actually REACHES the shader. Every depth number
 		 * logged so far is CPU-side arithmetic showing what the value would be,
@@ -2114,8 +2298,9 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	 * samples it or ignores it.
 	 *
 	 * This used to say the selector "rides hParam.w". It does not, and s32 made
-	 * that actively misleading: hParam.w is now the road depth bias (dumpreq
-	 * `trkbias`, see the NEAR-BAND block in ctr_track.v.pica). Anyone trusting
+	 * that actively misleading: hParam.w is now the drawOrder tie-break weight
+	 * (dumpreq `dorder`, s41 -- it named the long-removed `trkbias` lever until
+	 * then, which is the same stale-comment failure twice over). Anyone trusting
 	 * the old wording would have gone looking for a texture flag in a depth
 	 * uniform -- and on a part whose uniform names are offsets into ONE shared
 	 * physical register file, a wrong belief about who owns a component is
@@ -2617,9 +2802,9 @@ void N3DS_StereoRenderRightEye(void)
 	s_stereoEye = 1;
 
 	C3D_FrameDrawOn(s_renderTargetRight);
-	/* Same pillarbox crop as N3DS_C3DBeginFrame -- viewport state does not
-	 * automatically follow the framebuffer binding. */
-	C3D_SetViewport(0, N3DS_TOP_CONTENT_X, 240, N3DS_TOP_CONTENT_W);
+	/* Same pillarbox crop (or widescreen lift) as N3DS_C3DBeginFrame --
+	 * viewport state does not automatically follow the framebuffer binding. */
+	C3D_SetViewport(0, g_dbg_widescreen ? 0 : N3DS_TOP_CONTENT_X, 240, g_dbg_widescreen ? 400 : N3DS_TOP_CONTENT_W);
 #ifdef CTR_NATIVE_OT_DEPTH
 	/* Frame-wide depth pair, mirroring BeginFrame's policy exactly --
 	 * whatever state the left eye's last draw left behind is not it. */
@@ -2884,6 +3069,8 @@ unsigned int N3DS_ReadButtons(void)
 	 *   textureless -- toggle g_dbg_texturelessMode
 	 *   triscopes   -- toggle g_dbg_perfTriScopes (per-triangle perf split; taxed)
 	 *   drawmerge   -- toggle g_dbg_drawMerge (CTR_NATIVE_DRAW_MERGE builds only)
+	 *   flagrainbow [N] -- menu/loading flag: 1 = pride stripes (default),
+	 *                  0 = retail grey checkers
 	 *   renderthread -- toggle g_dbg_renderThread (core-2 render worker routing;
 	 *                  OFF falls back to synchronous main-thread rendering)
 	 *   lodgeo [N]  -- track LOD distance, percent of retail (CTR_NATIVE_LOD_BIAS)
@@ -2915,8 +3102,8 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  overwrite a live entry owned by a different matrix.
 	 *   stereo      -- toggle g_dbg_stereo (master 3D enable; the physical slider
  *                  still gates frame by frame, this just forces mono)
- *   stereowindow -- toggle window mode (default ON: no pop-out, the world
- *                  starts at the screen; OFF restores clamped pop-out)
+ *   stereowindow -- toggle window mode (default OFF per owner: pop-out is
+ *                  cooler; ON = no pop-out, world starts at the screen)
  *   stereosep [N] -- full-slider disparity at infinite depth, PSX px
  *                  (default 12; negative swaps the eyes; bare resets)
  *   stereoconv [N] -- screen-plane depth, view.z units (default 1200;
@@ -2925,6 +3112,9 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  1=no depth test (painter's order) 2=track tests but
 	 *                  does not write depth. Bare token cycles 0->1->2->0.
 	 *                  Hardware button: SELECT+ZL.
+	 *   wide [N]    -- g_dbg_widescreen: bare toggles off<->REAL (mode 2,
+	 *                  wide FOV window at 4:3 pixel scale); `wide 1` is the
+	 *                  rejected anamorphic stretch. Button: SELECT+D-DOWN.
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -2948,7 +3138,50 @@ unsigned int N3DS_ReadButtons(void)
 				fclose(req);
 				remove("sdmc:/dumpreq.txt");
 
-				if (strncmp(word, "subpage", 7) == 0)
+				if (strncmp(word, "widemask", 8) == 0)
+				{
+					/* Strips-hunt kill switches (s37): bit 1 = instance bbox
+					 * margin, 2 = per-tri margin, 4 = sky face margin,
+					 * 8 = sky extra sectors. `widemask N` (decimal 0-15)
+					 * sets; bare resets to all-on. MUST be matched before
+					 * the `wide` token -- shared prefix. */
+					extern int g_dbg_wideMarginMask;
+					char msg[48];
+
+					g_dbg_wideMarginMask = (word[8] == ' ') ? (atoi(&word[9]) & 0xF) : 0xF;
+					snprintf(msg, sizeof(msg), "[CTR-3DS] wide margin mask: 0x%X", (unsigned)g_dbg_wideMarginMask);
+					N3DS_DebugLog(msg);
+				}
+				else if (strncmp(word, "wide", 4) == 0)
+				{
+					/* Bare token toggles off<->REAL. `wide N` (0/1/2) sets a
+					 * mode directly -- 1 is the rejected anamorphic stretch,
+					 * kept reachable only this explicit way. */
+					if (word[4] == ' ' && word[5] >= '0' && word[5] <= '2')
+					{
+						g_dbg_widescreen = word[5] - '0';
+					}
+					else
+					{
+						g_dbg_widescreen = (g_dbg_widescreen != 0) ? 0 : 2;
+					}
+					N3DS_DebugLog((g_dbg_widescreen == 2)   ? "[CTR-3DS] widescreen: REAL (wide FOV window, 4:3 pixel scale)"
+					              : (g_dbg_widescreen == 1) ? "[CTR-3DS] widescreen: STRETCH (anamorphic)"
+					                                        : "[CTR-3DS] widescreen: off (4:3 crop)");
+				}
+				else if (strncmp(word, "framesync", 9) == 0)
+				{
+					g_dbg_frameSync ^= 1;
+					N3DS_DebugLog(g_dbg_frameSync ? "[CTR-3DS] framesync: ON (FrameBegin waits for hw vblank)"
+					                              : "[CTR-3DS] framesync: OFF (begin immediately)");
+				}
+				else if (strncmp(word, "fastpresent", 11) == 0)
+				{
+					g_dbg_fastPresent ^= 1;
+					N3DS_DebugLog(g_dbg_fastPresent ? "[CTR-3DS] fastpresent: ON (flush bottom framebuffer only)"
+					                                : "[CTR-3DS] fastpresent: off (whole-system gfxFlushBuffers)");
+				}
+				else if (strncmp(word, "subpage", 7) == 0)
 				{
 					void NativeRenderer3DS_DebugInvalidateCaches(void);
 
@@ -3259,6 +3492,44 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
 					N3DS_DebugLog(msg);
 				}
+				else if (strncmp(word, "decalaxis", 9) == 0)
+				{
+					extern int g_dbg_decalAxisFix;
+
+					/* s41: ground-decal 4x depth-axis unscale (shadows, skid
+					 * marks, tires). Bare token toggles; this is the A/B the
+					 * fix gets judged on, so 0 must reproduce pre-s41 exactly.
+					 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+					g_dbg_decalAxisFix ^= 1;
+					N3DS_DebugLog(g_dbg_decalAxisFix ? "[CTR-3DS] decal depth axis: FIXED (4x unscaled)"
+					                                : "[CTR-3DS] decal depth axis: off (pre-s41 behaviour)");
+				}
+				else if (strncmp(word, "dorder", 6) == 0)
+				{
+					char msg[80];
+
+					/* s41 phase 0 -- the drawOrder tie-break sweep. 'dorder N'
+					 * sets the weight in view.z units per drawOrder step (N is
+					 * an integer: 0 removes the term, 1 is the shipped value
+					 * this replaced); bare 'dorder' toggles 0 <-> 1 so the A/B
+					 * leg is one token. Integer-only on purpose: atoi is what
+					 * every sibling token here uses, and sub-unit weights are
+					 * not what this measurement is asking about.
+					 * docs/GROUND_DECAL_PASS_DESIGN.md 4. */
+					if (word[6] == ' ')
+					{
+						int n = atoi(&word[7]);
+
+						s_trackDrawOrderWeight = (float)((n < 0) ? 0 : (n > 64) ? 64 : n);
+					}
+					else
+					{
+						s_trackDrawOrderWeight = (s_trackDrawOrderWeight != 0.0f) ? 0.0f : 1.0f;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] track drawOrder weight: %d view.z units/step%s", (int)s_trackDrawOrderWeight,
+					         (s_trackDrawOrderWeight == 0.0f) ? " (term REMOVED -- phase 0 diagnostic)" : "");
+					N3DS_DebugLog(msg);
+				}
 #endif
 #ifdef CTR_NATIVE_MODEL_RENDERER
 				else if (strncmp(word, "modelrender", 11) == 0)
@@ -3268,12 +3539,12 @@ unsigned int N3DS_ReadButtons(void)
 					char msg[64];
 
 					/* Same idiom as 'trackrender' directly above: 'modelrender N'
-					 * sets a state, bare 'modelrender' cycles. Rung 2 draws the
-					 * native models in states 1 and 2 and does NOT yet suppress
-					 * the packet ones, so both currently look the same -- the
-					 * suppression is rung 4. Stated here because "1 and 2 look
-					 * identical" is otherwise a convincing symptom of a broken
-					 * toggle. */
+					 * sets a state, bare 'modelrender' cycles. State 1 REPLACES
+					 * the packet models (RenderBucket_DrawFunc_Normal's
+					 * mdlReplaces skips the packet write); state 2 draws both,
+					 * as an overlay A/B. A previous version of this comment said
+					 * suppression wasn't in yet -- it is, and that stale text
+					 * misdiagnosed a bug on 2026-08-06. */
 					if (word[11] == ' ')
 					{
 						int n = atoi(&word[12]);
@@ -3286,6 +3557,39 @@ unsigned int N3DS_ReadButtons(void)
 					}
 					snprintf(msg, sizeof(msg), "[CTR-3DS] model render: %s", names[g_dbg_modelRender]);
 					N3DS_DebugLog(msg);
+				}
+				else if (strncmp(word, "hudui", 5) == 0)
+				{
+					extern int g_dbg_hudModelsAsUi;
+
+					/* HUD models (place numeral, Wumpa counter, tokens...) take
+					 * the retail packet path so the UI-band rules apply to them.
+					 * OFF is the pop-out / "ST 1" / track-intersection state. */
+					if (word[5] == ' ')
+					{
+						g_dbg_hudModelsAsUi = (atoi(&word[6]) != 0);
+					}
+					else
+					{
+						g_dbg_hudModelsAsUi ^= 1;
+					}
+					N3DS_DebugLog(g_dbg_hudModelsAsUi ? "[CTR-3DS] HUD models: drawn as UI (retail packet path)" : "[CTR-3DS] HUD models: native capture (pops out, ST 1)");
+				}
+				else if (strncmp(word, "flagrainbow", 11) == 0)
+				{
+					extern int g_dbg_flagRainbow;
+
+					/* Menu/loading flag: pride stripes (default) vs retail grey
+					 * checkers. 'flagrainbow N' sets, bare token flips. */
+					if (word[11] == ' ')
+					{
+						g_dbg_flagRainbow = (atoi(&word[12]) != 0);
+					}
+					else
+					{
+						g_dbg_flagRainbow ^= 1;
+					}
+					N3DS_DebugLog(g_dbg_flagRainbow ? "[CTR-3DS] race flag: RAINBOW stripes" : "[CTR-3DS] race flag: retail grey checkers");
 				}
 				else if (strncmp(word, "axisfix", 7) == 0)
 				{
@@ -3413,14 +3717,37 @@ unsigned int N3DS_ReadButtons(void)
 		}
 	}
 
-	/* SELECT held + B: automated config sweep. Drive one lap with this on and
-	 * every config gets equal exposure to the same content -- see g_dbg_sweep. */
+	/* REPURPOSED s36: was the s29 automated config sweep, settled since
+	 * (dumpreq `sweep` still covers Azahar). Now the frame-pacing A/B --
+	 * g_dbg_frameSync, defined above N3DS_C3DBeginFrame. Mid-race by design:
+	 * a mid-run flip brackets [PERF] windows by state on identical content,
+	 * and dumpreq is unplaceable while the game holds the SD card. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_B))
 	{
-		extern int g_dbg_sweep;
+		g_dbg_frameSync ^= 1;
+		N3DS_DebugLog(g_dbg_frameSync ? "[CTR-3DS] framesync: ON (FrameBegin waits for hw vblank)"
+		                              : "[CTR-3DS] framesync: OFF (begin immediately)");
+	}
 
-		g_dbg_sweep ^= 1;
-		N3DS_DebugLog(g_dbg_sweep ? "[CTR-3DS] sweep: ON (auto-cycling configs)" : "[CTR-3DS] sweep: off");
+	/* SELECT held + TOUCH the bottom screen: present-path cost
+	 * (g_dbg_fastPresent, defined above N3DS_GfxPresent). Same reason as its
+	 * neighbours for being a button at all -- the A/B has to happen mid-race
+	 * on identical content, and dumpreq is unplaceable while the game holds
+	 * the SD card.
+	 *
+	 * The TOUCHSCREEN, because every button chord is genuinely taken: SELECT +
+	 * A/B/X/Y/L/R/ZL/ZR and all four d-pad directions all fire something, and
+	 * SELECT+START is the master renderer switch. This first shipped on
+	 * SELECT+A, which is the model-render toggle 200 lines below -- one press
+	 * flipped BOTH and silently confounded the measurement (owner caught it:
+	 * "select A turns models off"). Touch reads nothing else in the whole
+	 * build, so it cannot collide with another session's chord, and SELECT is
+	 * still required so a stray thumb on the bottom screen can't fire it. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_TOUCH))
+	{
+		g_dbg_fastPresent ^= 1;
+		N3DS_DebugLog(g_dbg_fastPresent ? "[CTR-3DS] fastpresent: ON (flush bottom framebuffer only)"
+		                                : "[CTR-3DS] fastpresent: off (whole-system gfxFlushBuffers)");
 	}
 
 	/* SELECT held + X: bottom-screen verbosity. Default off (s29) -- the stats
@@ -3473,12 +3800,16 @@ unsigned int N3DS_ReadButtons(void)
 	 * hardware A/B would be cross-run. The OFF transition is safe mid-race
 	 * by construction: Route() fences the worker before the first direct
 	 * call (native_render_queue.c). */
+	/* REPURPOSED s36: was the render-worker routing A/B, settled since s25b
+	 * (dumpreq `renderthread` still covers Azahar if it's ever needed again).
+	 * Now the widescreen toggle, because the owner wants to eyeball it on
+	 * the real panel and dumpreq is unplaceable while the game holds the SD
+	 * card. Toggles off<->REAL (mode 2); the rejected stretch (mode 1) is
+	 * dumpreq-only. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DDOWN))
 	{
-		extern int g_dbg_renderThread;
-
-		g_dbg_renderThread ^= 1;
-		N3DS_DebugLog(g_dbg_renderThread ? "[CTR-3DS] render worker routing: ON" : "[CTR-3DS] render worker routing: OFF (sync on main thread)");
+		g_dbg_widescreen = (g_dbg_widescreen == 2) ? 0 : 2;
+		N3DS_DebugLog((g_dbg_widescreen == 2) ? "[CTR-3DS] widescreen: REAL (wide FOV window, 4:3 pixel scale)" : "[CTR-3DS] widescreen: off (4:3 crop)");
 	}
 
 	/* SELECT held + D-pad RIGHT: textureless. Was bare SELECT (2026-07-20),

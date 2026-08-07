@@ -37,6 +37,13 @@
 
 int g_dbg_modelRender = CTR_NATIVE_RENDERER_DEFAULT_ON;
 
+/* Route HUD-model instances (UI pushbuffer) down the retail packet path so the
+ * UI-band rules see them -- full argument on the test in
+ * NativeModelEmit_BeginInstance. Default ON: OFF is the owner-reported
+ * "ST 1"/pop-out/track-intersection behaviour, kept only as the A/B.
+ * dumpreq `hudui`. */
+int g_dbg_hudModelsAsUi = 1;
+
 /*
  * CAPS. Measured (s30 [MODELFRAME], hardware): ~1500 triangles/frame across
  * ~9 instances in Arcade on N. Gin Labs, ~440 across ~5 in Time Trial. Note
@@ -410,6 +417,55 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 	if ((g_dbg_modelRender == 0) || (idpp == NULL) || (pb == NULL))
 	{
 		return 0;
+	}
+
+	/*
+	 * HUD MODELS ARE UI, NOT WORLD GEOMETRY (s41, owner UI pass).
+	 *
+	 * The place numeral (STATIC_BIG1), the Wumpa counter (STATIC_FRUITDISP),
+	 * the CTR letters, tokens, relics, keys and trophies are all born through
+	 * UI_INSTANCE_BirthWithThread -> INSTANCE_Birth2D, whose defining act is
+	 * `idpp[0].pushBuffer = &gGT->pushBuffer_UI` (game/INSTANCE.c). Drawing
+	 * into the UI pushbuffer is what makes a thing UI: its packets land in the
+	 * UI OT, the walk crosses into the UI band, and everything downstream that
+	 * asks "is this UI?" -- the stereo flatten and the widescreen X ramp
+	 * (NativeWide_UiShiftX) both test the UI-band stamp -- answers yes.
+	 *
+	 * Capturing them here bypasses the OT walk entirely, so they never enter
+	 * the band and are invisible to BOTH rules at once. Owner-reported on
+	 * hardware as four separate complaints that are one bug: the elements pop
+	 * out of the screen while flat UI sits at screen level; the widescreen
+	 * shift moves the "ST" suffix but not the numeral model, giving "ST 1"
+	 * instead of "1ST"; the numeral is intersected by the track (which no UI
+	 * element can ever legitimately lose to); and they generally read as not
+	 * belonging to the HUD.
+	 *
+	 * Declining capture is the conservative fix: mdlCapture == 0 leaves
+	 * mdlReplaces == 0 at the call site (RenderBucket_QueueExecute.c), so the
+	 * retail packet write runs untouched and these elements behave exactly as
+	 * they do on the retail path -- which is the behaviour being asked for.
+	 * The alternative, teaching the native path the UI rules, is strictly more
+	 * work for models this small (a numeral, a fruit, three letters) and buys
+	 * nothing the owner asked for.
+	 *
+	 * NOT keyed on SCREENSPACE_INSTANCE, even though Birth2D sets it (flags
+	 * 0x40f includes 0x400): that flag is also set by hand on menu instances
+	 * born through Birth3D -- the character-select and main-menu characters
+	 * among them -- and dropping those to the retail path would be a visible
+	 * downgrade nobody asked for. The pushbuffer identity is the narrow test.
+	 *
+	 * pushBuffer_DecalMP is the multiplayer Wumpa display's pushbuffer
+	 * (UI_INSTANCE_InitAll routes fruitDisp through it at >= 2 players), so it
+	 * is UI by the same argument.
+	 */
+	if (g_dbg_hudModelsAsUi)
+	{
+		const struct GameTracker *gGT = sdata->gGT;
+
+		if ((gGT != NULL) && ((pb == &gGT->pushBuffer_UI) || (pb == &sdata->pushBuffer_DecalMP)))
+		{
+			return 0;
+		}
 	}
 
 	/*
@@ -1132,6 +1188,7 @@ int NativeModelEmit_SkipRetailDraw(void)
 #endif
 }
 
+
 #if defined(__3DS__)
 /*
  * ===========================================================================
@@ -1454,6 +1511,12 @@ void NativeModelDraw_IssueForWalk(void)
 				out[v].x = src[v].x;
 				out[v].y = src[v].y;
 				out[v].z = src[v].z;
+				/* Single-channel for now (s40b): the model path computes its
+				 * own depth rather than reading a packet stamp, so occlusion
+				 * and parallax are the same number here. The dmodel stereo
+				 * fix (s34's open split-channel item) is what would give this
+				 * one a value of its own. */
+				out[v].w = src[v].z;
 
 				if (textured)
 				{

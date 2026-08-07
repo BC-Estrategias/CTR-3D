@@ -25,6 +25,10 @@
  * different implicit tag for the same struct name. */
 #include "platform/native_track_mesh.h"
 
+/* Bake-parity hooks (s38): declarations only; every call below is gated on
+ * CTR_NATIVE_BAKE_PARITY, so this costs nothing when that gate is off. */
+#include "platform/native_bake_parity.h"
+
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 
 /* struct NativeTrackVert itself now lives in the header above (rung 3a step
@@ -465,6 +469,65 @@ static const u8 sTrackUvPerm[8][4] = {
 /* TextureLayout corner byte offsets relative to &layout->u0: (u,v) pairs for
  * UV indices 0-3 sit at +0, +4, +8, +10 (clut/tpage interleave between). */
 static const u8 sTrackUvByteOfs[4] = {0, 4, 8, 10};
+
+/*
+ * faceMode 1/2 faces are TRIANGLES, not quads (s38, the Coco Park stripe +
+ * Crash Cove sky-plank classes). Retail indexes the face's full 5-bit value
+ * into a 24-word corner-selection table (R226.scratchInitTable); the mode 1/2
+ * words repeat a corner slot -- a degenerate quad, i.e. a triangle -- and
+ * their UV assignment does NOT follow the rotation-only interpretation above.
+ * Emitting these as full quads drew the unused 4th grid corner (whose index
+ * slot is unread asset data on retail -- garbage in-bounds values produced
+ * wood-textured sails anchored in the sky) and misassigned the corner UVs
+ * (stripes at the wrong angle on the drawn half).
+ *
+ * Both tables below were LEARNED from retail's own packets, not derived from
+ * the selector bit-packing: the bake-parity instrument's face-table map
+ * (platform/native_bake_parity.c) recorded, for every matched mode 1/2 face
+ * across five tracks plus the intro cutscene levels, which grid corner and
+ * which layout UV index retail put at each packet corner -- all 16 rows
+ * unanimous (disagree=0) at n up to ~800 faces per row, s38 facemap run.
+ * Row index is (faceBits & 0x1f) - 8. Corner order here is retail's packet
+ * order; the index emission below applies the same swap-last-two that maps
+ * retail's (0,1,2)/(1,3,2) tri order onto this file's (0,2,1)/(1,2,3) split.
+ */
+static const u8 sTrackModeTriGrid[16][3] = {
+    {1, 2, 0}, /* v=8  None   mode 1 */
+    {2, 1, 0}, /* v=9  Rot90  mode 1 */
+    {0, 1, 2}, /* v=10 Rot180 mode 1 */
+    {1, 0, 2}, /* v=11 Rot270 mode 1 */
+    {1, 0, 2}, /* v=12 FRot270 mode 1 */
+    {0, 1, 2}, /* v=13 FRot180 mode 1 */
+    {2, 1, 0}, /* v=14 FRot90 mode 1 */
+    {1, 2, 0}, /* v=15 Flip   mode 1 */
+    {2, 0, 1}, /* v=16 None   mode 2 */
+    {0, 2, 1}, /* v=17 Rot90  mode 2 */
+    {1, 2, 0}, /* v=18 Rot180 mode 2 */
+    {2, 1, 0}, /* v=19 Rot270 mode 2 */
+    {2, 1, 0}, /* v=20 FRot270 mode 2 */
+    {1, 2, 0}, /* v=21 FRot180 mode 2 */
+    {0, 2, 1}, /* v=22 FRot90 mode 2 */
+    {2, 0, 1}, /* v=23 Flip   mode 2 */
+};
+
+static const u8 sTrackModeTriIdx[16][3] = {
+    {0, 1, 2}, /* v=8  */
+    {0, 2, 3}, /* v=9  */
+    {1, 3, 2}, /* v=10 */
+    {1, 0, 3}, /* v=11 */
+    {0, 1, 2}, /* v=12 */
+    {0, 2, 3}, /* v=13 */
+    {1, 3, 2}, /* v=14 */
+    {1, 0, 3}, /* v=15 */
+    {0, 1, 2}, /* v=16 */
+    {0, 2, 3}, /* v=17 */
+    {1, 3, 2}, /* v=18 */
+    {1, 0, 3}, /* v=19 */
+    {0, 1, 2}, /* v=20 */
+    {0, 2, 3}, /* v=21 */
+    {1, 3, 2}, /* v=22 */
+    {1, 0, 3}, /* v=23 */
+};
 
 static u64 NativeTrackMesh_PackPos(const struct LevVertex *v)
 {
@@ -2008,6 +2071,329 @@ static int NativeTrackMesh_LeafTouchesAnim(const struct BSP *bsp, const u8 *anim
  */
 int g_dbg_trackGapFill = 0;
 
+#if defined(CTR_NATIVE_TRACK_BAKE_EXPORT) && CTR_NATIVE_TRACK_BAKE_EXPORT
+
+/*
+ * .ctrbake v1 (s38) -- the serialized form of exactly what this file just
+ * built. Sections, all little-endian, in order:
+ *   magic "CTRBAKE1", u32 version,
+ *   u32 levelID, numQuadBlock, numVertex, bspNodeCount   (source fingerprint)
+ *   u32 vertCount, indexCount, leafCount, texCount, rectCount, animTexCount
+ *   verts        vertCount x 16B   (struct NativeTrackVert, packed, asserted)
+ *   indices      indexCount x u16
+ *   leaves       leafCount x 26B   (field-wise -- the in-memory struct has
+ *                                   alignment padding, the file does not)
+ *   bspToLeaf    bspNodeCount x s32
+ *   texSnap      texCount x 12B    (TextureLayout u0..v3/clut/tpage verbatim
+ *                                   -- the table's live form is heap POINTERS)
+ *   rects        rectCount x 14B   (identity + bbox + decode origin + alloc
+ *                                   size; NO placement -- the packer re-derives
+ *                                   that deterministically)
+ *   u32 sentinel "BAKE"
+ * animTexCount > 0 tells a future loader this level ALSO needs the live
+ * anim-chain walk (chains reference runtime heap layouts; deliberately not
+ * serialized in v1).
+ */
+#define TRACK_BAKE_VERSION 1u
+#define TRACK_BAKE_SENTINEL 0x454B4142u /* "BAKE" */
+
+static void TrackBake_PutU16(FILE *f, u16 v)
+{
+	u8 b[2] = {(u8)v, (u8)(v >> 8)};
+
+	fwrite(b, 1, 2, f);
+}
+
+static void TrackBake_PutU32(FILE *f, u32 v)
+{
+	u8 b[4] = {(u8)v, (u8)(v >> 8), (u8)(v >> 16), (u8)(v >> 24)};
+
+	fwrite(b, 1, 4, f);
+}
+
+/* Field-wise little-endian image of one leaf range -- shared by writer and
+ * verifier so the two can never disagree about the encoding. */
+static void TrackBake_LeafImage(const struct NativeTrackLeafRange *lr, u8 out[26])
+{
+	out[0] = (u8)lr->bspIndex;
+	out[1] = (u8)(lr->bspIndex >> 8);
+	out[2] = (u8)lr->atlasBin;
+	out[3] = (u8)(lr->atlasBin >> 8);
+	out[4] = (u8)lr->firstIndex;
+	out[5] = (u8)(lr->firstIndex >> 8);
+	out[6] = (u8)(lr->firstIndex >> 16);
+	out[7] = (u8)(lr->firstIndex >> 24);
+	out[8] = (u8)lr->indexCount;
+	out[9] = (u8)(lr->indexCount >> 8);
+	out[10] = (u8)(lr->indexCount >> 16);
+	out[11] = (u8)(lr->indexCount >> 24);
+
+	for (int a = 0; a < 3; a++)
+	{
+		out[12 + a * 2] = (u8)(u16)lr->boxMin[a];
+		out[13 + a * 2] = (u8)((u16)lr->boxMin[a] >> 8);
+		out[18 + a * 2] = (u8)(u16)lr->boxMax[a];
+		out[19 + a * 2] = (u8)((u16)lr->boxMax[a] >> 8);
+	}
+
+	out[24] = (u8)lr->drawOrderMin;
+	out[25] = (u8)lr->drawOrderMax;
+}
+
+/* Field-wise little-endian image of one atlas rect (identity, no placement). */
+static void TrackBake_RectImage(const struct NativeTrackAtlasRect *rect, u8 out[14])
+{
+	out[0] = (u8)rect->tpage;
+	out[1] = (u8)(rect->tpage >> 8);
+	out[2] = (u8)rect->clut;
+	out[3] = (u8)(rect->clut >> 8);
+	out[4] = rect->minU;
+	out[5] = rect->minV;
+	out[6] = rect->maxU;
+	out[7] = rect->maxV;
+	out[8] = rect->srcU;
+	out[9] = rect->srcV;
+	out[10] = (u8)rect->allocW;
+	out[11] = (u8)(rect->allocW >> 8);
+	out[12] = (u8)rect->allocH;
+	out[13] = (u8)(rect->allocH >> 8);
+}
+
+static int TrackBake_GetU32(FILE *f, u32 *out)
+{
+	u8 b[4];
+
+	if (fread(b, 1, 4, f) != 4)
+	{
+		return 0;
+	}
+
+	*out = (u32)b[0] | ((u32)b[1] << 8) | ((u32)b[2] << 16) | ((u32)b[3] << 24);
+	return 1;
+}
+
+static const char *TrackBake_CmpHeaderU32(FILE *f, u32 expect, const char *tag)
+{
+	u32 v;
+
+	if (!TrackBake_GetU32(f, &v) || v != expect)
+	{
+		return tag;
+	}
+
+	return NULL;
+}
+
+static const char *TrackBake_CmpBulk(FILE *f, const void *live, size_t bytes, const char *tag)
+{
+	const u8 *src = (const u8 *)live;
+	u8 buf[1024];
+	size_t off = 0;
+
+	while (off < bytes)
+	{
+		size_t n = (bytes - off < sizeof(buf)) ? (bytes - off) : sizeof(buf);
+
+		if (fread(buf, 1, n, f) != n || memcmp(buf, src + off, n) != 0)
+		{
+			return tag;
+		}
+
+		off += n;
+	}
+
+	return NULL;
+}
+
+/* Re-read the file just written and compare every byte against the live mesh.
+ * Returns NULL on success or the name of the first divergent section -- a
+ * format bug dies here, in the same build that wrote the file, instead of in
+ * a future loader on other hardware. */
+static const char *TrackBake_Verify(const char *path, int levelID, int numQuadBlock, int numVertex)
+{
+	FILE *f = fopen(path, "rb");
+	const char *bad = NULL;
+	char magic[8];
+
+	if (f == NULL)
+	{
+		return "reopen";
+	}
+
+	if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "CTRBAKE1", 8) != 0)
+	{
+		bad = "magic";
+	}
+
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, TRACK_BAKE_VERSION, "version");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, (u32)levelID, "levelID");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, (u32)numQuadBlock, "numQuadBlock");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, (u32)numVertex, "numVertex");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, s_trackMesh.bspNodeCount, "bspNodeCount");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, s_trackMesh.vertCount, "vertCount");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, s_trackMesh.indexCount, "indexCount");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, s_trackMesh.leafCount, "leafCount");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, (u32)s_trackMesh.texCount, "texCount");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, (u32)s_trackMesh.atlas.rectCount, "rectCount");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, s_trackMesh.animTexCount, "animTexCount");
+	}
+
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpBulk(f, s_trackMesh.verts, (size_t)s_trackMesh.vertCount * sizeof(struct NativeTrackVert), "verts");
+	}
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpBulk(f, s_trackMesh.indices, (size_t)s_trackMesh.indexCount * sizeof(u16), "indices");
+	}
+
+	for (u32 l = 0; bad == NULL && l < s_trackMesh.leafCount; l++)
+	{
+		u8 expect[26], got[26];
+
+		TrackBake_LeafImage(&s_trackMesh.leafRanges[l], expect);
+
+		if (fread(got, 1, 26, f) != 26 || memcmp(got, expect, 26) != 0)
+		{
+			bad = "leaves";
+		}
+	}
+
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpBulk(f, s_trackMesh.bspToLeafIndex, (size_t)s_trackMesh.bspNodeCount * sizeof(s32), "bspToLeaf");
+	}
+
+	for (u32 t = 0; bad == NULL && t < s_trackMesh.texCount; t++)
+	{
+		bad = TrackBake_CmpBulk(f, (const u8 *)&((const struct TextureLayout *)s_trackMesh.texTable[t])->u0, 12, "texSnap");
+	}
+
+	for (int r = 0; bad == NULL && r < s_trackMesh.atlas.rectCount; r++)
+	{
+		u8 expect[14], got[14];
+
+		TrackBake_RectImage(&s_trackMesh.atlas.rects[r], expect);
+
+		if (fread(got, 1, 14, f) != 14 || memcmp(got, expect, 14) != 0)
+		{
+			bad = "rects";
+		}
+	}
+
+	if (bad == NULL)
+	{
+		bad = TrackBake_CmpHeaderU32(f, TRACK_BAKE_SENTINEL, "sentinel");
+	}
+	if (bad == NULL && fgetc(f) != EOF)
+	{
+		bad = "trailing";
+	}
+
+	fclose(f);
+	return bad;
+}
+
+static void NativeTrackBake_Export(int levelID, int numQuadBlock, int numVertex)
+{
+	char path[160];
+
+	snprintf(path, sizeof(path), "debug/trackbake_lvl%02d_qb%d_vtx%d.ctrbake", levelID, numQuadBlock, numVertex);
+
+	FILE *f = fopen(path, "wb");
+
+	if (f == NULL)
+	{
+		return;
+	}
+
+	fwrite("CTRBAKE1", 1, 8, f);
+	TrackBake_PutU32(f, TRACK_BAKE_VERSION);
+	TrackBake_PutU32(f, (u32)levelID);
+	TrackBake_PutU32(f, (u32)numQuadBlock);
+	TrackBake_PutU32(f, (u32)numVertex);
+	TrackBake_PutU32(f, s_trackMesh.bspNodeCount);
+	TrackBake_PutU32(f, s_trackMesh.vertCount);
+	TrackBake_PutU32(f, s_trackMesh.indexCount);
+	TrackBake_PutU32(f, s_trackMesh.leafCount);
+	TrackBake_PutU32(f, (u32)s_trackMesh.texCount);
+	TrackBake_PutU32(f, (u32)s_trackMesh.atlas.rectCount);
+	TrackBake_PutU32(f, s_trackMesh.animTexCount);
+
+	fwrite(s_trackMesh.verts, sizeof(struct NativeTrackVert), s_trackMesh.vertCount, f);
+	fwrite(s_trackMesh.indices, sizeof(u16), s_trackMesh.indexCount, f);
+
+	for (u32 l = 0; l < s_trackMesh.leafCount; l++)
+	{
+		u8 image[26];
+
+		TrackBake_LeafImage(&s_trackMesh.leafRanges[l], image);
+		fwrite(image, 1, 26, f);
+	}
+
+	fwrite(s_trackMesh.bspToLeafIndex, sizeof(s32), s_trackMesh.bspNodeCount, f);
+
+	for (u32 t = 0; t < s_trackMesh.texCount; t++)
+	{
+		fwrite((const u8 *)&((const struct TextureLayout *)s_trackMesh.texTable[t])->u0, 1, 12, f);
+	}
+
+	for (int r = 0; r < s_trackMesh.atlas.rectCount; r++)
+	{
+		u8 image[14];
+
+		TrackBake_RectImage(&s_trackMesh.atlas.rects[r], image);
+		fwrite(image, 1, 14, f);
+	}
+
+	TrackBake_PutU32(f, TRACK_BAKE_SENTINEL);
+
+	long bytes = ftell(f);
+	int writeOk = (ferror(f) == 0);
+
+	fclose(f);
+
+	const char *bad = writeOk ? TrackBake_Verify(path, levelID, numQuadBlock, numVertex) : "write";
+
+	Platform_Log("[TRKBAKE] lvl=%d %s bytes=%ld verts=%u idx=%u leaves=%u tex=%d rects=%d anim=%u roundtrip=%s\n", levelID, path, bytes,
+	             s_trackMesh.vertCount, s_trackMesh.indexCount, s_trackMesh.leafCount, s_trackMesh.texCount, s_trackMesh.atlas.rectCount,
+	             s_trackMesh.animTexCount, (bad == NULL) ? "OK" : bad);
+}
+
+#endif /* CTR_NATIVE_TRACK_BAKE_EXPORT */
+
 void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 {
 	/* Latch = pointer + content fingerprint (arena heaps reuse addresses --
@@ -2054,6 +2440,14 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	}
 
 	NativeTrackMesh_Free();
+
+#if defined(CTR_NATIVE_TRACK_BAKE_EXPORT) && CTR_NATIVE_TRACK_BAKE_EXPORT && !defined(__3DS__)
+	/* Build-time measurement (s38): sizes what a .ctrbake LOADER would
+	 * actually buy at runtime. Starts here -- past the already-built
+	 * early-out above, so only real builds are timed -- and is read by the
+	 * export call at the end of this function. */
+	u64 bakeBuildT0 = SDL_GetPerformanceCounter();
+#endif
 
 	int numQuadBlock = mesh->numQuadBlock;
 	int numVertex = mesh->numVertex;
@@ -2127,6 +2521,12 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * leaf-only loop) and would otherwise read as stale/uninitialized. */
 	memset(s_trackMesh.bspToLeafIndex, 0xff, (size_t)mesh->numBspNodes * sizeof(s32));
 
+#if defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
+	/* New build starting: clear the parity side arrays and invalidate the
+	 * walk-side index before any vert is emitted. */
+	BakeParity_BuildReset();
+#endif
+
 	/* Weld pre-pass: canonical mid per matched edge, over ALL quadblocks so
 	 * the choice is stable regardless of which leaves end up resident. */
 	struct NativeTrackWeldTable *weldTable = (struct NativeTrackWeldTable *)calloc(1, sizeof(struct NativeTrackWeldTable));
@@ -2167,7 +2567,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	static const s8 sEdgeOfSlot[9] = {-1, -1, -1, -1, 0, 1, -1, 2, 3};
 	int weldCount = 0;
 
-	int leavesTotal = 0, leavesExcluded = 0, facesDoubleSided = 0, facesNoTexture = 0, facesAnimTex = 0;
+	int leavesTotal = 0, leavesExcluded = 0, facesDoubleSided = 0, facesNoTexture = 0, facesAnimTex = 0, facesModeTri = 0, facesMode3 = 0;
 	/* keptWater and keptAnim are both populations that USED to be dropped whole
 	 * and now are not -- the two halves of the s30 hole fix, kept as separate
 	 * columns because they answer different questions. keptWater is how much
@@ -2397,6 +2797,33 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				u8 faceMode = (u8)((faceBits >> 3) & 3);
 				const u8 *uvBytes = &layout->u0;
 
+				/* faceMode 1/2: this face is a TRIANGLE (see sTrackModeTriGrid's
+				 * derivation note). The three used corners take the LEARNED
+				 * layout indices; the unused corner keeps the rotation-derived
+				 * one -- it is never referenced by an index, so this only keeps
+				 * its bytes deterministic. faceMode 3 has no row in retail's
+				 * 24-entry table; treat it as a quad and count it so real
+				 * assets carrying it would show up instead of guessing. */
+				u8 uvIdxOf[4] = {uvPerm[0], uvPerm[1], uvPerm[2], uvPerm[3]};
+				int modeTri = (faceMode == 1) || (faceMode == 2);
+
+				if (modeTri)
+				{
+					const u8 *triGrid = sTrackModeTriGrid[faceBits - 8];
+					const u8 *triIdx = sTrackModeTriIdx[faceBits - 8];
+
+					for (int t = 0; t < 3; t++)
+					{
+						uvIdxOf[triGrid[t]] = triIdx[t];
+					}
+
+					facesModeTri++;
+				}
+				else if (faceMode == 3)
+				{
+					facesMode3++;
+				}
+
 				for (int c = 0; c < 4; c++)
 				{
 					int gridSlot = sTrackFaceCorners[face][c];
@@ -2462,28 +2889,51 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					 * per-face rotation/flip is already resolved into it, which
 					 * is the point -- the patcher never has to re-derive
 					 * faceBits from a QuadBlock it no longer holds. */
-					dst->faceFlags = (u8)(doubleSided | (faceMode << 1) | ((uvPerm[c] & 3) << 3));
+					dst->faceFlags = (u8)(doubleSided | (faceMode << 1) | ((uvIdxOf[c] & 3) << 3));
 					dst->r = src->color_hi[0];
 					dst->g = src->color_hi[1];
 					dst->b = src->color_hi[2];
 					dst->a = 0xff;
-					dst->u = uvBytes[sTrackUvByteOfs[uvPerm[c]]];
-					dst->v = uvBytes[sTrackUvByteOfs[uvPerm[c]] + 1];
+					dst->u = uvBytes[sTrackUvByteOfs[uvIdxOf[c]]];
+					dst->v = uvBytes[sTrackUvByteOfs[uvIdxOf[c]] + 1];
 					dst->texRef = texRef;
+
+#if defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
+					/* src, not dst: the parity matcher wants the PRE-weld
+					 * position (what retail's GTE will actually see) and
+					 * color_lo (the far-fade source the color classifier
+					 * checks against). */
+					BakeParity_BuildNoteVert(dstIndex, src);
+#endif
 				}
 
 				facesDoubleSided += doubleSided;
 
-				/* ctr-tools' export split: (0,2,1)(1,2,3). */
 				u16 *idx = &s_trackMesh.indices[s_trackMesh.indexCount];
 
-				idx[0] = (u16)(baseVert + 0);
-				idx[1] = (u16)(baseVert + 2);
-				idx[2] = (u16)(baseVert + 1);
-				idx[3] = (u16)(baseVert + 1);
-				idx[4] = (u16)(baseVert + 2);
-				idx[5] = (u16)(baseVert + 3);
-				s_trackMesh.indexCount += 6;
+				if (modeTri)
+				{
+					/* Learned packet order (a,b,c) mapped through the same
+					 * swap-last-two that turns retail's quad-split tris
+					 * (0,1,2)/(1,3,2) into this file's (0,2,1)/(1,2,3). */
+					const u8 *triGrid = sTrackModeTriGrid[faceBits - 8];
+
+					idx[0] = (u16)(baseVert + triGrid[0]);
+					idx[1] = (u16)(baseVert + triGrid[2]);
+					idx[2] = (u16)(baseVert + triGrid[1]);
+					s_trackMesh.indexCount += 3;
+				}
+				else
+				{
+					/* ctr-tools' export split: (0,2,1)(1,2,3). */
+					idx[0] = (u16)(baseVert + 0);
+					idx[1] = (u16)(baseVert + 2);
+					idx[2] = (u16)(baseVert + 1);
+					idx[3] = (u16)(baseVert + 1);
+					idx[4] = (u16)(baseVert + 2);
+					idx[5] = (u16)(baseVert + 3);
+					s_trackMesh.indexCount += 6;
+				}
 			}
 		}
 
@@ -2768,6 +3218,34 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	}
 #endif
 
+#if defined(CTR_NATIVE_TRACK_BAKE_EXPORT) && CTR_NATIVE_TRACK_BAKE_EXPORT
+	/* Track bake pre-export (s38): serialize THIS builder's latched output --
+	 * never a re-derivation of it -- so re-baking after any builder fix is
+	 * automatic and a baked file can never drift from the live path. Value
+	 * types only: texture-table entries are heap POINTERS live, so the file
+	 * stores each layout's 12-byte footprint (u0..v3/clut/tpage) verbatim
+	 * instead; atlas rect PLACEMENT (unit/x/y, p2) is deliberately excluded
+	 * because the packer re-derives it from the rect set deterministically,
+	 * and serializing it would only add staleness surface. No timestamps --
+	 * a rebuild of an unchanged level produces byte-identical output, so
+	 * baked files diff clean. Same deterministic-name/self-dedup convention
+	 * and same silent-skip-without-debug/ contract as the OBJ dump above.
+	 * Immediately re-read and compared against the live mesh: a format bug
+	 * dies here as [TRKBAKE] roundtrip=FAIL, not in a future loader. */
+	NativeTrackBake_Export(NativePerf_CurrentLevelID(), numQuadBlock, numVertex);
+
+#if !defined(__3DS__)
+	{
+		u64 freq = SDL_GetPerformanceFrequency();
+		double buildMs = (freq != 0) ? ((double)(SDL_GetPerformanceCounter() - bakeBuildT0) * 1000.0 / (double)freq) : 0.0;
+
+		/* Includes the export+verify I/O just above -- an upper bound on
+		 * what a loader could save, which is the honest direction to err. */
+		Platform_Log("[TRKBAKE] buildMs=%.2f (mesh build + atlas pack + export + verify, PC)\n", buildMs);
+	}
+#endif
+#endif
+
 	/*
 	 * lvl= joins lev= because a heap pointer does not identify a track. The
 	 * open Polar Pass defect (untextured holes in ground and wall) has to be
@@ -2778,13 +3256,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * an option.
 	 */
 	Platform_Log("[TRKMESH] lvl=%d lev=%p leaves=%u/%d (excl=%d keptWater=%d keptAnim=%d empty=%d noFaces=%d) verts=%u idx=%u tex=%u dropIdxCap=%d dropCap=%d "
-	             "animVerts=%u animWelded=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d | welds=%d\n",
+	             "animVerts=%u animWelded=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d modeTri=%d mode3=%d | welds=%d\n",
 	             NativePerf_CurrentLevelID(), (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, leavesKeptWater, leavesKeptAnim,
 	             leavesSkippedEmpty, leavesEmittedNothing,
 	             s_trackMesh.vertCount, s_trackMesh.indexCount, s_trackMesh.texCount, facesDroppedIndexCap, facesDroppedCapacity,
 	             s_trackMesh.animVertCount, s_trackMesh.animVertWelded,
 	             (u32)(s_trackMesh.vertCount * sizeof(struct NativeTrackVert) / 1024), (u32)(s_trackMesh.indexCount * sizeof(u16) / 1024), facesDoubleSided,
-	             facesAnimTex, facesNoTexture, weldCount);
+	             facesAnimTex, facesNoTexture, facesModeTri, facesMode3, weldCount);
 
 	/*
 	 * The animated-texture ledger. `chains` is how many texture chains any

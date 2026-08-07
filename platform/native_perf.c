@@ -523,6 +523,20 @@ internal void NativePerf_Report3DSWindow(void)
 		N3DS_DebugLog(out);
 	}
 
+	/* s36 CPU-vs-GPU split (see N3DS_C3DGpuTimeWindow). cpuUs ~ the worker's
+	 * whole frame (FrameBegin..FrameEnd), gpuUs = PICA hardware execution --
+	 * the number no CPU bucket can see. gpuUs approaching avgWorkUs means the
+	 * frame is GPU-bound and walk-side optimization cannot help. */
+	{
+		int gtCpuUs;
+		int gtGpuUs;
+		unsigned gtFrames;
+
+		N3DS_C3DGpuTimeWindow(&gtCpuUs, &gtGpuUs, &gtFrames);
+		snprintf(out, sizeof(out), "[GPUTIME] cpuUs=%d gpuUs=%d frames=%u", gtCpuUs, gtGpuUs, gtFrames);
+		N3DS_DebugLog(out);
+	}
+
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 	/* Separate line, deliberately not appended to `header` -- its 224-byte
 	 * buffer is already nearly full. Counters live in native_audio.c and are

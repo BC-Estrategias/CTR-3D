@@ -9,6 +9,14 @@
 #define MAINFRAME_PERF_END(bucket)   ((void)0)
 #endif
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+/* s41 ground-decal depth-axis brackets. Declared here rather than pulled in via
+ * the platform header for the same reason RenderBucket_QueueExecute.c declares
+ * the instance pair by hand: game/ does not include platform/ headers. */
+extern void GTECapture_BeginFixedDepthShift(int shift);
+extern void GTECapture_EndInstanceDepth(void);
+#endif
+
 #ifdef CTR_INTERNAL
 volatile int gCtrDebugSkipLevelGeometry = 0;
 
@@ -887,12 +895,24 @@ void RenderAllFlag0x40(struct GameTracker *gGT)
 
 	int i;
 	struct PushBuffer *pb;
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s41: VehGroundSkids scales camera-relative points by 4
+	 * (VEH_GROUND_SKIDS_PROJECT_SCALE_SHIFT) and projects with a zero
+	 * translation vector -- 4x regime axis, outside RenderBucket. Brackets the
+	 * whole player loop: every iteration projects the same way, and the
+	 * bracket carries no per-instance state.
+	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	GTECapture_BeginFixedDepthShift(2);
+#endif
 	for (i = 0; i < gGT->numPlyrCurrGame; i++)
 	{
 		pb = &gGT->pushBuffer[i];
 		VehGroundSkids_Main(gGT->threadBuckets[PLAYER].thread, pb);
 		VehGroundSkids_Main(gGT->threadBuckets[ROBOT].thread, pb);
 	}
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	GTECapture_EndInstanceDepth();
+#endif
 }
 
 void RenderAllTitleDPP(struct GameTracker *gGT)
@@ -944,6 +964,15 @@ void RenderAllTires(struct GameTracker *gGT)
 	gGT_primMem = &gGT->backBuffer->primMem;
 	numPlyrCurrGame = gGT->numPlyrCurrGame;
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s41: DrawTires projects camera-relative positions pre-multiplied by 4
+	 * (DrawTiresSolid_SetupGteState, `<< 2`) with a zero translation vector,
+	 * so its SZ3 lands on the 4x regime axis. Outside RenderBucket, so the
+	 * dispatch-site bracket never covered it.
+	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	GTECapture_BeginFixedDepthShift(2);
+#endif
+
 	if (gGT->threadBuckets[PLAYER].thread != 0)
 	{
 		DrawTires_Solid(gGT->threadBuckets[PLAYER].thread, gGT_primMem, numPlyrCurrGame);
@@ -961,6 +990,10 @@ void RenderAllTires(struct GameTracker *gGT)
 		DrawTires_Solid(gGT->threadBuckets[GHOST].thread, gGT_primMem, numPlyrCurrGame);
 		DrawTires_Reflection(gGT->threadBuckets[GHOST].thread, gGT_primMem, numPlyrCurrGame);
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	GTECapture_EndInstanceDepth();
+#endif
 }
 
 void RenderAllShadows(struct GameTracker *gGT)
@@ -969,7 +1002,17 @@ void RenderAllShadows(struct GameTracker *gGT)
 	{
 		return;
 	}
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s41: VehGroundShadow scales its camera delta by 4
+	 * (VEH_GROUND_SHADOW_CAMERA_DELTA_SCALE) and projects with a zero
+	 * translation vector -- 4x regime axis, outside RenderBucket.
+	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	GTECapture_BeginFixedDepthShift(2);
 	VehGroundShadow_Main();
+	GTECapture_EndInstanceDepth();
+#else
+	VehGroundShadow_Main();
+#endif
 }
 
 void RenderAllHeatParticles(struct GameTracker *gGT)
