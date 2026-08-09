@@ -144,6 +144,17 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
     /* dominantCandidate 0: nests inside draw_otag_ms (it runs at the head of
      * the walk, on the walk thread) -- see the enum comment. */
     {"track_anim_ms", 0},
+    /* dominantCandidate 0: all three nest inside platform_end_scene_ms -- see
+     * the enum comment. Named native_* so they never read as the retail
+     * packet path's draw_* buckets. */
+    {"native_track_draw_ms", 0},
+    {"native_model_draw_ms", 0},
+    {"merge_flush_ms", 0},
+    /* dominantCandidate 0: nests inside mainframe_render_vsync_ms. */
+    {"render_vsync_drawsync_ms", 0},
+    /* dominantCandidate 0: a re-timing of work already inside draw_otag_ms /
+     * platform_end_scene_ms, from the worker's side of the fence. */
+    {"worker_exec_ms", 0},
 };
 
 global_variable FILE *s_csvFile;
@@ -216,6 +227,7 @@ global_variable int s_windowMaxFrameKeyOns;
 #define NATIVE_PERF_3DS_CONSOLE_BUCKETS 2
 global_variable int s_perfConsoleTotalUs;
 global_variable int s_perfConsoleWorkUs;
+global_variable int s_perfConsoleWorstUs;
 global_variable const char *s_perfConsoleName[NATIVE_PERF_3DS_CONSOLE_BUCKETS];
 global_variable int s_perfConsoleUs[NATIVE_PERF_3DS_CONSOLE_BUCKETS];
 #endif
@@ -454,6 +466,12 @@ internal void NativePerf_Report3DSWindow(void)
 	// effectively muted ("mute") -- a perf figure recorded without that
 	// context has already misled this project once.
 	s_perfConsoleTotalUs = (int)(s_windowTotalMs * toAvgUs);
+	/* The window's WORST single frame, for the bottom screen. With SD logging
+	 * off (g_dbg_sdLog, the s36 default) the console is the only readout, and
+	 * an average cannot show a hitch -- six sessions of averages hid a 150ms
+	 * frame per window that the owner could feel the whole time. Not scaled by
+	 * toAvgUs: it is one frame, not a per-frame mean. */
+	s_perfConsoleWorstUs = (int)(s_windowMaxTotalMs * 1000.0);
 	s_perfConsoleWorkUs = (int)(s_windowWorkMs * toAvgUs);
 
 	/*
@@ -537,15 +555,34 @@ internal void NativePerf_Report3DSWindow(void)
 		N3DS_DebugLog(out);
 	}
 
+	/* Trailing by one window by construction: these are the flushes that
+	 * happened DURING the window just reported, and this line is itself
+	 * logged before the flush it may trigger. Compare worstUs against the
+	 * window's own worst frame (the [PERF-VOICE] maxFrameUs field) -- if they
+	 * track each other, the hitch is the instrument, not the game. */
+	{
+		unsigned lfWorst = 0;
+		unsigned lfTotal = 0;
+		unsigned lfCount = 0;
+
+		N3DS_LogFlushStats(&lfWorst, &lfTotal, &lfCount);
+		snprintf(out, sizeof(out), "[LOGFLUSH] worstUs=%u totalUs=%u n=%u", lfWorst, lfTotal, lfCount);
+		N3DS_DebugLog(out);
+	}
+
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 	/* Separate line, deliberately not appended to `header` -- its 224-byte
 	 * buffer is already nearly full. Counters live in native_audio.c and are
 	 * window-reset inside the format call. */
 	NativeAudio_DebugFormatVoiceProfWindow(out, (int)sizeof(out), (int)(s_windowMaxTotalMs * 1000.0), s_windowMaxFrameKeyOns);
 	N3DS_DebugLog(out);
-	s_windowMaxTotalMs = 0.0;
 	s_windowMaxFrameKeyOns = 0;
 #endif
+
+	/* Reset unconditionally, outside the profile gate above: the bottom
+	 * screen reads this every window now, so it must not depend on whether
+	 * the audio profiler happens to be compiled in. */
+	s_windowMaxTotalMs = 0.0;
 
 #if CTR_NATIVE_DISC_IO_PROFILE
 	/* One line per disc-reading thread rather than one combined line: the

@@ -1153,6 +1153,14 @@ void MM_Cheat_IcyTracks(void);
 void MM_Cheat_SuperTurboPads(void);
 void MM_Cheat_OneLap(void);
 void MM_Cheat_TurboCounter(void);
+#if defined(CTR_NATIVE)
+/* Native-only flag easter eggs -- docs/EASTER_EGGS.md. SpyroFlag replaces
+ * MainKillGame_LaunchSpyro2 as SOAR's handler (that function hard-locks on
+ * native); PrideFlag is reached by the WONDER sequence, matched in
+ * MM_ParseCheatCodes rather than from the full D230 cheat table. */
+void MM_Cheat_PrideFlag(void);
+void MM_Cheat_SpyroFlag(void);
+#endif
 
 void UI_Map_DrawMap_ExtraFunc(struct Icon *icon, POLY_FT4 *p, s16 posX, s16 empty, struct PrimMem *primMem, uint32_t *otMem, u32 transparency);
 

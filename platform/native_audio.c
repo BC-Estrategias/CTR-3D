@@ -6330,6 +6330,42 @@ void NativeAudio_StepVBlank(void)
 #endif
 #endif
 
+#if defined(__3DS__) && defined(CTR_INTERNAL)
+	/*
+	 * Pop receipt, on its own ~2s throttle so it prints even when there is no
+	 * source underrun. The stats block below is gated on underrun/overflow being
+	 * nonzero (NativeAudio_ShouldReportOutputStatsNoLock) and stays silent in the
+	 * pure seam-pop case, which is exactly the case we need to see. flush=full/early:
+	 * aggregation into big wave buffers is what suppresses per-vblank seams, so an
+	 * early-dominant ratio means the DSP kept running dry and got short buffers back
+	 * -> seam pops. dropped= is pool-full drops. On a hardware sitting: early-flush
+	 * high => seam pops (raise cushion/aggregate depth); underrun high => source
+	 * starvation (raise SD-side XA read-ahead) -- two different fixes.
+	 */
+	{
+		static int s_naFlushReportCountdown = 0;
+
+		if (s_naFlushReportCountdown > 0)
+		{
+			s_naFlushReportCountdown--;
+		}
+		else
+		{
+			char line[160];
+			int fullFlushes = 0, earlyFlushes = 0;
+			int droppedBlocks;
+
+			s_naFlushReportCountdown = 120; /* ~2s at 60Hz */
+			N3DS_NdspGetFlushCounts(&fullFlushes, &earlyFlushes);
+			droppedBlocks = N3DS_NdspGetDroppedBlocks();
+
+			snprintf(line, sizeof(line), "[CTR-3DS] audio flush=%d/%d(full/early) dropped=%d underrun=%d", fullFlushes, earlyFlushes, droppedBlocks,
+			         s_audio.output.underrunFrames);
+			N3DS_DebugLog(line);
+		}
+	}
+#endif
+
 #ifdef CTR_INTERNAL
 	if (shouldReportStats)
 	{

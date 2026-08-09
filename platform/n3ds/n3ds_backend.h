@@ -154,6 +154,14 @@ void N3DS_C3DEndFrame(void);
  */
 void N3DS_C3DGpuTimeWindow(int *cpuUs, int *gpuUs, unsigned *frames);
 
+/*
+ * Cost of the SD-log flush inside N3DS_DebugLog, since the last call (which
+ * resets). The flush is throttled to ~2s -- the same cadence as the [PERF]
+ * window -- so if it is expensive it lands as exactly one monster frame per
+ * window, which is what the 2026-08-06 Tubes log shows.
+ */
+void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count);
+
 /* ------------------------------------------------------------- stereo 3D --- */
 /*
  * Depth-layered stereoscopic 3D (PORT_FEASIBILITY_3DS.md "Stereoscopic 3D",

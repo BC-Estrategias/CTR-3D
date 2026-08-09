@@ -512,6 +512,11 @@ void DrawOTag(void *p)
 	// Hand the walk the capture buffer this frame just wrote -- game thread,
 	// before the post, so the queue's own lock orders it for the worker.
 	GTECapture_PublishForWalk();
+	// s42d: same publish point for the deferred-smoke packet-address set --
+	// same game-thread-before-post ordering guarantee.
+	NativeGpu_PublishSmokePackets();
+	// s43: same publish point for the skybox packet range.
+	NativeGpu_PublishSkyRange();
 #endif
 
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER

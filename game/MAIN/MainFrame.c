@@ -149,6 +149,16 @@ void MainFrame_ResetDB(struct GameTracker *gGT)
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 	GTECapture_Clear();
+	// s42b: clear the deferred driver-local smoke capture on the same frame
+	// boundary (the pass redraws it after the model pass; this guarantees it
+	// never carries across frames). Paired with NativeGpu_DrawDeferredSmoke.
+	NativeGpu_ResetDeferredSmoke();
+	// s42d: flip the smoke packet-address set's write buffer at the frame
+	// boundary (same idiom as GTECapture_Clear above); DrawOTag publishes it.
+	NativeGpu_ClearSmokePackets();
+	// s43: flip the skybox packet range's write buffer on the same boundary;
+	// DrawSky_Full marks it this frame, DrawOTag publishes it.
+	NativeGpu_ClearSkyRange();
 	// The swapchain OT's first six entries (terminator + pushBuffer_UI's OT,
 	// set up below) are the UI band: the DrawOTag walk crosses into them after
 	// all world geometry, and every packet from there on is UI, whose

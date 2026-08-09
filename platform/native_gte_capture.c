@@ -707,6 +707,7 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 				sz3 = (t > 0xFFFFu) ? (u16)0xFFFFu : (u16)t;
 			}
 		}
+
 	}
 
 	/* Same key AND live generation means this slot already holds a projection
@@ -747,6 +748,22 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 	entry->vz = vz;
 	entry->mtxId = (u8)s_gteMtxCurId;
 	buf->mtxStores[s_gteMtxCurId]++;
+}
+
+/* s42: exhaust-smoke billboard corner. Particles project with raw gte_rtps_b
+ * and never reach GTECapture_Store on their own, so a driver-local smoke quad
+ * would miss the resolver and fall back to the parse-order ordinal axis --
+ * useless the instant its depth is actually tested (deferred smoke pass). This
+ * stores each corner's sz3 under its exact truncated screen key so the resolver
+ * HITS and stamps the quad onto the shared view.z axis. No near-bias: drawn
+ * after the body, the smoke's own true depth is enough (owner-tested). The
+ * sub-pixel, hOverSz3 and model-vector fields feed desnap/model lookups only,
+ * never the depth path, so they are left at defaults. Runs on the game thread
+ * inside Particle_RenderList, outside every Store bracket
+ * (instance/flag/suppress), so it takes the plain path above. */
+void GTECapture_StoreParticleCorner(s16 sx, s16 sy, u16 sz3)
+{
+	GTECapture_Store(sx, sy, (s64)sx << 16, (s64)sy << 16, sz3, 0, 0, 0, 0);
 }
 
 int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8)

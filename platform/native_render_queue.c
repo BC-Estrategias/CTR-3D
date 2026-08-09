@@ -139,7 +139,13 @@ static void NativeRenderQueue_WorkerMain(void)
 			stop = (job.kind == NATIVE_RENDER_JOB_STOP);
 			if (!stop)
 			{
+				/* s36: the worker's side of the fence -- see the bucket's
+				 * comment. Everything OUTSIDE this scope in the loop is queue
+				 * handshake: the lock pairs above and below, the done-signal,
+				 * and the wake wait. */
+				NativePerf_BeginScope(NATIVE_PERF_BUCKET_WORKER_EXEC);
 				NativeRenderQueue_ExecuteJob(&job);
+				NativePerf_EndScope(NATIVE_PERF_BUCKET_WORKER_EXEC);
 			}
 
 			N3DS_RenderQueueLock();

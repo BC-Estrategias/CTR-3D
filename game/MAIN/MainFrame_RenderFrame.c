@@ -846,10 +846,29 @@ void RenderAllNormalParticles(struct GameTracker *gGT)
 		return;
 	}
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s41b: the whole particle position space is 4x world units -- the camera
+	 * offset is `camera.t << 2` (Particle.c:1144) and a driver-local particle
+	 * adds `inst.t << 2` (Particle.c:1238). The game says so itself at
+	 * Particle.c:1282, where the draw-distance limit is scaled `<< 2` to meet
+	 * `depth` in its own units. Same 4x regime axis as tires/shadows/skids,
+	 * and likewise outside RenderBucket.
+	 *
+	 * Torch's heat-warp list is NOT in this bracket and must not be: it reads
+	 * the same particle fields with `>> 8` instead of `>> 6` (Torch.c:565),
+	 * which already divides the 4x back out.
+	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	GTECapture_BeginFixedDepthShift(2);
+#endif
+
 	for (i = 0; i < gGT->numPlyrCurrGame; i++)
 	{
 		Particle_RenderList(&gGT->pushBuffer[i], gGT->particleList_ordinary);
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	GTECapture_EndInstanceDepth();
+#endif
 }
 
 void RenderDispEnv_World(struct GameTracker *gGT)
@@ -1659,7 +1678,13 @@ void RenderVSYNC(struct GameTracker *gGT)
 		// falls through to the BreakDraw guard below instead.
 		// must be called in the loop,
 		// or else it wont properly sync
+		// s36: bracketed to separate "waiting for the render worker" from
+		// "waiting for the 30fps clock" (vsync_wait_ms, inside VSync below).
+		// The parent bucket alone cannot tell those apart, and they have
+		// completely different fixes.
+		MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_RENDER_VSYNC_DRAWSYNC);
 		DrawSync(0);
+		MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_RENDER_VSYNC_DRAWSYNC);
 #endif
 
 		if (ReadyToFlip(gGT))

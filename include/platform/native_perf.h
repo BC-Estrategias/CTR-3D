@@ -116,6 +116,49 @@ enum NativePerfBucket
 	 * inserted: s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_TRACK_ANIM,
+	/*
+	 * s36: the resident renderers' own GPU-issue passes, and the merge flush
+	 * that precedes them. These are THE feature of the whole render campaign
+	 * -- the track and every kart -- and until now they had no bucket at all
+	 * (native_model_emit.c contained zero scopes). The cost of that: on Roo's
+	 * Tubes the game thread blocks ~29ms waiting for the render worker while
+	 * the worker's accounted buckets sum to ~12-15ms, and the missing half
+	 * had nowhere it could even show up. Owner, correctly: "we gotta find out
+	 * how to make that work more efficient" -- which needs it visible first.
+	 *
+	 * All three sit INSIDE platform_end_scene_ms, so dominantCandidate is 0:
+	 * they are slices of a bucket that is already a candidate.
+	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
+	 */
+	NATIVE_PERF_BUCKET_NATIVE_TRACK_DRAW,
+	NATIVE_PERF_BUCKET_NATIVE_MODEL_DRAW,
+	NATIVE_PERF_BUCKET_MERGE_FLUSH,
+	/*
+	 * s36: DrawSync(0) inside RenderVSYNC's poll loop -- the game thread
+	 * waiting for the RENDER WORKER, as opposed to waiting for the 30fps
+	 * clock (which is vsync_wait_ms). Splitting them is the whole question:
+	 * mainframe_render_vsync_ms is ~27ms on BOTH Roo's Tubes and the light
+	 * track, but vsync_wait accounts for 23.7ms of it on the light track and
+	 * only 2.4ms on Tubes. So ~25ms of Tubes' loop is something else, and
+	 * this bucket says whether that something is the worker.
+	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
+	 */
+	NATIVE_PERF_BUCKET_RENDER_VSYNC_DRAWSYNC,
+	/*
+	 * s36: total time the render worker spends INSIDE job executors, summed
+	 * over every job in the frame. The closing question of the hunt: the game
+	 * thread blocks 25.7ms in DrawSync on Roo's Tubes (vs 3ms on Coco Park),
+	 * but the worker's own buckets sum to ~8ms of CPU and the PICA is busy
+	 * 8.7ms -- 16.7ms accounted, ~9ms not.
+	 *
+	 * If this lands near 25ms the worker is genuinely busy and the missing
+	 * time is inside an executor with no scope of its own. If it lands near
+	 * 16ms the gap is the queue handshake -- two lock/unlock pairs and a
+	 * signal PER JOB, with the game thread parked on each round trip -- which
+	 * is fixed by batching, not by drawing less.
+	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
+	 */
+	NATIVE_PERF_BUCKET_WORKER_EXEC,
 	NATIVE_PERF_BUCKET_COUNT
 };
 

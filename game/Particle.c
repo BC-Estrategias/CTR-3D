@@ -1055,10 +1055,36 @@ static struct ParticleRenderListMatrix Particle_RenderList_BuildNormalMatrix(str
 	return matrix;
 }
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+/* s42b: put a driver-local exhaust-smoke corner on the shared view.z depth
+ * axis (native_gte_capture.c). Declared locally, gated the same, so a
+ * capture-off build (PC) never references it and this whole feature vanishes.
+ * The macro reads the GTE's just-projected screen XY (MFC2(14)) and SZ3
+ * (MFC2(19)) -- the same MFC2(14) written to the packet corner, so the stored
+ * key matches the coordinate the walk resolves against. */
+extern void GTECapture_StoreParticleCorner(s16 sx, s16 sy, u16 sz3);
+/* s42d: register this smoke packet's address for the deferred pass (native_gpu.c).
+ * Address-keyed, so nothing about how the packet renders is touched -- unlike
+ * s42c's code-byte bit, which collided with the raw-texture flag. */
+extern void NativeGpu_MarkSmokePacket(uintptr_t addr);
+#define PARTICLE_SMOKE_CAPTURE_CORNER(defer)                                                                      \
+	do                                                                                                           \
+	{                                                                                                            \
+		if (defer)                                                                                               \
+		{                                                                                                        \
+			u32 ctr_smoke_xy_ = (u32)MFC2(14);                                                                   \
+			GTECapture_StoreParticleCorner((s16)(ctr_smoke_xy_ & 0xFFFFu), (s16)(ctr_smoke_xy_ >> 16), (u16)MFC2(19)); \
+		}                                                                                                        \
+	} while (0)
+#else
+#define PARTICLE_SMOKE_CAPTURE_CORNER(defer) ((void)(defer))
+#endif
+
 static void Particle_RenderList_WriteNormalPrimitive(POLY_FT4 *poly, struct Icon *icon, u16 flagsAxis, u16 flagsSetColor, u32 color,
-                                                     struct ParticleRenderListMatrix *matrix, s32 *scratchDepth)
+                                                     struct ParticleRenderListMatrix *matrix, s32 *scratchDepth, int deferSmoke)
 {
 	(void)flagsAxis;
+	(void)deferSmoke;
 	s32 width;
 	s32 height;
 	s32 halfWidth;
@@ -1072,6 +1098,17 @@ static void Particle_RenderList_WriteNormalPrimitive(POLY_FT4 *poly, struct Icon
 	CTC2(matrix->r33, 4);
 
 	CtrGpu_WriteColorCode(&poly->r0, color | PARTICLE_GPU_CODE_POLY_FT4);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s42d: register this packet's ADDRESS as driver-local smoke for the
+	 * deferred post-model pass. Address-keyed (native_gpu.c) so the packet's
+	 * own bytes -- and therefore how it renders -- are left exactly as retail
+	 * wrote them. s42c set code bit 0x01 here, which is the PS1 raw-texture
+	 * flag; that drew the plume unshaded/opaque. Do NOT touch poly->code. */
+	if (deferSmoke)
+	{
+		NativeGpu_MarkSmokePacket((uintptr_t)poly);
+	}
+#endif
 	CtrGpu_WritePackedUVWord(&poly->u0, CTR_ReadU32LE(&icon->texLayout.u0));
 	CtrGpu_WritePackedUVWord(&poly->u1, (CTR_ReadU32LE(&icon->texLayout.u1) & PARTICLE_TEXTURE_DRAW_MODE_MASK) |
 	                                        ((u32)(flagsSetColor & PARTICLE_SET_COLOR_FLAG_DRAW_MODE_MASK) << 16));
@@ -1097,21 +1134,25 @@ static void Particle_RenderList_WriteNormalPrimitive(POLY_FT4 *poly, struct Icon
 	gte_rtps_b();
 	CtrGpu_WritePackedXY(&poly->x0, MFC2(14));
 	*scratchDepth = (s32)MFC2(19);
+	PARTICLE_SMOKE_CAPTURE_CORNER(deferSmoke);
 
 	input = Particle_RenderList_PackXY(halfWidth, -halfHeight);
 	MTC2(input, 0);
 	gte_rtps_b();
 	CtrGpu_WritePackedXY(&poly->x1, MFC2(14));
+	PARTICLE_SMOKE_CAPTURE_CORNER(deferSmoke);
 
 	input = Particle_RenderList_PackXY(-halfWidth, halfHeight);
 	MTC2(input, 0);
 	gte_rtps_b();
 	CtrGpu_WritePackedXY(&poly->x2, MFC2(14));
+	PARTICLE_SMOKE_CAPTURE_CORNER(deferSmoke);
 
 	input = Particle_RenderList_PackXY(halfWidth, halfHeight);
 	MTC2(input, 0);
 	gte_rtps_b();
 	CtrGpu_WritePackedXY(&poly->x3, MFC2(14));
+	PARTICLE_SMOKE_CAPTURE_CORNER(deferSmoke);
 }
 
 // NOTE(aalhendi): ASM-verified NTSC-U 926 0x8003f590-0x80040308
@@ -1168,6 +1209,7 @@ void Particle_RenderList(struct PushBuffer *pb, void *particleList)
 			s32 posZ;
 			s32 depth;
 			u32 color;
+			int isDriverLocalSmoke = 0; /* s42b: player's own kart exhaust -> deferred pass */
 
 			prim = primCursor;
 			driverID = (s8)particle->driverID;
@@ -1235,6 +1277,12 @@ void Particle_RenderList(struct PushBuffer *pb, void *particleList)
 					goto next_particle;
 				}
 
+				/* s42b: this is the player's own kart exhaust smoke -- the
+				 * driver-local billboards that must paint over their own kart
+				 * body. Flagged for the deferred post-model pass; the tag +
+				 * depth capture happen in WriteNormalPrimitive. */
+				isDriverLocalSmoke = 1;
+
 				posX += CTR_MipsSll(inst->matrix.t[0], 2);
 				if ((flagsSetColor & PARTICLE_SET_COLOR_FLAG_DRIVER_LOCAL_IGNORE_Y) == 0)
 				{
@@ -1296,7 +1344,7 @@ void Particle_RenderList(struct PushBuffer *pb, void *particleList)
 
 			struct ParticleRenderListMatrix matrix = Particle_RenderList_BuildNormalMatrix(particle, flagsAxis);
 
-			Particle_RenderList_WriteNormalPrimitive((POLY_FT4 *)prim, icon, flagsAxis, flagsSetColor, color, &matrix, &scratch->depth);
+			Particle_RenderList_WriteNormalPrimitive((POLY_FT4 *)prim, icon, flagsAxis, flagsSetColor, color, &matrix, &scratch->depth, isDriverLocalSmoke);
 			Particle_RenderList_LinkAndAdvance(&primCursor, &payloadCursor, particle, idpp, flagsSetColor, scratch->depth, scratch->ot);
 			prim = primCursor;
 

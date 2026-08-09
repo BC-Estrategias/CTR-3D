@@ -492,12 +492,31 @@ void RaceFlag_DrawLoadingString(void)
 /* Defined platform-side (native_gpu.c) -- file scope, not the block-local
  * idiom used for NativeWide_CullMarginX below, because the use site is deep
  * inside RaceFlag_DrawSelf's nested loops and a block-scoped declaration
- * would not be visible there. */
-extern int g_dbg_flagRainbow;
+ * would not be visible there. 0 = retail checkers, 1 = pride stripes,
+ * 2 = purple checkers. See docs/EASTER_EGGS.md. */
+extern int g_dbg_flagStyle;
+
+/*
+ * SOAR / Spyro easter egg: PURPLE AND WHITE checkers (owner's colour and
+ * call). Two distinct tones rather than a solid purple flag, because the
+ * CHECKS are what still read as CTR. Purple/gold was considered first and
+ * rejected as likely ugly at flag scale.
+ *
+ * Only the purple tile is tinted. The white tile takes the lighting value
+ * straight, which makes it EXACTLY retail's white rather than an approximation
+ * -- multiplying by a 255 tint would quietly shave a level off every channel.
+ *
+ * The purple is a TINT, modulated by the same wave lighting the grey checkers
+ * use, so it renders from roughly half to full intensity across the cloth.
+ * Both tiles take the LIGHT-tile brightness curve (the wider-ranged of retail's
+ * two); hue supplies the checker contrast here, so neither tone is stuck in the
+ * dimmer half.
+ */
+static const u8 s_rfSpyroPurpleRGB[3] = {140, 117, 188};
 
 /*
  * Pride-flag stripe colours, top to bottom (the six-colour flag). Used when
- * g_dbg_flagRainbow is on -- see the pattern block in RaceFlag_DrawSelf.
+ * g_dbg_flagStyle == 1 -- see the pattern block in RaceFlag_DrawSelf.
  *
  * These are TINTS, not final colours: each is modulated by the same per-quad
  * wave lighting the checkers use, so a stripe runs from roughly half to full
@@ -526,7 +545,67 @@ static const u8 s_rfStripeRGB[6][3] = {
  * red at the bottom and violet at the top, which is upside down for a flag
  * whose stripe order is the point. Indexing from the end puts red on top. */
 #define RACE_FLAG_STRIPE_QUADS_TALL 29u
-#define RACE_FLAG_STRIPE_INDEX(quadY) (5u - (((u32)(quadY)*6u) / RACE_FLAG_STRIPE_QUADS_TALL))
+
+/*
+ * Widescreen crops the flag vertically: gte_SetGeomScreen runs at 0x180 rather
+ * than 0x100 there, a 3/2 zoom to cover the wide window, which pushes the top
+ * and bottom of the mesh off-screen. Spreading six bands over the full mesh
+ * then hides two of them -- owner on hardware: red and orange entirely above
+ * the top edge, violet a sliver. So in wide mode the bands are packed into the
+ * quads that are actually on screen.
+ *
+ * The visible band is NOT the middle of the mesh. Row positions run
+ * vy -910..+1628, so the mesh sits off-centre vertically before the zoom is
+ * applied at all -- which is why these are measured constants rather than a
+ * ratio derived from 3/2.
+ *
+ * Bands are a FIXED WIDTH in quads rather than a span divided six ways. The
+ * division form left one band a quad wider than its neighbours (14/6 = 2.33,
+ * and whichever band's lower edge landed on an exact integer swallowed the
+ * remainder -- owner saw it as a fat yellow stripe). A fixed width cannot do
+ * that. Everything at or below VIS_LO is violet and everything past the sixth
+ * band is red; both of those ends are largely off-screen anyway, which is what
+ * absorbs the mesh's cropped extremes.
+ *
+ * Current layout, owner-tuned on hardware -- quad i counts UP the screen:
+ *   violet 0-6, blue 7-8, green 9-10, yellow 11-12, orange 13-14, red 15-28.
+ * Red and orange are where he wants them; move VIS_LO to shift the lower four
+ * without disturbing those two.
+ *
+ * 4:3 keeps the full-height mapping.
+ */
+enum
+{
+	RACE_FLAG_STRIPE_VIS_LO = 5,
+	RACE_FLAG_STRIPE_BAND_QUADS = 2
+};
+
+/* Band for a quad row. Inverted (5 - n) because i counts UP the screen: the
+ * title-flag matrix flips the model-space vy the row loop steps along, so
+ * without this red lands at the bottom. */
+force_inline u32 RaceFlag_StripeIndex(int quadY, int wide)
+{
+	u32 n;
+
+	if (!wide)
+	{
+		n = ((u32)quadY * 6u) / RACE_FLAG_STRIPE_QUADS_TALL;
+	}
+	else if (quadY <= RACE_FLAG_STRIPE_VIS_LO)
+	{
+		n = 0u;
+	}
+	else
+	{
+		n = (u32)(quadY - RACE_FLAG_STRIPE_VIS_LO) / (u32)RACE_FLAG_STRIPE_BAND_QUADS;
+	}
+
+	if (n > 5u)
+	{
+		n = 5u;
+	}
+	return 5u - n;
+}
 
 /*
  * Quads per checker square. Retail is 4 -- the original `>> 2` on both axes --
@@ -885,16 +964,16 @@ SKIP_LOADING_TEXT:
 				if (quadVisible)
 				{
 #ifdef CTR_NATIVE
-					/* Rainbow stripes (g_dbg_flagRainbow, native_gpu.c). The
+					/* Rainbow stripes (g_dbg_flagStyle == 1, native_gpu.c). The
 					 * checker below is a 2D parity test over BOTH quad axes;
 					 * a stripe is a 1D band over the vertical axis alone, so
 					 * the only structural change is dropping `column` from the
 					 * pattern. Lighting, mesh, wave and geometry are identical
 					 * to retail's -- only the colour written into the same two
 					 * gouraud corners differs. */
-					if (g_dbg_flagRainbow)
+					if (g_dbg_flagStyle == 1)
 					{
-						const u8 *tint = s_rfStripeRGB[RACE_FLAG_STRIPE_INDEX(i)];
+						const u8 *tint = s_rfStripeRGB[RaceFlag_StripeIndex(i, flagWide)];
 						/* Lighting with the LIGHT-tile curve for every stripe:
 						 * the two curves exist to separate the checker's own
 						 * two tones, which a coloured stripe does not need, and
@@ -907,6 +986,33 @@ SKIP_LOADING_TEXT:
 						CTR_WriteU32LE(&p->r2, CTR_ReadU32LE(&p->r0));
 
 						setRGB1(p, (u8)((lumL * tint[0]) >> 8), (u8)((lumL * tint[1]) >> 8), (u8)((lumL * tint[2]) >> 8));
+						CTR_WriteU32LE(&p->r3, CTR_ReadU32LE(&p->r1));
+					}
+					else if (g_dbg_flagStyle == 2)
+					{
+						/* Purple/white checkers -- the SOAR/Spyro egg. Exactly
+						 * retail's checker pattern and wave lighting; the only
+						 * change is tinting one tile purple, so it still reads
+						 * as a chequered flag. Light-tile curve for both (see
+						 * the tint table's comment) -- hue, not the curves,
+						 * carries the contrast here. */
+						const u8 boolDark = (((((u32)column / RACE_FLAG_CHECKER_QUADS) + ((u32)i / RACE_FLAG_CHECKER_QUADS)) & 1U) != 0);
+						const u8 *tint = boolDark ? s_rfSpyroPurpleRGB : NULL;
+						u8 lumR = RaceFlag_CalculateBrightness(lightR, 0);
+						u8 lumL = RaceFlag_CalculateBrightness(lightL, 0);
+
+						if (tint != NULL)
+						{
+							setRGB0(p, (u8)((lumR * tint[0]) >> 8), (u8)((lumR * tint[1]) >> 8), (u8)((lumR * tint[2]) >> 8));
+							setRGB1(p, (u8)((lumL * tint[0]) >> 8), (u8)((lumL * tint[1]) >> 8), (u8)((lumL * tint[2]) >> 8));
+						}
+						else
+						{
+							/* White tile: untinted, so identical to retail's. */
+							setRGB0(p, lumR, lumR, lumR);
+							setRGB1(p, lumL, lumL, lumL);
+						}
+						CTR_WriteU32LE(&p->r2, CTR_ReadU32LE(&p->r0));
 						CTR_WriteU32LE(&p->r3, CTR_ReadU32LE(&p->r1));
 					}
 					else

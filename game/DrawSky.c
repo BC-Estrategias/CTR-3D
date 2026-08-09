@@ -12,6 +12,9 @@
 // Sample hooks elsewhere in game/. The prototype is checked against the real
 // one at the point MainFrame.c does include the header.
 extern void GTECapture_SetStoreSuppressed(int suppressed);
+// s43: register the skybox packets' address span for the far-depth pin. Same
+// local-extern idiom and same header-checked-later guarantee as above.
+extern void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end);
 #endif
 
 struct DrawSkyContext
@@ -221,6 +224,11 @@ void DrawSky_Full(void *skybox, struct PushBuffer *pb, struct PrimMem *primMem)
 {
 	struct Skybox *sky = skybox;
 	u32 *prim = (u32 *)primMem->cursor;
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s43: the emitted packets run contiguously from here; the span is closed
+	 * and registered after the last DrawSky_Piece below. */
+	uintptr_t skyPrimStart = (uintptr_t)prim;
+#endif
 
 	// NOTE(aalhendi): PSX-backfeed blocker: retail saves/restores ra and s0-s2 in scratchpad 0x00-0x0c.
 	// Native C relies on the host ABI because the only retail data temporaries live in 0x10 and 0x14 and are explicit below.
@@ -322,6 +330,13 @@ void DrawSky_Full(void *skybox, struct PushBuffer *pb, struct PrimMem *primMem)
 		GTECapture_SetStoreSuppressed(0);
 #endif
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* s43: close and register the emitted span [start, cursor). When sky==NULL
+	 * nothing advanced, so this is an empty range and NativeGpu_IsSkyPacket
+	 * matches nothing -- the same no-op the suppression bracket takes. */
+	NativeGpu_MarkSkyRange(skyPrimStart, (uintptr_t)prim);
+#endif
 
 	primMem->cursor = prim;
 }

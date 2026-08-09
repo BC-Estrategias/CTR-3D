@@ -1,5 +1,39 @@
 #include <common.h>
 
+#if defined(CTR_NATIVE)
+/*
+ * Native-only flag easter eggs (docs/EASTER_EGGS.md). The style selector lives
+ * platform-side (native_gpu.c): 0 retail checkers, 1 pride stripes, 2 purple.
+ *
+ * MM_Cheat_SpyroFlag REPLACES MainKillGame_LaunchSpyro2 as the SOAR handler,
+ * and doing so fixes a hard-lock rather than merely repurposing a dead code:
+ * retail's SOAR chain-loaded the Spyro 2 demo off the disc, native cannot
+ * chain-load an executable, and that function tears the game down (error
+ * screen, Music_Stop, howl_StopAudio, Bank_DestroyAll, howl_Disable,
+ * MainKillGame_StopCTR) and then sits in `while (1) {}`. Entering SOAR on a
+ * native build killed audio and froze the console. The D230 cheat table was its
+ * only caller, so repointing that one row removes the hazard entirely.
+ *
+ * Both play the same success SFX as every retail cheat, so the feedback is
+ * indistinguishable from a stock code.
+ */
+void MM_Cheat_PrideFlag(void)
+{
+	extern int g_dbg_flagStyle;
+
+	g_dbg_flagStyle = (g_dbg_flagStyle == 1) ? 0 : 1;
+	OtherFX_Play(MM_CHEAT_SUCCESS_SFX, 1);
+}
+
+void MM_Cheat_SpyroFlag(void)
+{
+	extern int g_dbg_flagStyle;
+
+	g_dbg_flagStyle = (g_dbg_flagStyle == 2) ? 0 : 2;
+	OtherFX_Play(MM_CHEAT_SUCCESS_SFX, 1);
+}
+#endif
+
 // NOTE(aalhendi): ASM-verified NTSC-U 926 0x800ac9fc-0x800aca34.
 void MM_Cheat_MaxWumpa(void)
 {
@@ -205,6 +239,48 @@ void MM_ParseCheatCodes(void)
 			D230.cheats[cheatIndex].handler();
 		}
 	}
+
+#if defined(CTR_NATIVE)
+	/*
+	 * NATIVE-ONLY CHEATS, matched here rather than added to D230.cheats.
+	 *
+	 * Not a stylistic choice: that array is sized `cheats[MM_CHEAT_COUNT]`
+	 * inside OverlayDATA_230, it is already exactly full (22 rows against
+	 * MM_CHEAT_COUNT 0x16), and SIX offsetof static asserts guard fields
+	 * declared AFTER it (videoCol, cupSel_Color, battleWeaponEnabledColor,
+	 * highscore_iconColor, characterSelectPlayerState,
+	 * characterSelectTransitionFrame). Growing the array by one 48-byte row
+	 * shifts every one of them and breaks the build. Matching alongside costs
+	 * a few compares on frames where a cheat button was tapped at all.
+	 *
+	 * Same matching rule as the retail loop above: cheatButtonHistory is
+	 * newest-first, so the table is indexed backwards.
+	 *
+	 * WONDER = Left(W) Circle(O) Up(N) Down(D) Right(E) Right(R) -- the letter
+	 * scheme is retail's own (game/230/D230.c's CHEAT_* defines); spelled with
+	 * BTN_* here because those defines are local to that file.
+	 */
+	{
+		static const u32 nativeCheatWonder[6] = {BTN_LEFT, BTN_CIRCLE, BTN_UP, BTN_DOWN, BTN_RIGHT, BTN_RIGHT};
+		const s32 wonderLen = (s32)(sizeof(nativeCheatWonder) / sizeof(nativeCheatWonder[0]));
+		b32 wonderMatches = true;
+		s32 buttonIndex;
+
+		for (buttonIndex = 0; buttonIndex < wonderLen; buttonIndex++)
+		{
+			if ((D230.cheatButtonHistory[buttonIndex] & nativeCheatWonder[wonderLen - buttonIndex - 1]) == 0)
+			{
+				wonderMatches = false;
+				break;
+			}
+		}
+
+		if (wonderMatches)
+		{
+			MM_Cheat_PrideFlag();
+		}
+	}
+#endif
 
 	return;
 }

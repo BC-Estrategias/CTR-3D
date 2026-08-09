@@ -23,6 +23,43 @@ extern int g_dbg_gteCapture;
 
 void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3, s16 vx, s16 vy, s16 vz);
 int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8);
+/* s42b: store one exhaust-smoke billboard corner's depth (sz3) keyed by its
+ * truncated screen coordinate, so the packet-depth resolver HITS for a
+ * driver-local smoke quad and stamps it onto the shared view.z axis instead of
+ * the parse-order ordinal it would otherwise fall back to. Particles project
+ * with raw gte_rtps_b and never call GTECapture_Store themselves, so without
+ * this a deferred smoke draw reads as infinitely far and loses every depth
+ * test. Game-thread only, same ownership as Store. See ctr-3ds-s42 spec and
+ * game/Particle.c. */
+void GTECapture_StoreParticleCorner(s16 sx, s16 sy, u16 sz3);
+/* Deferred driver-local smoke pass (native_renderer_3ds): master A/B, default
+ * ON, dumpreq 'smokedefer'. Defined in native_gpu.c. (No near-bias -- the
+ * captured view.z depth alone is sufficient; owner-tested, removed s42f.) */
+extern int g_dbg_smokeDefer;
+/* Deferred-smoke pass plumbing (native_gpu.c). DrawDeferredSmoke redraws the
+ * captured driver-local smoke after the model pass (called from
+ * native_renderer_3ds.c); ResetDeferredSmoke clears the capture buffer at the
+ * frame boundary (called from MainFrame_ResetDB, beside GTECapture_Clear). */
+void NativeGpu_DrawDeferredSmoke(void);
+void NativeGpu_ResetDeferredSmoke(void);
+/* s42d driver-local smoke packet-address tag (native_gpu.c). Mark: game thread,
+ * per smoke packet, during Particle_RenderList. Publish: DrawOTag, read=write
+ * before the walk is posted. Clear: MainFrame_ResetDB, flip write at frame
+ * start. See the definitions for the double-buffer contract. */
+void NativeGpu_MarkSmokePacket(uintptr_t addr);
+void NativeGpu_PublishSmokePackets(void);
+void NativeGpu_ClearSmokePackets(void);
+/* s43 skybox packet-range tag (native_gpu.c). Pins DrawSky_Full's packets to
+ * the far depth plane so translucent track geometry (the waterfalls) stops
+ * losing the depth test to the sky's OT-bucket fallback. Mark: game thread, once
+ * per frame, around DrawSky_Full's emit. Publish: DrawOTag, read=write before
+ * the walk is posted. Clear: MainFrame_ResetDB, flip write at frame start. Same
+ * double-buffer contract as the smoke tag above. Runtime A/B: dumpreq 'skyfar'
+ * (default ON). */
+extern int g_dbg_skyFar;
+void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end);
+void NativeGpu_PublishSkyRange(void);
+void NativeGpu_ClearSkyRange(void);
 // Model-space vector that produced this screen coordinate (same rendezvous
 // and same miss-on-collision safety as GTECapture_Lookup). Consumed by the
 // OTWALK_PROFILE retainability instrument; the retained-geometry play proper

@@ -261,6 +261,41 @@ global_variable int s_mergeActive = 0;
 /* Runtime A/B toggle (dumpreq 'drawmerge', n3ds_backend.c); the compile
  * gate is the opt-in, so default ON when built. */
 int g_dbg_drawMerge = 1;
+
+/*
+ * s43 SKYBOX-FIRST accumulator. The skybox is OPAQUE, but it must draw UNDER the
+ * translucent track surfaces (Crash Cove / N. Gin Labs waterfalls). Those write
+ * NO depth (anti-carve), so once they are on screen a later opaque draw at the
+ * same or farther depth paints straight over them -- and the merge bins flush in
+ * NativeRenderer_EndScene AFTER the resident track pass, so the sky (in a bin)
+ * landed on top of the already-drawn waterfall. Confirmed on hardware via the
+ * 'trackafter' sledgehammer (which fixed the sky but also shoved shadows/skids
+ * behind the track).
+ *
+ * Fix: collect the sky's triangles HERE instead of in the opaque bins, and draw
+ * them at the TOP of EndScene -- before the track pass -- so the waterfall paints
+ * over the sky, while every other packet effect (shadows, skids, karts, UI) keeps
+ * its normal post-track order. The sky is always untextured (DrawSky's dome and
+ * CAM_SkyboxGlow's gradient are both white-atlas gouraud/flat), so one draw with
+ * N3DS_WHITE_ATLAS, doubling 0, serves it -- same emit as the UNTEX bin. Depth is
+ * still stamped far by PacketDepth_ResolveXY (g_dbg_skyFar) so the opaque cliffs
+ * that draw after it in the track pass occlude it correctly.
+ *
+ * Walk-thread-local, no double buffer: written during the OT walk and drawn in
+ * EndScene on the same thread, exactly like s_mergeBinVerts. Overflow drops the
+ * excess triangles (a few missing backdrop tris are invisible) rather than
+ * flushing mid-walk, which would draw the sky in the wrong place.
+ *
+ * Runtime A/B: dumpreq 'skyfirst' (default ON). OFF routes the sky back into the
+ * opaque bins -- i.e. the punch-through behaviour -- for comparison.
+ *
+ * N3DS_DrawSkyPass itself is defined beside N3DS_MergeFlush below -- it needs
+ * N3DS_MergeEmit and N3DS_WHITE_ATLAS, both declared later in this file.
+ */
+int g_dbg_skyFirst = 1;
+#define N3DS_SKY_VERT_CAP 2048
+global_variable N3DS_Vertex s_skyVerts[N3DS_SKY_VERT_CAP];
+global_variable int s_skyVertUsed = 0;
 /* Diagnostics for the stats block: draws emitted by the merge path split
  * by class, plus the events that cost extra draws or a mid-frame barrier. */
 global_variable u32 s_mergeEmitOpaque = 0;
@@ -480,6 +515,12 @@ int g_dbg_texturelessMode = 0;
  * base path itself is broken. s_forcedTexValid is reset once per frame in
  * NativeRenderer_SwapWindow. Toggle off to restore normal rendering.
  */
+/* Cost of the 64-frame bottom-screen stats block, previous window, in us.
+ * s36 hitch hunt -- see the timer at the top of that block. Prefixed s_stats*
+ * per the unity-TU rule (two same-named file-scope statics in different
+ * included .c files silently merge into one object). */
+global_variable unsigned long s_statsBlockUs = 0;
+
 int g_dbg_forceSingleTexture = 0;
 global_variable s16 s_forcedPage = 0;
 global_variable s16 s_forcedClut = 0;
@@ -2403,6 +2444,29 @@ internal void N3DS_MergeFlush(void)
 	s_runUntextured = -1;
 }
 
+/* s43: draw the accumulated skybox triangles. Called from NativeRenderer_EndScene
+ * BEFORE the resident track pass, so the translucent waterfalls (which write no
+ * depth) paint over the sky instead of the sky painting over them. See the
+ * s_skyVerts block above. Same emit triple as the UNTEX bin (BM_NONE, untextured,
+ * white atlas); the local lastDoubling=-1 and N3DS_MergeEmit's depth-write memo
+ * make it self-contained regardless of the walk's leftover state. */
+internal void N3DS_DrawSkyPass(void)
+{
+	int baseVertex;
+	int lastDoubling = -1;
+
+	if (s_skyVertUsed <= 0)
+	{
+		return;
+	}
+	baseVertex = N3DS_C3DAppendVertices(s_skyVerts, s_skyVertUsed);
+	if (baseVertex >= 0)
+	{
+		N3DS_MergeEmit(0, 0, N3DS_WHITE_ATLAS, baseVertex, s_skyVertUsed, &lastDoubling);
+	}
+	s_skyVertUsed = 0;
+}
+
 /* A bin hit capacity mid-frame: spill it as one opaque segment (order-free,
  * so WHERE it lands in the segment list is irrelevant) and keep binning. */
 internal void N3DS_MergeSpillBin(int bin)
@@ -2946,6 +3010,7 @@ void NativeRenderer_BeginScene(void)
 			s_mergeBinUsed[bin] = 0;
 		}
 	}
+	s_skyVertUsed = 0; /* s43: sky accumulator shares the bins' frame lifecycle */
 	s_mergeOpaqueSegCount = 0;
 	s_mergeBlendSegCount = 0;
 #endif
@@ -2956,6 +3021,19 @@ void NativeRenderer_EndScene(void)
 	if (!s_rendererInitialised)
 	{
 		return;
+	}
+
+	/*
+	 * s43: draw the skybox FIRST -- before the resident track pass and before the
+	 * merge barrier -- so the translucent waterfalls (which write no depth) paint
+	 * over it instead of it painting over them. The sky was routed out of the
+	 * opaque bins into s_skyVerts during the walk (native_direct_emit.c), so it is
+	 * not double-drawn by MergeFlush below. Packet state from the walk is still
+	 * active here, which is what N3DS_MergeEmit assumes. dumpreq 'skyfirst'.
+	 */
+	if (g_dbg_skyFirst)
+	{
+		N3DS_DrawSkyPass();
 	}
 
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
@@ -2990,7 +3068,10 @@ void NativeRenderer_EndScene(void)
 	if (!g_dbg_trackAfterMerge)
 	{
 		extern void NativeTrackDraw_IssueForWalk(void);
+
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_NATIVE_TRACK_DRAW);
 		NativeTrackDraw_IssueForWalk();
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_NATIVE_TRACK_DRAW);
 
 		/* NativeTrackDraw_IssueForWalk's own N3DS_TrackDraw_End (called once
 		 * per leaf-draw bracket, even when zero leaves drew) already restored
@@ -3016,11 +3097,13 @@ void NativeRenderer_EndScene(void)
 	/* Last flush point of the frame: whatever the final splits left
 	 * deferred (merge bins/segments, or just the pending run) has to be
 	 * recorded before C3D_FrameEnd submits the frame. */
+	NativePerf_BeginScope(NATIVE_PERF_BUCKET_MERGE_FLUSH);
 #ifdef CTR_NATIVE_DRAW_MERGE
 	N3DS_MergeFlush();
 #else
 	N3DS_FlushPendingRun();
 #endif
+	NativePerf_EndScope(NATIVE_PERF_BUCKET_MERGE_FLUSH);
 
 #if defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
 	/*
@@ -3042,7 +3125,10 @@ void NativeRenderer_EndScene(void)
 	 */
 	{
 		extern void NativeModelDraw_IssueForWalk(void);
+
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_NATIVE_MODEL_DRAW);
 		NativeModelDraw_IssueForWalk();
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_NATIVE_MODEL_DRAW);
 	}
 #endif
 
@@ -3051,7 +3137,38 @@ void NativeRenderer_EndScene(void)
 	if (g_dbg_trackAfterMerge)
 	{
 		extern void NativeTrackDraw_IssueForWalk(void);
+
+		NativePerf_BeginScope(NATIVE_PERF_BUCKET_NATIVE_TRACK_DRAW);
 		NativeTrackDraw_IssueForWalk();
+		NativePerf_EndScope(NATIVE_PERF_BUCKET_NATIVE_TRACK_DRAW);
+	}
+#endif
+
+#if defined(CTR_NATIVE_DRAW_MERGE) && CTR_NATIVE_GTE_CAPTURE
+	/*
+	 * s42: driver-local exhaust smoke, deliberately held out of the merge
+	 * above (DrawAllSplits flagged its splits deferredSmoke), is redrawn HERE --
+	 * last of all, after the model pass -- so it paints over its own kart body
+	 * (retail's painter's order) while the depth test still lets a genuinely
+	 * nearer wall or kart occlude it. The smoke carries real view.z depth
+	 * (GTECapture_StoreParticleCorner) so the LEQUAL test is meaningful against
+	 * the body's own view.z depth; before this change it fell back to the
+	 * parse-order ordinal axis and read as infinitely far.
+	 *
+	 * NativeGpu_DrawDeferredSmoke re-runs the captured splits through the normal
+	 * DrawSplit path, binning them back into the now-empty merge as blends --
+	 * which already draw depth-test-on / depth-write-off (the s32 anti-carve
+	 * rule) -- and the MergeFlush below drains them onto the command list on top
+	 * of the body. s_mergeDepthWriteState is forced to "unknown" first so the
+	 * smoke's first emit re-asserts the LEQUAL depth state the model pass left.
+	 * No-op on any frame with no driver-local smoke on screen, and a plain A/B
+	 * against the old look via dumpreq 'smokedefer'.
+	 */
+	{
+		extern void NativeGpu_DrawDeferredSmoke(void);
+		NativeGpu_DrawDeferredSmoke();
+		s_mergeDepthWriteState = -1;
+		N3DS_MergeFlush();
 	}
 #endif
 
@@ -3150,6 +3267,105 @@ void NativeRenderer_UpdateSwapIntervalState(int swapInterval)
 	(void)swapInterval;
 }
 
+/*
+ * s36 bottom-screen hitch. Measured on hardware: the stats block cost ~50ms,
+ * landing on ONE frame every 64 -- the whole residual hitch after the SD-log
+ * flush was killed (owner: Crash Cove ~50, Tubes ~48-50).
+ *
+ * Why it was so expensive: libctru's console renders every cell as a glyph
+ * blit into a COLUMN-major rotated framebuffer, and `\x1b[2J` clears by
+ * printing a space into all 40x30 = 1200 cells BEFORE a single character of
+ * text is drawn. The text itself is only ~600 more. So three quarters of the
+ * cost was erasing cells that were about to be redrawn with the same
+ * characters -- labels like "frames" and ">> SEL+START = ours <-> retail"
+ * never change at all.
+ *
+ * So: keep a shadow of what is already on each row and emit only rows whose
+ * text actually differs, positioning the cursor per row instead of clearing.
+ * A full clear still happens when the LAYOUT changes (verbose/sweep toggled),
+ * because that is when stale rows could otherwise be left behind.
+ */
+#define N3DS_STATS_ROWS 40
+#define N3DS_STATS_COLS 41 /* 40 columns + NUL */
+/*
+ * The block below does not draw at all any more -- it composes text into
+ * s_statsPending, and ONE row per frame is painted from there (StatsDripRow).
+ * Owner's idea, and it is strictly better than the shadow-diff it replaces:
+ *
+ *  - No hitch at all. The whole screen costs ~40 glyph cells per frame,
+ *    spread evenly, instead of arriving in one lump every 64 frames.
+ *  - It scrubs foreign text for free. The diff version only repainted rows
+ *    IT had changed, so anything else printing to this console (boot banners,
+ *    another session's debug lines) sat there permanently -- owner: "noise on
+ *    the lines that don't get updated". Repainting every row in rotation
+ *    overwrites that within one sweep, no clear needed.
+ *
+ * A full sweep is 40 rows, so at 30fps any given row refreshes about every
+ * 1.3s -- comfortably faster than the 64-frame cadence that changes it.
+ */
+global_variable char s_statsPending[N3DS_STATS_ROWS][N3DS_STATS_COLS];
+global_variable int s_statsRow = 0;
+global_variable int s_statsCursor = 0;
+
+internal void N3DS_StatsEmitRow(const char *text)
+{
+	if (s_statsRow < N3DS_STATS_ROWS)
+	{
+		/* Padded to the full 40 columns: a line that got SHORTER must still
+		 * erase the tail of whatever it replaces. */
+		snprintf(s_statsPending[s_statsRow], N3DS_STATS_COLS, "%-40.40s", text);
+	}
+
+	s_statsRow++;
+}
+
+internal void N3DS_StatsDripRow(void)
+{
+	const int r = s_statsCursor;
+
+	s_statsCursor = (s_statsCursor + 1) % N3DS_STATS_ROWS;
+	/* Unconditional, not diffed -- repainting an unchanged row is what makes
+	 * this self-cleaning. Rows the block never filled are blank by static
+	 * init, so they scrub to spaces rather than keeping stale text. */
+	printf("\x1b[%d;1H%-40.40s", r + 1, s_statsPending[r]);
+}
+
+/*
+ * Drop-in for printf inside the stats block only (see the #define below it).
+ * Splits on embedded newlines so the existing call sites -- several of which
+ * print leading or trailing blank lines -- keep their exact layout.
+ */
+internal void N3DS_StatsPrintf(const char *fmt, ...)
+{
+	char buf[256];
+	char *p = buf;
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	for (;;)
+	{
+		char *nl = strchr(p, '\n');
+
+		if (nl != NULL)
+		{
+			*nl = '\0';
+			N3DS_StatsEmitRow(p);
+			p = nl + 1;
+		}
+		else
+		{
+			if (*p != '\0')
+			{
+				N3DS_StatsEmitRow(p);
+			}
+			break;
+		}
+	}
+}
+
 void NativeRenderer_SwapWindow(void)
 {
 	if (!s_rendererInitialised)
@@ -3186,6 +3402,27 @@ void NativeRenderer_SwapWindow(void)
 	 */
 	if ((s_frameCounter & 63) == 0)
 	{
+		/* s36: time this whole block. Killing the SD flush took the worst frame
+		 * per window from ~150ms to 55-80ms (owner, track by track), so
+		 * something ELSE lands on this same 64-frame beat -- and this block is
+		 * the candidate: \x1b[2J clears 230KB, then ~20 lines of glyphs are
+		 * drawn into a COLUMN-major rotated framebuffer, about as cache-hostile
+		 * as ARM11 memory work gets. Shown next window as `stats`; if it tracks
+		 * (worst - 33ms), the readout itself is the remaining hitch. */
+		const unsigned long long statsT0 = N3DS_GetTickCount();
+
+		/*
+		 * Every printf from here to the end of this block goes through the
+		 * shadow-diff emitter above -- textual, scoped, #undef'd at the end of
+		 * the block. Done as a macro rather than editing ~40 call sites so the
+		 * lines themselves stay readable and merge cleanly with other
+		 * sessions' edits to this screen. snprintf/N3DS_DebugLog are
+		 * untouched.
+		 */
+		s_statsRow = 0;
+
+#define printf(...) N3DS_StatsPrintf(__VA_ARGS__)
+
 		/*
 		 * On-screen stats block. Getting files off the console is awkward (the
 		 * SD is under the backplate and only one homebrew app runs at a time,
@@ -3229,7 +3466,7 @@ void NativeRenderer_SwapWindow(void)
 		// previous, longer values behind wherever a new line was shorter,
 		// which reads as garbled overlapping text -- useless in a photo, and a
 		// photo of this screen is the whole readout on real hardware.
-		printf("\x1b[2J\x1b[1;1H---- 3DS port stats ----------------\n");
+		printf("---- 3DS port stats ----------------\n");
 		printf("frames %-8lu vblanks %-8lu\n", frames, vblanks);
 		printf("fps    %lu.%lu now / %lu.%lu avg (target 30)   \n",
 		       nowX10 / 10UL, nowX10 % 10UL, avgX10 / 10UL, avgX10 % 10UL);
@@ -3275,7 +3512,17 @@ void NativeRenderer_SwapWindow(void)
 				static const char *const wideNames[3] = {"off", "strch", "REAL"};
 				int wm = g_dbg_widescreen;
 
-				printf(">> wide  %-5s\n\n", wideNames[(wm >= 0 && wm <= 2) ? wm : 0]);
+				printf(">> wide  %-5s\n", wideNames[(wm >= 0 && wm <= 2) ? wm : 0]);
+			}
+			{
+				extern int g_dbg_sdLog;
+
+				/* Logging earns a line of its own with its chord spelled out:
+				 * ON costs a ~100-170ms hitch every 2s (the SD flush, s36), so
+				 * this is the one toggle whose state silently invalidates a
+				 * "how does it feel" verdict. Reads one window late like every
+				 * line here -- the block only redraws every 64 frames. */
+				printf(">> log   %-3s   SEL+R\n\n", g_dbg_sdLog ? "ON" : "off");
 			}
 		}
 
@@ -3703,6 +3950,13 @@ void NativeRenderer_SwapWindow(void)
 			       ((unsigned long)s_perfConsoleTotalUs % 1000UL) / 100UL, (unsigned long)s_perfConsoleWorkUs / 1000UL,
 			       ((unsigned long)s_perfConsoleWorkUs % 1000UL) / 100UL);
 
+			/* WORST frame of the window, beside the average. The average alone
+			 * cannot distinguish "every frame is 35ms" from "63 frames at cap
+			 * plus one 150ms hitch" -- and those need opposite fixes.
+			 * `stats` is what THIS block cost last window (see statsT0). */
+			printf("worst  %lu.%lums   stats %lu.%lums      \n", (unsigned long)s_perfConsoleWorstUs / 1000UL,
+			       ((unsigned long)s_perfConsoleWorstUs % 1000UL) / 100UL, s_statsBlockUs / 1000UL, (s_statsBlockUs % 1000UL) / 100UL);
+
 			/*
 			 * Sweep step. Driven from HERE, not from a frame counter, so a
 			 * config is always held for a whole number of stats windows and
@@ -3793,7 +4047,35 @@ void NativeRenderer_SwapWindow(void)
 				}
 			}
 		}
+
+#undef printf
+
+		/* Blank every row the block did not fill this time. Turning verbose or
+		 * the sweep off shortens the layout, and without this the rows they
+		 * used would keep their last text forever -- the drip would faithfully
+		 * repaint stale lines. */
+		while (s_statsRow < N3DS_STATS_ROWS)
+		{
+			N3DS_StatsEmitRow("");
+		}
+
+		/* Closing the timer opened at the top of the block. Displayed on the
+		 * NEXT window, so this frame's own cost never inflates the number it
+		 * is reporting. */
+		{
+			const unsigned long long freq = N3DS_GetTickFrequency();
+
+			if (freq != 0ULL)
+			{
+				s_statsBlockUs = (unsigned long)(((N3DS_GetTickCount() - statsT0) * 1000000ULL) / freq);
+			}
+		}
 	}
+
+	/* One row of the bottom screen, every frame -- see N3DS_StatsDripRow.
+	 * Sits here, just before the present that pushes the console framebuffer,
+	 * so the row is on screen the same frame it is drawn. */
+	N3DS_StatsDripRow();
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_N3DS_GFX_PRESENT);
 	N3DS_GfxPresent();

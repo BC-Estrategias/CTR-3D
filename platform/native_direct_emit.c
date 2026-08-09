@@ -337,11 +337,30 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 							bin = N3DS_MERGE_UNTEX_BIN;
 						}
 
-						if ((s_mergeBinUsed[bin] + 3) > N3DS_MERGE_BIN_CAP_VERTS)
+						/* s43 sky-first: the skybox (tagged by s_skyNodeActive
+						 * during the walk, native_gpu.c) accumulates into its own
+						 * buffer so N3DS_DrawSkyPass can draw it BEFORE the track
+						 * pass -- otherwise, binned as ordinary opaque, it flushes
+						 * after the track and paints over the depth-less waterfall.
+						 * Overflow drops the tri (a few backdrop tris are
+						 * invisible) rather than flush mid-walk. Toggle off routes
+						 * the sky back to the opaque bin (the punch-through leg). */
+						if (g_dbg_skyFirst && s_skyNodeActive)
 						{
-							N3DS_MergeSpillBin(bin);
+							if ((s_skyVertUsed + 3) > N3DS_SKY_VERT_CAP)
+							{
+								continue;
+							}
+							dst = &s_skyVerts[s_skyVertUsed];
 						}
-						dst = &s_mergeBinVerts[bin][s_mergeBinUsed[bin]];
+						else
+						{
+							if ((s_mergeBinUsed[bin] + 3) > N3DS_MERGE_BIN_CAP_VERTS)
+							{
+								N3DS_MergeSpillBin(bin);
+							}
+							dst = &s_mergeBinVerts[bin][s_mergeBinUsed[bin]];
+						}
 
 						for (k = 0; k < 3; k++)
 						{
@@ -398,7 +417,15 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 								dst[k].b = (u8)((col >> 16) & 0xFFu);
 							}
 						}
-						s_mergeBinUsed[bin] += 3;
+						/* s43: advance whichever buffer this tri went to. */
+						if (g_dbg_skyFirst && s_skyNodeActive)
+						{
+							s_skyVertUsed += 3;
+						}
+						else
+						{
+							s_mergeBinUsed[bin] += 3;
+						}
 						s_demit.frameEmitTris++;
 					}
 				}

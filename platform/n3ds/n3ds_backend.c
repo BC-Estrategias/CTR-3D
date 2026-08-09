@@ -147,6 +147,29 @@ void N3DS_EarlyInit(void)
  * sdmc is a host folder with free flushes). */
 static u64 s_logLastFlushTick = 0;
 
+/*
+ * SD-card logging master switch. DEFAULT OFF as of 2026-08-06.
+ *
+ * The 3DS's SD stack is slow at file work, and N3DS_DebugLog's throttled
+ * fflush+fsync runs on the GAME THREAD every ~2s. The Tubes log that night
+ * carried exactly ONE frame of 76-176ms in every single 64-frame window --
+ * same cadence, no other candidate (voice was ruled out: the first window had
+ * zero key-ons and a 162ms worst frame). One such frame costs ~1.8ms of the
+ * window average, which was the entire remaining gap to a solid 30fps. So the
+ * profiler was the thing making the game stutter.
+ *
+ * Off still leaves: svcOutputDebugString per line (free with no debugger
+ * attached, and Azahar still captures it, so emulator diagnosis is unchanged)
+ * and the whole bottom-screen readout, which is CPU-only. Turn back on when a
+ * log is actually wanted -- SELECT + TOUCH on hardware, dumpreq `sdlog`.
+ */
+int g_dbg_sdLog = 0;
+
+/* [LOGFLUSH] accumulators -- see the timing block inside N3DS_DebugLog. */
+static unsigned s_logFlushWorstUs = 0;
+static unsigned s_logFlushTotalUs = 0;
+static unsigned s_logFlushCount = 0;
+
 void N3DS_DebugLog(const char *msg)
 {
 	if (msg == NULL)
@@ -162,7 +185,11 @@ void N3DS_DebugLog(const char *msg)
 		fputc('\n', stderr);
 	}
 
-	if (s_logFile != NULL)
+	/* g_dbg_sdLog off: no fputs either, not just no flush. A buffered write
+	 * is only free until the 16KB buffer fills, and then stdio flushes it
+	 * wherever it happens to be -- mid-corner, unthrottled, exactly the stall
+	 * this switch exists to remove. */
+	if ((s_logFile != NULL) && g_dbg_sdLog)
 	{
 		fputs(msg, s_logFile);
 		fputc('\n', s_logFile);
@@ -173,13 +200,22 @@ void N3DS_DebugLog(const char *msg)
 	 * N3DS_NetloadStreamInit). Both are post-hoc trails that tolerate a
 	 * bounded tail loss on a hard crash; svcOutputDebugString above is the
 	 * per-line instant trail. */
-	if ((s_logFile != NULL) || s_netloadStreamActive)
+	if (((s_logFile != NULL) && g_dbg_sdLog) || s_netloadStreamActive)
 	{
 		const u64 now = svcGetSystemTick();
 
 		if ((now - s_logLastFlushTick) > (SYSCLOCK_ARM11 * 2ull))
 		{
-			if (s_logFile != NULL)
+			/* s36: time the flush itself. Every 64-frame window in the
+			 * 2026-08-06 Tubes log carries exactly ONE frame of 76-176ms, and
+			 * this 2s-throttled SD write is the only thing in the build whose
+			 * cadence matches. One hitch per window costs ~1.8ms of the
+			 * window AVERAGE, which is the whole remaining gap to a solid 30
+			 * -- so if this is it, every perf number we have is carrying our
+			 * own instrument on its back. Reported as [LOGFLUSH]. */
+			const u64 flushStart = svcGetSystemTick();
+
+			if ((s_logFile != NULL) && g_dbg_sdLog)
 			{
 				fflush(s_logFile);
 				/* fflush alone moves bytes into the FS session; the FAT
@@ -197,8 +233,30 @@ void N3DS_DebugLog(const char *msg)
 				fflush(stderr);
 			}
 			s_logLastFlushTick = now;
+
+			{
+				const u64 took = svcGetSystemTick() - flushStart;
+				const unsigned tookUs = (unsigned)((took * 1000000ull) / (u64)SYSCLOCK_ARM11);
+
+				s_logFlushTotalUs += tookUs;
+				if (tookUs > s_logFlushWorstUs)
+				{
+					s_logFlushWorstUs = tookUs;
+				}
+				s_logFlushCount++;
+			}
 		}
 	}
+}
+
+void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count)
+{
+	*worstUs = s_logFlushWorstUs;
+	*totalUs = s_logFlushTotalUs;
+	*count = s_logFlushCount;
+	s_logFlushWorstUs = 0;
+	s_logFlushTotalUs = 0;
+	s_logFlushCount = 0;
 }
 
 /*
@@ -331,9 +389,14 @@ void N3DS_GfxExit(void)
  * The one thing that ever READ them on the CPU is the pause freeze-frame
  * (N3DS_CopyDisplayedTopFrame), which was silently relying on this flush for
  * coherency -- it now does its own invalidate, which is where that belongs.
- * Runtime A/B: SELECT+A on hardware, dumpreq `fastpresent` in Azahar.
+ * DEFAULT 1 as of 2026-08-06, hardware-measured: present 3.70 -> 1.67ms, and
+ * ~0.8ms of that reached the frame (Tubes median 36.1 -> 35.3ms). Small,
+ * because ordinary frames were already at the 30fps cap -- but it is free CPU
+ * with no visual or behavioural change, so there is nothing to trade off.
+ * dumpreq `fastpresent` only now; its SELECT+TOUCH chord went to the SD-log
+ * switch, which turned out to be worth far more (see g_dbg_sdLog).
  */
-int g_dbg_fastPresent = 0;
+int g_dbg_fastPresent = 1;
 
 void N3DS_GfxPresent(void)
 {
@@ -2036,6 +2099,13 @@ void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short
 	}
 }
 
+/* s43 backface-cull toggle (dumpreq 'bfcull'): 0 = off (draw every face, today's
+ * behaviour), 1 = cull GPU back-faces, 2 = cull front-faces. Applied per-frame in
+ * N3DS_TrackDraw_Begin, undone in _End. See the block in Begin for the winding
+ * caveat and how to read the result. Default 0 -- this is an unproven perf/parity
+ * experiment, not the accepted default. */
+int g_dbg_bfCull = 0;
+
 void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h)
 {
 	C3D_TexEnv *env;
@@ -2067,6 +2137,30 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	C3D_BindProgram(&s_trackShaderProgram);
 	C3D_SetAttrInfo(&s_trackAttrInfo);
 	C3D_SetBufInfo(&s_trackBufInfo);
+
+	/*
+	 * s43 backface-cull A/B (dumpreq 'bfcull'), scoped to the TRACK only.
+	 *
+	 * Retail rejects back-facing SINGLE-SIDED faces per-face (GTE NCLIP winding
+	 * test gated by the DOUBLE_SIDED bit, game/226 DrawLevelOvr); our bake emits
+	 * every face regardless of winding and the GPU runs GPU_CULL_NONE globally
+	 * (:1128), so we draw backfaces retail drops -- e.g. Crash Cove's second
+	 * waterfall. This tries PICA hardware culling as the stand-in, restored to
+	 * NONE in N3DS_TrackDraw_End so the packet/UI/model draws after the track are
+	 * never affected. 1 vs 2 exists because the bake's winding convention is
+	 * unverified: if 1 (cull back) punches holes, the bake winds the other way
+	 * and 2 (cull front) is the correct one; if BOTH hole, winding is mixed and
+	 * culling is unsafe without a bake normalization pass. Judge on: holes in the
+	 * track (unsafe) vs the second waterfall vanishing cleanly + fps rising.
+	 */
+	if (g_dbg_bfCull == 1)
+	{
+		C3D_CullFace(GPU_CULL_BACK_CCW);
+	}
+	else if (g_dbg_bfCull == 2)
+	{
+		C3D_CullFace(GPU_CULL_FRONT_CCW);
+	}
 
 #ifdef CTR_NATIVE_OT_DEPTH
 	/* State 2 (TRACKRO, see g_dbg_depthTest): the track still TESTS against
@@ -2415,6 +2509,15 @@ void N3DS_TrackDraw_End(void)
 	 * path's merge-bin flush right after this call is never left pointed at
 	 * track state by a call-order mistake upstream. */
 	N3DS_BindPacketDrawState();
+
+	/* s43: undo any track-scoped backface cull so the packet/UI/model/sky draws
+	 * after the track are never culled (their winding is not guaranteed). Only
+	 * when the toggle is live, so the default leg issues no redundant state
+	 * change. Matches the global GPU_CULL_NONE set once in N3DS_C3DInit. */
+	if (g_dbg_bfCull != 0)
+	{
+		C3D_CullFace(GPU_CULL_NONE);
+	}
 
 #ifdef CTR_NATIVE_OT_DEPTH
 	/* Undo state 2's read-only depth mask. Unconditional on the state rather
@@ -3047,16 +3150,7 @@ unsigned int N3DS_ReadButtons(void)
 	held = hidKeysHeld();
 
 #ifdef CTR_INTERNAL
-	/* SELECT+R (R down-edge while SELECT held): dump emulated PSX VRAM to
-	 * sdmc:/vramdump.bin for the texture-corruption investigation. L+R is
-	 * powersliding (core CTR mechanic) so it can't be used; SELECT is not a
-	 * driving button. Checked here because hidScanInput() already ran above --
-	 * a second scan elsewhere would consume the R down-edge. Runs before the
-	 * textureless toggle so the two never fire on the same frame. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_R))
-	{
-		N3DS_DebugCaptureAll();
-	}
+	/* s41: SELECT+R freed (the VRAM/debug capture set). Still reachable as dumpreq `capture`. */
 
 	/* Host-scriptable trigger (2026-07-21): Azahar's SD card is a plain host
 	 * folder, so an autonomous session can drive diagnostics by creating
@@ -3069,8 +3163,9 @@ unsigned int N3DS_ReadButtons(void)
 	 *   textureless -- toggle g_dbg_texturelessMode
 	 *   triscopes   -- toggle g_dbg_perfTriScopes (per-triangle perf split; taxed)
 	 *   drawmerge   -- toggle g_dbg_drawMerge (CTR_NATIVE_DRAW_MERGE builds only)
-	 *   flagrainbow [N] -- menu/loading flag: 1 = pride stripes (default),
-	 *                  0 = retail grey checkers
+	 *   flagstyle [N] -- menu/loading flag: 0 = retail grey checkers (default),
+	 *                  1 = pride stripes, 2 = purple/white (Spyro). Bare token
+	 *                  cycles. Also reachable in-game by cheat: WONDER, SOAR.
 	 *   renderthread -- toggle g_dbg_renderThread (core-2 render worker routing;
 	 *                  OFF falls back to synchronous main-thread rendering)
 	 *   lodgeo [N]  -- track LOD distance, percent of retail (CTR_NATIVE_LOD_BIAS)
@@ -3175,6 +3270,12 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_frameSync ? "[CTR-3DS] framesync: ON (FrameBegin waits for hw vblank)"
 					                              : "[CTR-3DS] framesync: OFF (begin immediately)");
 				}
+				else if (strncmp(word, "sdlog", 5) == 0)
+				{
+					g_dbg_sdLog ^= 1;
+					N3DS_DebugLog(g_dbg_sdLog ? "[CTR-3DS] sdlog: ON (writing ctr3ds.log -- costs a ~2s hitch)"
+					                          : "[CTR-3DS] sdlog: off (no SD writes; bottom screen still live)");
+				}
 				else if (strncmp(word, "fastpresent", 11) == 0)
 				{
 					g_dbg_fastPresent ^= 1;
@@ -3275,6 +3376,63 @@ unsigned int N3DS_ReadButtons(void)
 
 					g_dbg_resolveMemo ^= 1;
 					N3DS_DebugLog(g_dbg_resolveMemo ? "[CTR-3DS] resolve memo: ON" : "[CTR-3DS] resolve memo: OFF");
+				}
+				else if (strncmp(word, "smokedefer", 10) == 0)
+				{
+					extern int g_dbg_smokeDefer;
+
+					/* s42 A/B: driver-local exhaust smoke redrawn after the model
+					 * pass (over its own kart, retail's painter's order) vs the old
+					 * in-merge draw where the body paints over it. */
+					g_dbg_smokeDefer ^= 1;
+					N3DS_DebugLog(g_dbg_smokeDefer ? "[CTR-3DS] deferred smoke: ON (over own kart)"
+					                               : "[CTR-3DS] deferred smoke: off (in-merge, old look)");
+				}
+				else if (strncmp(word, "skyfar", 6) == 0)
+				{
+					extern int g_dbg_skyFar;
+
+					/* s43 A/B: pin the skybox to the far depth plane so translucent
+					 * track geometry (the waterfalls) wins the depth test against it,
+					 * vs the old OT-bucket fallback the sky punched through with. */
+					g_dbg_skyFar ^= 1;
+					N3DS_DebugLog(g_dbg_skyFar ? "[CTR-3DS] sky far-pin: ON (waterfalls over sky)"
+					                           : "[CTR-3DS] sky far-pin: off (old bucket depth)");
+				}
+				else if (strncmp(word, "skyfirst", 8) == 0)
+				{
+					extern int g_dbg_skyFirst;
+
+					/* s43: draw the skybox BEFORE the track pass (its own vertex
+					 * accumulator) so the depth-less translucent waterfall paints
+					 * over it. OFF routes the sky back into the opaque merge bins,
+					 * which flush after the track = the punch-through. */
+					g_dbg_skyFirst ^= 1;
+					N3DS_DebugLog(g_dbg_skyFirst ? "[CTR-3DS] sky-first: ON (sky under waterfalls)"
+					                             : "[CTR-3DS] sky-first: off (sky in merge, punches through)");
+				}
+				else if (strncmp(word, "bfcull", 6) == 0)
+				{
+					extern int g_dbg_bfCull;
+
+					/* s43 perf/parity experiment: track-scoped backface culling.
+					 * 'bfcull N' sets 0=off / 1=cull-back / 2=cull-front directly
+					 * -- deterministic for a PRE-LAUNCH dumpreq on hardware, where
+					 * the SD can't be written mid-race; bare 'bfcull' cycles for a
+					 * quick Azahar A/B. Watch for holes in the track (winding
+					 * inconsistent = unsafe) vs the second waterfall vanishing
+					 * cleanly + fps rising. Rationale in N3DS_TrackDraw_Begin. */
+					if ((word[6] == ' ') && (word[7] >= '0') && (word[7] <= '2'))
+					{
+						g_dbg_bfCull = word[7] - '0';
+					}
+					else
+					{
+						g_dbg_bfCull = (g_dbg_bfCull + 1) % 3;
+					}
+					N3DS_DebugLog(g_dbg_bfCull == 0   ? "[CTR-3DS] backface cull (track): OFF (draw all faces)"
+					              : g_dbg_bfCull == 1 ? "[CTR-3DS] backface cull (track): BACK faces culled"
+					                                  : "[CTR-3DS] backface cull (track): FRONT faces culled");
 				}
 				else if (strncmp(word, "fbtest", 6) == 0)
 				{
@@ -3575,21 +3733,28 @@ unsigned int N3DS_ReadButtons(void)
 					}
 					N3DS_DebugLog(g_dbg_hudModelsAsUi ? "[CTR-3DS] HUD models: drawn as UI (retail packet path)" : "[CTR-3DS] HUD models: native capture (pops out, ST 1)");
 				}
-				else if (strncmp(word, "flagrainbow", 11) == 0)
+				else if (strncmp(word, "flagstyle", 9) == 0)
 				{
-					extern int g_dbg_flagRainbow;
+					extern int g_dbg_flagStyle;
+					static const char *const flagStyleNames[3] = {"retail grey checkers", "PRIDE stripes", "PURPLE/WHITE checkers (Spyro)"};
+					char styleMsg[80];
 
-					/* Menu/loading flag: pride stripes (default) vs retail grey
-					 * checkers. 'flagrainbow N' sets, bare token flips. */
-					if (word[11] == ' ')
+					/* Menu/loading flag style. 'flagstyle N' sets, bare token
+					 * cycles 0->1->2->0. Both non-retail styles are also
+					 * reachable in-game by their cheat codes (WONDER, SOAR) --
+					 * docs/EASTER_EGGS.md. */
+					if (word[9] == ' ')
 					{
-						g_dbg_flagRainbow = (atoi(&word[12]) != 0);
+						const int n = atoi(&word[10]);
+
+						g_dbg_flagStyle = ((n >= 0) && (n <= 2)) ? n : 0;
 					}
 					else
 					{
-						g_dbg_flagRainbow ^= 1;
+						g_dbg_flagStyle = (g_dbg_flagStyle + 1) % 3;
 					}
-					N3DS_DebugLog(g_dbg_flagRainbow ? "[CTR-3DS] race flag: RAINBOW stripes" : "[CTR-3DS] race flag: retail grey checkers");
+					snprintf(styleMsg, sizeof(styleMsg), "[CTR-3DS] race flag: %s", flagStyleNames[g_dbg_flagStyle]);
+					N3DS_DebugLog(styleMsg);
 				}
 				else if (strncmp(word, "axisfix", 7) == 0)
 				{
@@ -3729,25 +3894,24 @@ unsigned int N3DS_ReadButtons(void)
 		                              : "[CTR-3DS] framesync: OFF (begin immediately)");
 	}
 
-	/* SELECT held + TOUCH the bottom screen: present-path cost
-	 * (g_dbg_fastPresent, defined above N3DS_GfxPresent). Same reason as its
-	 * neighbours for being a button at all -- the A/B has to happen mid-race
-	 * on identical content, and dumpreq is unplaceable while the game holds
-	 * the SD card.
+	/* SELECT held + R: SD logging on/off (g_dbg_sdLog, defined by the log
+	 * statics near the top of this file). R came free when the VRAM-capture
+	 * diagnostic was retired; the owner reassigned it here because this is the
+	 * toggle he reaches for most -- ON costs a ~100-170ms hitch every 2s, so
+	 * it is the one switch whose state can invalidate a whole sitting.
 	 *
-	 * The TOUCHSCREEN, because every button chord is genuinely taken: SELECT +
-	 * A/B/X/Y/L/R/ZL/ZR and all four d-pad directions all fire something, and
-	 * SELECT+START is the master renderer switch. This first shipped on
-	 * SELECT+A, which is the model-render toggle 200 lines below -- one press
-	 * flipped BOTH and silently confounded the measurement (owner caught it:
-	 * "select A turns models off"). Touch reads nothing else in the whole
-	 * build, so it cannot collide with another session's chord, and SELECT is
-	 * still required so a stray thumb on the bottom screen can't fire it. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_TOUCH))
+	 * Briefly lived on SELECT+TOUCH (now free again), which itself replaced an
+	 * attempt on SELECT+A -- that is the model-render toggle ~200 lines below,
+	 * so one press flipped BOTH and silently confounded the measurement (owner
+	 * caught it: "select A turns models off"). Grep the whole platform tree for
+	 * a key token before binding it; most chords belong to other sessions. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_R))
 	{
-		g_dbg_fastPresent ^= 1;
-		N3DS_DebugLog(g_dbg_fastPresent ? "[CTR-3DS] fastpresent: ON (flush bottom framebuffer only)"
-		                                : "[CTR-3DS] fastpresent: off (whole-system gfxFlushBuffers)");
+		g_dbg_sdLog ^= 1;
+		/* Logged AFTER the flip so turning it back ON announces itself in the
+		 * file; turning it off leaves its last word in the svc trail only. */
+		N3DS_DebugLog(g_dbg_sdLog ? "[CTR-3DS] sdlog: ON (writing ctr3ds.log -- costs a ~2s hitch)"
+		                          : "[CTR-3DS] sdlog: off (no SD writes; bottom screen still live)");
 	}
 
 	/* SELECT held + X: bottom-screen verbosity. Default off (s29) -- the stats
@@ -3760,19 +3924,22 @@ unsigned int N3DS_ReadButtons(void)
 		N3DS_DebugLog(g_dbg_statsVerbose ? "[CTR-3DS] stats: VERBOSE" : "[CTR-3DS] stats: quiet");
 	}
 
-	/* SELECT held + Y: step the packet depth bias 0 -> 32 -> 64 -> 128 -> 256
-	 * -> 0. Owner-dialled mid-race on hardware ("just pull them a little bit
-	 * closer"), which is why it is a button and why the ladder is short: the
-	 * judgement is "do racers still sink" vs "can I see them through a wall",
-	 * and only a human mid-race can make it. */
+	/* s43: SELECT+Y = backface-cull A/B (track-scoped), toggles OFF <-> cull
+	 * BACK. Mid-race by design -- sit at one spot and flip it while watching the
+	 * `work` ms and the holes/waterfall change live; a dumpreq can't be placed
+	 * while the game holds the SD card. BACK is the established-correct winding
+	 * (quads cull clean; only stray triangle faces hole). FRONT (state 2) stays
+	 * reachable as dumpreq `bfcull 2` for winding checks -- from any culling
+	 * state this chord returns to OFF first. SELECT+Y was freed in s41 from the
+	 * packet-depth-bias ladder (still dumpreq `pktbias`); reused for this perf
+	 * experiment because it needs to be flippable mid-race. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_Y))
 	{
-		extern int g_dbg_pktDepthBias;
-		char msg[64];
+		extern int g_dbg_bfCull;
 
-		g_dbg_pktDepthBias = N3DS_NextPktBias(g_dbg_pktDepthBias);
-		snprintf(msg, sizeof(msg), "[CTR-3DS] packet depth bias: %d (units nearer)", g_dbg_pktDepthBias);
-		N3DS_DebugLog(msg);
+		g_dbg_bfCull = g_dbg_bfCull ? 0 : 1;
+		N3DS_DebugLog(g_dbg_bfCull ? "[CTR-3DS] backface cull (track): BACK faces culled (watch `work` ms)"
+		                           : "[CTR-3DS] backface cull (track): OFF (draw all faces)");
 	}
 
 	/* SELECT held + ZL: depth-test state cycle 0->1->2->0 (see g_dbg_depthTest
@@ -3800,43 +3967,18 @@ unsigned int N3DS_ReadButtons(void)
 	 * hardware A/B would be cross-run. The OFF transition is safe mid-race
 	 * by construction: Route() fences the worker before the first direct
 	 * call (native_render_queue.c). */
-	/* REPURPOSED s36: was the render-worker routing A/B, settled since s25b
-	 * (dumpreq `renderthread` still covers Azahar if it's ever needed again).
-	 * Now the widescreen toggle, because the owner wants to eyeball it on
-	 * the real panel and dumpreq is unplaceable while the game holds the SD
-	 * card. Toggles off<->REAL (mode 2); the rejected stretch (mode 1) is
-	 * dumpreq-only. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DDOWN))
-	{
-		g_dbg_widescreen = (g_dbg_widescreen == 2) ? 0 : 2;
-		N3DS_DebugLog((g_dbg_widescreen == 2) ? "[CTR-3DS] widescreen: REAL (wide FOV window, 4:3 pixel scale)" : "[CTR-3DS] widescreen: off (4:3 crop)");
-	}
+	/* s41: SELECT+DDOWN freed (widescreen -- now part of the SELECT+START master). Still reachable as dumpreq `wide`. */
 
-	/* SELECT held + D-pad RIGHT: textureless. Was bare SELECT (2026-07-20),
-	 * mirroring PC's F2, but once other held-SELECT combos joined the family
-	 * every stray SELECT tap was silently flipping textures too -- owner
-	 * moved it onto the same held-SELECT d-pad convention as the rest
-	 * (2026-07-29). SELECT still feeds N3DS_BTN_SELECT below as normal. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DRIGHT))
-	{
-		g_dbg_texturelessMode ^= 1;
-		N3DS_DebugLog(g_dbg_texturelessMode ? "[CTR-3DS] textureless mode: 1" : "[CTR-3DS] textureless mode: 0");
-	}
+	/* s41: SELECT+DRIGHT freed (textureless debug view). Still reachable as dumpreq `textureless`. */
 
 #ifdef CTR_NATIVE_DIRECT_EMIT
-	/* SELECT held + D-pad LEFT: direct-emit fast path A/B, part of the
-	 * held-SELECT d-pad family (DOWN=render worker, RIGHT=textureless).
-	 * Same rationale as the others: hardware cannot place a dumpreq file
-	 * mid-race, and only a mid-run flip brackets [PERF] windows on
-	 * identical content. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DLEFT))
-	{
-		extern int g_dbg_directEmit;
-
-		g_dbg_directEmit ^= 1;
-		N3DS_DebugLog(g_dbg_directEmit ? "[CTR-3DS] direct emit: ON" : "[CTR-3DS] direct emit: OFF");
-	}
+	/* s41: SELECT+DLEFT freed (direct emit -- baseline since 2026-07-28, A/B settled). Still reachable as dumpreq `directemit`. */
 #endif
+
+	/* s41c: SELECT+DLEFT freed again (the particle-lift sweep did its job and
+	 * was removed -- the lift nudged every particle, not just a kart's own
+	 * smoke). Still reachable as nothing; the real driver-local fix carries no
+	 * runtime knob. */
 
 #if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
 	/* SELECT held + D-pad UP: GTE capture cost A/B (s29). The depth model the
@@ -3869,49 +4011,12 @@ unsigned int N3DS_ReadButtons(void)
 	 * alone puts the two geometry sources on different axes. This is the
 	 * toggle the "karts through walls" objection gets tested against, so it
 	 * has to be a button: a dumpreq file cannot be placed mid-race. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_L))
-	{
-		extern int g_dbg_packetDepth;
-
-		g_dbg_packetDepth ^= 1;
-		N3DS_DebugLog(g_dbg_packetDepth ? "[CTR-3DS] packet depth: ON (sz3 true-depth axis, both sources)"
-		                                : "[CTR-3DS] packet depth: off (emit ordinals)");
-	}
+	/* s41: SELECT+L freed -- packet depth folded into the SELECT+START master.
+	 * Still reachable as dumpreq `packetdepth`. */
 #endif
 
 #ifdef CTR_NATIVE_TRACK_RENDERER
-	/* SELECT held + ZR: native track renderer state cycle 0->1->2->0 (rung
-	 * 3a). Reassigned from the s27 fbtest probe (design doc 12b: fbtest's
-	 * question is closed/null) -- ZR was fbtest's combo, not resolve-memo's;
-	 * the s26 resolve-memo combo lived on SELECT+ZL, which this pass simply
-	 * frees (its dumpreq token 'resolvememo' stays reachable in Azahar, it
-	 * just has no hardware button anymore). Both 'fbtest' and 'resolvememo'
-	 * dumpreq tokens stay reachable in Azahar either way -- only the
-	 * hardware BUTTON combos are freed here, because a mid-race hardware A/B
-	 * needs a BUTTON (dumpreq is unplaceable while the game holds the SD
-	 * card) and trackrender is now the toggle that matters for that. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZR))
-	{
-		extern int g_dbg_trackRender;
-		static const char *const names[3] = {"OFF (retail)", "ON (resident replaces retail)", "BOTH (resident + retail overlay)"};
-		char msg[64];
-
-		/*
-		 * TWO states on the button, not three. BOTH is not a way to play -- it
-		 * draws the level twice -- and cycling through it mid-race costs a
-		 * press every time the owner wants to A/B the thing that matters. It
-		 * stays reachable as 'trackrender 2' via dumpreq, because drawing both
-		 * at once is still the fastest visual check for the two renderers
-		 * disagreeing about position or depth: they fight each other on screen
-		 * in one frame instead of having to be inferred from a sunk kart.
-		 *
-		 * From 2 the button drops to 0 rather than sticking, so a dumpreq into
-		 * BOTH can always be escaped from the console.
-		 */
-		g_dbg_trackRender = (g_dbg_trackRender == 0) ? 1 : 0;
-		snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
-		N3DS_DebugLog(msg);
-	}
+	/* s41: SELECT+ZR freed (native track renderer (incl. state 2, BOTH)). Still reachable as dumpreq `trackrender`. */
 #endif
 
 #if defined(CTR_NATIVE_TRACK_RENDERER) && defined(CTR_NATIVE_MODEL_RENDERER) && defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
@@ -3921,21 +4026,32 @@ unsigned int N3DS_ReadButtons(void)
 	 * boot. Two states: everything native (1,1,1) or everything retail
 	 * (0,0,0); a mixed state goes native first, so one press from clean boot
 	 * lands on the config being targeted. START still reaches the game, so
-	 * in-race this also opens the pause menu -- acceptable, documented, and
-	 * the only chord left (every other SELECT combo is taken; see the family
-	 * above). The individual toggles below remain for isolating one variable. */
+	 * in-race this also opens the pause menu -- acceptable and documented.
+	 *
+	 * s41: this is now the ONLY renderer chord. The individual track / models /
+	 * packet-depth buttons (ZR / A / L) and the widescreen button (D-DOWN) are
+	 * gone -- owner's call, "not much use in individual toggles, all in one, I
+	 * don't wanna fiddle with toggles". Every one of them survives as a dumpreq
+	 * token (`trackrender`, `modelrender`, `packetdepth`, `wide`) for the day a
+	 * single variable genuinely needs isolating, and isolating one variable is
+	 * a deliberate debugging act that can afford a relaunch. Widescreen joins
+	 * the master because "ours" includes it: REAL (2) on, 4:3 crop (0) off; the
+	 * rejected stretch (1) stays dumpreq-only. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_START))
 	{
 		extern int g_dbg_trackRender;
 		extern int g_dbg_modelRender;
 		extern int g_dbg_packetDepth;
-		const int allOn = (g_dbg_trackRender != 0) && (g_dbg_modelRender != 0) && (g_dbg_packetDepth != 0);
+		const int allOn =
+		    (g_dbg_trackRender != 0) && (g_dbg_modelRender != 0) && (g_dbg_packetDepth != 0) && (g_dbg_widescreen != 0);
 		const int target = allOn ? 0 : 1;
 
 		g_dbg_trackRender = target;
 		g_dbg_modelRender = target;
 		g_dbg_packetDepth = target;
-		N3DS_DebugLog(target ? "[CTR-3DS] OUR CONFIG: track+models+dmodel all ON" : "[CTR-3DS] our config: all off (full retail)");
+		g_dbg_widescreen = target ? 2 : 0; /* REAL, not stretch */
+		N3DS_DebugLog(target ? "[CTR-3DS] OUR CONFIG: track+models+dmodel+widescreen all ON"
+		                     : "[CTR-3DS] our config: all off (full retail, 4:3)");
 	}
 #endif
 
@@ -3959,13 +4075,9 @@ unsigned int N3DS_ReadButtons(void)
 	 *
 	 * Two states, not three, matching the trackrender button's reasoning: BOTH
 	 * stays reachable as 'modelrender 2' via dumpreq. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_A))
-	{
-		extern int g_dbg_modelRender;
-
-		g_dbg_modelRender = (g_dbg_modelRender == 0) ? 1 : 0;
-		N3DS_DebugLog(g_dbg_modelRender ? "[CTR-3DS] model render: ON (PICA-native models)" : "[CTR-3DS] model render: off (packets only)");
-	}
+	/* s41: SELECT+A freed -- model render folded into the SELECT+START master.
+	 * Still reachable as dumpreq `modelrender` (including state 2, BOTH).
+	 * Frees the accelerate button from carrying a chord at all. */
 #endif
 #endif
 

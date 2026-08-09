@@ -102,6 +102,12 @@ typedef struct
 	u16 numVerts;
 
 	const char *debugText;
+
+	/* s42b: this split is driver-local exhaust smoke (Particle.c tagged its
+	 * packet with code bit 0x01). Forces a dedicated split via the AddSplit
+	 * coalescing check and makes DrawAllSplits hold it out of the normal pass
+	 * for a redraw after the native model pass. Always 0 off 3DS. */
+	bool deferredSmoke;
 } GPUDrawSplit;
 
 #define MAX_DRAW_SPLITS 4096
@@ -262,22 +268,31 @@ typedef struct
 int g_dbg_otzWiden = 0;
 
 /*
- * Rainbow-stripe checkered flag (owner request, 2026-08-06) -- the menu/loading
- * flag drawn as horizontal pride stripes instead of grey checkers. Read by
- * RaceFlag_DrawSelf (game/RaceFlag.c); the pattern rule and the colour table
- * live there, this is only the switch.
+ * Menu/loading flag STYLE (owner easter eggs -- docs/EASTER_EGGS.md):
+ *   0 = retail grey checkers (default; the port's look stays close to retail)
+ *   1 = six-colour pride stripes   -- cheat WONDER, or a June date check
+ *   2 = purple checkers ("respect the dragon") -- cheat SOAR, retail's dead
+ *       Spyro 2 demo code repurposed
+ *
+ * Read by RaceFlag_DrawSelf (game/RaceFlag.c); the pattern rules and colour
+ * tables live there, this is only the selector.
  *
  * Lives on the platform side of the seam rather than in game/ because it is a
  * native-only presentation choice: the flag mesh, its wave and its lighting are
- * untouched retail behaviour either way, and PC compiles the same branch.
+ * untouched retail behaviour in every style, and style 0 is byte-identical to
+ * retail (its branch does no tinting arithmetic at all).
  *
- * DEFAULT OFF (owner ruling, 2026-08-06): the port's default look stays close to
- * retail. Kept as an opt-in -- dumpreq `flagrainbow` -- and the owner's stated
- * intent for it is a Pride Month easter egg (check the system date, enable it
- * for June), which is why this is a plain int rather than a compile-time gate:
- * a date check can simply write to it at startup.
+ * A plain int, not a compile-time gate, precisely so the cheat handlers and a
+ * startup date check can write to it.
  */
-int g_dbg_flagRainbow = 0;
+enum
+{
+	FLAG_STYLE_RETAIL = 0,
+	FLAG_STYLE_PRIDE = 1,
+	FLAG_STYLE_PURPLE = 2
+};
+
+int g_dbg_flagStyle = FLAG_STYLE_RETAIL;
 
 /* See include/platform/native_gpu.h. Lives here, not in the 3DS renderer that
  * writes it, so the windowed instruments that READ it (native_perf.c, the
@@ -1127,7 +1142,7 @@ enum
 	/*
 	 * 4 UI prims per stamp -> the band orders 64*4 = 256 primitives.
 	 *
-	 * DO NOT RAISE THIS TO BUY CAPACITY. It was tried (16/stamp, 1024 prims,
+	 * Raising this to buy capacity does not work. It was tried (16/stamp, 1024 prims,
 	 * 2026-08-07) to stop the band overflowing once HUD models were routed
 	 * through it, and it made UI layering MUCH WORSE on hardware: the menu
 	 * glyph/panel ordering degraded further, the level-preview video was
@@ -1280,6 +1295,170 @@ global_variable int s_pktDepthLastResolved;
  * costs nothing and changes nothing until it is asked for.
  */
 int g_dbg_pktDepthBias = 0;
+
+/* s42 deferred driver-local exhaust-smoke pass. External linkage (the dumpreq
+ * handler lives in the separate n3ds_backend.c TU). A/B master, default ON:
+ * 1 = driver-local smoke is held out of the normal merge and redrawn AFTER the
+ * native model pass so it paints over its own kart body (retail's painter's
+ * order) while a nearer wall/kart still occludes it; 0 = old behaviour (smoke
+ * in the merge, body over it). Runtime A/B: dumpreq 'smokedefer'.
+ *
+ * NO near-bias: the smoke's own captured view.z depth
+ * (GTECapture_StoreParticleCorner), drawn after the body, is sufficient on its
+ * own -- owner tested bias 0 and it was perfect, so the dial was removed (s42f).
+ * The depth CAPTURE is still essential: without it the smoke falls back to the
+ * parse-order ordinal axis, reads as infinitely far, and is occluded by all. */
+int g_dbg_smokeDefer = 1;
+
+/* s43 skybox far-pin A/B (dumpreq 'skyfar'). Default ON. Defined out here beside
+ * g_dbg_smokeDefer, not inside the CTR_NATIVE_GTE_CAPTURE block below, so the
+ * dumpreq extern resolves in any 3DS config -- same placement as smokeDefer. The
+ * range table and resolver branch it gates live in that guarded block. */
+int g_dbg_skyFar = 1;
+
+/* s42d tag: which POLY_FT4 packets are driver-local exhaust smoke, identified
+ * by PACKET ADDRESS (unique per frame) -- NOT a code-byte bit. Every bit of a
+ * PS1 primitive code is a real GPU flag; s42c set bit 0x01, which is the
+ * raw-texture / shade-OFF bit (ProcessFlatPoly: shadeTexOn = (code & 1) == 0),
+ * so the smoke drew unshaded at full brightness = the opaque plume. This side
+ * table leaves the packet's rendering completely untouched. Double-buffered
+ * exactly like GTECapture: Particle.c Marks on the game thread while building
+ * the OT, DrawOTag Publishes (read=write) before the walk is posted,
+ * MainFrame_ResetDB Clears (flip write) at the frame boundary; the walk (worker
+ * thread on 3DS) reads the published buffer. */
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+#define NATIVE_SMOKE_PKT_MAX 512
+global_variable uintptr_t s_smokePktAddr[2][NATIVE_SMOKE_PKT_MAX];
+global_variable u32 s_smokePktN[2];
+global_variable int s_smokePktWriteIdx = 0;
+global_variable int s_smokePktReadIdx = 0;
+global_variable u32 s_smokePktDropped = 0;
+
+void NativeGpu_MarkSmokePacket(uintptr_t addr)
+{
+	u32 n = s_smokePktN[s_smokePktWriteIdx];
+
+	if (n < NATIVE_SMOKE_PKT_MAX)
+	{
+		s_smokePktAddr[s_smokePktWriteIdx][n] = addr;
+		s_smokePktN[s_smokePktWriteIdx] = n + 1;
+	}
+	else
+	{
+		s_smokePktDropped++;
+	}
+}
+
+void NativeGpu_PublishSmokePackets(void)
+{
+	s_smokePktReadIdx = s_smokePktWriteIdx;
+}
+
+void NativeGpu_ClearSmokePackets(void)
+{
+	s_smokePktWriteIdx ^= 1;
+	s_smokePktN[s_smokePktWriteIdx] = 0;
+}
+
+internal int NativeGpu_IsSmokePacket(uintptr_t addr)
+{
+	const uintptr_t *a = s_smokePktAddr[s_smokePktReadIdx];
+	u32 n = s_smokePktN[s_smokePktReadIdx];
+	u32 i;
+
+	for (i = 0; i < n; i++)
+	{
+		if (a[i] == addr)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * SKYBOX packet range (s43). DrawSky_Full's packets, identified by their
+ * contiguous ADDRESS RANGE in primMem for this frame -- same address-tag
+ * discipline as the smoke table above, but a single [start,end) span because
+ * DrawSky emits all its pieces back-to-back with nothing interleaved.
+ *
+ * WHY. The skybox is projected with the GTE translation vector zeroed
+ * (DrawSky.c, `CTC2(0, 5..7)`): it lives at infinity and has no real depth, so
+ * its stores are suppressed (GTECapture_SetStoreSuppressed) and the resolver
+ * treats every sky vertex as a miss. The miss path derives depth from the OT
+ * bucket (0xFFFF - (otIndex << 6)) -- but the sky's bucket is not guaranteed to
+ * out-distance genuinely-far real geometry, and a translucent surface that only
+ * TESTS depth (the Crash Cove / N. Gin Labs waterfalls -- textured animated
+ * TRACK geometry, on real captured depth) then loses to the sky's stamp and
+ * vanishes, showing the sky through the waterfall. Pinning the sky to the
+ * absolute far plane (stamp 0) makes it lose to every real surface by
+ * construction, which is exactly retail's behaviour: no depth buffer, sky
+ * simply painted first. Runtime A/B: dumpreq 'skyfar' (g_dbg_skyFar, defined
+ * above beside g_dbg_smokeDefer).
+ *
+ * Double-buffered like the smoke table: MarkSkyRange on the game thread during
+ * DrawSky_Full, PublishSkyRange (read=write) at DrawOTag before the walk is
+ * posted, ClearSkyRange (flip write) at the frame boundary; the walk (worker
+ * thread on 3DS) reads the published span.
+ */
+global_variable uintptr_t s_skyRangeStart[2];
+global_variable uintptr_t s_skyRangeEnd[2];
+global_variable int s_skyRangeWriteIdx = 0;
+global_variable int s_skyRangeReadIdx = 0;
+
+void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end)
+{
+	/* UNION across the frame's backdrop producers. Two register their spans:
+	 * DrawSky_Full (the dome mesh, 1P only) and CAM_SkyboxGlow (the horizon
+	 * gradient, once per player). They emit back-to-back into the same primMem
+	 * with no non-sky primitive interleaved -- the track is drawn before them
+	 * and the sky is the last world content of the frame -- so [min start, max
+	 * end) is exactly the backdrop and nothing else. (0,0) is the cleared-empty
+	 * sentinel; a real primMem address is never 0, so the first mark seeds it. */
+	if (end <= start)
+	{
+		return; /* empty span (e.g. DrawSky_Full with skybox==NULL) */
+	}
+	if (s_skyRangeEnd[s_skyRangeWriteIdx] == 0)
+	{
+		s_skyRangeStart[s_skyRangeWriteIdx] = start;
+		s_skyRangeEnd[s_skyRangeWriteIdx] = end;
+		return;
+	}
+	if (start < s_skyRangeStart[s_skyRangeWriteIdx])
+	{
+		s_skyRangeStart[s_skyRangeWriteIdx] = start;
+	}
+	if (end > s_skyRangeEnd[s_skyRangeWriteIdx])
+	{
+		s_skyRangeEnd[s_skyRangeWriteIdx] = end;
+	}
+}
+
+void NativeGpu_PublishSkyRange(void)
+{
+	s_skyRangeReadIdx = s_skyRangeWriteIdx;
+}
+
+void NativeGpu_ClearSkyRange(void)
+{
+	s_skyRangeWriteIdx ^= 1;
+	s_skyRangeStart[s_skyRangeWriteIdx] = 0;
+	s_skyRangeEnd[s_skyRangeWriteIdx] = 0;
+}
+
+internal int NativeGpu_IsSkyPacket(uintptr_t addr)
+{
+	return (addr >= s_skyRangeStart[s_skyRangeReadIdx]) && (addr < s_skyRangeEnd[s_skyRangeReadIdx]);
+}
+
+/* Set per node by the OT walk (beside GTECapture_MarkOTNode): whether the node
+ * the walk is about to hand to direct-emit or the parse path is skybox. Read by
+ * PacketDepth_ResolveXY, which sees only screen coordinates, not the packet
+ * address. Self-resetting -- assigned IsSkyPacket() every node -- so it needs no
+ * separate per-walk clear. */
+global_variable int s_skyNodeActive;
+#endif
 
 internal u16 PacketDepth_ClampWorld(u32 stamp)
 {
@@ -1515,6 +1694,39 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 	{
 		perVert = NULL;
 		perVertPar = NULL;
+	}
+
+	if (g_dbg_skyFar && s_skyNodeActive)
+	{
+		/*
+		 * SKYBOX -> absolute far plane (s43, block above NativeGpu_MarkSkyRange).
+		 * Taken before the suppressed/exempt/miss machinery below: the sky has no
+		 * real depth to resolve, and the OT-bucket fallback those paths would give
+		 * it is not guaranteed to lose to distant real geometry -- the waterfall
+		 * punch-through. Stamp 0 (farthest on the nearer=larger axis) directly,
+		 * NOT through PacketDepth_ClampWorld, so g_dbg_pktDepthBias cannot nudge
+		 * the sky forward off the far plane. Flat across the primitive: a backdrop
+		 * at infinity has no per-vertex relief. The sky is opaque, so it still
+		 * writes depth -- harmless at 0, since nothing is farther.
+		 */
+		*out = 0;
+		if (perVert)
+		{
+			for (i = 0; i < n; i++)
+			{
+				perVert[i] = 0;
+			}
+		}
+		if (perVertPar)
+		{
+			for (i = 0; i < n; i++)
+			{
+				perVertPar[i] = 0;
+			}
+		}
+		s_pendingDepthIsModel = 0;
+		s_pendingDepthSpread = 0;
+		return 1;
 	}
 
 	if (GTECapture_LookupSuppressed())
@@ -2277,6 +2489,7 @@ void ClearSplits(void)
 	s_gpu.splits[0].psxTexturedSemiTrans = false;
 	s_gpu.splits[0].psxTextureOutputSTP = false;
 	s_gpu.splits[0].psxDrawMaskSet = false;
+	s_gpu.splits[0].deferredSmoke = false;
 	s_gpu.framebufferFeedbackRunActive = false;
 }
 
@@ -3145,9 +3358,20 @@ internal void NativeGpu_PrepareFramebufferFeedback(int tpage)
 	s_gpu.framebufferFeedbackRunActive = true;
 }
 
+/* s42b one-shot: set by ProcessFlatPoly's FT4 case for a code-bit-0x01
+ * (driver-local smoke) packet, consumed by the very next AddSplit. Unity-TU
+ * unique name (see CLAUDE.md static-collision hazard). */
+global_variable int s_ngpuDeferSmokeNext = 0;
+
 internal void AddSplit(bool semiTrans, bool textured, bool framebufferFeedback)
 {
 	int tpage = activeDrawEnv.tpage;
+	/* Consume the smoke one-shot up front so every early return below leaves it
+	 * cleared -- a coalesce that keeps the current split must not let the flag
+	 * leak onto the following primitive. */
+	const bool wantDeferredSmoke = (s_ngpuDeferSmokeNext != 0);
+
+	s_ngpuDeferSmokeNext = 0;
 
 	if (framebufferFeedback)
 	{
@@ -3189,7 +3413,7 @@ internal void AddSplit(bool semiTrans, bool textured, bool framebufferFeedback)
 	    curSplit->psxTextureOutputSTP == psxTextureOutputSTP && curSplit->psxDrawMaskSet == s_gpu.psxDrawMaskSet &&
 	    curSplit->drawenv.clip.x == activeDrawEnv.clip.x && curSplit->drawenv.clip.y == activeDrawEnv.clip.y &&
 	    curSplit->drawenv.clip.w == activeDrawEnv.clip.w && curSplit->drawenv.clip.h == activeDrawEnv.clip.h && curSplit->drawenv.dfe == activeDrawEnv.dfe &&
-	    curSplit->debugText == s_gpu.currentSplitDebugText)
+	    curSplit->debugText == s_gpu.currentSplitDebugText && curSplit->deferredSmoke == wantDeferredSmoke)
 	{
 		return;
 	}
@@ -3213,6 +3437,7 @@ internal void AddSplit(bool semiTrans, bool textured, bool framebufferFeedback)
 	split->drawenv = activeDrawEnv;
 	split->dispenv = activeDispEnv;
 	split->debugText = s_gpu.currentSplitDebugText;
+	split->deferredSmoke = wantDeferredSmoke;
 
 	split->drawenv.tw.w = s_gpu.overrideTextureWidth;
 	split->drawenv.tw.h = s_gpu.overrideTextureHeight;
@@ -3311,6 +3536,94 @@ internal void SetPSXMaskState(u32 code)
 	s_gpu.psxDrawMaskSet = (code & 1) != 0;
 }
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+/*
+ * s42b deferred driver-local exhaust-smoke pass.
+ *
+ * DrawAllSplits holds every split flagged deferredSmoke out of the normal draw
+ * and copies its vertices (and a rebased split descriptor) into these private
+ * buffers. native_renderer_3ds.c then calls NativeGpu_DrawDeferredSmoke() AFTER
+ * the native model pass, so the smoke draws over its own kart body (retail's
+ * painter's order) while the depth test still lets a nearer wall/kart occlude
+ * it -- the smoke carries real view.z depth via GTECapture_StoreParticleCorner.
+ *
+ * A private vertex copy, not the split's indices into s_gpu.vertexBuffer:
+ * ClearSplits (end of DrawAllSplits) resets s_gpu.vertexIndex to 0, so those
+ * indices are free for reuse the moment DrawAllSplits returns -- long before
+ * the post-model redraw. One kart's exhaust is a handful of quads; the copy is
+ * cheap and immune to buffer reuse.
+ */
+#define NATIVE_DEFERRED_SMOKE_MAX_SPLITS 64
+#define NATIVE_DEFERRED_SMOKE_MAX_VERTS 2048
+global_variable GPUDrawSplit s_deferredSmokeSplits[NATIVE_DEFERRED_SMOKE_MAX_SPLITS];
+global_variable GrVertex s_deferredSmokeVerts[NATIVE_DEFERRED_SMOKE_MAX_VERTS];
+global_variable int s_deferredSmokeSplitCount = 0;
+global_variable int s_deferredSmokeVertCount = 0;
+global_variable u32 s_deferredSmokeDropped = 0; /* splits/verts that didn't fit */
+
+/* Copy one deferred-smoke split's verts into the private buffer with a rebased
+ * startVertex. Silently drops (counted) if either buffer is full -- a dropped
+ * smoke puff is a cosmetic miss, never a corruption. */
+internal void NativeGpu_CaptureDeferredSmoke(const GPUDrawSplit *split)
+{
+	int n = split->numVerts;
+	int base = s_deferredSmokeVertCount;
+	int k;
+
+	if ((s_deferredSmokeSplitCount >= NATIVE_DEFERRED_SMOKE_MAX_SPLITS) || (base + n > NATIVE_DEFERRED_SMOKE_MAX_VERTS))
+	{
+		s_deferredSmokeDropped++;
+		return;
+	}
+	for (k = 0; k < n; k++)
+	{
+		s_deferredSmokeVerts[base + k] = s_gpu.vertexBuffer[split->startVertex + k];
+	}
+	s_deferredSmokeSplits[s_deferredSmokeSplitCount] = *split;
+	s_deferredSmokeSplits[s_deferredSmokeSplitCount].startVertex = (u16)base;
+	s_deferredSmokeSplitCount++;
+	s_deferredSmokeVertCount += n;
+}
+
+/*
+ * Redraw the captured smoke, AFTER the model pass. Called once per frame from
+ * native_renderer_3ds.c between NativeModelDraw_IssueForWalk and the trailing
+ * N3DS_MergeFlush. Re-points the renderer at the private vertex copy and runs
+ * each split through the ordinary DrawSplit path, so the smoke bins back into
+ * the (now empty) merge as blends -- which already draw depth-test-on /
+ * depth-write-off -- and the caller's MergeFlush drains it onto the command
+ * list on top of the body. Draw order among the smoke splits themselves is
+ * their capture order, matching retail's painter's pass. No-op when nothing
+ * was deferred (the common case: no driver-local smoke on screen).
+ */
+/* Frame-boundary reset, called from MainFrame_ResetDB alongside
+ * GTECapture_Clear -- the authoritative once-per-frame guarantee that captures
+ * never accumulate across frames even if a frame-end flush is ever skipped
+ * (the after-flush reset in DrawDeferredSmoke handles the common case). */
+void NativeGpu_ResetDeferredSmoke(void)
+{
+	s_deferredSmokeSplitCount = 0;
+	s_deferredSmokeVertCount = 0;
+}
+
+void NativeGpu_DrawDeferredSmoke(void)
+{
+	int i;
+
+	if (s_deferredSmokeSplitCount <= 0)
+	{
+		return;
+	}
+	NativeRenderer_UpdateVertexBuffer(s_deferredSmokeVerts, s_deferredSmokeVertCount);
+	for (i = 0; i < s_deferredSmokeSplitCount; i++)
+	{
+		DrawSplit(&s_deferredSmokeSplits[i]);
+	}
+	s_deferredSmokeSplitCount = 0;
+	s_deferredSmokeVertCount = 0;
+}
+#endif /* CTR_NATIVE_GTE_CAPTURE */
+
 //
 // Draws all polygons after AggregatePTAG
 //
@@ -3345,6 +3658,16 @@ void DrawAllSplits()
 
 	for (int i = 1; i <= s_gpu.splitIndex; i++)
 	{
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		/* s42b: hold driver-local exhaust smoke out of the normal pass and copy
+		 * it for the post-model redraw (NativeGpu_DrawDeferredSmoke). Toggle off
+		 * (dumpreq 'smokedefer') falls straight through to the old in-merge draw. */
+		if (s_gpu.splits[i].deferredSmoke && g_dbg_smokeDefer)
+		{
+			NativeGpu_CaptureDeferredSmoke(&s_gpu.splits[i]);
+			continue;
+		}
+#endif
 		DrawSplit(&s_gpu.splits[i]);
 	}
 
@@ -3688,6 +4011,10 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 			GTECapture_MarkOTNode(basePacket); /* gate widened with BeginOTWalk above (s29) */
+			/* s43 skybox tag: set before the direct-emit fast path AND the parse
+			 * path below, so whichever one resolves this node's depth sees it.
+			 * Self-resetting -- 0 for every non-sky node -- so no per-walk clear. */
+			s_skyNodeActive = NativeGpu_IsSkyPacket((uintptr_t)basePacket);
 #endif
 			if (tagLength > 0)
 			{
@@ -4173,6 +4500,17 @@ internal int ProcessFlatPoly(P_TAG *polyTag)
 
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
 		BakeParity_NotePolyFT4(poly);
+#endif
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		/* s42d: Particle.c registered this packet's address as driver-local
+		 * exhaust smoke (NativeGpu_MarkSmokePacket). Route it to its own split,
+		 * held out of the merge for a redraw after the model pass. The one-shot
+		 * is consumed by the AddSplit immediately below. Address-keyed, not a
+		 * code bit -- the code byte has no free bits (0x01 is raw-texture). */
+		if (NativeGpu_IsSmokePacket((uintptr_t)poly))
+		{
+			s_ngpuDeferSmokeNext = 1;
+		}
 #endif
 		AddSplit(semiTrans, true, NativeGpu_TPageOverlapsActiveDrawPage(poly->tpage));
 
