@@ -3411,6 +3411,55 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_skyFirst ? "[CTR-3DS] sky-first: ON (sky under waterfalls)"
 					                             : "[CTR-3DS] sky-first: off (sky in merge, punches through)");
 				}
+				else if (strncmp(word, "uiorder", 7) == 0)
+				{
+					extern int g_dbg_uiOrder;
+
+					/* s44: UI off the depth test. ON routes every UI-band prim out
+					 * of the state bins into one ordered list drawn last, in
+					 * submission order, with all UI pinned to a single depth stamp
+					 * -- painter's order, which is what retail does. OFF restores
+					 * the per-ordinal band stamps and leaves UI in the bins, i.e.
+					 * the old behaviour (256-prim budget, glyph/panel ties resolved
+					 * by whichever state bin each landed in). Both halves move
+					 * together; they are only correct as a pair. */
+					g_dbg_uiOrder ^= 1;
+					N3DS_DebugLog(g_dbg_uiOrder ? "[CTR-3DS] ui-order: ON (UI in submission order, off the depth test)"
+					                            : "[CTR-3DS] ui-order: off (UI in merge bins, depth-ordered)");
+				}
+				else if (strncmp(word, "uipin", 5) == 0)
+				{
+					extern int g_dbg_uiPin;
+
+					/* s44 BISECT (temporary): splits the pin half off the routing
+					 * half so a defect can be attributed to one of them. OFF keeps
+					 * the ordered pass but restores per-ordinal UI stamps. Not a
+					 * supported configuration -- diagnostic only. */
+					g_dbg_uiPin ^= 1;
+					N3DS_DebugLog(g_dbg_uiPin ? "[CTR-3DS] ui-pin: ON (all UI at one stamp)"
+					                          : "[CTR-3DS] ui-pin: off (per-ordinal UI stamps, ordered pass still on)");
+				}
+				else if (strncmp(word, "uilast", 6) == 0)
+				{
+					extern int g_dbg_uiLast;
+
+					/* s44 BISECT (temporary): WHERE the ordered UI pass runs. OFF
+					 * moves it back to the old post-merge slot, which separates
+					 * "content never drawn" from "content painted over by UI drawn
+					 * last". Diagnostic only. */
+					g_dbg_uiLast ^= 1;
+					N3DS_DebugLog(g_dbg_uiLast ? "[CTR-3DS] ui-last: ON (UI pass draws last of all)"
+					                           : "[CTR-3DS] ui-last: off (UI pass draws right after the merge barrier)");
+				}
+				else if (strncmp(word, "uidump", 6) == 0)
+				{
+					extern int g_dbg_uiDump;
+
+					/* s44 bisect instrument: one-shot dump of the ordered UI list's
+					 * contents on the next frame. Needs the SD log on. */
+					g_dbg_uiDump = 1;
+					N3DS_DebugLog("[CTR-3DS] ui-dump: armed (next frame)");
+				}
 				else if (strncmp(word, "bfcull", 6) == 0)
 				{
 					extern int g_dbg_bfCull;

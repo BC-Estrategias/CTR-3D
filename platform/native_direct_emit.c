@@ -481,6 +481,35 @@ internal int NativeDirectEmit_TryNode(const u8 *packet, u32 tagLength)
 	 * has no GrVertex to carry them in. */
 	active = 0;
 #endif
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/*
+	 * s44 ORDERED UI PASS: stand aside for 2D/UI nodes so UI has exactly ONE
+	 * producer.
+	 *
+	 * THE BUG THIS FIXES (owner-confirmed on Azahar by toggling this whole path
+	 * off): the ordered UI list is only correct if appends arrive in OT-WALK
+	 * order, and the two paths that produce UI do not interleave. Direct emit
+	 * writes its vertices DURING the parse, while the packet path's prims are
+	 * replayed later from splits (DrawOTag parses, THEN calls DrawAllSplits).
+	 * So a list fed by both is ordered [all direct-emit UI][all packet UI], not
+	 * walk order -- and menu text (opaque, taken by this path) ended up beneath
+	 * the translucent panel behind it (blended, so packet path), which is the
+	 * inverse of retail.
+	 *
+	 * Declining the node sends it down the packet path, which preserves walk
+	 * order within itself, so ordering is right by construction rather than by
+	 * a sort. Costs ~nothing: UI is a tiny share of a frame's prims, and this
+	 * path exists for heavy opaque WORLD content.
+	 *
+	 * s_gteCaptureSuppress (the sticky "walk is in 2D/UI territory" flag) is the
+	 * same predicate PacketDepth_ResolveXY uses to decide a prim belongs in the
+	 * UI band, so the two cannot disagree about what counts as UI.
+	 */
+	if (g_dbg_uiOrder && GTECapture_LookupSuppressed())
+	{
+		active = 0;
+	}
+#endif
 #else
 	/* PC: the renderer consumes splits, not bins -- measure, never emit. */
 	active = 0;

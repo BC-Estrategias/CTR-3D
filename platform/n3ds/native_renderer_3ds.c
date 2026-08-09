@@ -296,6 +296,157 @@ int g_dbg_skyFirst = 1;
 #define N3DS_SKY_VERT_CAP 2048
 global_variable N3DS_Vertex s_skyVerts[N3DS_SKY_VERT_CAP];
 global_variable int s_skyVertUsed = 0;
+
+/*
+ * s44 ORDERED UI PASS -- UI stops depending on the depth test for its layering.
+ *
+ * THE PROBLEM. Retail orders UI by painter's order and nothing else. Our depth
+ * substrate exists so opaque WORLD content can be reordered into per-state bins
+ * for speed -- a trade UI never needed and cannot pay, because a glyph and the
+ * panel behind it are DIFFERENT STATES, so binning separates exactly the things
+ * whose relative order matters. UI was then given ordering back via a 64-stamp
+ * near band packed 4 prims/stamp = 256 prims, and everything since has been
+ * managing that band's symptoms: the pause-menu flicker (band overflow once HUD
+ * models were routed through it), the glowing tail letters (late glyphs losing to
+ * the panel), character-select ordering, the black box over the level-preview
+ * video. Raising the packing was tried and made hardware WORSE (2026-08-07,
+ * reverted); widening the band is the s39 kart-through-head bug. Both alternatives
+ * are measured dead ends -- see PacketDepth_UiStamp's header in native_gpu.c.
+ *
+ * THE FIX, and it is two changes that are only correct TOGETHER:
+ *
+ *   1. Every UI-band primitive is pinned to ONE stamp (0xFFFF, PacketDepth_UiStamp).
+ *      There is no ordinal, so there is no 256-prim budget, no wrap and no
+ *      saturation -- that whole class of problem stops existing.
+ *   2. UI primitives are routed OUT of the state bins into this single ordered
+ *      list and replayed last, in submission order (N3DS_DrawUiPass).
+ *
+ * Why the pair is indivisible: pinning alone would tie ALL UI at one depth and
+ * leave the tie to arbitrary bin order (catastrophic); routing alone would leave
+ * the old distinct stamps FIGHTING submission order, because a later-submitted
+ * prim carrying a farther stamp fails LEQUAL against an earlier nearer one. With
+ * both, every UI prim carries the same depth, GPU_LEQUAL PASSES ON EQUAL, so the
+ * later draw wins -- which is painter's order, i.e. exactly retail. One toggle
+ * therefore gates both (dumpreq 'uiorder').
+ *
+ * Against the world nothing changes: the pinned stamp is the nearest value in the
+ * band, so UI still beats world content exactly as it did before.
+ *
+ * THE STAMP IS KEPT AS A CLASSIFIER, only its ordering role is retired. Both
+ * downstream "is this UI?" tests still key off it being >= 0xFFC0 -- the stereo
+ * flatten (ctr.v.pica) and the widescreen X ramp (NativeWide_UiShiftX) -- and
+ * 0xFFFF satisfies both. Do not remove the band.
+ *
+ * EXACTLY ONE PRODUCER, and that is load-bearing. This list is only correct if
+ * appends arrive in OT-WALK order, so UI must reach it through a single path:
+ * NativeRenderer_DrawTriangles. The direct-emit fast path stands aside for 2D/UI
+ * nodes (native_direct_emit.c, NativeDirectEmit_TryNode) precisely so that holds.
+ *
+ * DO NOT "fix" a future gap by teaching a second path to append here. The first
+ * version of this change did exactly that and produced an ordering INVERSION,
+ * owner-visible as menu text drawn beneath the translucent panel behind it:
+ * direct emit writes its vertices DURING the parse, while the packet path's are
+ * replayed later from splits (DrawOTag parses, THEN calls DrawAllSplits), so a
+ * list fed by both is ordered [all direct-emit UI][all packet UI] -- not walk
+ * order. Two producers cannot be interleaved here without carrying a per-prim
+ * walk sequence number and sorting on it; declining the node is cheaper and
+ * exact.
+ *
+ * Opaque and blended UI share the list, which is itself a fix: blended UI used to
+ * be emitted after ALL opaque UI (MergeFlush's class ordering), so a translucent
+ * panel submitted BEFORE a glyph still landed on top of it.
+ *
+ * Runs coalesce while state (blend/doubling/atlas) holds and close to a segment
+ * on any change, so a text-heavy menu costs a handful of draws, not one per glyph.
+ * Walk-thread-local and drawn on the same thread in EndScene, same lifecycle as
+ * s_mergeBinVerts.
+ */
+/*
+ * DEFAULT OFF (2026-08-09), pending one unresolved regression -- see "KNOWN
+ * REGRESSION" below. Everything this fixes is real and owner-verified on Azahar
+ * (menu and character-select text layering), but turning it on also loses the
+ * character-select diorama's gradient backdrop, so it ships opt-in until that is
+ * closed. Flip with dumpreq 'uiorder'.
+ *
+ * KNOWN REGRESSION, and the state of the hunt (s44). With this ON, the gradient
+ * behind the rotating character on character select does not draw. Established
+ * by measurement, not argument:
+ *   - The content DOES reach this list. The one-shot 'uidump' shows three large
+ *     slabs at the box (~460x92, seg00-02): two blended layers and one OPAQUE,
+ *     all at the same screen rect. Other segments in the same list draw fine
+ *     (both text strips, the blue selection highlight), so the pass works.
+ *   - dropped=0, so it is not a capacity loss.
+ *   - REFUTED by runtime A/B, each individually: the s43 sky-first accumulator
+ *     ('skyfirst'), backface culling ('bfcull', still 1 when the gradient
+ *     appeared), the depth-stamp pin ('uipin' -- gradient stays missing without
+ *     it, so the pin is innocent), WHERE the pass runs ('uilast' -- moving it
+ *     back to the post-merge slot changes nothing, so it is not an occlusion
+ *     problem), and the direct-emit fast path ('directemit').
+ *
+ * LEADING HYPOTHESIS, untested: those three slabs are one gradient built in
+ * layers. The old bin scheme always drew opaque content before blended content
+ * regardless of submission order, so the opaque slab landed as a BASE and the two
+ * blended layers painted over it. This pass replays true submission order, which
+ * puts the opaque slab LAST -- on top of the layers that make the gradient
+ * visible. If that holds it is the exact mirror of the menu-text bug this change
+ * fixed (where class ordering was wrong and submission order was right), meaning
+ * neither rule alone is correct and the resolution is a design question, not a
+ * patch. Next step: emit the list opaque-first and see whether the gradient
+ * returns.
+ */
+int g_dbg_uiOrder = 0;
+/*
+ * s44 BISECT TOGGLE (temporary, dumpreq 'uipin'). The change above is two halves
+ * -- the depth-stamp PIN (PacketDepth_UiStamp, native_gpu.c) and the ordered
+ * ROUTING (this file) -- and they normally move together because neither is
+ * correct alone. This splits them so a defect can be attributed to one half
+ * without rebuilding twice: 'uipin' off leaves UI on its old per-ordinal stamps
+ * while still routing it through the ordered pass.
+ *
+ * Diagnostic only. Any combination other than both-ON is a known-broken state
+ * (see the header above for why), so this is not a supported configuration --
+ * it exists to answer "which half did it?" and should be removed once the
+ * character-select gradient regression is attributed.
+ */
+int g_dbg_uiPin = 1;
+/*
+ * s44 BISECT TOGGLE 2 (temporary, dumpreq 'uilast'). WHERE the ordered UI pass
+ * runs. 1 = last of all (after the model pass and deferred smoke), which is the
+ * shipped behaviour. 0 = immediately after the merge barrier, i.e. the slot UI
+ * used to occupy when it lived in the bins.
+ *
+ * Exists to answer one binary question about the character-select gradient
+ * regression: is that content NEVER DRAWN, or drawn and then PAINTED OVER by UI
+ * that now comes last? Moving the pass earlier separates those without another
+ * round of reading code. Diagnostic only; remove once attributed.
+ */
+int g_dbg_uiLast = 1;
+/* Multiple of 3. A text-heavy menu (track lists, high scores) is the peak
+ * producer; overflow closes the open run early and keeps going, so the cost of
+ * a small buffer is extra draws, never dropped or misordered UI. */
+#define N3DS_UIORD_RUN_CAP 3072
+#define N3DS_UIORD_MAX_SEGS 512
+global_variable N3DS_Vertex s_uiOrdRunVerts[N3DS_UIORD_RUN_CAP];
+global_variable int s_uiOrdRunUsed = 0;
+global_variable int s_uiOrdRunBlend = -1;
+global_variable int s_uiOrdRunDoubling = -1;
+global_variable int s_uiOrdRunAtlas = -1;
+global_variable N3DS_MergeSegment s_uiOrdSegs[N3DS_UIORD_MAX_SEGS];
+global_variable int s_uiOrdSegCount = 0;
+/* s44 bisect instrument: screen-space bbox per segment (x0,y0,x1,y1), filled at
+ * run close. Identifying WHICH on-screen shape a segment is has been the missing
+ * fact in this whole investigation -- a big box-filling quad is the gradient, a
+ * cluster of small ones is the portrait frames. Diagnostic only. */
+global_variable short s_uiOrdSegBox[N3DS_UIORD_MAX_SEGS][4];
+/* Prims that could not be recorded (segment list full). Reported by the stats
+ * block: silently dropping UI would read as "covered everything" when it did not. */
+global_variable u32 s_uiOrdDropped = 0;
+/* High-water UI prims in one frame -- the replacement for [PKTDEPTH] uiMax, which
+ * measured a budget that no longer exists. Kept because it is the number that says
+ * whether this list is near ITS capacity. */
+global_variable u32 s_uiOrdPrimsMax = 0;
+global_variable u32 s_uiOrdPrims = 0;
+
 /* Diagnostics for the stats block: draws emitted by the merge path split
  * by class, plus the events that cost extra draws or a mid-frame barrier. */
 global_variable u32 s_mergeEmitOpaque = 0;
@@ -2467,6 +2618,182 @@ internal void N3DS_DrawSkyPass(void)
 	s_skyVertUsed = 0;
 }
 
+/*
+ * s44 ordered UI pass (see the s_uiOrd* block near the top for the whole design).
+ *
+ * Closes the open UI run into a recorded segment: vertices to the frame VBO now,
+ * the draw itself deferred to N3DS_DrawUiPass so submission order is replayed
+ * intact at the end of the frame. Same shape as N3DS_MergeCloseBlendRun, minus
+ * the capacity escalation -- a mid-frame barrier is exactly what this pass must
+ * NOT do, since drawing part of the UI early would put it under world content.
+ * A full segment list therefore drops (counted) rather than reordering.
+ */
+internal void N3DS_UiOrderCloseRun(void)
+{
+	int baseVertex;
+
+	if (s_uiOrdRunUsed <= 0)
+	{
+		s_uiOrdRunAtlas = -1;
+		return;
+	}
+	if (s_uiOrdSegCount >= N3DS_UIORD_MAX_SEGS)
+	{
+		s_uiOrdDropped += (u32)(s_uiOrdRunUsed / 3);
+		s_uiOrdRunUsed = 0;
+		s_uiOrdRunAtlas = -1;
+		return;
+	}
+	baseVertex = N3DS_C3DAppendVertices(s_uiOrdRunVerts, s_uiOrdRunUsed);
+	if (baseVertex < 0)
+	{
+		s_uiOrdDropped += (u32)(s_uiOrdRunUsed / 3);
+	}
+	else
+	{
+		N3DS_MergeSegment *seg = &s_uiOrdSegs[s_uiOrdSegCount];
+		short x0 = 32767, y0 = 32767, x1 = -32768, y1 = -32768;
+		int k;
+
+		seg->blendMode = (u8)s_uiOrdRunBlend;
+		seg->doubling = (u8)s_uiOrdRunDoubling;
+		seg->atlas = (u8)s_uiOrdRunAtlas;
+		seg->baseVertex = baseVertex;
+		seg->vertCount = s_uiOrdRunUsed;
+
+		/* s44 instrument: bbox of what this segment actually covers on screen. */
+		for (k = 0; k < s_uiOrdRunUsed; k++)
+		{
+			const short vx = (short)s_uiOrdRunVerts[k].x;
+			const short vy = (short)s_uiOrdRunVerts[k].y;
+
+			if (vx < x0) { x0 = vx; }
+			if (vy < y0) { y0 = vy; }
+			if (vx > x1) { x1 = vx; }
+			if (vy > y1) { y1 = vy; }
+		}
+		s_uiOrdSegBox[s_uiOrdSegCount][0] = x0;
+		s_uiOrdSegBox[s_uiOrdSegCount][1] = y0;
+		s_uiOrdSegBox[s_uiOrdSegCount][2] = x1;
+		s_uiOrdSegBox[s_uiOrdSegCount][3] = y1;
+		s_uiOrdSegCount++;
+	}
+	s_uiOrdRunUsed = 0;
+	s_uiOrdRunAtlas = -1;
+}
+
+/*
+ * Reserve room for one UI triangle and return where to write its 3 vertices,
+ * or NULL if it could not be recorded. Coalesces into the open run while
+ * (blend, doubling, atlas) holds; any change closes the run first, which is what
+ * keeps a text-heavy menu at a handful of draws instead of one per glyph.
+ *
+ * Called by BOTH UI producers -- NativeRenderer_DrawTriangles and the direct-emit
+ * fast path -- during the OT walk, so appends arrive in parse order and the list
+ * IS submission order.
+ */
+internal N3DS_Vertex *N3DS_UiOrderAppend(int blendMode, int doubling, int atlas)
+{
+	N3DS_Vertex *dst;
+
+	if ((atlas != s_uiOrdRunAtlas) || (blendMode != s_uiOrdRunBlend) || (doubling != s_uiOrdRunDoubling) ||
+	    ((s_uiOrdRunUsed + 3) > N3DS_UIORD_RUN_CAP))
+	{
+		N3DS_UiOrderCloseRun();
+		s_uiOrdRunBlend = blendMode;
+		s_uiOrdRunDoubling = doubling;
+		s_uiOrdRunAtlas = atlas;
+	}
+	if ((s_uiOrdRunUsed + 3) > N3DS_UIORD_RUN_CAP)
+	{
+		/* Run buffer smaller than one triangle cannot happen (cap is a
+		 * multiple of 3 >= 3); the close above always empties it. Guard
+		 * anyway so a future cap change cannot overrun the buffer. */
+		s_uiOrdDropped++;
+		return NULL;
+	}
+	dst = &s_uiOrdRunVerts[s_uiOrdRunUsed];
+	s_uiOrdRunUsed += 3;
+	s_uiOrdPrims++;
+	return dst;
+}
+
+/*
+ * Draw the frame's UI, in submission order, LAST -- after the merge barrier, the
+ * model pass and the deferred smoke, so nothing can paint over it. Every prim
+ * carries the same pinned stamp, so GPU_LEQUAL passes on equal and the later
+ * draw wins: painter's order, which is what retail does and what the depth-test
+ * ordering could never reliably reproduce.
+ *
+ * Emits through N3DS_MergeEmit so the stereo journal records these draws too and
+ * the right-eye replay reissues them identically. lastDoubling = -1 makes the
+ * pass self-contained against whatever state the model/smoke passes left.
+ */
+/* s44 bisect instrument (dumpreq 'uidump'): one-shot dump of what the ordered UI
+ * list actually holds on the current screen. Answers the question every theory so
+ * far has guessed at -- whether a given piece of content is classified as UI and
+ * reaches this list at all. Untextured segments are called out separately because
+ * the character-select gradient is untextured gouraud, so untexVerts==0 means it
+ * never entered the list and the loss is upstream of this pass. */
+int g_dbg_uiDump = 0;
+
+internal void N3DS_DrawUiPass(void)
+{
+	int lastDoubling = -1;
+	int i;
+
+	N3DS_UiOrderCloseRun(); /* the frame's last run is still open */
+
+	if (g_dbg_uiDump)
+	{
+		char line[192];
+		int untexSegs = 0, untexVerts = 0, totalVerts = 0;
+
+		for (i = 0; i < s_uiOrdSegCount; i++)
+		{
+			totalVerts += s_uiOrdSegs[i].vertCount;
+			if ((int)s_uiOrdSegs[i].atlas == N3DS_WHITE_ATLAS)
+			{
+				untexSegs++;
+				untexVerts += s_uiOrdSegs[i].vertCount;
+			}
+		}
+		snprintf(line, sizeof(line), "[UIDUMP] segs=%d verts=%d untexSegs=%d untexVerts=%d", s_uiOrdSegCount, totalVerts, untexSegs,
+		         untexVerts);
+		N3DS_DebugLog(line);
+		for (i = 0; i < s_uiOrdSegCount; i++)
+		{
+			const int w = s_uiOrdSegBox[i][2] - s_uiOrdSegBox[i][0];
+			const int h = s_uiOrdSegBox[i][3] - s_uiOrdSegBox[i][1];
+
+			/* Every segment, in draw order: the question is what is emitted AFTER
+			 * the big diorama slabs, since that is what can cover them. */
+			snprintf(line, sizeof(line), "[UIDUMP]  seg%02d atlas=%d blend=%d dbl=%d verts=%d box=%d,%d..%d,%d (%dx%d)", i,
+			         (int)s_uiOrdSegs[i].atlas, (int)s_uiOrdSegs[i].blendMode, (int)s_uiOrdSegs[i].doubling,
+			         s_uiOrdSegs[i].vertCount, s_uiOrdSegBox[i][0], s_uiOrdSegBox[i][1], s_uiOrdSegBox[i][2], s_uiOrdSegBox[i][3], w,
+			         h);
+			N3DS_DebugLog(line);
+		}
+		g_dbg_uiDump = 0; /* one-shot */
+	}
+
+	if (s_uiOrdPrims > s_uiOrdPrimsMax)
+	{
+		s_uiOrdPrimsMax = s_uiOrdPrims;
+	}
+	for (i = 0; i < s_uiOrdSegCount; i++)
+	{
+		const N3DS_MergeSegment *seg = &s_uiOrdSegs[i];
+
+		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
+	}
+	s_uiOrdSegCount = 0;
+	s_uiOrdPrims = 0;
+	/* Leave the depth-write memo unknown: this pass may have emitted blended
+	 * UI (write off), and the next frame's first consumer must reassert. */
+	s_mergeDepthWriteState = -1;
+}
+
 /* A bin hit capacity mid-frame: spill it as one opaque segment (order-free,
  * so WHERE it lands in the segment list is irrelevant) and keep binning. */
 internal void N3DS_MergeSpillBin(int bin)
@@ -3013,6 +3340,14 @@ void NativeRenderer_BeginScene(void)
 	s_skyVertUsed = 0; /* s43: sky accumulator shares the bins' frame lifecycle */
 	s_mergeOpaqueSegCount = 0;
 	s_mergeBlendSegCount = 0;
+	/* s44: same reason as the bins above -- the VBO cursor just reset, so any
+	 * baseVertex a skipped EndScene stranded must not survive into this frame. */
+	s_uiOrdSegCount = 0;
+	s_uiOrdRunUsed = 0;
+	s_uiOrdRunAtlas = -1;
+	s_uiOrdRunBlend = -1;
+	s_uiOrdRunDoubling = -1;
+	s_uiOrdPrims = 0;
 #endif
 }
 
@@ -3105,6 +3440,15 @@ void NativeRenderer_EndScene(void)
 #endif
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_MERGE_FLUSH);
 
+#ifdef CTR_NATIVE_DRAW_MERGE
+	/* s44 bisect ('uilast' off): draw the UI pass HERE, in the slot UI occupied
+	 * when it still lived in the merge bins, instead of last. See g_dbg_uiLast. */
+	if (!g_dbg_uiLast)
+	{
+		N3DS_DrawUiPass();
+	}
+#endif
+
 #if defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
 	/*
 	 * PICA-native model instances (rung 2, docs/NATIVE_MODEL_RENDERER_DESIGN.md).
@@ -3169,6 +3513,21 @@ void NativeRenderer_EndScene(void)
 		NativeGpu_DrawDeferredSmoke();
 		s_mergeDepthWriteState = -1;
 		N3DS_MergeFlush();
+	}
+#endif
+
+#ifdef CTR_NATIVE_DRAW_MERGE
+	/*
+	 * s44: the frame's UI, in submission order, LAST -- after the merge barrier,
+	 * the model pass and the deferred smoke, so nothing can paint over it. This
+	 * is the point of the whole change: UI layering is now painter's order (what
+	 * retail does) instead of an artefact of which state bin each glyph and panel
+	 * happened to land in. No-op when the toggle is off (nothing was routed here,
+	 * so the list is empty and UI stayed in the bins). dumpreq 'uiorder'.
+	 */
+	if (g_dbg_uiLast)
+	{
+		N3DS_DrawUiPass();
 	}
 #endif
 
@@ -3600,6 +3959,22 @@ void NativeRenderer_SwapWindow(void)
 			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] merge active=%d emitOpaque=%lu emitBlend=%lu spills=%lu escalations=%lu",
 			         s_mergeActive, (unsigned long)s_mergeEmitOpaque, (unsigned long)s_mergeEmitBlend,
 			         (unsigned long)s_mergeBinSpills, (unsigned long)s_mergeEscalations);
+			N3DS_DebugLog(cacheLine);
+
+			/*
+			 * s44 ordered UI pass. primsMax is the replacement for [PKTDEPTH]
+			 * uiMax, which measured a 256-prim budget that no longer exists --
+			 * this list's capacity is the live one. dropped MUST stay 0: it counts
+			 * UI that could not be recorded (segment list full), and silently
+			 * losing UI would read as "everything drew" when it did not.
+			 */
+			if (g_dbg_statsVerbose)
+			{
+				printf("uiord  %-3s primsMax %-6lu segs %-4d dropped %-6lu\n", g_dbg_uiOrder ? "ON" : "off",
+				       (unsigned long)s_uiOrdPrimsMax, N3DS_UIORD_MAX_SEGS, (unsigned long)s_uiOrdDropped);
+			}
+			snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] uiorder active=%d primsMax=%lu maxSegs=%d dropped=%lu",
+			         g_dbg_uiOrder, (unsigned long)s_uiOrdPrimsMax, N3DS_UIORD_MAX_SEGS, (unsigned long)s_uiOrdDropped);
 			N3DS_DebugLog(cacheLine);
 
 			/*
@@ -4748,6 +5123,39 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 		}
 
 #ifdef CTR_NATIVE_DRAW_MERGE
+		/*
+		 * s44: UI leaves the state bins HERE, before the opaque branch below, so
+		 * that blended UI is caught by the same test (the opaque branch takes
+		 * BM_NONE only) and keeps its true order against opaque UI. Replayed in
+		 * submission order at the end of the frame -- see the s_uiOrd* block.
+		 *
+		 * Gated on packet depth being live: with it off the stamp is an emit
+		 * ordinal, not a depth, and the band test would misfire -- the same gate
+		 * the widescreen ramp and the stereo mask already use.
+		 */
+		{
+			extern int g_dbg_packetDepth;
+
+			if (s_mergeActive && g_dbg_uiOrder && g_dbg_packetDepth && (triVerts[0].emitOrdinal >= 0xFFC0u))
+			{
+				N3DS_Vertex *uiDst = N3DS_UiOrderAppend(s_currentBlendMode, untextured ? 0 : 1, atlasIdx);
+
+				if (uiDst != NULL)
+				{
+					if (perfScopes)
+					{
+						NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+					}
+					N3DS_ConvertTriangleVerts(uiDst, triVerts, untextured, cellX, cellY, pixelBaseU, pixelBaseV, originU, originV);
+					if (perfScopes)
+					{
+						NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+					}
+				}
+				continue;
+			}
+		}
+
 		if (s_mergeActive && (s_currentBlendMode == 0 /* BM_NONE */))
 		{
 			/* Opaque under merge: no run, no order -- straight into the

@@ -1233,8 +1233,44 @@ internal void PacketDepth_BeginWalk(void)
  */
 internal u16 PacketDepth_UiStamp(u32 uiOrdinal)
 {
-	u32 slot = uiOrdinal >> PKTDEPTH_UI_ORD_SHIFT;
+	u32 slot;
 
+#if defined(__3DS__)
+	/*
+	 * s44 ORDERED UI PASS: every UI primitive gets the SAME stamp, the nearest
+	 * value in the band. The ordinal -- and with it the 256-prim budget, the
+	 * wrap, and the saturation below -- stops mattering, because UI no longer
+	 * depends on the depth test for its layering at all: it is routed out of the
+	 * state bins into one ordered list and replayed in submission order at the
+	 * end of the frame (N3DS_DrawUiPass, native_renderer_3ds.c, where the whole
+	 * design is written up).
+	 *
+	 * These two halves are only correct TOGETHER. Pinning alone would tie all UI
+	 * at one depth and hand the tie to arbitrary bin order; the ordered pass
+	 * alone would leave these stamps fighting submission order, since a later
+	 * prim carrying a farther stamp fails LEQUAL against an earlier nearer one.
+	 * With both, GPU_LEQUAL passes on equal and the later draw wins -- painter's
+	 * order, which is what retail does. One toggle gates both (dumpreq 'uiorder').
+	 *
+	 * The band is KEPT as a classifier: the stereo flatten (ctr.v.pica) and the
+	 * widescreen X ramp (NativeWide_UiShiftX) both ask "is this stamp >= 0xFFC0?"
+	 * and 0xFFFF answers yes. Only the ordering role is retired.
+	 *
+	 * 3DS-only by construction: the merge bins that made UI order state-dependent
+	 * exist only there, and PC's packet depth must stay byte-identical.
+	 */
+	{
+		extern int g_dbg_uiOrder;
+		extern int g_dbg_uiPin; /* s44 bisect: pin half, split off from routing */
+
+		if (g_dbg_uiOrder && g_dbg_uiPin)
+		{
+			return (u16)0xFFFF;
+		}
+	}
+#endif
+
+	slot = uiOrdinal >> PKTDEPTH_UI_ORD_SHIFT;
 	if (slot > (u32)(PKTDEPTH_UI_BAND - 1))
 	{
 		slot = (u32)(PKTDEPTH_UI_BAND - 1);
