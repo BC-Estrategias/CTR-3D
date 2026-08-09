@@ -3358,6 +3358,19 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_renderThread ? "[CTR-3DS] render worker routing: ON"
 					                                 : "[CTR-3DS] render worker routing: OFF (sync on main thread)");
 				}
+				else if (strncmp(word, "framepipe", 9) == 0)
+				{
+					extern int g_dbg_framePipeline;
+
+					/* s36 present-pipelining: RenderVSYNC's DrawSync fences only
+					 * on the OT walk, letting the present float and overlap the
+					 * next frame's build. No transition fence needed -- both
+					 * modes are correct waits, so a flip is safe mid-race and the
+					 * next DrawSync self-corrects. Needs the render worker up. */
+					g_dbg_framePipeline ^= 1;
+					N3DS_DebugLog(g_dbg_framePipeline ? "[CTR-3DS] framepipe: ON (build next frame; fence on walk, not present)"
+					                                  : "[CTR-3DS] framepipe: off (DrawSync waits for present)");
+				}
 #ifdef CTR_NATIVE_DIRECT_EMIT
 				else if (strncmp(word, "directemit", 10) == 0)
 				{
@@ -3892,6 +3905,23 @@ unsigned int N3DS_ReadButtons(void)
 		g_dbg_frameSync ^= 1;
 		N3DS_DebugLog(g_dbg_frameSync ? "[CTR-3DS] framesync: ON (FrameBegin waits for hw vblank)"
 		                              : "[CTR-3DS] framesync: OFF (begin immediately)");
+	}
+
+	/* SELECT held + TOUCH: present-pipelining A/B (g_dbg_framePipeline, defined
+	 * in native_render_queue.c). This is the s36 "build the next frame instead
+	 * of waiting" fix -- the game thread's frame fence blocks on the OT walk
+	 * only, letting the vblank-gated present overlap the next frame's build.
+	 * Mid-race by design and a button by necessity: the two things it trades --
+	 * input lag and tearing -- can only be judged live, and a dumpreq file is
+	 * unplaceable while the game holds the SD card. SELECT+TOUCH has been free
+	 * since s36 (the SD-log chord moved to SELECT+R). */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_TOUCH))
+	{
+		extern int g_dbg_framePipeline;
+
+		g_dbg_framePipeline ^= 1;
+		N3DS_DebugLog(g_dbg_framePipeline ? "[CTR-3DS] framepipe: ON (build next frame; fence on walk, not present)"
+		                                  : "[CTR-3DS] framepipe: off (DrawSync waits for present)");
 	}
 
 	/* SELECT held + R: SD logging on/off (g_dbg_sdLog, defined by the log

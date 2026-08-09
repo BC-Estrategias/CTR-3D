@@ -83,10 +83,26 @@ int DrawSync(int mode)
 
 	if (NativeRenderQueue_Route())
 	{
-		struct NativeRenderJob job;
+		if (g_dbg_framePipeline)
+		{
+			// s36 present-pipelining A/B: block only until the last OT walk
+			// finishes, NOT the trailing END_FRAME present. The walk is what
+			// frees the double-buffered OT/primMem this fence guards and what
+			// bool_DrawOTag_InProgress (cleared by the callback below) tracks;
+			// the present reads the color target citro3d flips under its own
+			// backpressure, so the game thread need never wait on it -- it
+			// overlaps the next frame's build instead. Skipping the DRAW_SYNC
+			// job loses nothing on 3DS: its exec body (UpdateVRAM/framebuffer
+			// readback) is a no-op there and the walk already flushed splits.
+			NativeRenderQueue_FenceWalk();
+		}
+		else
+		{
+			struct NativeRenderJob job;
 
-		NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_DRAW_SYNC);
-		NativeRenderQueue_RunSync(&job);
+			NativeRenderQueue_JobInit(&job, NATIVE_RENDER_JOB_DRAW_SYNC);
+			NativeRenderQueue_RunSync(&job);
+		}
 	}
 	else
 	{

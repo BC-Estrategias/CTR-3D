@@ -106,6 +106,26 @@ unsigned int NativeRenderQueue_Post(const struct NativeRenderJob *job);
 /* Wait until the given ticket has completed. */
 void NativeRenderQueue_Wait(unsigned int ticket);
 
+/*
+ * Present-pipelining fence (s36). Block only until the LAST OT walk (DRAW_OTAG)
+ * has completed, letting a trailing END_FRAME present float on the worker. This
+ * is the narrower fence the game-frame stall wants: the walk is what frees the
+ * double-buffered OT/primMem and what bool_DrawOTag_InProgress tracks, whereas
+ * the present only reads the color target citro3d flips under its own
+ * backpressure -- so the game thread need never wait on it. Gated at the call
+ * site by g_dbg_framePipeline; DrawSync uses it in place of a full queue drain
+ * when the toggle is on. Real only on the render-thread build; a no-op stub
+ * otherwise. Safe from anywhere (no-op when the queue is inactive or on the
+ * worker itself), like NativeRenderQueue_Fence.
+ */
+void NativeRenderQueue_FenceWalk(void);
+
+/* Runtime A/B for the present-pipelining fence above (dumpreq 'framepipe',
+ * hardware chord SELECT+TOUCH). 0 = today's behavior (DrawSync drains the whole
+ * queue, present included); 1 = walk-only fence. Default 0: owner opts in and
+ * judges the two risks -- input lag and tearing -- by feel. */
+extern int g_dbg_framePipeline;
+
 static inline void NativeRenderQueue_RunSync(const struct NativeRenderJob *job)
 {
 	NativeRenderQueue_Wait(NativeRenderQueue_Post(job));
