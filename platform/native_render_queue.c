@@ -22,11 +22,6 @@
  * (NativeRenderQueue_Route). */
 int g_dbg_renderThread = 1;
 
-/* Present-pipelining A/B (dumpreq 'framepipe', chord SELECT+TOUCH). See the
- * header and DrawSync (native_libgpu.c). Defined unconditionally so the dead
- * routed branch on non-render-thread builds still links. Default OFF. */
-int g_dbg_framePipeline = 0;
-
 #if defined(__3DS__) && CTR_NATIVE_RENDER_THREAD
 
 #include "n3ds/n3ds_render_thread.h"
@@ -35,9 +30,8 @@ int g_dbg_framePipeline = 0;
 #define NATIVE_RENDER_QUEUE_RING 64
 
 static struct NativeRenderJob s_jobs[NATIVE_RENDER_QUEUE_RING];
-static unsigned int s_postedCount;        /* queue-lock guarded */
-static unsigned int s_completedCount;     /* queue-lock guarded */
-static unsigned int s_lastDrawOtagTicket; /* queue-lock guarded: ticket of the most recent DRAW_OTAG post, for FenceWalk */
+static unsigned int s_postedCount;    /* queue-lock guarded */
+static unsigned int s_completedCount; /* queue-lock guarded */
 static int s_workerUp;
 static int s_routeWasActive;
 
@@ -185,12 +179,6 @@ unsigned int NativeRenderQueue_Post(const struct NativeRenderJob *job)
 	s_jobs[s_postedCount % NATIVE_RENDER_QUEUE_RING] = *job;
 	s_postedCount++;
 	ticket = s_postedCount;
-	if (job->kind == NATIVE_RENDER_JOB_DRAW_OTAG)
-	{
-		/* Latch the walk's ticket so FenceWalk can wait for THIS frame's walk
-		 * without draining the END_FRAME present that follows it. */
-		s_lastDrawOtagTicket = ticket;
-	}
 	N3DS_RenderQueueUnlock();
 
 	N3DS_RenderWorkSignal();
@@ -227,27 +215,6 @@ void NativeRenderQueue_Fence(void)
 
 	N3DS_RenderQueueLock();
 	ticket = s_postedCount;
-	N3DS_RenderQueueUnlock();
-
-	NativeRenderQueue_Wait(ticket);
-}
-
-void NativeRenderQueue_FenceWalk(void)
-{
-	unsigned int ticket;
-
-	if (!s_workerUp || N3DS_RenderWorkerIsSelf())
-	{
-		return;
-	}
-
-	/* Wait for the last posted walk, not the queue tail. A trailing END_FRAME
-	 * present (posted after DRAW_OTAG by Platform_EndFrame) is deliberately left
-	 * in flight; the worker still runs it in FIFO order before the next walk, so
-	 * ordering and visuals are unchanged -- only the game thread stops blocking
-	 * on it. If no walk has posted yet, ticket 0 completes immediately. */
-	N3DS_RenderQueueLock();
-	ticket = s_lastDrawOtagTicket;
 	N3DS_RenderQueueUnlock();
 
 	NativeRenderQueue_Wait(ticket);
@@ -311,10 +278,6 @@ unsigned int NativeRenderQueue_Post(const struct NativeRenderJob *job)
 void NativeRenderQueue_Wait(unsigned int ticket)
 {
 	(void)ticket;
-}
-
-void NativeRenderQueue_FenceWalk(void)
-{
 }
 
 #endif
