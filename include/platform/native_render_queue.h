@@ -121,7 +121,7 @@ void NativeRenderQueue_Wait(unsigned int ticket);
 void NativeRenderQueue_FenceWalk(void);
 
 /* Runtime A/B for the present-pipelining fence above (dumpreq 'framepipe',
- * hardware chord SELECT+TOUCH). 0 = today's behavior (DrawSync drains the whole
+ * hardware chord SELECT+L). 0 = today's behavior (DrawSync drains the whole
  * queue, present included); 1 = walk-only fence. Default 0: owner opts in and
  * judges the two risks -- input lag and tearing -- by feel. */
 extern int g_dbg_framePipeline;

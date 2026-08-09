@@ -3362,11 +3362,12 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_framePipeline;
 
-					/* s36 present-pipelining: RenderVSYNC's DrawSync fences only
-					 * on the OT walk, letting the present float and overlap the
-					 * next frame's build. No transition fence needed -- both
-					 * modes are correct waits, so a flip is safe mid-race and the
-					 * next DrawSync self-corrects. Needs the render worker up. */
+					/* s36 present-pipelining (hardware chord SELECT+L):
+					 * RenderVSYNC's DrawSync fences only on the OT walk, letting
+					 * the present float and overlap the next frame's build. No
+					 * transition fence needed -- both modes are correct waits, so
+					 * a flip is safe mid-race and the next DrawSync self-corrects.
+					 * Needs the render worker up. */
 					g_dbg_framePipeline ^= 1;
 					N3DS_DebugLog(g_dbg_framePipeline ? "[CTR-3DS] framepipe: ON (build next frame; fence on walk, not present)"
 					                                  : "[CTR-3DS] framepipe: off (DrawSync waits for present)");
@@ -3907,15 +3908,21 @@ unsigned int N3DS_ReadButtons(void)
 		                              : "[CTR-3DS] framesync: OFF (begin immediately)");
 	}
 
-	/* SELECT held + TOUCH: present-pipelining A/B (g_dbg_framePipeline, defined
-	 * in native_render_queue.c). This is the s36 "build the next frame instead
-	 * of waiting" fix -- the game thread's frame fence blocks on the OT walk
-	 * only, letting the vblank-gated present overlap the next frame's build.
-	 * Mid-race by design and a button by necessity: the two things it trades --
-	 * input lag and tearing -- can only be judged live, and a dumpreq file is
-	 * unplaceable while the game holds the SD card. SELECT+TOUCH has been free
-	 * since s36 (the SD-log chord moved to SELECT+R). */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_TOUCH))
+	/* SELECT held + L: present-pipelining A/B (g_dbg_framePipeline, defined in
+	 * native_render_queue.c). This is the s36 "build the next frame instead of
+	 * waiting" fix -- the game thread's frame fence blocks on the OT walk only,
+	 * letting the vblank-gated present overlap the next frame's build. Mid-race
+	 * by design and a button by necessity: the two things it trades -- input lag
+	 * and tearing -- can only be judged live, and a dumpreq file is unplaceable
+	 * while the game holds the SD card.
+	 *
+	 * Moved off SELECT+TOUCH (s36b): the touchscreen edge missed most presses in
+	 * an owner A/B sitting -- only 1 of several registered -- so the A/B was
+	 * silently stuck ON. L is a free shoulder (R is sdlog, ZL is depthtest, ZR
+	 * free) and gives a clean discrete edge. Like every chord here it also fires
+	 * its in-game action (L1) for the one frame it's held; harmless as a brief
+	 * tap, same as SELECT+B firing the brake. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_L))
 	{
 		extern int g_dbg_framePipeline;
 
