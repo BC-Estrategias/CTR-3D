@@ -3430,6 +3430,23 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_smokeDefer ? "[CTR-3DS] deferred smoke: ON (over own kart)"
 					                               : "[CTR-3DS] deferred smoke: off (in-merge, old look)");
 				}
+				else if (strncmp(word, "stpass1", 7) == 0)
+				{
+					extern int g_dbg_stPass1;
+
+					/* s46 minimap-box probe, native_gpu.c DrawSplit: skip the
+					 * blending-off opaque-body pass of two-pass semi-trans draws. */
+					g_dbg_stPass1 ^= 1;
+					N3DS_DebugLog(g_dbg_stPass1 ? "[CTR-3DS] semi-trans pass 1: ON" : "[CTR-3DS] semi-trans pass 1: SKIPPED");
+				}
+				else if (strncmp(word, "stpass2", 7) == 0)
+				{
+					extern int g_dbg_stPass2;
+
+					/* s46 minimap-box probe: skip the blended STP-texel pass. */
+					g_dbg_stPass2 ^= 1;
+					N3DS_DebugLog(g_dbg_stPass2 ? "[CTR-3DS] semi-trans pass 2: ON" : "[CTR-3DS] semi-trans pass 2: SKIPPED");
+				}
 				else if (strncmp(word, "skyfar", 6) == 0)
 				{
 					extern int g_dbg_skyFar;

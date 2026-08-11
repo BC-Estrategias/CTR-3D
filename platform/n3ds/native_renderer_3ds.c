@@ -2610,6 +2610,16 @@ internal void N3DS_DrawSkyPass(void)
 	{
 		return;
 	}
+	/* s46 (the minimap black box, owner-bisected to s43): the walk's LAST blend
+	 * run can still be open when EndScene reaches this pass -- in-race that run
+	 * is the HUD map sheet's blended half, because UI is the tail of the walk.
+	 * N3DS_MergeEmit below stamps s_runBlendMode = 0 as a side effect, and
+	 * N3DS_MergeCloseBlendRun reads s_runBlendMode at CLOSE time -- so emitting
+	 * the sky over an open run re-labels that run opaque, and its STP texels
+	 * replay solid black. Both heal legs of the A/B (skyfirst 0, directemit 0)
+	 * were really "the sky pass didn't run". Close the run first, so it is
+	 * recorded under the state it actually accumulated with. */
+	N3DS_MergeCloseBlendRun(N3DS_BLEND_CLOSE_STATE);
 	baseVertex = N3DS_C3DAppendVertices(s_skyVerts, s_skyVertUsed);
 	if (baseVertex >= 0)
 	{

@@ -1389,6 +1389,16 @@ int g_dbg_smokeDefer = 1;
  * range table and resolver branch it gates live in that guarded block. */
 int g_dbg_skyFar = 1;
 
+/* s46 minimap-box probe (dumpreq 'stpass1' / 'stpass2'): skip pass 1 or pass 2
+ * of every textured-semi-trans two-pass split (DrawSplit below). Whichever skip
+ * removes the minimap's black box names the guilty pass -- PASS1 is the
+ * opaque-body view drawn blending-off (a box there means 0x0000/STP texels are
+ * leaking into the PASS1 view on this platform), PASS2 is the blended STP view
+ * (a box there means the blend state is wrong at replay time). Diagnostic
+ * only; both default ON = unchanged output, and PC has no toggle for them. */
+int g_dbg_stPass1 = 1;
+int g_dbg_stPass2 = 1;
+
 /* s42d tag: which POLY_FT4 packets are driver-local exhaust smoke, identified
  * by PACKET ADDRESS (unique per frame) -- NOT a code-byte bit. Every bit of a
  * PS1 primitive code is a real GPU flag; s42c set bit 0x01, which is the
@@ -3676,13 +3686,19 @@ void DrawSplit(const GPUDrawSplit *split)
 		// PS1 textured ABE only blends texels whose sampled 16-bit color has STP
 		// set; non-STP texels remain opaque. Native split state is per draw,
 		// so draw this primitive-sized split twice with shader-side STP masks.
-		NativeRenderer_SetBlendMode(BM_NONE);
-		NativeRenderer_SetPSXTextureSemiTransPass(1);
-		NativeRenderer_DrawTriangles(split->startVertex, split->numVerts / 3);
+		if (g_dbg_stPass1)
+		{
+			NativeRenderer_SetBlendMode(BM_NONE);
+			NativeRenderer_SetPSXTextureSemiTransPass(1);
+			NativeRenderer_DrawTriangles(split->startVertex, split->numVerts / 3);
+		}
 
-		NativeRenderer_SetBlendMode(split->blendMode);
-		NativeRenderer_SetPSXTextureSemiTransPass(2);
-		NativeRenderer_DrawTriangles(split->startVertex, split->numVerts / 3);
+		if (g_dbg_stPass2)
+		{
+			NativeRenderer_SetBlendMode(split->blendMode);
+			NativeRenderer_SetPSXTextureSemiTransPass(2);
+			NativeRenderer_DrawTriangles(split->startVertex, split->numVerts / 3);
+		}
 
 		NativeRenderer_SetPSXTextureSemiTransPass(0);
 	}
@@ -4181,7 +4197,11 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 			GTECapture_MarkOTNode(basePacket); /* gate widened with BeginOTWalk above (s29) */
 			/* s43 skybox tag: set before the direct-emit fast path AND the parse
 			 * path below, so whichever one resolves this node's depth sees it.
-			 * Self-resetting -- 0 for every non-sky node -- so no per-walk clear. */
+			 * Self-resetting -- 0 for every non-sky node -- so no per-walk clear.
+			 * (s46 verified the range does NOT over-catch UI-band nodes in-race:
+			 * a walk-order guard here counted zero rescues across a full sitting
+			 * -- the minimap black box was the sky PASS clobbering the open blend
+			 * run's state memo, fixed in N3DS_DrawSkyPass.) */
 			s_skyNodeActive = NativeGpu_IsSkyPacket((uintptr_t)basePacket);
 #endif
 			if (tagLength > 0)
