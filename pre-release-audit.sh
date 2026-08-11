@@ -124,6 +124,14 @@ if command -v rg >/dev/null 2>&1; then
 
     scan_diff "retail state width/type edits" \
         '^\+[^+].*(typedef|enum|struct|s8|u8|s16|u16|s32|u32|b32|bool)'
+
+    # Comments must state standing constraints, not history (see CLAUDE.md,
+    # Code style). This flags NEW comment lines carrying session tags, dates,
+    # or review-fix framing. The s-number class skips s16/s32 (integer types).
+    # Acceptable matches exist: "rung N" as renderer-design phase vocabulary
+    # and live-hunt instrumentation docs -- eyeball, don't auto-reject.
+    scan_diff "session-history comments" \
+        '^\+[^+].*(//|/\*| \* ).*\b(s(1[0-57-9]|2[0-9]|3[013-9]|4[0-9])\b|[Ss]ession [0-9]|[Rr]ung [0-9]|[Ss]itting [0-9]|20[0-9]{2}-[01][0-9]-[0-3][0-9]|[Rr]eview fix|REVIEW FIX|[Rr]eview finding)'
 else
     echo
     echo "WARN: rg not found; skipped risky-pattern scans."
