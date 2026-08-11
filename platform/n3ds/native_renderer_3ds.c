@@ -3874,6 +3874,17 @@ void NativeRenderer_SwapWindow(void)
 				printf(">> wide  %-5s\n", wideNames[(wm >= 0 && wm <= 2) ? wm : 0]);
 			}
 			{
+				/* s44 UI pop-out, with its chord spelled out. On screen rather
+				 * than in the log because it is dialled BY EYE with the 3D slider
+				 * up, and the SD log cannot be read while the game holds the card
+				 * -- the number has to be visible in the moment it is being
+				 * judged. Only meaningful in stereo; shown always so a mono
+				 * glance still says what it is set to. */
+				extern int g_dbg_uiPopPct;
+
+				printf(">> uipop %-3d%%  SEL+LEFT/RIGHT\n", g_dbg_uiPopPct);
+			}
+			{
 				extern int g_dbg_sdLog;
 
 				/* Logging earns a line of its own with its chord spelled out:

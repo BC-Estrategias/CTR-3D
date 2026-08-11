@@ -507,6 +507,24 @@ static DVLB_s *s_shaderDvlb = NULL;
 static shaderProgram_s s_shaderProgram;
 static int s_uLocProjection = -1;
 static int s_uLocStereo = -1;
+static int s_uLocStereoUi = -1;
+/*
+ * s44 UI POP-OUT, as a PERCENT of this eye's at-infinity shift k. The owner's
+ * target is UI "just barely popping out of the screen" -- explicitly NOT at the
+ * screen plane (what the shader's UI mask used to force) and explicitly less
+ * than the character-select rotating character, which he called the too-far
+ * reference.
+ *
+ * A percent of k rather than an absolute pixel count, so it tracks the 3D slider
+ * for free and is identically 0 when the slider is down -- mono safety by
+ * construction, the same property the s40b flag split relies on.
+ *
+ * Runtime-tunable (dumpreq 'uipop N') because this is a comfort value that can
+ * only be judged by eye, on hardware, by its owner -- a compile-time constant
+ * would cost a rebuild and a redeploy per iteration.
+ */
+int g_dbg_uiPopPct = 25;
+static float s_stereoVecUi[2][4];
 static C3D_RenderTarget *s_renderTarget = NULL;
 
 static C3D_Mtx s_projection;
@@ -823,6 +841,19 @@ static void N3DS_StereoLatchFrame(void)
 
 			N3DS_StereoEyeVec(k, s_stereoVecWorld[eye]);
 			N3DS_StereoEyeVec(pktLive ? k : 0.0f, s_stereoVecPkt[eye]);
+
+			/*
+			 * s44 UI pop-out. NEGATIVE k: pop-out is CROSSED disparity, i.e. the
+			 * opposite sign to the at-infinity shift (p = k - kC/d goes below k as
+			 * content comes nearer, and reaches 0 at the convergence depth). One
+			 * expression covers both eyes because k already carries the per-eye
+			 * sign. Rides the packet vector's liveness so UI never pops out on a
+			 * frame where packet depth is off and the band test is meaningless.
+			 */
+			s_stereoVecUi[eye][0] = (pktLive ? -k : 0.0f) * ((float)g_dbg_uiPopPct * 0.01f);
+			s_stereoVecUi[eye][1] = 0.0f;
+			s_stereoVecUi[eye][2] = 0.0f;
+			s_stereoVecUi[eye][3] = 0.0f;
 		}
 	}
 
@@ -1031,6 +1062,10 @@ static void N3DS_BindPacketDrawState(void)
 	 * state exactly like the projection rows above, re-asserted on every
 	 * return to packet drawing for the identical s29 reason. */
 	N3DS_StereoUploadUniform(s_uLocStereo, (const float(*)[4])s_stereoVecPkt);
+	/* s44: UI pop-out rides the same re-upload -- it sits on f5, which the model
+	 * program uses for qy, so it must be re-asserted on every return to packet
+	 * state exactly as the stereo vector is. */
+	N3DS_StereoUploadUniform(s_uLocStereoUi, (const float(*)[4])s_stereoVecUi);
 }
 
 int N3DS_C3DInit(void)
@@ -1083,6 +1118,7 @@ int N3DS_C3DInit(void)
 	C3D_BindProgram(&s_shaderProgram);
 	s_uLocProjection = shaderInstanceGetUniformLocation(s_shaderProgram.vertexShader, "projection");
 	s_uLocStereo = shaderInstanceGetUniformLocation(s_shaderProgram.vertexShader, "stereo");
+	s_uLocStereoUi = shaderInstanceGetUniformLocation(s_shaderProgram.vertexShader, "stereoUi");
 
 	/*
 	 * Placeholder until the first N3DS_C3DSetProjection call, which derives
@@ -1510,6 +1546,10 @@ void N3DS_C3DBeginFrame(void)
 	/* Left eye's parallax (zero in mono) -- rides beside the projection for
 	 * the same reason it does in N3DS_BindPacketDrawState. */
 	N3DS_StereoUploadUniform(s_uLocStereo, (const float(*)[4])s_stereoVecPkt);
+	/* s44: UI pop-out rides the same re-upload -- it sits on f5, which the model
+	 * program uses for qy, so it must be re-asserted on every return to packet
+	 * state exactly as the stereo vector is. */
+	N3DS_StereoUploadUniform(s_uLocStereoUi, (const float(*)[4])s_stereoVecUi);
 
 	/* Every draw this frame appends into the SAME persistent buffer at a
 	 * fresh offset (see the header comment on N3DS_C3DAppendVertices) --
@@ -3451,6 +3491,35 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_uiLast ? "[CTR-3DS] ui-last: ON (UI pass draws last of all)"
 					                           : "[CTR-3DS] ui-last: off (UI pass draws right after the merge barrier)");
 				}
+				else if (strncmp(word, "uipop", 5) == 0)
+				{
+					/* s44: how far UI pops out of the screen, as a percent of this
+					 * eye's at-infinity shift. 0 = the old flat-at-screen-plane
+					 * behaviour. 'uipop N' sets it directly -- a comfort value only
+					 * its owner's eyes can judge, so it is dialled at runtime on
+					 * hardware rather than rebuilt. Only visible with the 3D slider
+					 * up; identically 0 in mono by construction. */
+					const char *arg = word + 5;
+
+					while ((*arg == ' ') || (*arg == '\t'))
+					{
+						arg++;
+					}
+					if ((*arg >= '0') && (*arg <= '9'))
+					{
+						g_dbg_uiPopPct = atoi(arg);
+						if (g_dbg_uiPopPct > 200)
+						{
+							g_dbg_uiPopPct = 200;
+						}
+					}
+					{
+						char msg[96];
+
+						snprintf(msg, sizeof(msg), "[CTR-3DS] ui pop-out: %d%% of k", g_dbg_uiPopPct);
+						N3DS_DebugLog(msg);
+					}
+				}
 				else if (strncmp(word, "uidump", 6) == 0)
 				{
 					extern int g_dbg_uiDump;
@@ -4086,6 +4155,41 @@ unsigned int N3DS_ReadButtons(void)
 	 * a deliberate debugging act that can afford a relaunch. Widescreen joins
 	 * the master because "ours" includes it: REAL (2) on, 4:3 crop (0) off; the
 	 * rejected stretch (1) stays dumpreq-only. */
+	/*
+	 * s44 UI pop-out dial: SELECT + D-LEFT / D-RIGHT, in 5% steps of the eye's
+	 * at-infinity shift. Earns a chord (owner-approved) on the one criterion
+	 * that justifies one: it is a COMFORT value, judged by eye, in stereo, on
+	 * hardware -- and it cannot be dialled any other way there, because dumpreq
+	 * needs the SD card the game is holding. Deliberately not the touch screen:
+	 * touch is a bad A/B edge (s36 -- it disturbs the thing being judged).
+	 *
+	 * Clamped 0..100 here: 0 restores the old flat-at-screen-plane UI, and 100
+	 * is already well past the owner's "not as much as the character" bound, so
+	 * the dial cannot walk into eye strain by held-button accident. dumpreq
+	 * 'uipop N' still reaches 200 for deliberate experiments.
+	 *
+	 * Current value is on the bottom-screen stats block, not the log: the log is
+	 * unreadable while the game runs, and this number is only meaningful at the
+	 * moment it is being looked at.
+	 */
+	if ((held & KEY_SELECT) && (hidKeysDown() & (KEY_DLEFT | KEY_DRIGHT)))
+	{
+		const int step = (hidKeysDown() & KEY_DRIGHT) ? 5 : -5;
+		char msg[80];
+
+		g_dbg_uiPopPct += step;
+		if (g_dbg_uiPopPct < 0)
+		{
+			g_dbg_uiPopPct = 0;
+		}
+		if (g_dbg_uiPopPct > 100)
+		{
+			g_dbg_uiPopPct = 100;
+		}
+		snprintf(msg, sizeof(msg), "[CTR-3DS] ui pop-out: %d%% of k", g_dbg_uiPopPct);
+		N3DS_DebugLog(msg);
+	}
+
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_START))
 	{
 		extern int g_dbg_trackRender;

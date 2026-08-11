@@ -44,6 +44,21 @@
 ; to packet state: N3DS_BindPacketDrawState does, same discipline as the
 ; projection rows above it (the s29 register-collision lesson).
 .fvec stereo
+; s44 UI POP-OUT. x = this eye's parallax for UI-band vertices, in PSX px,
+; already signed per eye and already scaled by the slider (N3DS_StereoEyeVec).
+; y/z/w unused.
+;
+; Owner's target: UI should sit "just barely popping out of the screen", not at
+; it -- flat-zero was never the goal, it was what the mask happened to give.
+; Applying it here (rather than shifting X on the CPU) is forced: the right eye
+; is a journal REPLAY of the same vertex buffer, so anything per-eye has to be a
+; uniform the shader reads.
+;
+; Lands on f5, which is qy in ctr_model.v.pica -- the s29 shared-register class.
+; Safe because both sides re-upload on every bind: the model path writes qx/qy/qw
+; per instance, and N3DS_BindPacketDrawState re-uploads this beside `stereo`.
+; If you add another uniform here, verify that property again before trusting it.
+.fvec stereoUi
 
 ; Constants
 .constf constants(0.0, 1.0, -1.0, 0.0)
@@ -117,7 +132,14 @@
 	add r1.w, stereo.xxxx, r1.w         ; p = k - kC/d
 	max r1.w, stereo.zzzz, r1.w         ; p >= lo (pop-out clamp)
 	min r1.w, stereo.wwww, r1.w         ; p <= hi
-	mul r1.w, r1.y, r1.w                ; UI band: p = 0
+	mul r1.w, r1.y, r1.w                ; world keeps p; UI -> 0
+	; s44: UI no longer stays at 0 -- it takes a small fixed pop-out instead.
+	; invMask is 1 for UI and 0 for world, so world is untouched bit-for-bit and
+	; the slider-down case is still identically 0 (stereoUi.x is 0 then).
+	mul r1.y, negOnes, r1.y             ; -mask
+	add r1.y, ones, r1.y                ; invMask = 1 - mask (1 for UI band)
+	mul r1.y, stereoUi.xxxx, r1.y       ; UI pop-out, 0 for world
+	add r1.w, r1.w, r1.y                ; p = world p, or the UI pop-out
 	add r0.x, r0.x, r1.w                ; shifted screen X (both temps)
 
 	dp4 outpos.x, projection[0], r0
