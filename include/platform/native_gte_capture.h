@@ -74,6 +74,12 @@ int GTECapture_LookupDepth(s16 sx, s16 sy, u16 *outSz3);
 // crates). A kart primitive whose vertices come back carrying the camera's id
 // is reading a depth that belongs to the road it is standing on.
 int GTECapture_LookupDepthEx(s16 sx, s16 sy, u16 *outSz3, u8 *outMtxId);
+// s45 miss forensics: stale-generation probe -- was this coordinate projected
+// in a recent PRIOR frame? Diagnostic only; see the definition's comment.
+int GTECapture_LookupDepthStale(s16 sx, s16 sy, u16 *outSz3, u32 *outAgeFrames);
+// s45 iteration 4: raw hash-slot occupant for a coordinate -- distinguishes
+// never-stored from clobbered-by-collision. See the definition's comment.
+int GTECapture_ProbeSlot(s16 sx, s16 sy, s16 *outOccX, s16 *outOccY, int *outGenState, u16 *outOccSz3);
 int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3]);
 // Model vector plus the frame-scoped matrix-state id the projection ran
 // under (s26 matrix-class probe; the retained full form's matrix classes).

@@ -504,8 +504,18 @@ internal int NativeDirectEmit_TryNode(const u8 *packet, u32 tagLength)
 	 * s_gteCaptureSuppress (the sticky "walk is in 2D/UI territory" flag) is the
 	 * same predicate PacketDepth_ResolveXY uses to decide a prim belongs in the
 	 * UI band, so the two cannot disagree about what counts as UI.
+	 *
+	 * UNCONDITIONAL, not gated on g_dbg_uiOrder (s45b, the minimap regression):
+	 * the same two-producer defect breaks UI with uiorder OFF too -- the in-race
+	 * minimap's racer dots (opaque, this path) were buried under the map sheet
+	 * (blended, packet path), and the sheet's dark texels drew as a solid black
+	 * box. Owner-reported 2026-08-08; root-caused by the 'directemit' A/B in
+	 * Azahar (box + buried dots track the toggle exactly). The sky cannot be
+	 * caught here: the suppress flag latches only once the walk enters the UI
+	 * push-buffer address band, and the sky walks before it -- so the s43
+	 * sky-first accumulator (which lives on this path) keeps its feed.
 	 */
-	if (g_dbg_uiOrder && GTECapture_LookupSuppressed())
+	if (GTECapture_LookupSuppressed())
 	{
 		active = 0;
 	}

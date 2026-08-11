@@ -111,6 +111,19 @@ internal u32 GTECapture_Hash(u32 key)
 	// Fibonacci multiplicative hash over the whole packed key -- both sx and
 	// sy must contribute; a plain mask would only look at sx (sy lives in the
 	// high 16 bits) and collide constantly on vertical runs.
+	//
+	// s45: fold the key before the multiply. A bare multiply is LINEAR, so its
+	// collisions form a lattice of fixed screen-space vectors -- and with only
+	// 16 output bits (3DS table) the lattice's short vectors are (+4,-62) and
+	// (+8,-124): every pixel shared a slot with the pixel 8 right / 124 up of
+	// it, verified live at an adventure-hub warp pad (all 8 sampled stolen
+	// slots held the pixel exactly one vector away). Scenery above the pad
+	// projects after the prize instances, so the prizes' depths were evicted
+	// every frame, resolve missed, and the bucket fallback buried them behind
+	// the mountain. The xor-fold makes the low half perturb the high half
+	// before the multiply, which breaks the linearity and with it the fixed
+	// vectors; residual collisions are unstructured and load-factor rare.
+	key ^= key >> 16;
 	return (key * 0x9E3779B1u) >> (32u - GTE_CAPTURE_TABLE_BITS);
 }
 
@@ -120,6 +133,10 @@ internal u32 GTECapture_Hash(u32 key)
 global_variable u32 s_gteMtxShadow[8];
 global_variable int s_gteMtxShadowValid;
 global_variable u32 s_gteMtxCurId;
+/* s45 watch instrument frame counter -- bumped in GTECapture_Clear, consumed
+ * by the [WATCH] throttle; the rest of the watch state lives further down
+ * with g_dbg_watchName. */
+global_variable u32 s_watchFrameCtr;
 
 /* s33 instance depth-axis bracket -- full block sits above GTECapture_Store;
  * these exist because Clear (the frame boundary) runs their window flush. */
@@ -155,6 +172,7 @@ void GTECapture_Clear(void)
 	/* [PKTAXIS] window boundary (s33 instance-axis bracket, below). Also the
 	 * belt-and-braces close of a bracket a mid-frame early-out left open --
 	 * the same leak the model capture closes in its EndFrame. */
+	s_watchFrameCtr++;
 	GTECapture_EndInstanceDepth();
 	if (g_dbg_modelDepthCheck && (++s_instAxisFrames >= 256))
 	{
@@ -366,14 +384,55 @@ u32 GTECapture_ReadEvictCensus(u32 *outSameMtx, u32 *outMaxDz)
  * for content beyond ~128 view units, and inside 128 units the scale error
  * is smaller than the near-band floor anyway (shift forced to 0 there).
  *
- * Known, accepted residual: the QUEUE-phase bbox projections (8 corners per
- * instance, RenderBucket_PrepareDrawContext) run outside this bracket and
- * still store scaled depths. Eight vertices against hundreds, at screen
- * coordinates the body immediately restores -- measure before caring.
+ * Known residual, now A/B-able (s45): the QUEUE-phase bbox projections (8
+ * corners per instance, RenderBucket_ProjectFrameBounds) run outside this
+ * bracket and still store scaled depths. The old wave-off said the body
+ * "immediately restores" those screen coordinates, but a bbox is a BOUND --
+ * its corners generally land outside the model's silhouette, where nothing
+ * restores them. Near-regime instances (the only ones whose bbox stores are
+ * 4x) are exactly the "bigger = buried" population of the warp-pad prize
+ * hunt, so this is the measurement that comment asked for: dumpreq
+ * 'bboxdepth 0' suppresses the stores; see g_dbg_bboxDepthStores below.
  */
 
 /* dumpreq 'pktaxisfix'. Default ON: OFF is the ice-pond vanish. */
 int g_dbg_pktAxisFix = 1;
+/* s45 (dumpreq 'bboxdepth'): 1 = queue-phase bbox corner projections store
+ * into the capture table (today's behaviour, the known unbracketed regime-axis
+ * leak above); 0 = suppress them, stores and evictions both, via the same
+ * SetStoreSuppressed contract DrawSky uses. The A/B for the warp-pad prize /
+ * mask-hint burial. */
+int g_dbg_bboxDepthStores = 1;
+
+/* s45 WATCH instrument (dumpreq 'watch <name>', bare 'watch' = off): put a tap
+ * on ONE NAMED OBJECT instead of inferring from anonymous primitives -- the
+ * owner's ask after a night of the latter. Matches the instance name (e.g.
+ * "prize1"/"prize2", INSTANCE_Birth3D's argument) OR the model name, so
+ * objects whose instance name is unknown (the mask hint, the start lights)
+ * can be watched by model. While the watched object's draw bracket is open,
+ * every GTE store is tallied: raw SZ3 range as projected, corrected range
+ * after the s33 unscale, plus the classify inputs (trueZ, mvp.t[2]) and the
+ * final shift. One [WATCH] line per bracket every 32 frames tells the whole
+ * store-side story: if corr ~= trueZ the stores are honest and the lie is
+ * downstream (walk/stamp side); if not, the wrong step is named by which
+ * number disagrees. */
+char g_dbg_watchName[16];
+global_variable int s_watchActive;
+global_variable char s_watchInstName[16];
+global_variable s64 s_watchTrueZ;
+global_variable s32 s_watchMvpZ;
+global_variable int s_watchFunc;
+global_variable u32 s_watchStores;
+global_variable u16 s_watchRawMin;
+global_variable u16 s_watchRawMax;
+global_variable u16 s_watchCorrMin;
+global_variable u16 s_watchCorrMax;
+/* v2: the exact inputs the classify reference was computed from -- when
+ * trueZ is garbage, these name WHICH input lied (instance matrix.t vs
+ * camera pos), which is the difference between designing the fix blind and
+ * naming the corrupter. */
+global_variable s32 s_watchInstT[3];
+global_variable s32 s_watchCamPos[3];
 /* s41: the ground-decal (shadows/skids/tires) fixed-shift unscale. Its own
  * switch rather than a share of g_dbg_pktAxisFix, so an A/B moves one thing. */
 int g_dbg_decalAxisFix = 1;
@@ -450,9 +509,21 @@ void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct Pus
 	}
 	else
 	{
-		s64 dx = (s64)inst->matrix.t[0] - (s64)pb->pos.x;
-		s64 dy = (s64)inst->matrix.t[1] - (s64)pb->pos.y;
-		s64 dz = (s64)inst->matrix.t[2] - (s64)pb->pos.z;
+		/* s45 ROOT CAUSE of the warp-pad prize burial: TRUNCATE THE DELTAS TO
+		 * s16, exactly as the GTE's MTC2 vertex registers do. The prize spin
+		 * (AH_WarpPad_SpinRewards) computes its orbit with u32 sines, so every
+		 * negative-phase component carries ~+2^20 of upper-bit garbage in
+		 * matrix.t -- garbage that is INVISIBLE to retail because 2^20 is 0
+		 * mod 2^16 and every GTE consumer truncates. This classifier was the
+		 * only full-width reader in existence: its 64-bit dot product saw the
+		 * phantom millions, called the instance quarter-regime, and stored
+		 * its depth 4x too far. Truncating reproduces retail's own semantics
+		 * bit-for-bit -- and wraps consistently with the mvp the classify
+		 * compares against, since that mvp was built through the same 16-bit
+		 * registers. MUST stay in lockstep with NativeModelEmit_BeginInstance. */
+		s64 dx = (s64)(s16)((s64)inst->matrix.t[0] - (s64)pb->pos.x);
+		s64 dy = (s64)(s16)((s64)inst->matrix.t[1] - (s64)pb->pos.y);
+		s64 dz = (s64)(s16)((s64)inst->matrix.t[2] - (s64)pb->pos.z);
 
 		trueZ = ((s64)pb->matrix_ViewProj.m[2][0] * dx + (s64)pb->matrix_ViewProj.m[2][1] * dy + (s64)pb->matrix_ViewProj.m[2][2] * dz) >> 12;
 	}
@@ -461,6 +532,40 @@ void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct Pus
 	s_instAxisTrueZ = trueZ;
 	s_instAxisFunc = ((funcKind >= 0) && (funcKind < 5)) ? funcKind : 0;
 	s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
+
+	/* s45 watch tap -- see g_dbg_watchName. Matched per bracket so multiple
+	 * same-named instances (the prize ring is three "prize1"s) each report. */
+	s_watchActive = 0;
+	if (g_dbg_watchName[0] != '\0')
+	{
+		const char *modelName = (inst->model != NULL) ? inst->model->name : "";
+
+		if ((strncmp(inst->name, g_dbg_watchName, 15) == 0) || (strncmp(modelName, g_dbg_watchName, 15) == 0))
+		{
+			int wi;
+
+			s_watchActive = 1;
+			for (wi = 0; wi < 15; wi++)
+			{
+				s_watchInstName[wi] = inst->name[wi];
+			}
+			s_watchInstName[15] = '\0';
+			s_watchTrueZ = trueZ;
+			s_watchMvpZ = mvpZIfNormal;
+			s_watchFunc = s_instAxisFunc;
+			s_watchInstT[0] = (s32)inst->matrix.t[0];
+			s_watchInstT[1] = (s32)inst->matrix.t[1];
+			s_watchInstT[2] = (s32)inst->matrix.t[2];
+			s_watchCamPos[0] = (s32)pb->pos.x;
+			s_watchCamPos[1] = (s32)pb->pos.y;
+			s_watchCamPos[2] = (s32)pb->pos.z;
+			s_watchStores = 0;
+			s_watchRawMin = 0xFFFFu;
+			s_watchRawMax = 0;
+			s_watchCorrMin = 0xFFFFu;
+			s_watchCorrMax = 0;
+		}
+	}
 
 	if (trueZ < 128)
 	{
@@ -508,6 +613,23 @@ void GTECapture_EndInstanceDepth(void)
 	if (!s_instAxisActive)
 	{
 		return;
+	}
+
+	/* s45 watch report -- one line per watched bracket, throttled to every
+	 * 32nd frame so three orbiting prizes cost ~3 lines/sec. stores=0 is
+	 * printed too: "the draw func rejected every triangle" is a finding. */
+	if (s_watchActive)
+	{
+		if ((s_watchFrameCtr & 31u) == 0u)
+		{
+			Platform_LogInstrument("[WATCH] name=%s func=%d trueZ=%ld mvpZ=%ld shift=%d stores=%lu raw=%u..%u corr=%u..%u t=(%ld,%ld,%ld) cam=(%ld,%ld,%ld)\n",
+			                       s_watchInstName, s_watchFunc,
+			                       (long)s_watchTrueZ, (long)s_watchMvpZ, (s_instAxisShift == GTE_INSTAXIS_UNRESOLVED) ? 99 : s_instAxisShift,
+			                       (unsigned long)s_watchStores, (unsigned)s_watchRawMin, (unsigned)s_watchRawMax, (unsigned)s_watchCorrMin,
+			                       (unsigned)s_watchCorrMax, (long)s_watchInstT[0], (long)s_watchInstT[1], (long)s_watchInstT[2], (long)s_watchCamPos[0],
+			                       (long)s_watchCamPos[1], (long)s_watchCamPos[2]);
+		}
+		s_watchActive = 0;
 	}
 
 	if (s_instAxisFixed)
@@ -692,6 +814,8 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 			}
 		} /* !s_instAxisFixed -- shared shift application follows */
 
+		u16 watchRaw = sz3;
+
 		if (g_dbg_pktAxisFix)
 		{
 			if (s_instAxisShift == 2)
@@ -708,6 +832,15 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 			}
 		}
 
+		/* s45 watch tap: raw = as the draw projected it, corr = as stored. */
+		if (s_watchActive && !s_instAxisFixed)
+		{
+			s_watchStores++;
+			if (watchRaw < s_watchRawMin) { s_watchRawMin = watchRaw; }
+			if (watchRaw > s_watchRawMax) { s_watchRawMax = watchRaw; }
+			if (sz3 < s_watchCorrMin) { s_watchCorrMin = sz3; }
+			if (sz3 > s_watchCorrMax) { s_watchCorrMax = sz3; }
+		}
 	}
 
 	/* Same key AND live generation means this slot already holds a projection
@@ -844,6 +977,50 @@ int GTECapture_LookupDepthEx(s16 sx, s16 sy, u16 *outSz3, u8 *outMtxId)
 	*outSz3 = entry->sz3;
 	*outMtxId = entry->mtxId;
 	return 1;
+}
+
+/* s45 miss forensics: was this exact screen coordinate projected in a RECENT
+ * prior frame? Entries are never wiped between frames -- only outdated by the
+ * generation bump -- so a stale-generation hit at the key IS last-projected
+ * evidence, with its age in frames and the depth it carried. A hit with age
+ * 1-2 convicts the stale-coordinates theory (a packet drawn with screen XY
+ * projected in an earlier frame); the sz3 it returns is the primitive's REAL
+ * depth at that time. Diagnostic only -- never feed this into a stamp: an aged
+ * depth for moving content is exactly the lie the resolver exists to avoid. */
+int GTECapture_LookupDepthStale(s16 sx, s16 sy, u16 *outSz3, u32 *outAgeFrames)
+{
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
+	u32 key = GTECapture_PackKey(sx, sy);
+	const GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
+
+	if ((entry->key != key) || (entry->generation == 0) || (entry->generation >= buf->generation))
+	{
+		return 0;
+	}
+
+	*outSz3 = entry->sz3;
+	*outAgeFrames = buf->generation - entry->generation;
+	return 1;
+}
+
+/* s45 miss forensics iteration 4: what does the missing coordinate's hash SLOT
+ * actually hold? The table is direct-mapped, so a key-mismatch lookup cannot
+ * tell "never stored" from "stored and then clobbered by a different pixel
+ * hashing to the same slot" -- this probe returns the occupant so the log can.
+ * genState: 2 = occupant written THIS frame (a live clobberer -- its key names
+ * the thief's screen pixel), 1 = an older frame's leftover, 0 = never written
+ * since boot. Diagnostic only. */
+int GTECapture_ProbeSlot(s16 sx, s16 sy, s16 *outOccX, s16 *outOccY, int *outGenState, u16 *outOccSz3)
+{
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
+	u32 key = GTECapture_PackKey(sx, sy);
+	const GTECaptureEntry *entry = &buf->entries[GTECapture_Hash(key)];
+
+	*outOccX = (s16)(entry->key & 0xFFFFu);
+	*outOccY = (s16)(entry->key >> 16);
+	*outOccSz3 = entry->sz3;
+	*outGenState = (entry->generation == 0) ? 0 : (entry->generation >= buf->generation) ? 2 : 1;
+	return entry->key != key; /* 1 = the slot belongs to someone else */
 }
 
 int GTECapture_LookupModelEx(s16 sx, s16 sy, s16 outV[3], u8 *outMtxId)

@@ -2498,7 +2498,12 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	/* Worst case: every quadblock in a static leaf, 4 faces x 4 verts and
 	 * 4 faces x 6 indices. Allocate flat, log the real usage. */
 	size_t maxVerts = (size_t)numQuadBlock * 16;
-	size_t maxIndices = (size_t)numQuadBlock * 24;
+	/* s43: up from 24 (6 idx/face). Backface culling gives triangles and
+	 * double-sided faces a reverse-wound copy (see the index emission below), so
+	 * the worst case is 4 double-sided quads/block = 48. Temporary bake buffer --
+	 * compacted to the actual index count after the draw-bin sort, so the extra
+	 * is only held during the build, not in the resident mesh. */
+	size_t maxIndices = (size_t)numQuadBlock * 48;
 
 	s_trackMesh.verts = (struct NativeTrackVert *)malloc(maxVerts * sizeof(struct NativeTrackVert));
 	s_trackMesh.indices = (u16 *)malloc(maxIndices * sizeof(u16));
@@ -2760,7 +2765,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				/* Allocation capacity guard (s27 review finding): the flat
 				 * buffers are sized for a PARTITION of the quadblock array;
 				 * overlapping leaf ranges could exceed it. Never write past. */
-				if (((size_t)s_trackMesh.vertCount + 4 > maxVerts) || ((size_t)s_trackMesh.indexCount + 6 > maxIndices))
+				if (((size_t)s_trackMesh.vertCount + 4 > maxVerts) || ((size_t)s_trackMesh.indexCount + 12 > maxIndices))
 				{
 					facesDroppedCapacity++;
 					continue;
@@ -2921,7 +2926,19 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					idx[0] = (u16)(baseVert + triGrid[0]);
 					idx[1] = (u16)(baseVert + triGrid[2]);
 					idx[2] = (u16)(baseVert + triGrid[1]);
-					s_trackMesh.indexCount += 3;
+					/* s43 backface culling: reverse-wound copy so a triangle
+					 * survives GPU_CULL_BACK from EITHER side. Triangle faces
+					 * wind inconsistently vs quads (owner: they all pinholed
+					 * under culling), and retail's per-face NCLIP cull is
+					 * camera-dependent -- something a static bake can't
+					 * reproduce -- so the safe equivalent is to make triangles
+					 * effectively double-sided. Indices only (same 3 verts); the
+					 * back-facing copy is the one the GPU discards, so a
+					 * front-facing triangle still rasterizes exactly once. */
+					idx[3] = (u16)(baseVert + triGrid[0]);
+					idx[4] = (u16)(baseVert + triGrid[1]);
+					idx[5] = (u16)(baseVert + triGrid[2]);
+					s_trackMesh.indexCount += 6;
 				}
 				else
 				{
@@ -2933,6 +2950,24 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					idx[4] = (u16)(baseVert + 2);
 					idx[5] = (u16)(baseVert + 3);
 					s_trackMesh.indexCount += 6;
+
+					if (doubleSided)
+					{
+						/* s43 backface culling: reverse-wound copies so a
+						 * DOUBLE-SIDED quad shows from both sides under
+						 * GPU_CULL_BACK. Retail always draws double-sided faces
+						 * regardless of facing (the bit means exactly "don't cull
+						 * me"). Single-sided quads get NO copy and cull normally
+						 * -- which is the point; that is what drops the erroneous
+						 * back-facing second waterfall. */
+						idx[6] = (u16)(baseVert + 0);
+						idx[7] = (u16)(baseVert + 1);
+						idx[8] = (u16)(baseVert + 2);
+						idx[9] = (u16)(baseVert + 1);
+						idx[10] = (u16)(baseVert + 3);
+						idx[11] = (u16)(baseVert + 2);
+						s_trackMesh.indexCount += 6;
+					}
 				}
 			}
 		}

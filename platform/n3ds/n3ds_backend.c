@@ -2139,12 +2139,14 @@ void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short
 	}
 }
 
-/* s43 backface-cull toggle (dumpreq 'bfcull'): 0 = off (draw every face, today's
- * behaviour), 1 = cull GPU back-faces, 2 = cull front-faces. Applied per-frame in
- * N3DS_TrackDraw_Begin, undone in _End. See the block in Begin for the winding
- * caveat and how to read the result. Default 0 -- this is an unproven perf/parity
- * experiment, not the accepted default. */
-int g_dbg_bfCull = 0;
+/* s43 backface culling (dumpreq 'bfcull', chord SELECT+Y): 0 = off (draw every
+ * face), 1 = cull GPU back-faces, 2 = cull front-faces. Applied per-frame in
+ * N3DS_TrackDraw_Begin, undone in _End. DEFAULT 1 (owner ruling 2026-08-08):
+ * culling is what retail does, it's near-free, and it removes erroneous
+ * back-facing geometry (the Crash Cove second waterfall and the like). Safe
+ * because the bake gives triangles and double-sided faces a reverse-wound copy
+ * (native_track_mesh.c) so only single-sided quads are actually culled. */
+int g_dbg_bfCull = 1;
 
 void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h)
 {
@@ -3990,6 +3992,88 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_gteNoEvict ^= 1;
 					N3DS_DebugLog(g_dbg_gteNoEvict ? "[CTR-3DS] capture evict: REFUSED across matrix states"
 					                               : "[CTR-3DS] capture evict: normal (last writer wins)");
+				}
+				else if (strncmp(word, "pktaxisfix", 10) == 0)
+				{
+					extern int g_dbg_pktAxisFix;
+
+					/* s45: was advertised since s33 but never wired -- the
+					 * packet-side s33 unscale had NO runtime switch until now.
+					 * OFF is the ice-pond kart vanish (Blizzard Bluff), which
+					 * doubles as this toggle's positive control. 'pktaxisfix N'
+					 * sets, bare token flips, same idiom as 'axisfix'. */
+					if (word[10] == ' ')
+					{
+						g_dbg_pktAxisFix = (atoi(&word[11]) != 0);
+					}
+					else
+					{
+						g_dbg_pktAxisFix ^= 1;
+					}
+					N3DS_DebugLog(g_dbg_pktAxisFix ? "[CTR-3DS] packet depth axis fix: ON (regime unscale at the store)"
+					                               : "[CTR-3DS] packet depth axis fix: off (raw regime axis = ice-pond vanish)");
+				}
+				else if (strncmp(word, "bboxdepth", 9) == 0)
+				{
+					extern int g_dbg_bboxDepthStores;
+
+					/* s45 warp-pad prize hunt: 0 removes the queue-phase bbox
+					 * corner stores -- the one unbracketed regime-axis producer
+					 * left in the capture table (native_gte_capture.c has the
+					 * story). If the prize burial vanishes at 0, that leak is
+					 * the bug. 'bboxdepth N' sets, bare token flips. */
+					if (word[9] == ' ')
+					{
+						g_dbg_bboxDepthStores = (atoi(&word[10]) != 0);
+					}
+					else
+					{
+						g_dbg_bboxDepthStores ^= 1;
+					}
+					N3DS_DebugLog(g_dbg_bboxDepthStores ? "[CTR-3DS] bbox corner stores: ON (today's behaviour, unbracketed)"
+					                                    : "[CTR-3DS] bbox corner stores: SUPPRESSED (s45 A/B leg)");
+				}
+				else if (strncmp(word, "dcheck", 6) == 0)
+				{
+					extern int g_dbg_modelDepthCheck;
+
+					/* s45: the depth-axis self-verification both classifiers
+					 * already carry -- [AXISCHK]/[MDLDEPTH] (native_model_emit)
+					 * and the [PKTAXIS] per-func ratio/reclass stats
+					 * (native_gte_capture), flushed every 256 frames while ON.
+					 * Was PC-argv-only (--model-depth-check) until now; the 3DS
+					 * build had no way to light it. Taxed per store, so a
+					 * toggle, not a default. */
+					g_dbg_modelDepthCheck ^= 1;
+					N3DS_DebugLog(g_dbg_modelDepthCheck ? "[CTR-3DS] depth axis check: ON ([AXISCHK]/[PKTAXIS] every 256f)"
+					                                    : "[CTR-3DS] depth axis check: off");
+				}
+				else if (strncmp(word, "watch", 5) == 0)
+				{
+					extern char g_dbg_watchName[16];
+					char msg[64];
+
+					/* s45: 'watch <name>' taps one named object (instance name
+					 * OR model name -- e.g. 'watch prize1'); [WATCH] lines
+					 * report its store-side depth story while it draws. Bare
+					 * 'watch' turns it off. */
+					if (word[5] == ' ')
+					{
+						int wi;
+
+						for (wi = 0; (wi < 15) && (word[6 + wi] != '\0') && (word[6 + wi] != '\n') && (word[6 + wi] != '\r') && (word[6 + wi] != ' '); wi++)
+						{
+							g_dbg_watchName[wi] = word[6 + wi];
+						}
+						g_dbg_watchName[wi] = '\0';
+						snprintf(msg, sizeof(msg), "[CTR-3DS] watch: '%s' ([WATCH] while it draws)", g_dbg_watchName);
+						N3DS_DebugLog(msg);
+					}
+					else
+					{
+						g_dbg_watchName[0] = '\0';
+						N3DS_DebugLog("[CTR-3DS] watch: off");
+					}
 				}
 #endif
 				else

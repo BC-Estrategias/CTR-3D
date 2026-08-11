@@ -503,9 +503,16 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 			}
 			else
 			{
-				s64 dx = (s64)worldInst->matrix.t[0] - (s64)pb->pos.x;
-				s64 dy = (s64)worldInst->matrix.t[1] - (s64)pb->pos.y;
-				s64 dz = (s64)worldInst->matrix.t[2] - (s64)pb->pos.z;
+				/* s45: s16-truncate the deltas like the GTE's vertex registers
+				 * do. Retail-faithful upper-bit garbage exists in instance
+				 * matrices (the warp-pad prize spin's u32 sines write ~+2^20
+				 * into negative-phase components) and every retail consumer
+				 * truncates it away; this full-width read was misclassifying
+				 * exactly that content. Lockstep twin of the fix in
+				 * GTECapture_BeginInstanceDepth -- see its comment. */
+				s64 dx = (s64)(s16)((s64)worldInst->matrix.t[0] - (s64)pb->pos.x);
+				s64 dy = (s64)(s16)((s64)worldInst->matrix.t[1] - (s64)pb->pos.y);
+				s64 dz = (s64)(s16)((s64)worldInst->matrix.t[2] - (s64)pb->pos.z);
 
 				trueZ = ((s64)pb->matrix_ViewProj.m[2][0] * dx + (s64)pb->matrix_ViewProj.m[2][1] * dy + (s64)pb->matrix_ViewProj.m[2][2] * dz) >> 12;
 			}

@@ -1312,6 +1312,43 @@ global_variable u32 s_pktDepthFlatFallback;
 global_variable int s_pktDepthLastAppended;
 global_variable int s_pktDepthLastResolved;
 
+/* s45 miss forensics (gated on g_dbg_modelDepthCheck, dumpreq 'dcheck'): up to
+ * 4 sampled misses per [PKTDEPTH] window. Per sample: the screen XY of the
+ * vertex that missed, how many vertices hit before it, a 3x3 neighbourhood
+ * probe of the capture table (nbr>0 = the depth exists a pixel away = rounding
+ * mismatch between store and packet; nbr=0 = never stored = producer gap), the
+ * OT slot the fallback read, and the depth it handed out (sentinels: 0xFFFE =
+ * no content bucket, kept ordinal; 0xFFFD = missordinal A/B kept ordinal).
+ * Exempt (flag) primitives are misses BY DESIGN and are not sampled. This is
+ * the instrument that decides the warp-pad prize burial's remaining unknown. */
+#define PKTMISS_SAMPLE_N 8
+global_variable u32 s_pktMissSampCount;
+global_variable s16 s_pktMissSampX[PKTMISS_SAMPLE_N];
+global_variable s16 s_pktMissSampY[PKTMISS_SAMPLE_N];
+global_variable u8 s_pktMissSampVerts[PKTMISS_SAMPLE_N];
+global_variable u8 s_pktMissSampHits[PKTMISS_SAMPLE_N];
+global_variable u8 s_pktMissSampNbr[PKTMISS_SAMPLE_N];
+global_variable u16 s_pktMissSampSlot[PKTMISS_SAMPLE_N];
+global_variable u16 s_pktMissSampOut[PKTMISS_SAMPLE_N];
+/* s45 iteration 2: the depth of the first vertex that DID hit (0xFFFF = no
+ * hits) -- if stale coordinates make hits coincidental strangers, this reads
+ * as the content BEHIND the primitive (the mountain), not the primitive. And
+ * the stale-generation probe: age>0 means this exact XY was projected age
+ * frames ago -- the smoking gun for reused/stale packet coordinates -- with
+ * the depth it carried then. Spread cap: at most 2 samples per frame so one
+ * frame's first misses cannot monopolise the window. */
+global_variable u16 s_pktMissSampHitZ[PKTMISS_SAMPLE_N];
+global_variable u16 s_pktMissSampStaleZ[PKTMISS_SAMPLE_N];
+global_variable u8 s_pktMissSampStaleAge[PKTMISS_SAMPLE_N]; /* 0 = no stale entry; clamped 255 */
+global_variable u32 s_pktMissSampFrameStamp;
+global_variable u32 s_pktMissSampThisFrame;
+/* Iteration 4: the missing coordinate's hash-slot occupant (see
+ * GTECapture_ProbeSlot). occGen 2 + a different occXY = a live clobberer. */
+global_variable s16 s_pktMissSampOccX[PKTMISS_SAMPLE_N];
+global_variable s16 s_pktMissSampOccY[PKTMISS_SAMPLE_N];
+global_variable u16 s_pktMissSampOccZ[PKTMISS_SAMPLE_N];
+global_variable u8 s_pktMissSampOccGen[PKTMISS_SAMPLE_N];
+
 /*
  * s29 owner-requested depth bias, in view.z units (stamp units are the same
  * scale: stamp = 0xFFFF - sz3, so +1 stamp == 1 unit NEARER the camera).
@@ -1945,6 +1982,69 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 			s_pktDepth2.mdlFellBack++;
 		}
 
+		/* s45 miss forensics -- see the sample array declarations. The missing
+		 * vertex is xs[i]/ys[i] (the loop broke at i; exempt pre-sets missed
+		 * with the loop never run, and is excluded as a miss by design). The
+		 * `out` field is patched at whichever of the three exits actually
+		 * fires, so a sample records not just where the miss was but which
+		 * fallback the primitive really took. */
+		int missSampIdx = -1;
+		if (s_pktMissSampFrameStamp != s_pktDepth.frames)
+		{
+			s_pktMissSampFrameStamp = s_pktDepth.frames;
+			s_pktMissSampThisFrame = 0;
+		}
+		/* Sample filter (iteration 3): the first two cuts of this sampler were
+		 * monopolised by boot-menu quads at (0,0) and by offscreen n=1 point
+		 * prims parked at (-1024,-1024) -- both parse early every frame and ate
+		 * the whole window. Only tri/quad prims with plausibly on-screen
+		 * coordinates are worth a slot. */
+		if (g_dbg_modelDepthCheck && !exempt && (s_pktMissSampCount < PKTMISS_SAMPLE_N) && (s_pktMissSampThisFrame < 2) && (i < n) && (n >= 3) &&
+		    (xs[i] > -64) && (xs[i] < 640) && (ys[i] > 0) && (ys[i] < 480))
+		{
+			int dx, dy, nbr = 0;
+			u16 staleZ = 0;
+			u32 staleAge = 0;
+
+			for (dy = -1; dy <= 1; dy++)
+			{
+				for (dx = -1; dx <= 1; dx++)
+				{
+					u16 nbrSz3;
+					u8 nbrMtx;
+
+					if (((dx != 0) || (dy != 0)) && GTECapture_LookupDepthEx((s16)(xs[i] + dx), (s16)(ys[i] + dy), &nbrSz3, &nbrMtx))
+					{
+						nbr++;
+					}
+				}
+			}
+			(void)GTECapture_LookupDepthStale(xs[i], ys[i], &staleZ, &staleAge);
+			{
+				s16 occX, occY;
+				int occGen;
+				u16 occZ;
+
+				(void)GTECapture_ProbeSlot(xs[i], ys[i], &occX, &occY, &occGen, &occZ);
+				s_pktMissSampOccX[s_pktMissSampCount] = occX;
+				s_pktMissSampOccY[s_pktMissSampCount] = occY;
+				s_pktMissSampOccZ[s_pktMissSampCount] = occZ;
+				s_pktMissSampOccGen[s_pktMissSampCount] = (u8)occGen;
+			}
+			s_pktMissSampThisFrame++;
+			missSampIdx = (int)s_pktMissSampCount++;
+			s_pktMissSampX[missSampIdx] = xs[i];
+			s_pktMissSampY[missSampIdx] = ys[i];
+			s_pktMissSampVerts[missSampIdx] = (u8)n;
+			s_pktMissSampHits[missSampIdx] = (u8)hits;
+			s_pktMissSampNbr[missSampIdx] = (u8)nbr;
+			s_pktMissSampSlot[missSampIdx] = (u16)s_gpu.otCurrentSlotIdx;
+			s_pktMissSampOut[missSampIdx] = 0xFFFEu;
+			s_pktMissSampHitZ[missSampIdx] = ((hits > 0) && (perVert != NULL)) ? sz3s[0] : 0xFFFFu;
+			s_pktMissSampStaleZ[missSampIdx] = staleZ;
+			s_pktMissSampStaleAge[missSampIdx] = (u8)((staleAge > 255u) ? 255u : staleAge);
+		}
+
 		if (s_gpu.otCurrentSlotIdx == NATIVE_GPU_NO_CONTENT_BUCKET)
 		{
 			/*
@@ -1963,9 +2063,17 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		{
 			/* Mechanism 2's A/B -- see the switch's own comment for the side
 			 * effect this is expected to produce. */
+			if (missSampIdx >= 0)
+			{
+				s_pktMissSampOut[missSampIdx] = 0xFFFDu;
+			}
 			return 0;
 		}
 		*out = PacketDepth_ClampWorld(0xFFFFu - (s_gpu.otCurrentSlotIdx << PKTDEPTH_OT_SHIFT));
+		if (missSampIdx >= 0)
+		{
+			s_pktMissSampOut[missSampIdx] = *out;
+		}
 		PacketDepth_NoteExtent(*out, &s_pktDepth.backMin, &s_pktDepth.backMax);
 		/* Bucket-derived depth is primitive-wide -- there is no per-vertex
 		 * information to recover, so the whole primitive stays flat. */
@@ -2424,8 +2532,32 @@ void NativeGpu_ResetEmitOrdinal(void)
 			 * the HUD. It should be 0. */
 			const u32 seen = prims + s_pktDepth.suppressed2d;
 
-			Platform_Log("[PKTDEPTHZ] realZ=%u..%u backZ=%u..%u uiZ=%u..%u (larger = nearer)\n", s_pktDepth.realMin, s_pktDepth.realMax,
+			/* s45: was Platform_Log, which never reaches ctr3ds.log on 3DS (the
+			 * s35 lesson) -- so backZ-vs-realZ, the number that would have named
+			 * the fallback-depth lie two sessions earlier, was dark on the only
+			 * platform with a depth test. LogInstrument like every line beside it. */
+			Platform_LogInstrument("[PKTDEPTHZ] realZ=%u..%u backZ=%u..%u uiZ=%u..%u (larger = nearer)\n", s_pktDepth.realMin, s_pktDepth.realMax,
 			             s_pktDepth.backMin, s_pktDepth.backMax, s_pktDepth.uiMin, s_pktDepth.uiMax);
+			/* s45 miss forensics flush -- see the sample declarations for the
+			 * field meanings. Sampled misses only exist while dcheck is on. */
+			{
+				u32 mk;
+
+				for (mk = 0; mk < s_pktMissSampCount; mk++)
+				{
+					/* hitZ: first hitting vertex's depth (0xFFFF = no hits) --
+					 * strangers read as the content BEHIND the prim. staleAge>0:
+					 * this XY was projected staleAge frames ago carrying staleZ
+					 * -- the stale-coordinate smoking gun. */
+					Platform_LogInstrument("[PKTMISS] xy=(%d,%d) n=%u hits=%u nbr=%u slot=%u out=%u hitZ=%u staleAge=%u staleZ=%u occ=(%d,%d) occGen=%u occZ=%u\n",
+					             (int)s_pktMissSampX[mk], (int)s_pktMissSampY[mk],
+					             (unsigned)s_pktMissSampVerts[mk], (unsigned)s_pktMissSampHits[mk], (unsigned)s_pktMissSampNbr[mk],
+					             (unsigned)s_pktMissSampSlot[mk], (unsigned)s_pktMissSampOut[mk], (unsigned)s_pktMissSampHitZ[mk],
+					             (unsigned)s_pktMissSampStaleAge[mk], (unsigned)s_pktMissSampStaleZ[mk],
+					             (int)s_pktMissSampOccX[mk], (int)s_pktMissSampOccY[mk], (unsigned)s_pktMissSampOccGen[mk], (unsigned)s_pktMissSampOccZ[mk]);
+				}
+				s_pktMissSampCount = 0;
+			}
 			Platform_LogInstrument("[PKTDEPTH] frames=%lu prims=%lu real=%lu fellBack=%lu realPct=%lu ui2d=%lu stamps=%lu escaped=%ld uiMax=%lu/%d\n",
 			             (unsigned long)s_pktDepth.frames, (unsigned long)prims, (unsigned long)s_pktDepth.real,
 			             (unsigned long)s_pktDepth.fellBack, (unsigned long)(prims ? ((s_pktDepth.real * 100u) / prims) : 0u),
