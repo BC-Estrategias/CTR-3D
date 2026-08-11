@@ -22,9 +22,7 @@
  * code -- section 3), offscreen render targets (section 4, deferred),
  * framebuffer readback (section 5, deferred), stereo (2c), clip/scissor
  * (SetupClipMode -- not staged into 2a by the design doc, not touched this
- * pass), the background clear color (NativeRenderer_Clear -- BeginScene
- * always clears to opaque black regardless of the game's DRAWENV clear
- * color), and the 32-bit RGBA override-texture path (TF_32_BIT_RGBA --
+ * pass), and the 32-bit RGBA override-texture path (TF_32_BIT_RGBA --
  * provably unreachable from any real game/ code path today, zero DR_PSYX_TEX
  * call sites; DrawTriangles skips a split entirely rather than guess at an
  * untested path).
@@ -64,13 +62,11 @@ global_variable u32 s_frameCounter = 0;
 global_variable unsigned int s_frameCounterForDump = 0;
 
 #ifdef CTR_INTERNAL
-/* Per-triangle addressing dump (session 16): one frame of (page, clut, fmt,
- * UVs, positions, resolved atlas cell) records, armed alongside the capture
- * set. Content dumps proved every sampled cell byte-correct while the screen
- * quilts; this captures the ADDRESSING side so it can be diffed against the
- * same records from PC (--tri-dump) at a matched scene. Record layout (LE,
- * 36 bytes, mirrored in native_offscreen_capture.c and
- * tools/texdump/tridump_diff.py):
+/* Per-triangle addressing dump: one frame of (page, clut, fmt, UVs,
+ * positions, resolved atlas cell) records, armed alongside the capture set,
+ * for diffing the ADDRESSING side against the same records from PC
+ * (--tri-dump) at a matched scene. Record layout (LE, 36 bytes, mirrored in
+ * native_offscreen_capture.c and tools/texdump/tridump_diff.py):
  *   u16 page, clut; u8 fmt, textured; u8 u0,u1,u2, v0,v1,v2;
  *   s16 x0,x1,x2, y0,y1,y2;
  *   s16 atlasIdx, pixelBaseU, pixelBaseV, originU, originV; u16 pad
@@ -155,23 +151,22 @@ global_variable TexFormat s_currentTexFormat = TF_16_BIT;
  * BlendMode value; s_semiTransPass is PC's two-pass shader STP split
  * (0 = normal, 1 = opaque-texels-only pass, 2 = STP-texels-only pass).
  *
- * PER-TEXEL STP (session 18, replacing session 17's whole-prim first cut):
- * PC discriminates the passes per-texel in its shader; the PICA has no
- * fragment shader, so the pass split is baked into the decode cache
- * instead -- s_semiTransPass selects which N3DS_TexView a triangle's
+ * PER-TEXEL STP: PC discriminates the passes per-texel in its shader; the
+ * PICA has no fragment shader, so the pass split is baked into the decode
+ * cache instead -- s_semiTransPass selects which N3DS_TexView a triangle's
  * texture resolves through (0->OPAQUE, 1->PASS1, 2->PASS2; see the
  * N3DS_TexView comment for the predicates). Pass 1 arrives with BM_NONE
- * (opaque draw of non-STP texels), pass 2 with the split's ABR mode
- * (blend of STP texels); the alpha test is the same GEQUAL-1 in every
- * pass. Fixes mixed-texel elements (wooden track arrows, tires,
- * character-select portraits) rendering wholly translucent.
+ * (opaque draw of non-STP texels), pass 2 with the split's ABR mode (blend
+ * of STP texels); the alpha test is the same GEQUAL-1 in every pass. Fixes
+ * mixed-texel elements (wooden track arrows, tires, character-select
+ * portraits) rendering wholly translucent.
  */
 global_variable int s_currentBlendMode = 0; /* BM_NONE */
 global_variable int s_semiTransPass = 0;
 /*
  * Pending-run state, FRAME scope, not per-DrawTriangles-call (cross-split
- * run persistence, session 17 -- docs/DRAW_CALL_BATCH_SURVEY.md). The
- * survey's finding: draw count ~= split count because every DrawTriangles
+ * run persistence -- docs/DRAW_CALL_BATCH_SURVEY.md). The survey's finding:
+ * draw count ~= split count because every DrawTriangles
  * call ended with an unconditional flush, while the whole frame's texture
  * working set lives in ~3 atlases -- so consecutive splits usually bind
  * the SAME atlas and their runs can merge. A run now stays open across
@@ -198,14 +193,12 @@ global_variable int s_runBlendMode = 0;
 #error "CTR_NATIVE_DRAW_MERGE requires CTR_NATIVE_OT_DEPTH: reordered opaque submission is only correct when the emit-ordinal depth test resolves paint order (see n3ds_backend.c's C3D_DepthTest block)."
 #endif
 /*
- * Cross-bucket draw merge (the z-break play's first consumer, 2026-07-28).
- * The depth substrate makes opaque submission order irrelevant -- the depth
- * test against per-prim emit ordinals reproduces painter's order regardless
- * of the order draws are issued in. So instead of flushing a draw at every
- * state transition of the OT walk (~26 distinct state keys but ~350
- * transitions per race frame, [OTPROF] session 2026-07-28), opaque
- * (BM_NONE) triangles accumulate in per-state BINS for the whole frame and
- * flush as ONE draw per bin at the barrier.
+ * Cross-bucket draw merge. The depth substrate makes opaque submission order
+ * irrelevant -- the depth test against per-prim emit ordinals reproduces
+ * painter's order regardless of issue order. So instead of flushing a draw
+ * at every OT-walk state transition, opaque (BM_NONE) triangles accumulate
+ * in per-state BINS for the whole frame and flush as one draw per bin at
+ * the barrier.
  *
  * Bin key: on 3DS the only draw-relevant states are (atlas, TEV doubling,
  * blend mode) -- clip/stencil/mask/STP-output are stubs or global here.
@@ -263,103 +256,74 @@ global_variable int s_mergeActive = 0;
 int g_dbg_drawMerge = 1;
 
 /*
- * s43 SKYBOX-FIRST accumulator. The skybox is OPAQUE, but it must draw UNDER the
- * translucent track surfaces (Crash Cove / N. Gin Labs waterfalls). Those write
- * NO depth (anti-carve), so once they are on screen a later opaque draw at the
- * same or farther depth paints straight over them -- and the merge bins flush in
- * NativeRenderer_EndScene AFTER the resident track pass, so the sky (in a bin)
- * landed on top of the already-drawn waterfall. Confirmed on hardware via the
- * 'trackafter' sledgehammer (which fixed the sky but also shoved shadows/skids
- * behind the track).
- *
- * Fix: collect the sky's triangles HERE instead of in the opaque bins, and draw
- * them at the TOP of EndScene -- before the track pass -- so the waterfall paints
- * over the sky, while every other packet effect (shadows, skids, karts, UI) keeps
- * its normal post-track order. The sky is always untextured (DrawSky's dome and
- * CAM_SkyboxGlow's gradient are both white-atlas gouraud/flat), so one draw with
- * N3DS_WHITE_ATLAS, doubling 0, serves it -- same emit as the UNTEX bin. Depth is
- * still stamped far by PacketDepth_ResolveXY (g_dbg_skyFar) so the opaque cliffs
- * that draw after it in the track pass occlude it correctly.
- *
- * Walk-thread-local, no double buffer: written during the OT walk and drawn in
- * EndScene on the same thread, exactly like s_mergeBinVerts. Overflow drops the
- * excess triangles (a few missing backdrop tris are invisible) rather than
- * flushing mid-walk, which would draw the sky in the wrong place.
- *
- * Runtime A/B: dumpreq 'skyfirst' (default ON). OFF routes the sky back into the
- * opaque bins -- i.e. the punch-through behaviour -- for comparison.
- *
- * N3DS_DrawSkyPass itself is defined beside N3DS_MergeFlush below -- it needs
- * N3DS_MergeEmit and N3DS_WHITE_ATLAS, both declared later in this file.
+ * The skybox is opaque but must draw UNDER translucent track surfaces
+ * (waterfalls write no depth, so a later opaque draw at equal/farther depth
+ * paints over them). Fix: collect sky triangles here instead of the opaque
+ * bins, and draw them at the TOP of EndScene before the track pass; every
+ * other packet effect keeps its normal post-track order. Sky content is
+ * always untextured, so one draw via N3DS_WHITE_ATLAS/doubling 0 covers it.
+ * Depth is still stamped far (PacketDepth_ResolveXY, g_dbg_skyFar) so later
+ * opaque cliffs occlude it correctly. Walk-thread-local, no double buffer;
+ * overflow silently drops excess sky triangles rather than flushing
+ * mid-walk. Runtime A/B: dumpreq 'skyfirst'.
  */
 int g_dbg_skyFirst = 1;
 #define N3DS_SKY_VERT_CAP 2048
 global_variable N3DS_Vertex s_skyVerts[N3DS_SKY_VERT_CAP];
 global_variable int s_skyVertUsed = 0;
 
+/* s46 BACKDROP accumulator -- the layer UNDER the sky accumulator. Retail
+ * clears the frame with GPU FILL packets (CAM_ClearScreen: flat clearColor
+ * split at the horizon) before painting the horizon gradient and dome over
+ * them; on 3DS those fills reach NativeRenderer_Clear, which appends them
+ * here as far-pin quads. A separate buffer from s_skyVerts on purpose: the
+ * first fix appended into s_skyVerts assuming the walk visits the fill
+ * before the sky, and it does NOT (bucket 0x3FF is walked head-first, and
+ * the sky prims are prepended after the fills), so the backdrop painted
+ * over the dome. Own buffer + own drain slot makes the order structural:
+ * N3DS_DrawBackdropPass runs immediately before N3DS_DrawSkyPass at the same
+ * far-pin depth, and LEQUAL's pass-on-equal lets each later layer win -- bg
+ * color, then gradient/dome, then everything real. (The first attempts also
+ * wrote vertex z=0 = RAW 32768, a mid-range depth that buried the sky no
+ * matter the order -- the far pin on the vertex axis is -32768.) 2 fills x
+ * 6 verts x 4 players bounds the cap; overflow drops. Same lifecycle as
+ * s_skyVerts. */
+#define N3DS_BACKDROP_VERT_CAP 48
+global_variable N3DS_Vertex s_backdropVerts[N3DS_BACKDROP_VERT_CAP];
+global_variable int s_backdropVertUsed = 0;
+/* Runtime A/B (dumpreq 'backdrop'): 0 skips both the accumulate and the
+ * drain, restoring the pre-s46 frame exactly. 'backdropdbg' arms a one-shot
+ * log of the drain-time counts on the next frame. */
+int g_dbg_backdrop = 1;
+int g_dbg_backdropDump = 0;
+
 /*
- * s44 ORDERED UI PASS -- UI stops depending on the depth test for its layering.
+ * UI cannot use the state-bin depth-substrate reorder that world content uses:
+ * a glyph and the panel behind it are different GPU states, and binning-by-state
+ * is exactly what would separate them and break their relative order.
  *
- * THE PROBLEM. Retail orders UI by painter's order and nothing else. Our depth
- * substrate exists so opaque WORLD content can be reordered into per-state bins
- * for speed -- a trade UI never needed and cannot pay, because a glyph and the
- * panel behind it are DIFFERENT STATES, so binning separates exactly the things
- * whose relative order matters. UI was then given ordering back via a 64-stamp
- * near band packed 4 prims/stamp = 256 prims, and everything since has been
- * managing that band's symptoms: the pause-menu flicker (band overflow once HUD
- * models were routed through it), the glowing tail letters (late glyphs losing to
- * the panel), character-select ordering, the black box over the level-preview
- * video. Raising the packing was tried and made hardware WORSE (2026-08-07,
- * reverted); widening the band is the s39 kart-through-head bug. Both alternatives
- * are measured dead ends -- see PacketDepth_UiStamp's header in native_gpu.c.
+ * Fix (both parts required together): (1) every UI-band primitive is pinned to
+ * ONE depth stamp (PacketDepth_UiStamp), so GPU_LEQUAL passes on equal and
+ * later-submitted UI always wins -- no ordinal budget/wrap/saturation; (2) UI
+ * primitives are routed OUT of the state bins into this ordered list and
+ * replayed last, in submission order (N3DS_DrawUiPass).
  *
- * THE FIX, and it is two changes that are only correct TOGETHER:
+ * The stamp is still read as a UI classifier elsewhere (>= 0xFFC0, stereo
+ * flatten, widescreen X ramp) -- do not remove the band.
  *
- *   1. Every UI-band primitive is pinned to ONE stamp (0xFFFF, PacketDepth_UiStamp).
- *      There is no ordinal, so there is no 256-prim budget, no wrap and no
- *      saturation -- that whole class of problem stops existing.
- *   2. UI primitives are routed OUT of the state bins into this single ordered
- *      list and replayed last, in submission order (N3DS_DrawUiPass).
+ * EXACTLY ONE PRODUCER is load-bearing: appends must arrive in OT-walk order,
+ * so only NativeRenderer_DrawTriangles may append here; the direct-emit fast
+ * path declines 2D/UI nodes for this reason. A second producer would interleave
+ * out of walk order without a per-prim sequence number to sort on.
  *
- * Why the pair is indivisible: pinning alone would tie ALL UI at one depth and
- * leave the tie to arbitrary bin order (catastrophic); routing alone would leave
- * the old distinct stamps FIGHTING submission order, because a later-submitted
- * prim carrying a farther stamp fails LEQUAL against an earlier nearer one. With
- * both, every UI prim carries the same depth, GPU_LEQUAL PASSES ON EQUAL, so the
- * later draw wins -- which is painter's order, i.e. exactly retail. One toggle
- * therefore gates both (dumpreq 'uiorder').
- *
- * Against the world nothing changes: the pinned stamp is the nearest value in the
- * band, so UI still beats world content exactly as it did before.
- *
- * THE STAMP IS KEPT AS A CLASSIFIER, only its ordering role is retired. Both
- * downstream "is this UI?" tests still key off it being >= 0xFFC0 -- the stereo
- * flatten (ctr.v.pica) and the widescreen X ramp (NativeWide_UiShiftX) -- and
- * 0xFFFF satisfies both. Do not remove the band.
- *
- * EXACTLY ONE PRODUCER, and that is load-bearing. This list is only correct if
- * appends arrive in OT-WALK order, so UI must reach it through a single path:
- * NativeRenderer_DrawTriangles. The direct-emit fast path stands aside for 2D/UI
- * nodes (native_direct_emit.c, NativeDirectEmit_TryNode) precisely so that holds.
- *
- * DO NOT "fix" a future gap by teaching a second path to append here. The first
- * version of this change did exactly that and produced an ordering INVERSION,
- * owner-visible as menu text drawn beneath the translucent panel behind it:
- * direct emit writes its vertices DURING the parse, while the packet path's are
- * replayed later from splits (DrawOTag parses, THEN calls DrawAllSplits), so a
- * list fed by both is ordered [all direct-emit UI][all packet UI] -- not walk
- * order. Two producers cannot be interleaved here without carrying a per-prim
- * walk sequence number and sorting on it; declining the node is cheaper and
- * exact.
- *
- * Opaque and blended UI share the list, which is itself a fix: blended UI used to
- * be emitted after ALL opaque UI (MergeFlush's class ordering), so a translucent
- * panel submitted BEFORE a glyph still landed on top of it.
+ * Opaque and blended UI share the list: blended UI used to be emitted after all
+ * opaque UI, so a translucent panel submitted before a glyph still landed on
+ * top of it.
  *
  * Runs coalesce while state (blend/doubling/atlas) holds and close to a segment
- * on any change, so a text-heavy menu costs a handful of draws, not one per glyph.
- * Walk-thread-local and drawn on the same thread in EndScene, same lifecycle as
- * s_mergeBinVerts.
+ * on any change, so a text-heavy menu costs a handful of draws, not one per
+ * glyph. Walk-thread-local and drawn on the same thread in EndScene, same
+ * lifecycle as s_mergeBinVerts.
  */
 /*
  * DEFAULT OFF (2026-08-09), pending one unresolved regression -- see "KNOWN
@@ -396,7 +360,7 @@ global_variable int s_skyVertUsed = 0;
  */
 int g_dbg_uiOrder = 0;
 /*
- * s44 BISECT TOGGLE (temporary, dumpreq 'uipin'). The change above is two halves
+ * BISECT TOGGLE (temporary, dumpreq 'uipin'). The change above is two halves
  * -- the depth-stamp PIN (PacketDepth_UiStamp, native_gpu.c) and the ordered
  * ROUTING (this file) -- and they normally move together because neither is
  * correct alone. This splits them so a defect can be attributed to one half
@@ -410,7 +374,7 @@ int g_dbg_uiOrder = 0;
  */
 int g_dbg_uiPin = 1;
 /*
- * s44 BISECT TOGGLE 2 (temporary, dumpreq 'uilast'). WHERE the ordered UI pass
+ * BISECT TOGGLE 2 (temporary, dumpreq 'uilast'). WHERE the ordered UI pass
  * runs. 1 = last of all (after the model pass and deferred smoke), which is the
  * shipped behaviour. 0 = immediately after the merge barrier, i.e. the slot UI
  * used to occupy when it lived in the bins.
@@ -433,7 +397,7 @@ global_variable int s_uiOrdRunDoubling = -1;
 global_variable int s_uiOrdRunAtlas = -1;
 global_variable N3DS_MergeSegment s_uiOrdSegs[N3DS_UIORD_MAX_SEGS];
 global_variable int s_uiOrdSegCount = 0;
-/* s44 bisect instrument: screen-space bbox per segment (x0,y0,x1,y1), filled at
+/* Bisect instrument: screen-space bbox per segment (x0,y0,x1,y1), filled at
  * run close. Identifying WHICH on-screen shape a segment is has been the missing
  * fact in this whole investigation -- a big box-filling quad is the gradient, a
  * cluster of small ones is the portrait frames. Diagnostic only. */
@@ -455,7 +419,7 @@ global_variable u32 s_mergeBinSpills = 0;
 global_variable u32 s_mergeEscalations = 0;
 
 /*
- * s31 UI probe. The counters above say HOW MANY draws each class costs; these
+ * UI probe. The counters above say HOW MANY draws each class costs; these
  * say how BIG they are and WHY the blend ones end where they do.
  *
  * The question they exist to answer: opaque content is binned by state across
@@ -500,16 +464,16 @@ enum N3DS_BlendCloseCause
 };
 #endif /* CTR_NATIVE_DRAW_MERGE */
 
-/* s29 ordering A/B (dumpreq 'trackafter') -- see NativeRenderer_EndScene.
+/* Ordering A/B (dumpreq 'trackafter') -- see NativeRenderer_EndScene.
  * Defined outside the DRAW_MERGE gate on purpose: the question it asks is
  * about the resident track draw's position relative to the frame's last
  * flush, which exists in both merge and non-merge builds. */
 int g_dbg_trackAfterMerge = 0;
 
 /*
- * Bottom-screen verbosity (SELECT+X, dumpreq 'verbose'). OFF by default as of
- * s29: the stats block had accreted every instrument this port has ever needed
- * -- decode-cache hits/misses/evictions/stale, sub-page routing, hazard
+ * Bottom-screen verbosity (SELECT+X, dumpreq 'verbose'). OFF by default: the
+ * stats block had accreted every instrument this port has ever needed --
+ * decode-cache hits/misses/evictions/stale, sub-page routing, hazard
  * counters, scene begin/end, audio thread microsecond profile, per-bucket perf
  * -- and on real hardware that screen is the ONLY readout there is. The owner
  * could not find the numbers that matter in the wall of ones that don't.
@@ -523,7 +487,7 @@ int g_dbg_trackAfterMerge = 0;
 int g_dbg_statsVerbose = 0;
 
 /*
- * s29 AUTOMATED CONFIG SWEEP (SELECT+B, dumpreq 'sweep').
+ * AUTOMATED CONFIG SWEEP (SELECT+B, dumpreq 'sweep').
  *
  * The hardware run that motivated this produced retail n=13 windows against
  * ours n=137, clustered in different stretches of the same race -- so the one
@@ -557,29 +521,24 @@ typedef struct
 } N3DS_SweepConfig;
 
 /*
- * s29 CONTENT ABLATION. The depth-bias configs (b64/b256) that lived here in
- * s29 are gone: they came out inside noise of ours-depth on both measured
- * tracks, which is what the near-clamp saturation predicts -- an offset has
- * nothing to act on once every near primitive already pins to depthMinWorld.
- *
- * What replaces them answers the only open perf question. On Polar Pass,
- * ours-depth spends 15.3ms in draw_all_splits and 12.5ms in draw_otag_parse of
- * a 55ms frame, and with the resident track drawing itself, none of those 28ms
- * is track. Each row below removes exactly one content class; frame-time delta
- * from "full" is that class's entire cost, game-side build plus submission.
- * "retail" stays first as the anchor that validates the harness every run.
+ * CONTENT ABLATION. Depth-bias configs are not included: an offset has
+ * nothing to act on once every near primitive already pins to
+ * depthMinWorld (near-clamp saturation). Each row below removes exactly
+ * one content class; frame-time delta from "full" is that class's entire
+ * cost, game-side build plus submission. "retail" stays first as the
+ * anchor that validates the harness every run.
  */
 static const N3DS_SweepConfig s_sweepConfigs[] = {
     {"retail", 0, 0, 0, 0, 0, 1},     /* the baseline every fps claim must beat   */
     {"full", 1, 1, 0, 0, 0, 1},       /* shipping config; ablation baseline       */
-    {"no-vsyncfx", 1, 1, 0, 0, 0, 0}, /* s29 vblank credit fix, OFF -- not content */
+    {"no-vsyncfx", 1, 1, 0, 0, 0, 0}, /* vblank credit fix, OFF -- not content    */
     {"no-inst", 1, 1, 1, 0, 0, 1},    /* karts, drivers, crates, weapons, pickups */
     {"no-hud", 1, 1, 0, 0, 1, 1},     /* race HUD                                 */
 };
 
 /*
  * no-fx (particles, weather, tires, shadows) is GONE, not disabled: it crashed
- * the s29 hardware run. Those RenderAll* calls advance state the rest of the
+ * a hardware run. Those RenderAll* calls advance state the rest of the
  * frame reads, so removing the draw removes a side effect something else
  * depends on. Ablating them needs the state/draw split done first.
  */
@@ -593,10 +552,10 @@ static const N3DS_SweepConfig s_sweepConfigs[] = {
  * cycle completed each config was measured on a DIFFERENT stretch of track --
  * and a stretch of Polar Pass differs from another stretch by more than the
  * variables under test. That is not a smaller version of the right experiment;
- * it is the same confound that made s29 report "ours is slower" from a log that
- * actually said the opposite, reintroduced by the harness written to prevent
- * it. Long blocks only average out if the run lasts many cycles, and runs get
- * cut short.
+ * it is the same confound that made an earlier report claim "ours is slower"
+ * from a log that actually said the opposite, reintroduced by the harness
+ * written to prevent it. Long blocks only average out if the run lasts many
+ * cycles, and runs get cut short.
  *
  * Short blocks instead: a config change costs one discarded settling window, so
  * one measured window is ~6s of wall clock per config and a full 5-config cycle
@@ -656,7 +615,7 @@ static void N3DS_SweepApply(int idx)
 int g_dbg_texturelessMode = 0;
 
 /*
- * Diagnostic (2026-07-20): force EVERY textured triangle to sample ONE fixed
+ * Diagnostic: force EVERY textured triangle to sample ONE fixed
  * texture, captured fresh each frame from the first textured triangle (so it is
  * always a currently-loaded, valid texture) and routed through the simple
  * full-page path. If the whole world then shows that single texture cleanly and
@@ -667,7 +626,7 @@ int g_dbg_texturelessMode = 0;
  * NativeRenderer_SwapWindow. Toggle off to restore normal rendering.
  */
 /* Cost of the 64-frame bottom-screen stats block, previous window, in us.
- * s36 hitch hunt -- see the timer at the top of that block. Prefixed s_stats*
+ * See the timer at the top of that block. Prefixed s_stats*
  * per the unity-TU rule (two same-named file-scope statics in different
  * included .c files silently merge into one object). */
 global_variable unsigned long s_statsBlockUs = 0;
@@ -679,7 +638,7 @@ global_variable TexFormat s_forcedFormat = TF_4_BIT;
 global_variable int s_forcedTexValid = 0;
 
 /*
- * Diagnostic (2026-07-20): route EVERY textured triangle through the full-page
+ * Diagnostic: route EVERY textured triangle through the full-page
  * tier, bypassing the sub-page tier entirely. The forced-single-texture test
  * proved the base decode/atlas/sample/coherency path renders one texture
  * cleanly across all geometry -- but it only ever exercised the full-page path,
@@ -690,14 +649,14 @@ global_variable int s_forcedTexValid = 0;
  */
 int g_dbg_disableSubPage = 0;
 
-/* Diagnostic (2026-07-21 session 16): 0 = off; k = draw atlas k-1 full-screen
+/* Diagnostic: 0 = off; k = draw atlas k-1 full-screen
  * instead of the game (see NativeRenderer_EndScene). Cycled by dumpreq
  * 'atlasview'. Compares the GPU's live view of atlas memory against the
  * capture set's CPU-side atlas dumps. */
 int g_dbg_atlasView = 0;
 
 /*
- * Per-triangle resolve memo (s26). The triscopes hardware decomposition put
+ * Per-triangle resolve memo. The triscopes hardware decomposition put
  * draw_triangles_resolve at ~25-28ms of a ~59-70ms Labs-class frame -- ~90%
  * of the whole draw stage -- while convert/append/flush never charted.
  * Consecutive triangles overwhelmingly ask the same question (same page,
@@ -718,12 +677,12 @@ int g_dbg_atlasView = 0;
  */
 int g_dbg_resolveMemo = 1;
 
-/* PROBE (s27): ablate the per-triangle fb-mirror overlap test inside
+/* PROBE: ablate the per-triangle fb-mirror overlap test inside
  * N3DS_ResolveTriangleTexture. Platform_EndScene re-arms s_fbMirrorStale
  * every frame (native_platform.c StoreFrameBuffer call), so the footprint
  * test RUNS on every textured triangle of every frame even though it only
  * FIRES for freeze-frame consumers (pause background, screen-copy wipes).
- * s26's memo A/B bounded the resolve floor at ~7-8us/call with the hash
+ * The earlier memo A/B bounded the resolve floor at ~7-8us/call with the hash
  * probe itself worth only ~1us -- this test plus its function call is one
  * of the remaining preamble suspects. Toggle ON = skip the test entirely:
  * pause backgrounds/wipes may show stale frames while ON (instrument, not
@@ -742,14 +701,14 @@ global_variable int s_rmemoAtlas, s_rmemoPbU, s_rmemoPbV;
 global_variable u32 s_rmemoStamp;
 global_variable u32 s_resolveMemoHits = 0;
 
-/* ABLATION A (2026-07-21, session 14): boot-splash present submits clear +
+/* ABLATION A: boot-splash present submits clear +
  * display transfer but no draw calls. Used to prove the real-hardware boot
  * hang lived in the draw path, not clear/transfer -- which led to the
  * partial-output-write fix in shaders/ctr.v.pica (outtc0.zw). Keep at 0. */
 int g_dbg_skipSplashDraws = 0;
 
 /*
- * Per-primitive perf scopes (2026-07-25, session 19): every NativePerf scope
+ * Per-primitive perf scopes: every NativePerf scope
  * boundary is an svcGetSystemTick SYSCALL (sdl3_compat_3ds.c ->
  * N3DS_GetTickCount), and the DrawTriangles-path scopes run per CALL (up to
  * thousands/frame), per TRIANGLE (RESOLVE/CONVERT: 4 reads x ~2600 triangles
@@ -768,8 +727,8 @@ global_variable const GrVertex *s_pendingVertices = NULL;
 global_variable int s_pendingVertexCount = 0;
 
 /*
- * VRAM is 1024x512 = 16x8 64x64 dirty-generation cells (2026-07-20,
- * shrunk from the original 4x2 256x256 page-sized grid -- design doc
+ * VRAM is 1024x512 = 16x8 64x64 dirty-generation cells (shrunk from the
+ * original 4x2 256x256 page-sized grid -- design doc
  * section 1 still describes the coarse version). With only 8 cells
  * covering all of VRAM, any write anywhere in an eighth of it staled
  * every decoded page sourced from that eighth, unrelated or not; race
@@ -780,7 +739,7 @@ global_variable int s_pendingVertexCount = 0;
  * generation(s) it was decoded against and is stale if any has since moved.
  */
 /*
- * VRAM dirty-tracking grid. 64 wide, but only 8 TALL (s31) -- the two axes are
+ * VRAM dirty-tracking grid. 64 wide, but only 8 TALL -- the two axes are
  * not symmetric and one of them is load-bearing.
  *
  * CTR's display buffers are 512x216 at y=0 and y=296 (MainMain.c's
@@ -870,7 +829,7 @@ internal void N3DS_DirtyVRAMRect(int x, int y, int w, int h)
  * PS1 mask bit) there, but the pause/wipe consumers draw the result as plain
  * opaque textures, so the mask bit carries nothing for this path.
  *
- * TWO armed slots, not one (session 17 hardware finding): CTR double-buffers
+ * TWO armed slots, not one (hardware finding): CTR double-buffers
  * the display, so EndScene's arm alternates between the two buffers' rects
  * (y=0 / y=296) -- and the pause BG samples the buffer armed the frame
  * BEFORE the most recent arm. A single most-recent rect therefore misses
@@ -939,7 +898,7 @@ internal void N3DS_RefreshFramebufferMirrorSlot(N3DS_FBStoreSlot *slot)
 	/*
 	 * Change-detecting write: only cells whose content actually moved get
 	 * their generation bumped. This is load-bearing, not an optimization
-	 * nicety (measured in Azahar, session 17): menu/idle content samples the
+	 * nicety (measured in Azahar): menu/idle content samples the
 	 * display region EVERY frame (the same screen-feedback blur PC's
 	 * per-frame FBREAD exists to serve), so this refresh runs per frame
 	 * there -- a blanket N3DS_DirtyVRAMRect(x,y,w,h) then re-decoded ~32
@@ -1018,7 +977,7 @@ internal void N3DS_FBRefreshIfOverlaps(int x, int y, int w, int h)
 
 /*
  * Which per-texel visibility predicate a decoded cell was built with -- the
- * per-texel STP mechanism (session 18). RGBA5551 has ONE alpha bit, but PS1
+ * per-texel STP mechanism. RGBA5551 has ONE alpha bit, but PS1
  * semi-transparent textured prims need THREE distinct texel-visibility views
  * (PC discriminates them in its shader, discardForSemiTransPass -- the
  * predicates below are that function's, verbatim):
@@ -1035,7 +994,7 @@ internal void N3DS_FBRefreshIfOverlaps(int x, int y, int w, int h)
  * way materializes one cell (the overwhelmingly common case); mixed usage
  * lazily materializes what its draws actually request. Chosen over RGBA4444
  * (a global 5->4-bit color loss to fix a small element set) and RGBA8
- * (doubles atlas memory, doesn't fit) -- session 17 status note.
+ * (doubles atlas memory, doesn't fit).
  */
 typedef enum
 {
@@ -1061,8 +1020,8 @@ typedef struct
 } N3DS_DecodeCacheEntry;
 
 /*
- * The decode cache is addressed as a flat array of atlas cells (2026-07-19,
- * switched from one dedicated texture per entry to atlas cells -- see the
+ * The decode cache is addressed as a flat array of atlas cells (switched
+ * from one dedicated texture per entry to atlas cells -- see the
  * header comment on N3DS_C3DUploadDecodedCell in n3ds_backend.h for why).
  * Flat index 0 is reserved for a permanent flat opaque-white texel
  * (untextured/Gouraud primitives -- N3DS_WHITE_ATLAS/CELL_X/CELL_Y below),
@@ -1086,7 +1045,7 @@ typedef struct
  * design doc's original guess of 32 was shipped, boot-tested, and measured
  * WRONG the same day: a menu background scene (hills/road/tunnel/sky) alone
  * peaked at 25/32 full-page cells with evictInUse=11846, i.e. severe
- * mid-frame-eviction-hazard pressure -- the exact mechanism session 9/10 tied
+ * mid-frame-eviction-hazard pressure -- the exact mechanism tied
  * directly to visible corruption. Meanwhile the sub-page tier peaked at only
  * ~86/1520 slots across the same content, so it had enormous unused headroom
  * to give back. Growing this further necessarily shrinks the sub-page tier
@@ -1105,7 +1064,7 @@ typedef struct
 
 /* Sized for every physical cell, not just the full-page partition: with
  * g_dbg_disableSubPage the full-page tier scans the idle sub-tier cells too
- * (N3DS_FullPageCellBound below), so the s14/s16 A/B isn't confounded by
+ * (N3DS_FullPageCellBound below), so the A/B isn't confounded by
  * eviction thrash -- 96 cells hold less than one busy scene's working set,
  * which is exactly what invalidated the first run of that experiment. */
 global_variable N3DS_DecodeCacheEntry s_decodeCache[N3DS_TOTAL_CELLS];
@@ -1156,7 +1115,7 @@ global_variable N3DS_SubPageCacheEntry s_subPageCache[N3DS_SUBPAGE_TOTAL_CELLS];
 global_variable int s_lastSubPageCellHit = -1;
 
 /*
- * Hash index over each tier's entry array (session 18). Hardware measured
+ * Hash index over each tier's entry array. Hardware measured
  * resolve at ~36us/triangle -- ~85% of DrawTriangles and ~half the frame --
  * and nearly all of it is the linear key scans below: the one-entry memo
  * only catches same-texture runs, and race content alternates textures and
@@ -1178,8 +1137,8 @@ global_variable int s_lastSubPageCellHit = -1;
 #define N3DS_SUBPAGE_HASH_SIZE  4096
 
 /*
- * Atlas allocation affinity (session 18). Race content keeps all 12 atlases
- * live with ~190 mid-run atlas-switch flushes/frame (s17 hardware) -- every
+ * Atlas allocation affinity. Race content keeps all 12 atlases
+ * live with ~190 mid-run atlas-switch flushes/frame (hardware) -- every
  * switch is a draw-call boundary, and PICA per-draw overhead is the
  * frame-end wait's main feeder. When a miss must pick a victim cell, prefer
  * one in the atlas the CURRENT pending run is bound to: the just-decoded
@@ -1208,9 +1167,9 @@ global_variable u32 s_lastStatFullPageHashHits = 0;
 global_variable u32 s_lastStatSubPageHashHits = 0;
 
 /*
- * Stale-miss attribution (session 19). Steady-state race content re-decodes
+ * Stale-miss attribution. Steady-state race content re-decodes
  * ~100k texels/frame per tier from staleness alone (full-page ~1.5/frame x
- * 65k texels, sub-page ~19/frame x 4k -- s17/s18 windows), and the CAUSE
+ * 65k texels, sub-page ~19/frame x 4k), and the CAUSE
  * picks the fix: pageGen movement = the sampled VRAM region was written
  * (real texture animation, or false sharing from an unrelated write landing
  * in the same 64x64 gen cell -- note the full-page tier keys freshness off
@@ -1249,7 +1208,7 @@ internal u32 N3DS_TexKeyHash(s16 page, s16 clut, TexFormat format, N3DS_TexView 
 }
 
 /*
- * CLUT-content variant caching (session 19). The staleattr counters showed
+ * CLUT-content variant caching. The staleattr counters showed
  * CLUT-generation movement driving the majority of stale re-decodes in race
  * content (sub-page ~80%, staleWindow ~14/frame; full-page ~60% of ~1.5/frame
  * x 65k texels) -- palette ANIMATION, i.e. the game cycling a small, bounded
@@ -1315,7 +1274,7 @@ internal void N3DS_SubCellIndexToAtlasCoord(int subIndex, int *outAtlas, int *ou
 }
 
 /*
- * Cache diagnostics (2026-07-19, added to investigate a real/reported-fps
+ * Cache diagnostics (added to investigate a real/reported-fps
  * mismatch -- SwapWindow's own fps_now is a frames-per-emulated-vblank
  * ratio, which can look fine on average even when per-frame cost is spiky;
  * a decode is only expensive on a miss, so these numbers say directly
@@ -1332,7 +1291,7 @@ global_variable u32 s_lastStatCacheEvictions = 0;
 
 /*
  * WHY a miss happened, which the counters above cannot distinguish and which
- * decides the whole architecture (2026-07-20). Menu content measures ~1151
+ * decides the whole architecture. Menu content measures ~1151
  * misses / 1088 evictions per 32-frame window -- nearly one eviction per miss
  * -- but "the cache is too small" and "the cache keeps being invalidated" look
  * IDENTICAL in that pair, and they have opposite fixes:
@@ -1349,7 +1308,7 @@ global_variable u32 s_lastStatCacheEvictions = 0;
  *
  * Decode-once-at-load is only viable if STALE is near zero. Measure before
  * committing to it: this project has already paid twice for optimising against
- * a premise that was never isolated (the atlas rework, and session 6's
+ * a premise that was never isolated (the atlas rework, and an earlier
  * "ruled out by measurement" list).
  */
 global_variable u32 s_decodeCacheStaleMisses = 0;
@@ -1375,7 +1334,7 @@ global_variable u32 s_frameTouchedPeak = 0;
  * MakeTexcoordTriangle/Quad emit runs of primitives off the same texture --
  * so this turns the common case from a 63-entry scan into one compare.
  *
- * Measured 2026-07-20, and this is why it exists: renderer_draw_triangles_ms
+ * Measured, and this is why it exists: renderer_draw_triangles_ms
  * was 16-18ms of a 36-63ms frame (~70% of render_submit_ms, the top bucket)
  * at ~2040 triangles/frame, i.e. ~8us per triangle -- while the cache was
  * hitting 362,396 times against 1,326 misses. The cost was never decoding;
@@ -1429,8 +1388,8 @@ global_variable u32 s_trianglesRoutedFullPage = 0;
 global_variable u32 s_drawCallCount = 0;
 
 /*
- * Draw-call structure counters (session 15 perf survey). Session 14's first
- * real-hardware race put the frame-end GPU wait (platform_end_frame_ms,
+ * Draw-call structure counters. An early real-hardware race put the
+ * frame-end GPU wait (platform_end_frame_ms,
  * 231-257ms of a ~350ms frame) on top with ~383 draws/frame, and real-PICA
  * per-draw overhead far exceeds Azahar's -- so draws/frame is the one
  * Azahar-measurable number that transfers. These split it into its
@@ -1512,7 +1471,7 @@ global_variable u32 s_droppedRuns = 0;
  * TEXELS wide in every colour mode -- 8bpp spans two tpage columns of VRAM
  * words, 16bpp four. (An earlier revision claimed 8bpp could only address
  * u=0..127, conflating VRAM-word width with texel width, and under-decoded
- * every wide 8/16bpp texture -- fixed session 13; see the decodeWidth
+ * every wide 8/16bpp texture -- fixed; see the decodeWidth
  * comment at the full-page call site.)
  *
  * Alpha is ONE bit (RGBA5551), so the caller picks WHICH texels get it via
@@ -1521,7 +1480,7 @@ global_variable u32 s_droppedRuns = 0;
  * cells instead, one predicate per view (see the N3DS_TexView comment). The
  * single C3D_AlphaTest(GPU_GEQUAL, 1) then serves every pass unchanged.
  *
- * Generalized 2026-07-20 for the sub-page decode cache (docs/
+ * Generalized for the sub-page decode cache (docs/
  * SUBPAGE_DECODE_CACHE_DESIGN.md): originU/originV/width/height say what
  * page-relative rectangle to decode (the page's own absolute VRAM origin is
  * still added internally, below); destStrideTiles says how wide the
@@ -1617,7 +1576,7 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, N3
 			 * Dest (PICA):  15-11 = R, 10-6 = G, 5-1 = B, 0 = A.
 			 *
 			 * Destination layout verified EMPIRICALLY, not inferred from the
-			 * format name -- inferring is precisely what made session 6 rule
+			 * format name -- inferring is precisely what once ruled
 			 * out a byte-order bug that turned out to be the bug. Converting a
 			 * solid R=0xF8,A=0xFF PNG with `tex3ds -r -z none -f rgba5551`
 			 * emits `01 f8` per texel, i.e. 0xF801 little-endian = R=31, G=0,
@@ -1653,12 +1612,12 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, N3
 /*
  * sampV0 is the FIRST PAGE ROW THIS LOOKUP ACTUALLY READS (the triangle's UV
  * bbox minV), and it is what page freshness is keyed on -- not the page
- * anchor. s31: CTR's HUD sheets live in the free VRAM strip below display
+ * anchor. CTR's HUD sheets live in the free VRAM strip below display
  * buffer A, in pages ANCHORED at y=0, i.e. inside the framebuffer. Keying off
  * the anchor cell therefore watched live picture on behalf of a texture that
  * sits 216 rows below it, and every HUD page re-decoded 65536 texels every
  * frame. The sibling test at N3DS_ResolveTriangleTexture's mirror-refresh call
- * already learned this in s17 -- its comment says so in as many words -- and
+ * already learned this -- its comment says so in as many words -- and
  * this is the same correction applied to the freshness key.
  *
  * Consequence to know: an entry's stored pageGen belongs to the row band of
@@ -1702,7 +1661,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N
 	 * (it holds a dead copy of exactly this texture), and reusing it in place
 	 * both skips the whole victim walk and stops animated textures from
 	 * churning a fresh slot per re-decode while their old cell decays into
-	 * LRU garbage (~19 stale re-decodes/frame in race content, s17 hardware). */
+	 * LRU garbage (~19 stale re-decodes/frame in race content, hardware). */
 	int sawStaleKeyMatch = 0;
 	int staleSawPageGen = 0;
 	int staleSawClutGen = 0;
@@ -1813,7 +1772,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N
 		/* Key matched but generations moved. Attribute the cause here, with
 		 * the entry at hand, and pick the reuse policy: a page-DATA change
 		 * makes the old copy worthless, so it stays the in-place stale-twin
-		 * victim (s18). A pure CLUT change leaves a viable palette-step
+		 * victim. A pure CLUT change leaves a viable palette-step
 		 * variant -- claiming it for in-place re-decode would purge the
 		 * variant library on every cycle step and the retarget above could
 		 * never fire (the cycle needs one cell PER palette step to
@@ -1856,7 +1815,7 @@ internal int N3DS_FindOrDecodeTexture(s16 texPage, s16 clut, TexFormat format, N
 	 * list at C3D_FrameEnd) while N3DS_C3DUploadDecodedCell memcpys over it
 	 * immediately, so evicting one silently repoints an already-queued triangle
 	 * at a different texture. That is the mid-frame eviction hazard, and it is
-	 * the same class of bug as the vertex-buffer aliasing fixed in session 6.
+	 * the same class of bug as the vertex-buffer aliasing fixed earlier.
 	 *
 	 * The old code could not avoid it and made it worse: it initialised
 	 * oldestSlot=1 and compared with strict <, so once every cell carried the
@@ -2012,7 +1971,7 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 {
 	const int pageOriginX = (texPage & 0xF) * 64;
 	const int pageOriginY = (texPage & 0x10) ? 256 : 0;
-	/* Keyed on the SAMPLED row, same correction as the full-page tier (s31).
+	/* Keyed on the SAMPLED row, same correction as the full-page tier.
 	 * This used to key on the tile's top row and note that a tile maps exactly
 	 * onto one dirty cell -- true when cells were 64 tall, no longer true now
 	 * they are 8, and not the property that matters anyway: a 64-tall tile
@@ -2038,8 +1997,8 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 	int staleSawClutGen = 0;
 	/* Stale-twin reuse, same rationale as the full-page tier -- and this is
 	 * the tier where it matters: the ~19 stale re-decodes/frame of race
-	 * content (s17 hardware) are nearly all here, and each one otherwise
-	 * pays a full N3DS_SUBPAGE_TOTAL_CELLS victim walk. Since session 19 it
+	 * content (hardware) are nearly all here, and each one otherwise
+	 * pays a full N3DS_SUBPAGE_TOTAL_CELLS victim walk. It
 	 * only claims PAGE-data-stale twins -- CLUT-stale cells are live palette
 	 * variants, see the full-page scan's comment. */
 	int staleMatchSlot = -1;
@@ -2299,7 +2258,7 @@ decodeIntoSubSlot:
  * comment on N3DS_C3DAppendVertices), and DrawTriangles is called once per
  * split -- up to thousands of times a frame -- so many runs get queued
  * before any of them actually executes. Drawing from offset 0 every time
- * (the bug this replaced, 2026-07-19) made every queued draw in the frame
+ * (the bug this replaced) made every queued draw in the frame
  * read whichever run's vertices were written last, since nothing stops a
  * later CPU-side write from landing before an earlier draw's GPU read.
  */
@@ -2508,7 +2467,7 @@ internal void N3DS_MergeFlush(void)
 	 * trailing-run block below ran, the opaque bin emits had already
 	 * overwritten it with BM_NONE -- and the frame's last blend run was
 	 * submitted with blending OFF, or with the last blend SEGMENT's mode when
-	 * there was one. Found by the s31 [MERGEB] counters disagreeing with
+	 * there was one. Found by the [MERGEB] counters disagreeing with
 	 * themselves: 43 blend draws carrying 60 vertices between them, because
 	 * two thirds of them were being classified as opaque at emit time.
 	 * s_runUntextured is not clobbered the same way, but is snapshotted with
@@ -2523,7 +2482,7 @@ internal void N3DS_MergeFlush(void)
 		return;
 	}
 
-	/* [MERGEDBG] removed (s29): it existed to answer ONE question -- whether
+	/* [MERGEDBG] removed: it existed to answer ONE question -- whether
 	 * content reached the merge bins and was emitted, or never got binned. It
 	 * answered it (emitted, and invisible), which located the uniform-register
 	 * collision fixed in N3DS_BindPacketDrawState. Question closed, instrument
@@ -2595,7 +2554,55 @@ internal void N3DS_MergeFlush(void)
 	s_runUntextured = -1;
 }
 
-/* s43: draw the accumulated skybox triangles. Called from NativeRenderer_EndScene
+/* s46: draw the accumulated backdrop fills, immediately BEFORE N3DS_DrawSkyPass
+ * (equal far-pin depth + LEQUAL means the later sky draw layers over this).
+ * Runs earliest of all, so on frames where it has content IT owns the
+ * close-the-open-blend-run duty -- emitting over an open run would re-label
+ * that run opaque (the s46 minimap black box). Same emit triple as the sky
+ * pass. */
+internal void N3DS_DrawBackdropPass(void)
+{
+	int baseVertex;
+	int lastDoubling = -1;
+
+	if (g_dbg_backdropDump)
+	{
+		char msg[96];
+
+		snprintf(msg, sizeof(msg), "[BACKDROP] drain: backdropVerts=%d skyVerts=%d enable=%d", s_backdropVertUsed, s_skyVertUsed, g_dbg_backdrop);
+		N3DS_DebugLog(msg);
+		g_dbg_backdropDump = 0;
+	}
+	if (!g_dbg_backdrop)
+	{
+		s_backdropVertUsed = 0;
+		return;
+	}
+	if (s_backdropVertUsed <= 0)
+	{
+		return;
+	}
+	/* Only under a frame that drew sky. Boot/load screens clear via the same
+	 * FILL packets but must present with ZERO draws -- the session-14 splash
+	 * hang class lived in the draw path -- and a frame with no sky content is
+	 * also the only case where the backdrop has nothing to be behind: the
+	 * walk's own draws cover whatever the fill would have shown. Read before
+	 * N3DS_DrawSkyPass zeroes the count. */
+	if (s_skyVertUsed <= 0)
+	{
+		s_backdropVertUsed = 0;
+		return;
+	}
+	N3DS_MergeCloseBlendRun(N3DS_BLEND_CLOSE_STATE);
+	baseVertex = N3DS_C3DAppendVertices(s_backdropVerts, s_backdropVertUsed);
+	if (baseVertex >= 0)
+	{
+		N3DS_MergeEmit(0, 0, N3DS_WHITE_ATLAS, baseVertex, s_backdropVertUsed, &lastDoubling);
+	}
+	s_backdropVertUsed = 0;
+}
+
+/* Draw the accumulated skybox triangles. Called from NativeRenderer_EndScene
  * BEFORE the resident track pass, so the translucent waterfalls (which write no
  * depth) paint over the sky instead of the sky painting over them. See the
  * s_skyVerts block above. Same emit triple as the UNTEX bin (BM_NONE, untextured,
@@ -2610,15 +2617,14 @@ internal void N3DS_DrawSkyPass(void)
 	{
 		return;
 	}
-	/* s46 (the minimap black box, owner-bisected to s43): the walk's LAST blend
-	 * run can still be open when EndScene reaches this pass -- in-race that run
-	 * is the HUD map sheet's blended half, because UI is the tail of the walk.
-	 * N3DS_MergeEmit below stamps s_runBlendMode = 0 as a side effect, and
-	 * N3DS_MergeCloseBlendRun reads s_runBlendMode at CLOSE time -- so emitting
-	 * the sky over an open run re-labels that run opaque, and its STP texels
-	 * replay solid black. Both heal legs of the A/B (skyfirst 0, directemit 0)
-	 * were really "the sky pass didn't run". Close the run first, so it is
-	 * recorded under the state it actually accumulated with. */
+	/* The walk's LAST blend run can still be open when EndScene reaches this
+	 * pass -- in-race that run is the HUD map sheet's blended half, because UI
+	 * is the tail of the walk. N3DS_MergeEmit below stamps s_runBlendMode = 0
+	 * as a side effect, and N3DS_MergeCloseBlendRun reads s_runBlendMode at
+	 * CLOSE time -- so emitting the sky over an open run re-labels that run
+	 * opaque, and its STP texels replay solid black (the minimap black box).
+	 * Close the run first, so it is recorded under the state it actually
+	 * accumulated with. */
 	N3DS_MergeCloseBlendRun(N3DS_BLEND_CLOSE_STATE);
 	baseVertex = N3DS_C3DAppendVertices(s_skyVerts, s_skyVertUsed);
 	if (baseVertex >= 0)
@@ -2629,7 +2635,7 @@ internal void N3DS_DrawSkyPass(void)
 }
 
 /*
- * s44 ordered UI pass (see the s_uiOrd* block near the top for the whole design).
+ * Ordered UI pass (see the s_uiOrd* block near the top for the whole design).
  *
  * Closes the open UI run into a recorded segment: vertices to the frame VBO now,
  * the draw itself deferred to N3DS_DrawUiPass so submission order is replayed
@@ -2671,7 +2677,7 @@ internal void N3DS_UiOrderCloseRun(void)
 		seg->baseVertex = baseVertex;
 		seg->vertCount = s_uiOrdRunUsed;
 
-		/* s44 instrument: bbox of what this segment actually covers on screen. */
+		/* Instrument: bbox of what this segment actually covers on screen. */
 		for (k = 0; k < s_uiOrdRunUsed; k++)
 		{
 			const short vx = (short)s_uiOrdRunVerts[k].x;
@@ -2739,7 +2745,7 @@ internal N3DS_Vertex *N3DS_UiOrderAppend(int blendMode, int doubling, int atlas)
  * the right-eye replay reissues them identically. lastDoubling = -1 makes the
  * pass self-contained against whatever state the model/smoke passes left.
  */
-/* s44 bisect instrument (dumpreq 'uidump'): one-shot dump of what the ordered UI
+/* Bisect instrument (dumpreq 'uidump'): one-shot dump of what the ordered UI
  * list actually holds on the current screen. Answers the question every theory so
  * far has guessed at -- whether a given piece of content is classified as UI and
  * reaches this list at all. Untextured segments are called out separately because
@@ -2855,7 +2861,7 @@ internal inline int MAX3(int a, int b, int c)
 /*
  * Converts one triangle's three GrVertex into dst[0..2] (any destination:
  * the pending-run scratch, or a CTR_NATIVE_DRAW_MERGE bin). Extracted from
- * the DrawTriangles loop 2026-07-28 so the merge path shares the exact
+ * the DrawTriangles loop so the merge path shares the exact
  * conversion -- especially the UV numerator formulas, whose history of
  * subtle wrongness (half-texel, V-flip) lives in the comments below. Keep
  * ONE copy of these formulas, ever.
@@ -2879,7 +2885,7 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
 		 * render darker than PC. See N3DS_C3DSetColorDoubling. */
 
 		{
-			/* s37 widescreen UI relocation: UI-band verts (raw stamp
+			/* Widescreen UI relocation: UI-band verts (raw stamp
 			 * 0xFFC0.. = the same d <= 63 band the stereo mask flattens)
 			 * get their X remapped toward the wide window edges -- see
 			 * NativeWide_UiShiftX (native_gpu.c) for the ramp and why it
@@ -2924,7 +2930,7 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
 		 * of the intended texel, where nearest-neighbour needs no
 		 * boundary tie-break at all.
 		 *
-		 * CORRECTED RECORD (session 16). The previous 2*texel - 1 form
+		 * CORRECTED RECORD. The previous 2*texel - 1 form
 		 * ("half-texel", e7ffe8d) cited PC vertices carrying tcx=tcy=-1;
 		 * that claim was wrong -- PC's tcx/tcy block is COMMENTED OUT
 		 * (native_gpu.c, g_cfg_bilinearFiltering), so PC simply floors
@@ -2940,7 +2946,7 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
 		 * fine, addressing was not.
 		 */
 		/*
-		 * V FLIP -- proven by direct observation (session 16 atlas
+		 * V FLIP -- proven by direct observation (atlas
 		 * inspector, dumpreq 'atlasview'): the GPU's live view of an
 		 * atlas is the CPU-side memory VERTICALLY MIRRORED (white cell
 		 * at memory top renders at screen bottom; cell rows in exact
@@ -2948,7 +2954,7 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
 		 * tex3ds parity probe used `tex3ds -r` (raw, unflipped), so it
 		 * validated Morton/tile math while silently inheriting the
 		 * wrong orientation, and PresentVRAMRect's empirical quad-V
-		 * swap (2026-07-20) was this same fact discovered locally.
+		 * swap was this same fact discovered locally.
 		 * Sample-side fix: numerator 2048-(2a+1) = 2047-2a targets
 		 * memory row a from the bottom-up T axis. Applies to the white
 		 * cell too -- the earlier "white renders fine unflipped"
@@ -3011,7 +3017,7 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 	 * any page anchored at y=0 overlaps the display rect even when every
 	 * texel it actually samples lies below it -- the whole-page form of this
 	 * test fired on essentially every frame of menu and race content
-	 * (measured in Azahar, session 17). Costs a few integer ops per textured
+	 * (measured in Azahar). Costs a few integer ops per textured
 	 * triangle when it doesn't fire. */
 	if (s_fbMirrorStale && !g_dbg_skipFbTriTest)
 	{
@@ -3136,7 +3142,7 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 	printf("%s\n", (windowName != NULL) ? windowName : "(no title)");
 	/* width/height here are the PC path's SDL window request (main.c passes
 	 * 800x600) -- nothing on 3DS renders at them, and echoing them as "PSX
-	 * display" read as a live 800x600 pipeline (user-flagged, session 18).
+	 * display" read as a live 800x600 pipeline (user-flagged).
 	 * Print what this platform actually does instead. */
 	(void)width;
 	(void)height;
@@ -3279,8 +3285,8 @@ void NativeRenderer_BeginScene(void)
 
 	/*
 	 * Fit the game's own display area to the panel, cropped to the PSX's
-	 * intended 4:3 aspect rather than widened to the top screen's 5:3
-	 * (2026-07-20). CTR runs a 512x216 DISPENV; previously this widened the
+	 * intended 4:3 aspect rather than widened to the top screen's 5:3.
+	 * CTR runs a 512x216 DISPENV; previously this widened the
 	 * ortho range to fill the full 400px panel width, which showed ~40 extra
 	 * PSX-space columns of world per edge that were never meant to be on
 	 * screen -- the source of the "can see past the edge of the track"
@@ -3347,10 +3353,11 @@ void NativeRenderer_BeginScene(void)
 			s_mergeBinUsed[bin] = 0;
 		}
 	}
-	s_skyVertUsed = 0; /* s43: sky accumulator shares the bins' frame lifecycle */
+	s_skyVertUsed = 0; /* sky accumulator shares the bins' frame lifecycle */
+	s_backdropVertUsed = 0; /* s46: backdrop accumulator, same lifecycle */
 	s_mergeOpaqueSegCount = 0;
 	s_mergeBlendSegCount = 0;
-	/* s44: same reason as the bins above -- the VBO cursor just reset, so any
+	/* Same reason as the bins above -- the VBO cursor just reset, so any
 	 * baseVertex a skipped EndScene stranded must not survive into this frame. */
 	s_uiOrdSegCount = 0;
 	s_uiOrdRunUsed = 0;
@@ -3369,7 +3376,7 @@ void NativeRenderer_EndScene(void)
 	}
 
 	/*
-	 * s43: draw the skybox FIRST -- before the resident track pass and before the
+	 * Draw the skybox FIRST -- before the resident track pass and before the
 	 * merge barrier -- so the translucent waterfalls (which write no depth) paint
 	 * over it instead of it painting over them. The sky was routed out of the
 	 * opaque bins into s_skyVerts during the walk (native_direct_emit.c), so it is
@@ -3378,6 +3385,11 @@ void NativeRenderer_EndScene(void)
 	 */
 	if (g_dbg_skyFirst)
 	{
+		/* Backdrop first, sky second: both sit at the far pin (vertex
+		 * -32768), LEQUAL passes on equal, so the later sky draw wins the
+		 * tie and layers over the fill -- bg color, then gradient/dome,
+		 * then everything real, retail's stack. */
+		N3DS_DrawBackdropPass();
 		N3DS_DrawSkyPass();
 	}
 
@@ -3396,7 +3408,7 @@ void NativeRenderer_EndScene(void)
 	 * this file before that one.
 	 */
 	/*
-	 * s29: the ONE difference that tracks the symptom. With merge OFF, packet
+	 * The ONE difference that tracks the symptom. With merge OFF, packet
 	 * content is drawn immediately DURING the walk -- before this call -- and
 	 * karts/UI/crates all appear with the resident renderer on. With merge ON,
 	 * essentially all packet content is deferred to N3DS_MergeFlush() below,
@@ -3428,7 +3440,7 @@ void NativeRenderer_EndScene(void)
 		 * tracker anyway so ANY other consumer between here and the next
 		 * BeginScene sees the same "unknown, please reassert" signal the
 		 * atlas inspector/PresentVRAMRect already leave behind after their
-		 * own foreign draws -- review fix (FIX 5): that reset now happens
+		 * own foreign draws: that reset now happens
 		 * INSIDE NativeTrackDraw_IssueForWalk itself, gated behind its own
 		 * toggle-0 early return, rather than unconditionally here every
 		 * frame this build option is compiled in. Toggle 0 is the A/B
@@ -3451,7 +3463,7 @@ void NativeRenderer_EndScene(void)
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_MERGE_FLUSH);
 
 #ifdef CTR_NATIVE_DRAW_MERGE
-	/* s44 bisect ('uilast' off): draw the UI pass HERE, in the slot UI occupied
+	/* Bisect ('uilast' off): draw the UI pass HERE, in the slot UI occupied
 	 * when it still lived in the merge bins, instead of last. See g_dbg_uiLast. */
 	if (!g_dbg_uiLast)
 	{
@@ -3487,7 +3499,7 @@ void NativeRenderer_EndScene(void)
 #endif
 
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
-	/* Other half of the s29 ordering A/B above. */
+	/* Other half of the ordering A/B above. */
 	if (g_dbg_trackAfterMerge)
 	{
 		extern void NativeTrackDraw_IssueForWalk(void);
@@ -3500,7 +3512,7 @@ void NativeRenderer_EndScene(void)
 
 #if defined(CTR_NATIVE_DRAW_MERGE) && CTR_NATIVE_GTE_CAPTURE
 	/*
-	 * s42: driver-local exhaust smoke, deliberately held out of the merge
+	 * Driver-local exhaust smoke, deliberately held out of the merge
 	 * above (DrawAllSplits flagged its splits deferredSmoke), is redrawn HERE --
 	 * last of all, after the model pass -- so it paints over its own kart body
 	 * (retail's painter's order) while the depth test still lets a genuinely
@@ -3511,7 +3523,7 @@ void NativeRenderer_EndScene(void)
 	 *
 	 * NativeGpu_DrawDeferredSmoke re-runs the captured splits through the normal
 	 * DrawSplit path, binning them back into the now-empty merge as blends --
-	 * which already draw depth-test-on / depth-write-off (the s32 anti-carve
+	 * which already draw depth-test-on / depth-write-off (the anti-carve
 	 * rule) -- and the MergeFlush below drains them onto the command list on top
 	 * of the body. s_mergeDepthWriteState is forced to "unknown" first so the
 	 * smoke's first emit re-asserts the LEQUAL depth state the model pass left.
@@ -3528,7 +3540,7 @@ void NativeRenderer_EndScene(void)
 
 #ifdef CTR_NATIVE_DRAW_MERGE
 	/*
-	 * s44: the frame's UI, in submission order, LAST -- after the merge barrier,
+	 * The frame's UI, in submission order, LAST -- after the merge barrier,
 	 * the model pass and the deferred smoke, so nothing can paint over it. This
 	 * is the point of the whole change: UI layering is now painter's order (what
 	 * retail does) instead of an artefact of which state bin each glyph and panel
@@ -3543,7 +3555,7 @@ void NativeRenderer_EndScene(void)
 
 #ifdef CTR_INTERNAL
 	/*
-	 * Atlas inspector (session 16, dumpreq 'atlasview'): draw atlas
+	 * Atlas inspector (dumpreq 'atlasview'): draw atlas
 	 * (g_dbg_atlasView - 1) full-screen INSTEAD of the game (DrawTriangles
 	 * suppresses normal emission while active). The screen then shows what
 	 * the GPU actually samples from that atlas; the capture set's
@@ -3637,22 +3649,16 @@ void NativeRenderer_UpdateSwapIntervalState(int swapInterval)
 }
 
 /*
- * s36 bottom-screen hitch. Measured on hardware: the stats block cost ~50ms,
- * landing on ONE frame every 64 -- the whole residual hitch after the SD-log
- * flush was killed (owner: Crash Cove ~50, Tubes ~48-50).
+ * Measured on hardware: the stats block cost ~50ms, landing on one frame
+ * every 64. libctru's console renders every cell as a glyph blit into a
+ * column-major rotated framebuffer, and `\x1b[2J` clears by printing a
+ * space into all 40x30=1200 cells before any text is drawn -- three
+ * quarters of the cost was erasing cells about to be redrawn with
+ * unchanged text.
  *
- * Why it was so expensive: libctru's console renders every cell as a glyph
- * blit into a COLUMN-major rotated framebuffer, and `\x1b[2J` clears by
- * printing a space into all 40x30 = 1200 cells BEFORE a single character of
- * text is drawn. The text itself is only ~600 more. So three quarters of the
- * cost was erasing cells that were about to be redrawn with the same
- * characters -- labels like "frames" and ">> SEL+START = ours <-> retail"
- * never change at all.
- *
- * So: keep a shadow of what is already on each row and emit only rows whose
- * text actually differs, positioning the cursor per row instead of clearing.
- * A full clear still happens when the LAYOUT changes (verbose/sweep toggled),
- * because that is when stale rows could otherwise be left behind.
+ * Fix below: keep a shadow of each row's text and repaint only rows that
+ * differ, positioning the cursor per row instead of clearing; a full clear
+ * still happens when the layout itself changes (verbose/sweep toggled).
  */
 #define N3DS_STATS_ROWS 40
 #define N3DS_STATS_COLS 41 /* 40 columns + NUL */
@@ -3761,18 +3767,15 @@ void NativeRenderer_SwapWindow(void)
 	s_frameCounterForDump = (unsigned int)s_frameCounter;
 
 	/*
-	 * s29: was `& 31` -- every 32 frames, i.e. roughly once a SECOND at real
-	 * race framerate, and this block both redraws the console AND writes a
-	 * dozen lines to the SD card. `& 63` halves the SD traffic (owner: "are we
-	 * recording too much to the SD card every second") while keeping the
-	 * on-screen toggle readout refreshing fast enough to dial SELECT+Y by eye.
-	 * Windowed counters below derive their deltas from the previous sample, so
-	 * they stay correct at any cadence -- only the sampling period changes.
+	 * `& 63` halves SD traffic versus a per-second cadence while keeping the
+	 * on-screen toggle readout responsive enough to dial by eye. Windowed
+	 * counters below derive their deltas from the previous sample, so they
+	 * stay correct at any cadence -- only the sampling period changes.
 	 */
 	if ((s_frameCounter & 63) == 0)
 	{
-		/* s36: time this whole block. Killing the SD flush took the worst frame
-		 * per window from ~150ms to 55-80ms (owner, track by track), so
+		/* Time this whole block. Killing the SD flush took the worst frame
+		 * per window from ~150ms to 55-80ms (track by track), so
 		 * something ELSE lands on this same 64-frame beat -- and this block is
 		 * the candidate: \x1b[2J clears 230KB, then ~20 lines of glyphs are
 		 * drawn into a COLUMN-major rotated framebuffer, about as cache-hostile
@@ -3871,7 +3874,7 @@ void NativeRenderer_SwapWindow(void)
 			 * reads as garbage in a photo, which is how this screen actually
 			 * gets used on hardware.
 			 *
-			 * s36 declutter (owner request): just the SELECT+START master
+			 * Declutter: just the SELECT+START master
 			 * switch and the three renderers it drives. Every other chord
 			 * still works; it's only the hints that are gone. */
 			printf("\n>> SEL+START = ours <-> retail\n");
@@ -3884,7 +3887,7 @@ void NativeRenderer_SwapWindow(void)
 				printf(">> wide  %-5s\n", wideNames[(wm >= 0 && wm <= 2) ? wm : 0]);
 			}
 			{
-				/* s44 UI pop-out, with its chord spelled out. On screen rather
+				/* UI pop-out, with its chord spelled out. On screen rather
 				 * than in the log because it is dialled BY EYE with the 3D slider
 				 * up, and the SD log cannot be read while the game holds the card
 				 * -- the number has to be visible in the moment it is being
@@ -3898,7 +3901,7 @@ void NativeRenderer_SwapWindow(void)
 				extern int g_dbg_sdLog;
 
 				/* Logging earns a line of its own with its chord spelled out:
-				 * ON costs a ~100-170ms hitch every 2s (the SD flush, s36), so
+				 * ON costs a ~100-170ms hitch every 2s (the SD flush), so
 				 * this is the one toggle whose state silently invalidates a
 				 * "how does it feel" verdict. Reads one window late like every
 				 * line here -- the block only redraws every 64 frames. */
@@ -3927,8 +3930,8 @@ void NativeRenderer_SwapWindow(void)
 			const unsigned long evictionsWindow = (unsigned long)(s_decodeCacheEvictions - s_lastStatCacheEvictions);
 			const unsigned long drawsWindow = (unsigned long)(s_drawCallCount - s_lastStatDrawCallCount);
 			/* Report interval is always exactly 64 frames -- the (s_frameCounter & 63)
-			 * gate above. This divided by 32 until s36 (a leftover from when the gate
-			 * really was & 31), which overstated draws/frame 2x on the bottom screen. */
+			 * gate above. This divided by 32 until the gate was changed from & 31 to
+			 * & 63 (a leftover), which overstated draws/frame 2x on the bottom screen. */
 			const unsigned long drawsPerFrameAvgX10 = (drawsWindow * 10UL) / 64UL;
 			char cacheLine[128];
 
@@ -3983,7 +3986,7 @@ void NativeRenderer_SwapWindow(void)
 			N3DS_DebugLog(cacheLine);
 
 			/*
-			 * s44 ordered UI pass. primsMax is the replacement for [PKTDEPTH]
+			 * Ordered UI pass. primsMax is the replacement for [PKTDEPTH]
 			 * uiMax, which measured a 256-prim budget that no longer exists --
 			 * this list's capacity is the live one. dropped MUST stay 0: it counts
 			 * UI that could not be recorded (segment list full), and silently
@@ -3999,7 +4002,7 @@ void NativeRenderer_SwapWindow(void)
 			N3DS_DebugLog(cacheLine);
 
 			/*
-			 * s31 UI probe: the same split as WINDOW DELTAS, with the size of
+			 * UI probe: the same split as WINDOW DELTAS, with the size of
 			 * each class of draw and why the blend ones ended. Deltas, not the
 			 * running totals above, because the question is per-config -- the
 			 * [SWEEP] harness changes what is on screen every few windows and a
@@ -4278,7 +4281,7 @@ void NativeRenderer_SwapWindow(void)
 				N3DS_DebugLog(cacheLine);
 
 				/*
-				 * The per-wake budget breakdown (session 21). Run 6 established
+				 * The per-wake budget breakdown. An earlier measurement established
 				 * THAT the worker governs frame rate on XA-music tracks; this
 				 * line is what says WHICH job does it. Read wakes first: a
 				 * healthy worker wakes ~60x per second of window, so
@@ -4566,7 +4569,7 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 	const int maxChunk = N3DS_VRAM_DISPLAY_TEX_DIM;
 	int y;
 	int chunkSlot = 0;
-	/* DIAGNOSTIC (2026-07-21, session 14): bounded entry/exit trace pairing
+	/* DIAGNOSTIC: bounded entry/exit trace pairing
 	 * with the FrameBegin/FrameEnd traces in n3ds_backend.c -- together they
 	 * bracket every stage of the boot-splash present that real hardware
 	 * freezes inside. */
@@ -4640,7 +4643,7 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 			N3DS_TileVRAMDisplayChunk(displayX + x, displayY + y, chunkW, chunkH, s_vramDisplayScratch);
 			N3DS_C3DUploadVramDisplayChunk(slot, s_vramDisplayScratch);
 
-			/* v0.0 experiment (2026-07-20): source top-of-rect landed on
+			/* v0.0 experiment: source top-of-rect landed on
 			 * screen bottom on real output despite the quad's own screen-
 			 * space Y matching the same proven per-frame projection every
 			 * other draw uses, and despite the tile-address math being a
@@ -4692,7 +4695,7 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 				verts[i].b = 255;
 			}
 
-			/* ABLATION A (2026-07-21, session 14, hardware GPU-wedge hunt):
+			/* ABLATION A (hardware GPU-wedge hunt):
 			 * submit the splash frames with clear+transfer but ZERO draws.
 			 * Real hardware never completes the first submitted command list
 			 * (FrameBegin #2 waits forever); this splits {clear/transfer}
@@ -4741,7 +4744,134 @@ void NativeRenderer_SaveVRAM(const char *outputFileName, int x, int y, int width
 
 void NativeRenderer_Clear(int x, int y, int w, int h, u8 r, u8 g, u8 b)
 {
-	(void)x; (void)y; (void)w; (void)h; (void)r; (void)g; (void)b;
+	/* s46: retail's backdrop is a GPU FILL packet (CAM_ClearScreen -- flat
+	 * clearColor split at the horizon) reaching here via ClearImage; PC
+	 * honours it as a scissored framebuffer clear, and ignoring it left raw
+	 * black above the skybox dome's rim. Emitted as a far-pin quad into the
+	 * BACKDROP accumulator -- NOT s_skyVerts: the fill is walked AFTER the
+	 * sky (bucket 0x3FF is head-first and the sky prims are prepended later
+	 * in the frame), so an append there painted over the dome. See the
+	 * s_backdropVerts block for the structural-order argument.
+	 *
+	 * The overlap math against the live DISPENV mirrors the PC implementation
+	 * (native_renderer.c) so the two renderers agree on which part of a fill
+	 * is visible backdrop vs off-screen VRAM housekeeping. */
+	int displayX = activeDispEnv.disp.x;
+	int displayY = activeDispEnv.disp.y;
+	int displayW = activeDispEnv.disp.w;
+	int displayH = activeDispEnv.disp.h;
+	int overlapX, overlapY, overlapRight, overlapBottom;
+	int relX, relY, relRight, relBottom;
+	int uWhite, vWhite, k;
+	N3DS_Vertex *dst;
+
+	if ((w <= 0) || (h <= 0))
+	{
+		return;
+	}
+
+	/* Game-thread direct caller (Platform_BeginScene's isbg clear) while the
+	 * render worker owns the accumulator: skip, as the stub always did. FILL
+	 * packets arrive via the walk and queued ClearImage jobs, both of which
+	 * execute on the walk's thread. */
+	if (NativeRenderQueue_Route())
+	{
+		return;
+	}
+
+	/* skyfirst OFF is the s43 punch-through comparison leg: nothing drains
+	 * the accumulators ahead of the track there, so keep the leg pure. */
+	if (!g_dbg_skyFirst || !g_dbg_backdrop)
+	{
+		return;
+	}
+
+	if ((s_backdropVertUsed + 6) > N3DS_BACKDROP_VERT_CAP)
+	{
+		return;
+	}
+
+	if ((displayW <= 0) || (displayH <= 0))
+	{
+		displayX = activeDrawEnv.clip.x;
+		displayY = activeDrawEnv.clip.y;
+		displayW = activeDrawEnv.clip.w;
+		displayH = activeDrawEnv.clip.h;
+	}
+
+	if ((displayW <= 0) || (displayH <= 0))
+	{
+		return;
+	}
+
+	overlapX = (x > displayX) ? x : displayX;
+	overlapY = (y > displayY) ? y : displayY;
+	overlapRight = ((x + w) < (displayX + displayW)) ? (x + w) : (displayX + displayW);
+	overlapBottom = ((y + h) < (displayY + displayH)) ? (y + h) : (displayY + displayH);
+
+	if ((overlapRight <= overlapX) || (overlapBottom <= overlapY))
+	{
+		return;
+	}
+
+	relX = overlapX - displayX;
+	relY = overlapY - displayY;
+	relRight = overlapRight - displayX;
+	relBottom = overlapBottom - displayY;
+
+	/* REAL-widescreen (mode 2) widens the ortho window past the display rect
+	 * (N3DS_C3DSetProjection); a backdrop fill that reaches a display edge
+	 * must keep going to the ortho edge or the widened margin shows black. */
+	{
+		extern int g_dbg_widescreen;
+
+		if (g_dbg_widescreen == 2)
+		{
+			const int extra = (displayW * (400 - N3DS_TOP_CONTENT_W)) / (2 * N3DS_TOP_CONTENT_W);
+
+			if (relX == 0)
+			{
+				relX = -extra;
+			}
+			if (relRight == displayW)
+			{
+				relRight = displayW + extra;
+			}
+		}
+	}
+
+	uWhite = ((N3DS_WHITE_CELL_X * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1) + 1;
+	vWhite = 2047 - ((N3DS_WHITE_CELL_Y * N3DS_DECODE_TEXTURE_DIM + (N3DS_DECODE_TEXTURE_DIM / 2)) << 1);
+
+	dst = &s_backdropVerts[s_backdropVertUsed];
+	/* Far pin: RAW stamp 0, and N3DS_Vertex carries z = raw - 32768 (the
+	 * direct-emit mapping), so the vertex value is -32768 -- z=0 here would
+	 * be raw 32768, a MID-RANGE depth that buried the whole sky (the first
+	 * two attempts' actual defect). w likewise: parallax at infinity is raw
+	 * 0 on the same biased axis. */
+	dst[0].x = (s16)relX;
+	dst[0].y = (s16)relY;
+	dst[1].x = (s16)relRight;
+	dst[1].y = (s16)relY;
+	dst[2].x = (s16)relX;
+	dst[2].y = (s16)relBottom;
+	dst[3].x = (s16)relRight;
+	dst[3].y = (s16)relY;
+	dst[4].x = (s16)relX;
+	dst[4].y = (s16)relBottom;
+	dst[5].x = (s16)relRight;
+	dst[5].y = (s16)relBottom;
+	for (k = 0; k < 6; k++)
+	{
+		dst[k].z = -32768;
+		dst[k].w = -32768;
+		dst[k].u = (s16)uWhite;
+		dst[k].v = (s16)vWhite;
+		dst[k].r = r;
+		dst[k].g = g;
+		dst[k].b = b;
+	}
+	s_backdropVertUsed += 6;
 }
 
 void NativeRenderer_ClearVRAM(int x, int y, int w, int h, u8 r, u8 g, u8 b)
@@ -5145,7 +5275,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 
 #ifdef CTR_NATIVE_DRAW_MERGE
 		/*
-		 * s44: UI leaves the state bins HERE, before the opaque branch below, so
+		 * UI leaves the state bins HERE, before the opaque branch below, so
 		 * that blended UI is caught by the same test (the opaque branch takes
 		 * BM_NONE only) and keeps its true order against opaque UI. Replayed in
 		 * submission order at the end of the frame -- see the s_uiOrd* block.
@@ -5314,7 +5444,7 @@ internal void N3DS_MetaWriteU32(FILE *f, u32 v)
  *   subpage entries [0 .. SUBPAGE_TOTAL_CELLS):
  *       used, page, clut, format, view, tileX, tileY, pageGen, clutGenA,
  *       clutGenB, lastUsedFrame
- * version 2 (session 18): inserted `view` (N3DS_TexView, the per-texel STP
+ * version 2: inserted `view` (N3DS_TexView, the per-texel STP
  * decode variant) after `format` in both entry records.
  */
 /* Backend-callable (dumpreq 'subpage' toggle): drop every cached decode in

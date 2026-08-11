@@ -40,15 +40,11 @@
 static FILE *s_logFile = NULL;
 
 /*
- * 3dslink netload stderr streaming (2026-07-21). When the app was sent over
- * Wi-Fi with 3dslink, HBL records the sender's IP in __3dslink_host; connect
- * a TCP stream back to it (3dslink must be run with -s to listen) and point
- * stderr at it. Every N3DS_DebugLog / Platform_Log line is then mirrored to
- * the PC live, which is the difference between "the exact last line before a
- * hardware freeze, on the host terminal" and pulling the SD card out from
- * behind the backplate. stdout is deliberately NOT redirected -- it is the
- * bottom-screen console. SD-card / Azahar launches have s_addr == 0 and skip
- * all of this.
+ * 3dslink netload stderr streaming: when sent over Wi-Fi via 3dslink, HBL
+ * records the sender's IP in __3dslink_host; connect a TCP stream back to it
+ * (3dslink must run with -s) and point stderr at it so every log line
+ * mirrors to the PC live. stdout stays the bottom-screen console; SD-card /
+ * Azahar launches have s_addr == 0 and skip this.
  */
 #define N3DS_SOC_ALIGN       0x1000
 #define N3DS_SOC_BUFFER_SIZE 0x100000
@@ -99,15 +95,13 @@ static void N3DS_NetloadStreamInit(void)
 		return;
 	}
 
-	/* Batch the stream: newlib's stderr is unbuffered, so every log line was
-	 * a synchronous soc:u send -- the stats window's ~17 back-to-back lines
-	 * cost one IPC each, every 32 frames, and each send is a chance for a
-	 * transient WiFi failure to kill the whole stream (which is how session
-	 * 19's first netload lost everything after boot). Buffer + the shared 2s
-	 * timed flush in N3DS_DebugLog turns that into one send per window batch.
-	 * Must precede the first stderr write, hence before the active flag flips
-	 * (every stream write is gated on it). svcOutputDebugString stays the
-	 * per-line instant trail for crash forensics. */
+	/* Batch the stream: newlib's stderr is unbuffered, so every log line is a
+	 * synchronous soc:u send, and each send is a chance for a transient WiFi
+	 * failure to kill the whole stream. Buffer + the shared 2s timed flush in
+	 * N3DS_DebugLog turns that into one send per window batch; must precede
+	 * the first stderr write, hence before the active flag flips (every
+	 * stream write is gated on it). svcOutputDebugString stays the per-line
+	 * instant trail for crash forensics. */
 	setvbuf(stderr, NULL, _IOFBF, 8192);
 
 	s_netloadStreamActive = 1;
@@ -118,9 +112,9 @@ void N3DS_EarlyInit(void)
 	consoleDebugInit(debugDevice_SVC);
 
 	/* One-deep rotation BEFORE the truncating open: "w" wipes the previous
-	 * boot's log, and that is exactly how session 19's hardware race numbers
-	 * were lost (crash -> relaunch -> the relaunch truncated the crashed
-	 * run's log). Keeps exactly the last two boots, never grows unbounded. */
+	 * boot's log, so a crash -> relaunch sequence would otherwise truncate
+	 * the crashed run's log before it can be read. Keeps exactly the last
+	 * two boots, never grows unbounded. */
 	remove(N3DS_LOG_PREV_PATH);
 	rename(N3DS_LOG_PATH, N3DS_LOG_PREV_PATH);
 
@@ -140,28 +134,23 @@ void N3DS_EarlyInit(void)
 	}
 }
 
-/* Last SD-log flush, in system ticks. Per-LINE fflush stalled gameplay
+/* Last SD-log flush, in system ticks. Per-LINE fflush stalls gameplay
  * visibly on hardware: each flush pays FAT + card latency (tens of ms), and
- * the stats window emits ~15 lines back-to-back, so every window froze the
- * frame for a beat (owner-reported, session 18 -- invisible in Azahar, whose
- * sdmc is a host folder with free flushes). */
+ * the stats window emits ~15 lines back-to-back, so every window freezes the
+ * frame for a beat. Invisible in Azahar, whose sdmc is a host folder with
+ * free flushes. */
 static u64 s_logLastFlushTick = 0;
 
 /*
- * SD-card logging master switch. DEFAULT OFF as of 2026-08-06.
+ * SD-card logging master switch, default off: the 3DS SD stack is slow at
+ * file work, and N3DS_DebugLog's throttled fflush+fsync runs on the game
+ * thread every ~2s, costing one stalled frame per window -- enough to erase
+ * the margin to a solid 30fps.
  *
- * The 3DS's SD stack is slow at file work, and N3DS_DebugLog's throttled
- * fflush+fsync runs on the GAME THREAD every ~2s. The Tubes log that night
- * carried exactly ONE frame of 76-176ms in every single 64-frame window --
- * same cadence, no other candidate (voice was ruled out: the first window had
- * zero key-ons and a 162ms worst frame). One such frame costs ~1.8ms of the
- * window average, which was the entire remaining gap to a solid 30fps. So the
- * profiler was the thing making the game stutter.
- *
- * Off still leaves: svcOutputDebugString per line (free with no debugger
- * attached, and Azahar still captures it, so emulator diagnosis is unchanged)
- * and the whole bottom-screen readout, which is CPU-only. Turn back on when a
- * log is actually wanted -- SELECT + TOUCH on hardware, dumpreq `sdlog`.
+ * Off still leaves svcOutputDebugString per line (free with no debugger
+ * attached, and Azahar still captures it) and the whole bottom-screen
+ * readout, which is CPU-only. Turn back on when a log is actually wanted --
+ * SELECT + TOUCH on hardware, dumpreq `sdlog`.
  */
 int g_dbg_sdLog = 0;
 
@@ -195,24 +184,23 @@ void N3DS_DebugLog(const char *msg)
 		fputc('\n', s_logFile);
 	}
 
-	/* Flush BOTH buffered sinks at most every ~2s (SD file and, since
-	 * session 19, the netload stderr stream -- see the setvbuf in
-	 * N3DS_NetloadStreamInit). Both are post-hoc trails that tolerate a
-	 * bounded tail loss on a hard crash; svcOutputDebugString above is the
-	 * per-line instant trail. */
+	/* Flush BOTH buffered sinks at most every ~2s (SD file and the netload
+	 * stderr stream -- see the setvbuf in N3DS_NetloadStreamInit). Both are
+	 * post-hoc trails that tolerate a bounded tail loss on a hard crash;
+	 * svcOutputDebugString above is the per-line instant trail. */
 	if (((s_logFile != NULL) && g_dbg_sdLog) || s_netloadStreamActive)
 	{
 		const u64 now = svcGetSystemTick();
 
 		if ((now - s_logLastFlushTick) > (SYSCLOCK_ARM11 * 2ull))
 		{
-			/* s36: time the flush itself. Every 64-frame window in the
-			 * 2026-08-06 Tubes log carries exactly ONE frame of 76-176ms, and
-			 * this 2s-throttled SD write is the only thing in the build whose
-			 * cadence matches. One hitch per window costs ~1.8ms of the
-			 * window AVERAGE, which is the whole remaining gap to a solid 30
-			 * -- so if this is it, every perf number we have is carrying our
-			 * own instrument on its back. Reported as [LOGFLUSH]. */
+			/* Time the flush itself. Every 64-frame window in the Tubes log
+			 * carries exactly ONE frame of 76-176ms, and this 2s-throttled SD
+			 * write is the only thing in the build whose cadence matches. One
+			 * hitch per window costs ~1.8ms of the window AVERAGE, which is
+			 * the whole remaining gap to a solid 30 -- so if this is it,
+			 * every perf number we have is carrying our own instrument on
+			 * its back. Reported as [LOGFLUSH]. */
 			const u64 flushStart = svcGetSystemTick();
 
 			if ((s_logFile != NULL) && g_dbg_sdLog)
@@ -220,12 +208,9 @@ void N3DS_DebugLog(const char *msg)
 				fflush(s_logFile);
 				/* fflush alone moves bytes into the FS session; the FAT
 				 * size/allocation metadata only commits on an fs-level
-				 * flush. Without this, a hard freeze loses EVERYTHING
-				 * after the first flush -- the crashed s19 netload run's
-				 * log read 1.6KB (ending at vblank=120) despite minutes
-				 * of 2s flushes, and s18's crash-run log was never
-				 * recoverable for the same reason. One FSFILE_Flush per
-				 * 2s is the durability we thought we already had. */
+				 * flush. Without fsync, a hard freeze loses everything
+				 * written after the first flush, since the file's
+				 * metadata never committed. */
 				fsync(fileno(s_logFile));
 			}
 			if (s_netloadStreamActive)
@@ -260,8 +245,8 @@ void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count)
 }
 
 /*
- * SELECT+R VRAM capture (CTR_INTERNAL, texture-corruption diagnostic,
- * 2026-07-20). The renderer TU owns vram[] but can't do the SELECT+R button
+ * SELECT+R VRAM capture (CTR_INTERNAL, texture-corruption diagnostic). The
+ * renderer TU owns vram[] but can't do the SELECT+R button
  * check (libctru's hid* live only in this TU); this TU can't see vram[]. So
  * the renderer registers the buffer pointer once and the button check +
  * fwrite happen here, in N3DS_ReadButtons, where hidScanInput() has already
@@ -280,7 +265,7 @@ void N3DS_DebugSetVRAMForDump(const void *vram, unsigned int bytes, const unsign
 
 #ifdef CTR_INTERNAL
 /* Frame number stamped into every capture filename. Fixed names already cost
- * one race capture (overwritten by a later menu capture, 2026-07-21); the
+ * one race capture (overwritten by a later menu capture); the
  * shared stamp also groups the vramdump/atlas/cachemeta files of one capture
  * instant into a self-identifying set. */
 static unsigned int N3DS_DebugCaptureFrame(void)
@@ -374,27 +359,22 @@ void N3DS_GfxExit(void)
 }
 
 /*
- * s36 present cost (measured 3.3ms/frame on the worker's critical path, the
- * single largest bucket inside platform_end_scene). 1 = flush only the BOTTOM
- * framebuffer; 0 = the old whole-system gfxFlushBuffers().
+ * 1 = flush only the BOTTOM framebuffer; 0 = the old whole-system
+ * gfxFlushBuffers().
  *
  * gfxFlushBuffers cleans the data cache for top-left, top-right AND bottom
  * (~806KB/frame with gfxSet3D on) via svcFlushProcessDataCache. libctru's own
- * header says it "is only used during software rendering" and "has significant
- * overhead" -- and our only software rendering is the bottom console, which
- * redraws once every 64 frames. The two top framebuffers are written by the
- * GPU (C3D_FrameEnd's display transfer), never by the CPU, so cleaning their
- * cache lines is ~576KB of pure waste every frame.
+ * header says it "is only used during software rendering" and "has
+ * significant overhead" -- and our only software rendering is the bottom
+ * console, which redraws once every 64 frames. The two top framebuffers are
+ * written by the GPU (C3D_FrameEnd's display transfer), never by the CPU, so
+ * cleaning their cache lines is ~576KB of pure waste every frame.
  *
  * The one thing that ever READ them on the CPU is the pause freeze-frame
- * (N3DS_CopyDisplayedTopFrame), which was silently relying on this flush for
- * coherency -- it now does its own invalidate, which is where that belongs.
- * DEFAULT 1 as of 2026-08-06, hardware-measured: present 3.70 -> 1.67ms, and
- * ~0.8ms of that reached the frame (Tubes median 36.1 -> 35.3ms). Small,
- * because ordinary frames were already at the 30fps cap -- but it is free CPU
- * with no visual or behavioural change, so there is nothing to trade off.
- * dumpreq `fastpresent` only now; its SELECT+TOUCH chord went to the SD-log
- * switch, which turned out to be worth far more (see g_dbg_sdLog).
+ * (N3DS_CopyDisplayedTopFrame); it does its own invalidate, which is where
+ * that belongs. Default 1, hardware-measured: present 3.70 -> 1.67ms, and
+ * ~0.8ms of that reached the frame (Tubes median 36.1 -> 35.3ms). Free CPU
+ * with no visual or behavioural change. dumpreq `fastpresent`.
  */
 int g_dbg_fastPresent = 1;
 
@@ -465,8 +445,8 @@ int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH)
 	}
 
 	/* This buffer is written by the GPU (C3D_FrameEnd's display transfer) and
-	 * read here by the CPU, so the CPU's cached view of it may be stale. Until
-	 * s36 that was covered by accident -- N3DS_GfxPresent's whole-system
+	 * read here by the CPU, so the CPU's cached view of it may be stale. This
+	 * used to be covered by accident -- N3DS_GfxPresent's whole-system
 	 * gfxFlushBuffers cleaned and invalidated all three framebuffers every
 	 * frame. g_dbg_fastPresent stops paying that 3.3ms, so the one reader that
 	 * actually needed it asks for it directly, on pause entry rather than
@@ -483,7 +463,7 @@ int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH)
 			/* Sample the pillarboxed content region only (N3DS_TOP_CONTENT_*):
 			 * the full-panel form re-ingested the black side bars, so the
 			 * pause background showed them squeezed inside the picture
-			 * (user-reported on hardware, session 18). */
+			 * (user-reported on hardware). */
 			const int sx = N3DS_TOP_CONTENT_X + ((x * N3DS_TOP_CONTENT_W) / dstW);
 			const u8 *p = fb + (((sx * 240) + (239 - sy)) * 3);
 
@@ -509,19 +489,16 @@ static int s_uLocProjection = -1;
 static int s_uLocStereo = -1;
 static int s_uLocStereoUi = -1;
 /*
- * s44 UI POP-OUT, as a PERCENT of this eye's at-infinity shift k. The owner's
- * target is UI "just barely popping out of the screen" -- explicitly NOT at the
- * screen plane (what the shader's UI mask used to force) and explicitly less
- * than the character-select rotating character, which he called the too-far
- * reference.
+ * UI pop-out amount, as a percent of this eye's at-infinity shift k --
+ * explicitly not at the screen plane, and less than the character-select
+ * rotating character.
  *
- * A percent of k rather than an absolute pixel count, so it tracks the 3D slider
- * for free and is identically 0 when the slider is down -- mono safety by
- * construction, the same property the s40b flag split relies on.
+ * A percent of k rather than an absolute pixel count tracks the 3D slider for
+ * free and is identically 0 when the slider is down -- mono safety by
+ * construction, the same property the flag depth/parallax split relies on.
  *
- * Runtime-tunable (dumpreq 'uipop N') because this is a comfort value that can
- * only be judged by eye, on hardware, by its owner -- a compile-time constant
- * would cost a rebuild and a redeploy per iteration.
+ * Runtime-tunable (dumpreq 'uipop N') because this is a comfort value judged
+ * by eye, on hardware.
  */
 int g_dbg_uiPopPct = 25;
 static float s_stereoVecUi[2][4];
@@ -536,7 +513,7 @@ static C3D_Tex s_vramDisplayTex[N3DS_VRAM_DISPLAY_TEX_COUNT];
 
 /* Native track renderer's dedicated atlas pool (rung 2b) -- see the header
  * comment on N3DS_TrackAtlas_Alloc. N3DS_TRACK_ATLAS_DIM/MAX_UNITS live in
- * n3ds_backend.h, not here (review finding #5) -- native_track_mesh.c's
+ * n3ds_backend.h, not here -- native_track_mesh.c's
  * packer checks its own constants against those exact macros at compile
  * time. Sized to the pool's own max unit count, NOT allocated up front;
  * s_trackAtlasUnitsAllocated tracks how many of these are actually live
@@ -590,21 +567,14 @@ static int s_trackULocQx = -1, s_trackULocQy = -1, s_trackULocQw = -1;
 static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange = -1;
 
 /*
- * s41 phase 0: the track's drawOrder tie-break weight, view.z units per
- * drawOrder step, uploaded as hParam.w (see the uniform write for the full
- * rationale and docs/GROUND_DECAL_PASS_DESIGN.md 3/4). 1.0 is the shipped
- * value this replaced -- a shader constant until now; 0.0 removes the term.
- *
- * DEFAULT RESTORED TO 1.0 (s41, 2026-08-07): the phase-0 ablation this briefly
- * defaulted to 0 for is DONE and REFUTED -- the owner drove it and the ground
- * decals were still buried, so the drawOrder term is not the burial mechanism
- * (docs/GROUND_DECAL_PASS_DESIGN.md 3). Leaving it at 0 would have shipped a
- * pointless road-marking shimmer in every build made from this shared tree.
- * The knob stays because it is now the cheapest way to size any decal-side
- * offset that turns out to be needed. File-scope rather than a shared g_dbg_*
- * because both readers (this uniform write and the dumpreq token) live in
- * this TU -- and n3ds_backend.c is its own TU, so the unity-build
- * tentative-definition collision hazard does not apply here.
+ * The track's drawOrder tie-break weight, in view.z units per drawOrder step,
+ * uploaded as hParam.w (docs/GROUND_DECAL_PASS_DESIGN.md 3/4). Default 1.0:
+ * an ablation to 0 (removing the term) was tested and the ground decals
+ * stayed buried, so the drawOrder term is not the burial mechanism. The knob
+ * remains as the cheapest way to size any future decal-side offset.
+ * File-scope rather than a shared g_dbg_* because both readers (this uniform
+ * write and the dumpreq token) live in this TU, which is its own TU so the
+ * unity-build tentative-definition collision hazard does not apply here.
  */
 static float s_trackDrawOrderWeight = 1.0f;
 static int s_trackULocUvOffset = -1, s_trackULocStereo = -1;
@@ -650,8 +620,8 @@ static int s_trackDrawActive = 0;
  * draw journal the right eye replays.
  *
  * The parallax model is p = k * (1 - convergence/depth) in PSX screen pixels,
- * on the shared view.z axis all three geometry sources sit on since s33.
- * Content AT the convergence depth has zero disparity (screen plane), farther
+ * on the shared view.z axis all three geometry sources sit on. Content AT the
+ * convergence depth has zero disparity (screen plane), farther
  * content goes into the screen (up to k px per eye at infinity), nearer
  * content pops out (clamped, see N3DS_StereoEyeVec). The physical slider
  * scales k continuously, so the slider IS the runtime control -- the dumpreq
@@ -664,7 +634,7 @@ static int s_trackDrawActive = 0;
  */
 int g_dbg_stereo = 1; /* master enable; the slider still gates frame by frame */
 /*
- * WINDOW MODE (owner-diagnosed, s34 night 2): with pop-out allowed, the
+ * WINDOW MODE: with pop-out allowed, the
  * clamp band turns the near ground into a constant-disparity sheet -- a
  * horizontal crease where graded road meets clamped road, which the owner
  * perceived as the ground "folding down" as it passes the kart. Window mode
@@ -761,7 +731,7 @@ static N3DS_StereoOp *N3DS_StereoRecord(int kind)
 	return op;
 }
 
-/* Whether packet depth stamps currently carry real view.z (s29 packet-depth
+/* Whether packet depth stamps currently carry real view.z (packet-depth
  * model) rather than emit ordinals. Same compile/runtime pair
  * N3DS_TrackDraw_Begin keys its own axis selector off, deliberately: parallax
  * from an ordinal stamp would be depth-shaped noise, so ordinal-stamped
@@ -809,7 +779,7 @@ static void N3DS_StereoEyeVec(float k, float *out4)
 /* Once per frame, from N3DS_C3DBeginFrame: read the physical slider, decide
  * whether this frame is stereo, reset the journal, compute both eyes'
  * vectors. Logs only on the active/inactive TRANSITION -- the slider is an
- * analog input and per-frame logging would grind the SD card (s31 lesson). */
+ * analog input and per-frame logging would grind the SD card. */
 static void N3DS_StereoLatchFrame(void)
 {
 	static int s_wasActive = -1;
@@ -843,7 +813,7 @@ static void N3DS_StereoLatchFrame(void)
 			N3DS_StereoEyeVec(pktLive ? k : 0.0f, s_stereoVecPkt[eye]);
 
 			/*
-			 * s44 UI pop-out. NEGATIVE k: pop-out is CROSSED disparity, i.e. the
+			 * UI pop-out. NEGATIVE k: pop-out is CROSSED disparity, i.e. the
 			 * opposite sign to the at-infinity shift (p = k - kC/d goes below k as
 			 * content comes nearer, and reaches 0 at the convergence depth). One
 			 * expression covers both eyes because k already carries the per-eye
@@ -910,8 +880,8 @@ void N3DS_StereoRecordVram(int slot, int baseVertex)
 
 /* Top-screen widescreen mode. 0 = off (4:3 pillarbox crop).
  * 1 = STRETCH: lift the viewport crop only -- the ortho still maps the same
- *     window, so the same picture shows at wider pixels (anamorphic; owner
- *     rejected it on sight, s36 -- kept as a dumpreq curiosity).
+ *     window, so the same picture shows at wider pixels (anamorphic; kept as
+ *     a dumpreq curiosity).
  * 2 = REAL: lift the crop AND extend the ortho window sideways by the same
  *     320->400 ratio (below), keeping PSX-units-per-panel-pixel IDENTICAL to
  *     4:3 mode. Perspective projection is planar, so content past the old
@@ -920,19 +890,17 @@ void N3DS_StereoRecordVram(int slot, int baseVertex)
  *     GPU with no screen clamp, so their content genuinely fills the extra
  *     40 panel columns per side; anything CPU/retail-projected at 4:3
  *     (packets, UI) just lands centered at correct aspect. The wall is
- *     game-side 4:3 PVS/frustum culling: margins can show missing geometry
- *     (the 2026-07-20 full-panel ortho experiment hit exactly that class).
+ *     game-side 4:3 PVS/frustum culling: margins can show missing geometry.
  * Non-static: the renderer TU's stats screen and projection-rebuild check
  * read it across the plain-scalar TU boundary.
  *
- * DEFAULT 2 (REAL widescreen) since 2026-08-06, owner request: the port boots
- * widescreen on our renderer, because that is the thing being built and the
- * thing being judged. SELECT+D-DOWN still cycles off<->REAL, and dumpreq
- * `wide`/`wide 1` still reach all three states including the rejected
- * anamorphic stretch. The known-open margin classes (game-side 4:3 PVS/frustum
- * culling holes, kart pop-in at the margin edges, full-screen fades not
- * covering the margins) are unchanged by this -- promoting the default does not
- * close them, it just stops hiding them behind a chord nobody presses. */
+ * Default 2 (REAL widescreen): the port boots widescreen by default.
+ * SELECT+D-DOWN cycles off<->REAL, and dumpreq `wide`/`wide 1` reach all
+ * three states including the anamorphic stretch. The known-open margin
+ * classes (game-side 4:3 PVS/frustum culling holes, kart pop-in at the
+ * margin edges, full-screen fades not covering the margins) are unchanged by
+ * this -- promoting the default does not close them, it just stops hiding
+ * them behind a chord nobody presses. */
 int g_dbg_widescreen = 2;
 
 void N3DS_C3DSetProjection(float left, float right, float bottom)
@@ -996,7 +964,7 @@ static void N3DS_BindPacketDrawState(void)
 	attrInfo = C3D_GetAttrInfo();
 	AttrInfo_Init(attrInfo);
 	/* v0 count is 4, not 3: x, y, z=occlusion depth, w=parallax depth (the
-	 * s40b channel split -- n3ds_backend.h's N3DS_Vertex comment). Must track
+	 * vertex channel split -- n3ds_backend.h's N3DS_Vertex comment). Must track
 	 * the struct's field count exactly; a mismatch is a hardware freeze class,
 	 * not a visual bug. */
 	AttrInfo_AddLoader(attrInfo, 0, GPU_SHORT, 4);         /* v0 = position (x, y, z=occlusion depth, w=parallax depth) */
@@ -1021,30 +989,12 @@ static void N3DS_BindPacketDrawState(void)
 	C3D_DirtyTexEnv(env);
 
 	/*
-	 * s29 ROOT CAUSE of "the resident track renderer hides karts/characters/UI".
-	 *
-	 * PICA200 vertex-shader float uniforms are PHYSICAL REGISTERS shared by
-	 * every program -- a uniform "location" is a register index, not a
-	 * per-program handle. The two shaders' declaration orders collide head-on:
-	 *
-	 *   ctr.v.pica        projection[4]            -> f0 f1 f2 f3
-	 *   ctr_track.v.pica  qx, qy, qw               -> f0 f1 f2
-	 *                     projection[4]            -> f3 f4 f5 f6
-	 *                     hParam, depthRange       -> f7 f8   (matches the
-	 *                       runtime log's own "uLocH=7 uLocDepth=8")
-	 *
-	 * So every N3DS_TrackDraw_Begin writes the track camera's qx/qy/qw over
-	 * the packet shader's projection rows 0-2. That matrix was uploaded ONCE
-	 * for the frame in N3DS_C3DBeginFrame -- BEFORE the track draw -- and
-	 * nothing re-uploaded it, so every packet draw issued AFTER the track
-	 * projected through the track's camera rows and landed nowhere visible.
-	 *
-	 * That is why the symptom tracked SUBMISSION ORDER and nothing else:
-	 * with CTR_NATIVE_DRAW_MERGE off, packet content draws during the walk
-	 * (before the track) and survives; with merge on, essentially all of it
-	 * is deferred to N3DS_MergeFlush (after the track) and died. It also
-	 * explains why the s29 depth model appeared to do nothing -- the content
-	 * it was meant to sort was never on screen to be sorted.
+	 * PICA200 vertex-shader float uniforms are physical registers shared by
+	 * every bound program, not per-program handles: ctr.v.pica's
+	 * projection[4] and ctr_track.v.pica's qx/qy/qw/projection/hParam/
+	 * depthRange land on overlapping register indices. Re-assert packet
+	 * projection/stereo uniforms here on every return to packet drawing, or
+	 * a track draw's uniform writes silently corrupt subsequent packet draws.
 	 *
 	 * Re-asserting it HERE rather than in N3DS_TrackDraw_End on purpose: this
 	 * function is the single definition of "packet draw state", it is already
@@ -1060,9 +1010,9 @@ static void N3DS_BindPacketDrawState(void)
 	/* The stereo vector rides f4, which BOTH sibling programs also use
 	 * (ctr_model's qx, ctr_track's projection row 1) -- so it is packet
 	 * state exactly like the projection rows above, re-asserted on every
-	 * return to packet drawing for the identical s29 reason. */
+	 * return to packet drawing for the identical reason. */
 	N3DS_StereoUploadUniform(s_uLocStereo, (const float(*)[4])s_stereoVecPkt);
-	/* s44: UI pop-out rides the same re-upload -- it sits on f5, which the model
+	/* UI pop-out rides the same re-upload -- it sits on f5, which the model
 	 * program uses for qy, so it must be re-asserted on every return to packet
 	 * state exactly as the stereo vector is. */
 	N3DS_StereoUploadUniform(s_uLocStereoUi, (const float(*)[4])s_stereoVecUi);
@@ -1071,7 +1021,7 @@ static void N3DS_BindPacketDrawState(void)
 int N3DS_C3DInit(void)
 {
 	/* 4x citro3d's 256KB default. Both hardware crashes to date
-	 * (crash_dump_00000007, s18 build; crash_dump_00000008, s19 build) were
+	 * (crash_dump_00000007; crash_dump_00000008) were
 	 * the SAME deliberate panic: prefetch abort, IFSR=debug event, svcBreak
 	 * from GPUCMD_AddInternal's overflow check (libctru gpu.c:33) under
 	 * C3D_DrawArrays <- N3DS_FlushRun -- a real race's draw volume (multiple
@@ -1142,7 +1092,7 @@ int N3DS_C3DInit(void)
 	/*
 	 * Visibility sentinel. The decode cache encodes alpha as a single bit,
 	 * with WHICH texels carry it decided per-cell at decode time (the
-	 * N3DS_TexView per-texel STP views, session 18: punch-through for
+	 * N3DS_TexView per-texel STP views: punch-through for
 	 * opaque cells, the STP split for semi-trans pass-1/pass-2 cells). One
 	 * GEQUAL-1 test therefore serves every pass unchanged -- the pass
 	 * distinction lives in the sampled cell, not in GPU state. Set once
@@ -1337,12 +1287,12 @@ void N3DS_C3DExit(void)
 }
 
 /*
- * DIAGNOSTIC (2026-07-21, session 14): real hardware freezes inside the
- * first boot-splash present with no further output. The two blocking
- * candidates are C3D_FrameBegin's SYNCDRAW wait (previous command list never
- * completed) and C3D_FrameEnd's queue handoff. Trace the first few frame
- * brackets so the stream names the exact call that never returns; bounded so
- * steady-state runs don't flood sdmc:/ctr3ds.log.
+ * DIAGNOSTIC: real hardware can freeze inside the first boot-splash present
+ * with no further output. The two blocking candidates are C3D_FrameBegin's
+ * SYNCDRAW wait (previous command list never completed) and C3D_FrameEnd's
+ * queue handoff. Trace the first few frame brackets so the stream names the
+ * exact call that never returns; bounded so steady-state runs don't flood
+ * sdmc:/ctr3ds.log.
  */
 static int s_frameTraceBudget = 48;
 
@@ -1356,15 +1306,10 @@ static void N3DS_FrameTrace(const char *msg)
 }
 
 /*
- * s29 occlusion split (docs/archive/HANDOFF_s29.md). The resident track renderer hides
- * karts/characters/skybox/HUD, and four theories for WHY were refuted in one
- * sitting (extra geometry, GPU state leak between the two paths, a track/HUD
- * depth tie, and the uiZ=0 "anomaly" -- which turned out to be an instrument
- * pointed at content that never reaches it, this project's third such miss).
- * Rather than reason further, this splits the remaining space by construction.
- * Every state is a VISUAL binary a human settles in one glance -- deliberately
- * not a counter, for the reason PORT_FEASIBILITY_3DS.md's "How to measure"
- * section exists:
+ * g_dbg_depthTest isolates whether the depth test (state 1) or the track's
+ * own depth writes (state 2) hide non-track content. Every state is a VISUAL
+ * binary a human settles in one glance -- deliberately not a counter, for the
+ * reason PORT_FEASIBILITY_3DS.md's "How to measure" section exists:
  *
  *   0 NORMAL  -- LEQUAL + depth writes. Today's behaviour, the baseline.
  *   1 NOTEST  -- GPU_ALWAYS + depth writes: pure submission (painter's) order.
@@ -1385,8 +1330,8 @@ static void N3DS_FrameTrace(const char *msg)
  *
  * State 1 vs 2 is the whole point -- 1 asks "is it depth at all", 2 asks "is it
  * OUR depth". Runtime, because the answer is worth more than a rebuild cycle:
- * dumpreq `depthtest [N]` in Azahar, SELECT+ZL on hardware (ZL is free since
- * s27 moved resolve-memo off it; a dumpreq file cannot be placed mid-race).
+ * dumpreq `depthtest [N]` in Azahar, SELECT+ZL on hardware (a dumpreq file
+ * cannot be placed mid-race).
  */
 int g_dbg_depthTest = 0;
 
@@ -1440,21 +1385,17 @@ static int N3DS_NextPktBias(int cur)
 }
 
 /*
- * s36 frame pacing: C3D_FrameBegin(SYNCDRAW) aligns the START of every frame
- * build to the 3DS hardware vblank. That alignment is native-only overhead,
- * not pacing: the 30fps cap is enforced by the game itself (ReadyToFlip
- * counts the EMULATED 60Hz clock, which is not phase-locked to the panel),
- * and presentation is vblank-latched by GSP regardless, so nothing tears
- * without it. Measured (s36 GPUTIME sitting): the wait is ~4ms avg of
- * renderer_begin_scene on the worker's serialized path, and on Tubes-ours
- * that path hovers right at the 2-vblank boundary -- the wait is plausibly
- * the margin between a 33ms frame and a 50ms one. 1 = align (behavior of
- * every build through s36), 0 = begin the moment the GPU is free.
- * Runtime A/B: SELECT+B on hardware, dumpreq `framesync` in Azahar.
+ * C3D_FrameBegin(SYNCDRAW) aligns the start of every frame build to the
+ * hardware vblank; that alignment is native-only overhead, not pacing, since
+ * the 30fps cap is enforced by the game itself (ReadyToFlip counts the
+ * emulated 60Hz clock, not phase-locked to the panel) and presentation is
+ * vblank-latched by GSP regardless, so nothing tears without it. 1 = align,
+ * 0 = begin the moment the GPU is free. Runtime A/B: SELECT+B on hardware,
+ * dumpreq `framesync` in Azahar.
  *
- * DEFAULT 0 (owner-accepted on hardware 2026-08-06): Tubes mono 41->34.7ms,
- * stereo 49->36.2ms -- most of s34's "+10ms stereo cost" was this wait
- * rounding stereo frames up to the next vblank multiple, not render cost.
+ * Default 0: hardware-measured, Tubes mono 41->34.7ms, stereo 49->36.2ms --
+ * most of stereo's extra frame cost was this wait rounding frames up to the
+ * next vblank multiple, not render cost.
  */
 int g_dbg_frameSync = 0;
 
@@ -1511,8 +1452,8 @@ void N3DS_C3DBeginFrame(void)
 #endif
 
 	/*
-	 * Pillarbox the top screen to the bottom screen's 4:3-equivalent width
-	 * (2026-07-20). Top panel is 400 wide, bottom is 320 -- PSX content is
+	 * Pillarbox the top screen to the bottom screen's 4:3-equivalent width.
+	 * Top panel is 400 wide, bottom is 320 -- PSX content is
 	 * meant for 4:3, and letting it fill the full 400 (what the ortho range
 	 * alone can't prevent, see NativeRenderer_BeginScene) shows ~40 extra PSX
 	 * columns of world per edge that were never meant to be on screen.
@@ -1530,9 +1471,9 @@ void N3DS_C3DBeginFrame(void)
 	 * reads the presented frame back -- keep them in lockstep with this call
 	 * (N3DS_CopyDisplayedTopFrame samples only the content region, else the
 	 * pause background re-ingests the black bars and shows them squeezed
-	 * inside the picture -- user-reported on hardware, session 18).
+	 * inside the picture -- user-reported on hardware).
 	 *
-	 * s36: any nonzero g_dbg_widescreen lifts the crop. Mode 1 alone is an
+	 * Any nonzero g_dbg_widescreen lifts the crop. Mode 1 alone is an
 	 * anamorphic STRETCH; mode 2 (REAL) pairs the lift with the extended
 	 * ortho window in N3DS_C3DSetProjection -- see the flag's definition.
 	 * KNOWN while wide: the pause-background readback still samples the
@@ -1546,7 +1487,7 @@ void N3DS_C3DBeginFrame(void)
 	/* Left eye's parallax (zero in mono) -- rides beside the projection for
 	 * the same reason it does in N3DS_BindPacketDrawState. */
 	N3DS_StereoUploadUniform(s_uLocStereo, (const float(*)[4])s_stereoVecPkt);
-	/* s44: UI pop-out rides the same re-upload -- it sits on f5, which the model
+	/* UI pop-out rides the same re-upload -- it sits on f5, which the model
 	 * program uses for qy, so it must be re-asserted on every return to packet
 	 * state exactly as the stereo vector is. */
 	N3DS_StereoUploadUniform(s_uLocStereoUi, (const float(*)[4])s_stereoVecUi);
@@ -1557,7 +1498,7 @@ void N3DS_C3DBeginFrame(void)
 	s_vertexCursor = 0;
 }
 
-/* s36 GPU-time window accumulator (see n3ds_backend.h). Written on whichever
+/* GPU-time window accumulator (see n3ds_backend.h). Written on whichever
  * thread ends frames (the render worker when the queue is live), fetched from
  * the game thread once per [PERF] window -- a torn read costs one frame of a
  * 64-frame average, so no lock. */
@@ -1630,7 +1571,7 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
  * 8x8 texels * 2 bytes/texel (RGBA5551) -- one PICA200 tile, tiled
  * contiguously.
  *
- * Was RGBA8 until 2026-07-20. The decode cache encoded a three-level alpha
+ * Previously RGBA8. The decode cache encoded a three-level alpha
  * (0 punch-through / 128 opaque / 255 STP-on) but NOTHING ever read the
  * 128-vs-255 distinction: the only alpha test in this file is a single
  * C3D_AlphaTest(true, GPU_GEQUAL, 1), i.e. zero-vs-nonzero. So half of
@@ -1641,7 +1582,7 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
  * 1441 capacity misses per 32-frame window (~45/frame) against a saturated
  * 63/63 working set, plus 2052 evictions of cells a queued draw still
  * referenced -- which is the visible texture corruption. The STP two-pass
- * blend (session 18) recovered the STP bit exactly as predicted here: from
+ * blend recovered the STP bit exactly as predicted here: from
  * VRAM at decode time, baked into per-view cells (N3DS_TexView), keeping
  * this format one bit of alpha.
  */
@@ -1662,7 +1603,7 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
  * Shared by the whole-cell (32x32-tile) and sub-cell (8x8-tile) decode-cache
  * upload wrappers below (docs/SUBPAGE_DECODE_CACHE_DESIGN.md), AND by the
  * native track renderer's dedicated atlas pool (N3DS_TrackAtlas_UploadRect,
- * rung 2b) -- generalized 2026-07-29 from a hardcoded s_atlasTextures[]/
+ * rung 2b) -- generalized from a hardcoded s_atlasTextures[]/
  * N3DS_ATLAS_DIM to an explicit destination texture + tiles-per-row so both
  * pools can share one blit implementation rather than duplicating it.
  * tilesWide/tilesHigh must be used for ALL FOUR of the base-tile calc (the
@@ -1736,7 +1677,7 @@ void N3DS_C3DUploadDecodedSubCell(int atlasIndex, int physCellX, int physCellY, 
 
 #ifdef CTR_INTERNAL
 /* Dumps every atlas texture's raw (8x8-Morton-tiled RGBA5551) linear storage to
- * sdmc:/atlas_<i>.bin for the texture-corruption investigation (2026-07-20).
+ * sdmc:/atlas_<i>.bin for the texture-corruption investigation.
  * Un-swizzled + rendered on the host. Triggered by SELECT+R alongside the VRAM
  * dump so both capture the same frame. s_atlasTextures[].data is CPU-written by
  * the decode (N3DS_C3DUploadTileBlock), so it is CPU-readable here. */
@@ -1883,7 +1824,7 @@ void N3DS_TrackAtlas_UploadRect(int unit, int dstX, int dstY, int wTexels, int h
 	 * N3DS_TRACK_ATLAS_DIM bounds. A violation here is a caller bug, not
 	 * routine content variation (the packer's own invariants guarantee this
 	 * in practice) -- reject and log it instead of silently writing into the
-	 * wrong tile or past the texture's backing memory (review finding #6). */
+	 * wrong tile or past the texture's backing memory. */
 	if (((dstX & 7) != 0) || ((dstY & 7) != 0) || ((wTexels & 7) != 0) || ((hTexels & 7) != 0) || ((dstX + wTexels) > N3DS_TRACK_ATLAS_DIM) ||
 	    ((dstY + hTexels) > N3DS_TRACK_ATLAS_DIM))
 	{
@@ -1982,7 +1923,7 @@ void N3DS_TrackGeom_Free(void)
 }
 
 /*
- * s30: rewrite the UV pair of `count` already-uploaded vertices in place.
+ * Rewrite the UV pair of `count` already-uploaded vertices in place.
  *
  * This is how animated track textures (turbo-pad arrows, waterfalls, lava)
  * move at all under the resident renderer -- everything else about a resident
@@ -2063,7 +2004,7 @@ void N3DS_TrackGeom_PatchUV(const unsigned short *vertIndices, const short *uvPa
 }
 
 /*
- * s30: the same in-place batched rewrite, for POSITION and COLOR rather than
+ * The same in-place batched rewrite, for POSITION and COLOR rather than
  * UV -- the animated-vertex case (water surfaces that physically rise and
  * fall, AnimateWater.c writing LevVertex.pos/.color_hi every frame).
  *
@@ -2139,13 +2080,13 @@ void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short
 	}
 }
 
-/* s43 backface culling (dumpreq 'bfcull', chord SELECT+Y): 0 = off (draw every
- * face), 1 = cull GPU back-faces, 2 = cull front-faces. Applied per-frame in
- * N3DS_TrackDraw_Begin, undone in _End. DEFAULT 1 (owner ruling 2026-08-08):
- * culling is what retail does, it's near-free, and it removes erroneous
- * back-facing geometry (the Crash Cove second waterfall and the like). Safe
- * because the bake gives triangles and double-sided faces a reverse-wound copy
- * (native_track_mesh.c) so only single-sided quads are actually culled. */
+/* Backface culling for the track (dumpreq 'bfcull', chord SELECT+Y): 0 = off
+ * (draw every face), 1 = cull GPU back-faces, 2 = cull front-faces. Applied
+ * per-frame in N3DS_TrackDraw_Begin, undone in _End. Default 1: culling
+ * matches retail, is near-free, and removes erroneous back-facing geometry
+ * (the Crash Cove second waterfall and the like). Safe because the bake gives
+ * triangles and double-sided faces a reverse-wound copy (native_track_mesh.c)
+ * so only single-sided quads are actually culled. */
 int g_dbg_bfCull = 1;
 
 void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h)
@@ -2181,7 +2122,7 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	C3D_SetBufInfo(&s_trackBufInfo);
 
 	/*
-	 * s43 backface-cull A/B (dumpreq 'bfcull'), scoped to the TRACK only.
+	 * Backface-cull A/B (dumpreq 'bfcull'), scoped to the TRACK only.
 	 *
 	 * Retail rejects back-facing SINGLE-SIDED faces per-face (GTE NCLIP winding
 	 * test gated by the DOUBLE_SIDED bit, game/226 DrawLevelOvr); our bake emits
@@ -2218,7 +2159,7 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 #endif
 
 	/*
-	 * Review fix (FIX 2): assert opaque blending explicitly rather than
+	 * Assert opaque blending explicitly rather than
 	 * inheriting whatever the LAST packet draw left set. N3DS_C3DSetBlendMode
 	 * memoizes through a static `lastMode` (below in this file) and this
 	 * function never called it before, so track draws silently picked up
@@ -2271,7 +2212,7 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 #endif
 
 		/* hParam.w: drawOrder tie-break weight, in view.z units per drawOrder
-		 * step (s41 phase 0 -- docs/GROUND_DECAL_PASS_DESIGN.md 3/4). Was the
+		 * step (docs/GROUND_DECAL_PASS_DESIGN.md 3/4). Was the
 		 * `bucketToDepth` shader constant at 1.0; moved onto the uniform so
 		 * the sweep is dumpreq `dorder N` instead of a rebuild per leg, for
 		 * the same reason the depth-axis selector above is a uniform: this
@@ -2287,7 +2228,7 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 		 * mechanism is confirmed and the fix is a decal-side offset, NOT
 		 * shipping 0 here (baked road markings may shimmer without it).
 		 *
-		 * That ablation RAN and came back negative (owner hardware, s41): the
+		 * That ablation RAN and came back negative: the
 		 * decals stayed buried at 0, so this term is not the cause and the
 		 * default is back at the shipped 1.0. See GROUND_DECAL_PASS_DESIGN.md
 		 * 3 for what replaced it (the unbracketed ×4 regime axis). */
@@ -2433,16 +2374,16 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	 * UV and N3DS_TrackDraw_SetTextured picks the combiner setup that either
 	 * samples it or ignores it.
 	 *
-	 * This used to say the selector "rides hParam.w". It does not, and s32 made
-	 * that actively misleading: hParam.w is now the drawOrder tie-break weight
-	 * (dumpreq `dorder`, s41 -- it named the long-removed `trkbias` lever until
-	 * then, which is the same stale-comment failure twice over). Anyone trusting
-	 * the old wording would have gone looking for a texture flag in a depth
-	 * uniform -- and on a part whose uniform names are offsets into ONE shared
-	 * physical register file, a wrong belief about who owns a component is
-	 * exactly how the s29 collision happened. Caught by the parallel
-	 * transparency session, whose own uvOffset was added as a NEW uniform
-	 * rather than parked on a spare component for the same reason.
+	 * This used to say the selector "rides hParam.w". It does not: hParam.w is
+	 * now the drawOrder tie-break weight (dumpreq `dorder` -- it named the
+	 * long-removed `trkbias` lever until then, the same stale-comment failure
+	 * twice over). Anyone trusting the old wording would have gone looking for
+	 * a texture flag in a depth uniform -- and on a part whose uniform names
+	 * are offsets into ONE shared physical register file, a wrong belief about
+	 * who owns a component is exactly how a past projection collision
+	 * happened. Caught by the parallel transparency work, whose own uvOffset
+	 * was added as a NEW uniform rather than parked on a spare component for
+	 * the same reason.
 	 */
 	if ((atlasBin >= 0) && (atlasBin < s_trackAtlasUnitsAllocated))
 	{
@@ -2479,14 +2420,12 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	 * Written on EVERY draw including opaque ones. An unset uniform component
 	 * holds whatever the last program to use that physical register left there,
 	 * and PICA uniforms are shared physical registers across programs, not
-	 * per-program handles -- the s29 projection collision was exactly that
+	 * per-program handles -- a past projection collision was exactly that
 	 * mistake and it destroyed every packet drawn after a track draw.
 	 */
-	/* .z carries the behind-eye depth kick's runtime gate (see the BEHIND-EYE
-	 * DEPTH KICK block in ctr_track.v.pica). It rides a spare component of a
-	 * uniform this path already writes every draw rather than claiming a new
-	 * register, for exactly the reason the paragraph above gives. .z/.w unused
-	 * (was a behind-eye depth-kick lever, removed). */
+	/* .z/.w unused (was the behind-eye depth-kick lever, removed); written
+	 * every draw to avoid the stale-register issue the paragraph above
+	 * describes. */
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocUvOffset, (float)(uvDx * 2), (float)(uvDy * 2), 0.0f, 0.0f);
 
 	/*
@@ -2552,7 +2491,7 @@ void N3DS_TrackDraw_End(void)
 	 * track state by a call-order mistake upstream. */
 	N3DS_BindPacketDrawState();
 
-	/* s43: undo any track-scoped backface cull so the packet/UI/model/sky draws
+	/* Undo any track-scoped backface cull so the packet/UI/model/sky draws
 	 * after the track are never culled (their winding is not guaranteed). Only
 	 * when the toggle is live, so the default leg issues no redundant state
 	 * change. Matches the global GPU_CULL_NONE set once in N3DS_C3DInit. */
@@ -2671,7 +2610,7 @@ void N3DS_ModelDraw_Begin(void)
 	 * expects, but "the registers hold the right value" is a separate claim
 	 * from "the registers are where we think" -- upload it explicitly rather
 	 * than inheriting whatever the last bound program left, which is the class
-	 * of assumption that produced the s29 uniform-collision bug.
+	 * of assumption that produced a past uniform-collision bug.
 	 */
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_modelULocProjection, &s_projection);
 
@@ -2724,9 +2663,8 @@ void N3DS_ModelDraw_Instance(const float *qx, const float *qy, const float *qw, 
 	/* Only .x is read by the shader; the other three are written because
 	 * leaving uniform components unset means "whatever the last program that
 	 * used this register put there". */
-	/* .y carries the instance depth bias (see the INSTANCE DEPTH BIAS block in
-	 * ctr_model.v.pica). Negated here so the dumpreq argument reads the same
-	 * hParam.y/z/w unused (was an instance depth-bias lever, removed). */
+	/* .y/.z/.w unused (was the instance depth-bias lever, removed); written
+	 * every draw to avoid the stale-register issue noted above. */
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_modelULocH, h, 0.0f, 0.0f, 0.0f);
 }
 
@@ -3170,7 +3108,7 @@ void NativeRenderer3DS_DebugArmTriangleDump(void);
  * storage, and both decode-cache tiers' metadata, all describing the same
  * instant, plus arms a per-triangle dump of the NEXT frame (page/clut/UV/
  * position/atlas-resolution per triangle -- the addressing-side complement
- * to the content-side dumps; session 16 proved content byte-correct while
+ * to the content-side dumps; content was proven byte-correct while
  * the screen quilts, so the divergence must be visible here). One entry
  * point so the button gesture and the host-side file trigger below can
  * never drift apart in what they capture. */
@@ -3192,12 +3130,12 @@ unsigned int N3DS_ReadButtons(void)
 	held = hidKeysHeld();
 
 #ifdef CTR_INTERNAL
-	/* s41: SELECT+R freed (the VRAM/debug capture set). Still reachable as dumpreq `capture`. */
+	/* SELECT+R freed (the VRAM/debug capture set). Still reachable as dumpreq `capture`. */
 
-	/* Host-scriptable trigger (2026-07-21): Azahar's SD card is a plain host
+	/* Host-scriptable trigger: Azahar's SD card is a plain host
 	 * folder, so an autonomous session can drive diagnostics by creating
 	 * sdmc:/dumpreq.txt -- no window focus or key injection involved. The
-	 * file's first word selects the action (session 16: the A/B toggles need
+	 * file's first word selects the action (the A/B toggles need
 	 * to be reachable without a gamepad):
 	 *   capture (or anything else) -- the full SELECT+R capture set
 	 *   subpage     -- toggle g_dbg_disableSubPage (route all to full-page tier)
@@ -3212,7 +3150,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  OFF falls back to synchronous main-thread rendering)
 	 *   lodgeo [N]  -- track LOD distance, percent of retail (CTR_NATIVE_LOD_BIAS)
 	 *   lodtex [N]  -- texture LOD distance, percent of retail (same gate)
-	 *   fbtest      -- toggle g_dbg_skipFbTriTest (s27 probe: skip resolve's
+	 *   fbtest      -- toggle g_dbg_skipFbTriTest (skip resolve's
 	 *                  per-triangle fb-mirror test; freeze frames stale while ON)
 	 *   otz         -- toggle g_dbg_otzWiden (widened depth stamps, track-
 	 *                  renderer rung 1; [OTZ] occupancy line while on)
@@ -3222,20 +3160,20 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  'trackrender N' sets a specific state. Also reachable on
 	 *                  hardware via SELECT+ZR (a dumpreq file can't be placed
 	 *                  mid-race there -- see the button handler below).
-	 *   packetdepth -- toggle g_dbg_packetDepth (s29 depth model): packets stamp
+	 *   packetdepth -- toggle g_dbg_packetDepth (depth model): packets stamp
 	 *                  GTE sz3 and the track shader switches to the same
 	 *                  true-depth axis, both at once. Hardware button: SELECT+L.
 	 *   gtecapture [N] -- g_dbg_gteCapture (CTR_NATIVE_GTE_CAPTURE builds):
 	 *                  1=full 2=store-only(no matrix note) 0=ablated, to price
 	 *                  the capture subsystem and its matrix probe separately.
 	 *                  Bare token cycles 1->2->0. Hardware button: SELECT+D-UP.
-	 *   strictmtx   -- toggle g_dbg_pktDepthStrictMtx (s32): a primitive whose
+	 *   strictmtx   -- toggle g_dbg_pktDepthStrictMtx: a primitive whose
 	 *                  vertices resolve to two different matrix states is
 	 *                  treated as a miss instead of trusting a foreign depth.
-	 *   missordinal -- toggle g_dbg_pktDepthMissOrdinal (s32): on a capture
+	 *   missordinal -- toggle g_dbg_pktDepthMissOrdinal: on a capture
 	 *                  miss keep the emit ordinal instead of deriving depth
 	 *                  from the OT bucket. Expect animated water over the HUD.
-	 *   noevict     -- toggle g_dbg_gteNoEvict (s32): a capture store may not
+	 *   noevict     -- toggle g_dbg_gteNoEvict: a capture store may not
 	 *                  overwrite a live entry owned by a different matrix.
 	 *   stereo      -- toggle g_dbg_stereo (master 3D enable; the physical slider
  *                  still gates frame by frame, this just forces mono)
@@ -3245,13 +3183,18 @@ unsigned int N3DS_ReadButtons(void)
  *                  (default 12; negative swaps the eyes; bare resets)
  *   stereoconv [N] -- screen-plane depth, view.z units (default 1200;
  *                  bare resets)
- *   depthtest [N] -- g_dbg_depthTest, the s29 occlusion split: 0=normal
+ *   depthtest [N] -- g_dbg_depthTest, the occlusion split: 0=normal
 	 *                  1=no depth test (painter's order) 2=track tests but
 	 *                  does not write depth. Bare token cycles 0->1->2->0.
 	 *                  Hardware button: SELECT+ZL.
 	 *   wide [N]    -- g_dbg_widescreen: bare toggles off<->REAL (mode 2,
 	 *                  wide FOV window at 4:3 pixel scale); `wide 1` is the
 	 *                  rejected anamorphic stretch. Button: SELECT+D-DOWN.
+	 *   padmux [N]  -- virtual multitap (default OFF -- renderer can't do
+	 *                  split-screen, and off keeps VS/battle behind retail's
+	 *                  own controller gate): `padmux N` drives pad N with the
+	 *                  3DS buttons, 0 = off (retail single-pad bus), bare =
+	 *                  cycle the driven pad. Button: SELECT+ZR.
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -3277,7 +3220,7 @@ unsigned int N3DS_ReadButtons(void)
 
 				if (strncmp(word, "widemask", 8) == 0)
 				{
-					/* Strips-hunt kill switches (s37): bit 1 = instance bbox
+					/* Strips-hunt kill switches: bit 1 = instance bbox
 					 * margin, 2 = per-tri margin, 4 = sky face margin,
 					 * 8 = sky extra sectors. `widemask N` (decimal 0-15)
 					 * sets; bare resets to all-on. MUST be matched before
@@ -3423,7 +3366,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_smokeDefer;
 
-					/* s42 A/B: driver-local exhaust smoke redrawn after the model
+					/* Driver-local exhaust smoke redrawn after the model
 					 * pass (over its own kart, retail's painter's order) vs the old
 					 * in-merge draw where the body paints over it. */
 					g_dbg_smokeDefer ^= 1;
@@ -3434,7 +3377,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_stPass1;
 
-					/* s46 minimap-box probe, native_gpu.c DrawSplit: skip the
+					/* Minimap-box probe, native_gpu.c DrawSplit: skip the
 					 * blending-off opaque-body pass of two-pass semi-trans draws. */
 					g_dbg_stPass1 ^= 1;
 					N3DS_DebugLog(g_dbg_stPass1 ? "[CTR-3DS] semi-trans pass 1: ON" : "[CTR-3DS] semi-trans pass 1: SKIPPED");
@@ -3443,7 +3386,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_stPass2;
 
-					/* s46 minimap-box probe: skip the blended STP-texel pass. */
+					/* Minimap-box probe: skip the blended STP-texel pass. */
 					g_dbg_stPass2 ^= 1;
 					N3DS_DebugLog(g_dbg_stPass2 ? "[CTR-3DS] semi-trans pass 2: ON" : "[CTR-3DS] semi-trans pass 2: SKIPPED");
 				}
@@ -3451,7 +3394,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_skyFar;
 
-					/* s43 A/B: pin the skybox to the far depth plane so translucent
+					/* Pin the skybox to the far depth plane so translucent
 					 * track geometry (the waterfalls) wins the depth test against it,
 					 * vs the old OT-bucket fallback the sky punched through with. */
 					g_dbg_skyFar ^= 1;
@@ -3462,7 +3405,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_skyFirst;
 
-					/* s43: draw the skybox BEFORE the track pass (its own vertex
+					/* Draw the skybox BEFORE the track pass (its own vertex
 					 * accumulator) so the depth-less translucent waterfall paints
 					 * over it. OFF routes the sky back into the opaque merge bins,
 					 * which flush after the track = the punch-through. */
@@ -3470,11 +3413,59 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_skyFirst ? "[CTR-3DS] sky-first: ON (sky under waterfalls)"
 					                             : "[CTR-3DS] sky-first: off (sky in merge, punches through)");
 				}
+				else if (strncmp(word, "backdropdbg", 11) == 0)
+				{
+					extern int g_dbg_backdropDump;
+
+					g_dbg_backdropDump = 1;
+					N3DS_DebugLog("[CTR-3DS] backdrop: one-shot drain dump armed");
+				}
+				else if (strncmp(word, "backdrop", 8) == 0)
+				{
+					extern int g_dbg_backdrop;
+
+					/* s46 clearColor backdrop fill A/B (native_renderer_3ds.c). */
+					g_dbg_backdrop ^= 1;
+					N3DS_DebugLog(g_dbg_backdrop ? "[CTR-3DS] backdrop: ON (clearColor fill under the sky pass)"
+					                             : "[CTR-3DS] backdrop: off (pre-s46 frame, fills ignored)");
+				}
+				else if (strncmp(word, "padmux", 6) == 0)
+				{
+					/* Virtual multitap (native_input.c): all four pads report
+					 * connected so VS/battle player counts open up; the 3DS
+					 * buttons drive one selectable pad. `padmux 0` = off
+					 * (retail single-pad bus), `padmux N` = drive pad N, bare
+					 * = cycle the driven pad. Chord: SELECT+ZR. */
+					extern int Platform_InputDebugPadMux(int op);
+					const char *arg = word + 6;
+					int op = -1;
+					int state;
+					char msg[80];
+
+					while ((*arg == ' ') || (*arg == '\t'))
+					{
+						arg++;
+					}
+					if ((*arg >= '0') && (*arg <= '9'))
+					{
+						op = atoi(arg);
+					}
+					state = Platform_InputDebugPadMux(op);
+					if (state == 0)
+					{
+						N3DS_DebugLog("[CTR-3DS] padmux: OFF (retail single-pad bus)");
+					}
+					else
+					{
+						snprintf(msg, sizeof(msg), "[CTR-3DS] padmux: 4 pads connected, driving pad %d", state);
+						N3DS_DebugLog(msg);
+					}
+				}
 				else if (strncmp(word, "uiorder", 7) == 0)
 				{
 					extern int g_dbg_uiOrder;
 
-					/* s44: UI off the depth test. ON routes every UI-band prim out
+					/* UI off the depth test. ON routes every UI-band prim out
 					 * of the state bins into one ordered list drawn last, in
 					 * submission order, with all UI pinned to a single depth stamp
 					 * -- painter's order, which is what retail does. OFF restores
@@ -3490,7 +3481,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_uiPin;
 
-					/* s44 BISECT (temporary): splits the pin half off the routing
+					/* BISECT (temporary): splits the pin half off the routing
 					 * half so a defect can be attributed to one of them. OFF keeps
 					 * the ordered pass but restores per-ordinal UI stamps. Not a
 					 * supported configuration -- diagnostic only. */
@@ -3502,7 +3493,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_uiLast;
 
-					/* s44 BISECT (temporary): WHERE the ordered UI pass runs. OFF
+					/* BISECT (temporary): WHERE the ordered UI pass runs. OFF
 					 * moves it back to the old post-merge slot, which separates
 					 * "content never drawn" from "content painted over by UI drawn
 					 * last". Diagnostic only. */
@@ -3512,7 +3503,7 @@ unsigned int N3DS_ReadButtons(void)
 				}
 				else if (strncmp(word, "uipop", 5) == 0)
 				{
-					/* s44: how far UI pops out of the screen, as a percent of this
+					/* How far UI pops out of the screen, as a percent of this
 					 * eye's at-infinity shift. 0 = the old flat-at-screen-plane
 					 * behaviour. 'uipop N' sets it directly -- a comfort value only
 					 * its owner's eyes can judge, so it is dialled at runtime on
@@ -3543,7 +3534,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_uiDump;
 
-					/* s44 bisect instrument: one-shot dump of the ordered UI list's
+					/* Bisect instrument: one-shot dump of the ordered UI list's
 					 * contents on the next frame. Needs the SD log on. */
 					g_dbg_uiDump = 1;
 					N3DS_DebugLog("[CTR-3DS] ui-dump: armed (next frame)");
@@ -3552,7 +3543,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_bfCull;
 
-					/* s43 perf/parity experiment: track-scoped backface culling.
+					/* Perf/parity experiment: track-scoped backface culling.
 					 * 'bfcull N' sets 0=off / 1=cull-back / 2=cull-front directly
 					 * -- deterministic for a PRE-LAUNCH dumpreq on hardware, where
 					 * the SD can't be written mid-race; bare 'bfcull' cycles for a
@@ -3575,7 +3566,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_skipFbTriTest;
 
-					/* s27 probe: ablate resolve's per-triangle fb-mirror
+					/* Ablate resolve's per-triangle fb-mirror
 					 * overlap test. ON = pause/wipe freeze frames may be
 					 * stale; instrument only, see the declaration comment. */
 					g_dbg_skipFbTriTest ^= 1;
@@ -3791,10 +3782,10 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_decalAxisFix;
 
-					/* s41: ground-decal 4x depth-axis unscale (shadows, skid
+					/* Ground-decal 4x depth-axis unscale (shadows, skid
 					 * marks, tires). Bare token toggles; this is the A/B the
-					 * fix gets judged on, so 0 must reproduce pre-s41 exactly.
-					 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+					 * fix gets judged on, so 0 must reproduce the pre-fix behaviour
+					 * exactly. docs/GROUND_DECAL_PASS_DESIGN.md 3. */
 					g_dbg_decalAxisFix ^= 1;
 					N3DS_DebugLog(g_dbg_decalAxisFix ? "[CTR-3DS] decal depth axis: FIXED (4x unscaled)"
 					                                : "[CTR-3DS] decal depth axis: off (pre-s41 behaviour)");
@@ -3803,7 +3794,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					char msg[80];
 
-					/* s41 phase 0 -- the drawOrder tie-break sweep. 'dorder N'
+					/* The drawOrder tie-break sweep. 'dorder N'
 					 * sets the weight in view.z units per drawOrder step (N is
 					 * an integer: 0 removes the term, 1 is the shipped value
 					 * this replaced); bare 'dorder' toggles 0 <-> 1 so the A/B
@@ -3839,7 +3830,7 @@ unsigned int N3DS_ReadButtons(void)
 					 * mdlReplaces skips the packet write); state 2 draws both,
 					 * as an overlay A/B. A previous version of this comment said
 					 * suppression wasn't in yet -- it is, and that stale text
-					 * misdiagnosed a bug on 2026-08-06. */
+					 * misdiagnosed a bug. */
 					if (word[11] == ' ')
 					{
 						int n = atoi(&word[12]);
@@ -3897,7 +3888,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_modelAxisFix;
 
-					/* s33 sink fix A/B: near-regime instances' mvp depth is 4x the
+					/* Near-regime instances' mvp depth is 4x the
 					 * track's view.z axis (measured, [AXISCHK]); ON divides it back
 					 * out per instance. 'axisfix N' sets, bare token flips. */
 					if (word[7] == ' ')
@@ -3934,7 +3925,7 @@ unsigned int N3DS_ReadButtons(void)
 					extern int g_dbg_trackLeafKeep;
 					char msg[64];
 
-					/* s33 drift-holes fix: frames a leaf survives past its last
+					/* Drift-holes fix: frames a leaf survives past its last
 					 * visible-list appearance. 'leafkeep N' sets (0 = off,
 					 * capped 255), bare token flips 0 <-> 15. */
 					if (word[8] == ' ')
@@ -4014,8 +4005,8 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_pktAxisFix;
 
-					/* s45: was advertised since s33 but never wired -- the
-					 * packet-side s33 unscale had NO runtime switch until now.
+					/* Was advertised but never wired -- the
+					 * packet-side unscale had NO runtime switch until now.
 					 * OFF is the ice-pond kart vanish (Blizzard Bluff), which
 					 * doubles as this toggle's positive control. 'pktaxisfix N'
 					 * sets, bare token flips, same idiom as 'axisfix'. */
@@ -4034,7 +4025,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_bboxDepthStores;
 
-					/* s45 warp-pad prize hunt: 0 removes the queue-phase bbox
+					/* Warp-pad prize hunt: 0 removes the queue-phase bbox
 					 * corner stores -- the one unbracketed regime-axis producer
 					 * left in the capture table (native_gte_capture.c has the
 					 * story). If the prize burial vanishes at 0, that leak is
@@ -4054,7 +4045,7 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					extern int g_dbg_modelDepthCheck;
 
-					/* s45: the depth-axis self-verification both classifiers
+					/* The depth-axis self-verification both classifiers
 					 * already carry -- [AXISCHK]/[MDLDEPTH] (native_model_emit)
 					 * and the [PKTAXIS] per-func ratio/reclass stats
 					 * (native_gte_capture), flushed every 256 frames while ON.
@@ -4070,7 +4061,7 @@ unsigned int N3DS_ReadButtons(void)
 					extern char g_dbg_watchName[16];
 					char msg[64];
 
-					/* s45: 'watch <name>' taps one named object (instance name
+					/* 'watch <name>' taps one named object (instance name
 					 * OR model name -- e.g. 'watch prize1'); [WATCH] lines
 					 * report its store-side depth story while it draws. Bare
 					 * 'watch' turns it off. */
@@ -4101,7 +4092,7 @@ unsigned int N3DS_ReadButtons(void)
 		}
 	}
 
-	/* REPURPOSED s36: was the s29 automated config sweep, settled since
+	/* Repurposed: was the automated config sweep, settled since
 	 * (dumpreq `sweep` still covers Azahar). Now the frame-pacing A/B --
 	 * g_dbg_frameSync, defined above N3DS_C3DBeginFrame. Mid-race by design:
 	 * a mid-run flip brackets [PERF] windows by state on identical content,
@@ -4133,7 +4124,7 @@ unsigned int N3DS_ReadButtons(void)
 		                          : "[CTR-3DS] sdlog: off (no SD writes; bottom screen still live)");
 	}
 
-	/* SELECT held + X: bottom-screen verbosity. Default off (s29) -- the stats
+	/* SELECT held + X: bottom-screen verbosity. Default off -- the stats
 	 * block had grown into a wall the owner couldn't read the live toggles in. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_X))
 	{
@@ -4143,13 +4134,13 @@ unsigned int N3DS_ReadButtons(void)
 		N3DS_DebugLog(g_dbg_statsVerbose ? "[CTR-3DS] stats: VERBOSE" : "[CTR-3DS] stats: quiet");
 	}
 
-	/* s43: SELECT+Y = backface-cull A/B (track-scoped), toggles OFF <-> cull
+	/* SELECT+Y = backface-cull A/B (track-scoped), toggles OFF <-> cull
 	 * BACK. Mid-race by design -- sit at one spot and flip it while watching the
 	 * `work` ms and the holes/waterfall change live; a dumpreq can't be placed
 	 * while the game holds the SD card. BACK is the established-correct winding
 	 * (quads cull clean; only stray triangle faces hole). FRONT (state 2) stays
 	 * reachable as dumpreq `bfcull 2` for winding checks -- from any culling
-	 * state this chord returns to OFF first. SELECT+Y was freed in s41 from the
+	 * state this chord returns to OFF first. SELECT+Y was freed from the
 	 * packet-depth-bias ladder (still dumpreq `pktbias`); reused for this perf
 	 * experiment because it needs to be flippable mid-race. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_Y))
@@ -4163,7 +4154,7 @@ unsigned int N3DS_ReadButtons(void)
 
 	/* SELECT held + ZL: depth-test state cycle 0->1->2->0 (see g_dbg_depthTest
 	 * above N3DS_C3DBeginFrame for what each state proves). ZL has been free
-	 * since s27 moved resolve-memo off it. Mid-race by design -- the question
+	 * since resolve-memo moved off it. Mid-race by design -- the question
 	 * is "where did the karts go", and the karts only exist mid-race, so a
 	 * cross-run A/B would confound content the way the LOD null did. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZL))
@@ -4177,6 +4168,25 @@ unsigned int N3DS_ReadButtons(void)
 		N3DS_DebugLog(msg);
 	}
 
+	/* SELECT held + ZR: virtual multitap (native_input.c) -- first press
+	 * connects all four pads (opening VS/battle player counts), further
+	 * presses cycle which pad the 3DS buttons drive; the others sit idle.
+	 * Default OFF: the renderer has no split-screen support, so these modes
+	 * stay behind retail's own controller gate until deliberately opened for
+	 * renderer work. Mid-race by necessity: hopping karts is the point, and
+	 * dumpreq is unplaceable while the game holds the SD card. ZR has been
+	 * free since trackrender folded into the SELECT+START master. dumpreq
+	 * `padmux [N]` sets a specific pad or turns the mux off again. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZR))
+	{
+		extern int Platform_InputDebugPadMux(int op);
+		const int state = Platform_InputDebugPadMux(-1);
+		char msg[64];
+
+		snprintf(msg, sizeof(msg), "[CTR-3DS] padmux: driving pad %d of 4", state);
+		N3DS_DebugLog(msg);
+	}
+
 	/* SELECT held + D-pad DOWN: toggle render-worker routing mid-run (mid-run
 	 * flips bracket [PERF] windows by state, killing the cross-run content
 	 * confound the same way textureless's combo does below). dumpreq
@@ -4186,21 +4196,21 @@ unsigned int N3DS_ReadButtons(void)
 	 * hardware A/B would be cross-run. The OFF transition is safe mid-race
 	 * by construction: Route() fences the worker before the first direct
 	 * call (native_render_queue.c). */
-	/* s41: SELECT+DDOWN freed (widescreen -- now part of the SELECT+START master). Still reachable as dumpreq `wide`. */
+	/* SELECT+DDOWN freed (widescreen -- now part of the SELECT+START master). Still reachable as dumpreq `wide`. */
 
-	/* s41: SELECT+DRIGHT freed (textureless debug view). Still reachable as dumpreq `textureless`. */
+	/* SELECT+DRIGHT freed (textureless debug view). Still reachable as dumpreq `textureless`. */
 
 #ifdef CTR_NATIVE_DIRECT_EMIT
-	/* s41: SELECT+DLEFT freed (direct emit -- baseline since 2026-07-28, A/B settled). Still reachable as dumpreq `directemit`. */
+	/* SELECT+DLEFT freed (direct emit -- baseline, A/B settled). Still reachable as dumpreq `directemit`. */
 #endif
 
-	/* s41c: SELECT+DLEFT freed again (the particle-lift sweep did its job and
+	/* SELECT+DLEFT freed again (the particle-lift sweep did its job and
 	 * was removed -- the lift nudged every particle, not just a kart's own
 	 * smoke). Still reachable as nothing; the real driver-local fix carries no
 	 * runtime knob. */
 
 #if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
-	/* SELECT held + D-pad UP: GTE capture cost A/B (s29). The depth model the
+	/* SELECT held + D-pad UP: GTE capture cost A/B. The depth model the
 	 * track renderer needs reads per-vertex sz3 out of the capture table, which
 	 * means capture stops being an optional instrument and becomes permanently
 	 * compiled in on the platform with the least frame time to spare -- so its
@@ -4225,21 +4235,23 @@ unsigned int N3DS_ReadButtons(void)
 	}
 
 	/* SELECT held + D-pad DOWN is the render worker; SELECT + L is packet depth
-	 * -- the s29 depth model's mid-race A/B. Flips BOTH sides at once (packets
+	 * -- the depth model's mid-race A/B. Flips BOTH sides at once (packets
 	 * stamp sz3, track shader switches to the true-depth axis), because either
 	 * alone puts the two geometry sources on different axes. This is the
 	 * toggle the "karts through walls" objection gets tested against, so it
 	 * has to be a button: a dumpreq file cannot be placed mid-race. */
-	/* s41: SELECT+L freed -- packet depth folded into the SELECT+START master.
+	/* SELECT+L freed -- packet depth folded into the SELECT+START master.
 	 * Still reachable as dumpreq `packetdepth`. */
 #endif
 
 #ifdef CTR_NATIVE_TRACK_RENDERER
-	/* s41: SELECT+ZR freed (native track renderer (incl. state 2, BOTH)). Still reachable as dumpreq `trackrender`. */
+	/* SELECT+ZR freed (native track renderer (incl. state 2, BOTH)). Still
+	 * reachable as dumpreq `trackrender`. ZR reassigned to the padmux
+	 * active-pad cycle (handler above, beside SELECT+ZL). */
 #endif
 
 #if defined(CTR_NATIVE_TRACK_RENDERER) && defined(CTR_NATIVE_MODEL_RENDERER) && defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
-	/* SELECT held + START: the owner's "our config" combo (requested s34) --
+	/* SELECT held + START: the owner's "our config" combo --
 	 * track renderer + native models + packet depth all flip together, because
 	 * reaching the target config from a clean boot cost three chords every
 	 * boot. Two states: everything native (1,1,1) or everything retail
@@ -4247,7 +4259,7 @@ unsigned int N3DS_ReadButtons(void)
 	 * lands on the config being targeted. START still reaches the game, so
 	 * in-race this also opens the pause menu -- acceptable and documented.
 	 *
-	 * s41: this is now the ONLY renderer chord. The individual track / models /
+	 * This is now the ONLY renderer chord. The individual track / models /
 	 * packet-depth buttons (ZR / A / L) and the widescreen button (D-DOWN) are
 	 * gone -- owner's call, "not much use in individual toggles, all in one, I
 	 * don't wanna fiddle with toggles". Every one of them survives as a dumpreq
@@ -4257,12 +4269,12 @@ unsigned int N3DS_ReadButtons(void)
 	 * the master because "ours" includes it: REAL (2) on, 4:3 crop (0) off; the
 	 * rejected stretch (1) stays dumpreq-only. */
 	/*
-	 * s44 UI pop-out dial: SELECT + D-LEFT / D-RIGHT, in 5% steps of the eye's
+	 * UI pop-out dial: SELECT + D-LEFT / D-RIGHT, in 5% steps of the eye's
 	 * at-infinity shift. Earns a chord (owner-approved) on the one criterion
 	 * that justifies one: it is a COMFORT value, judged by eye, in stereo, on
 	 * hardware -- and it cannot be dialled any other way there, because dumpreq
 	 * needs the SD card the game is holding. Deliberately not the touch screen:
-	 * touch is a bad A/B edge (s36 -- it disturbs the thing being judged).
+	 * touch is a bad A/B edge -- it disturbs the thing being judged.
 	 *
 	 * Clamped 0..100 here: 0 restores the old flat-at-screen-plane UI, and 100
 	 * is already well past the owner's "not as much as the character" bound, so
@@ -4316,7 +4328,7 @@ unsigned int N3DS_ReadButtons(void)
 	 * visibly sitting on the road.
 	 *
 	 * WAS D-RIGHT, which was a COLLISION, not a free chord: D-RIGHT has been
-	 * textureless mode since the owner moved it there on 2026-07-29 (see that
+	 * textureless mode since the owner moved it there (see that
 	 * handler above), so one press flipped both, and every A/B either control
 	 * was supposed to settle would have been confounded by the other. The
 	 * comment that used to sit here asserted D-RIGHT was free after checking
@@ -4329,7 +4341,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *
 	 * Two states, not three, matching the trackrender button's reasoning: BOTH
 	 * stays reachable as 'modelrender 2' via dumpreq. */
-	/* s41: SELECT+A freed -- model render folded into the SELECT+START master.
+	/* SELECT+A freed -- model render folded into the SELECT+START master.
 	 * Still reachable as dumpreq `modelrender` (including state 2, BOTH).
 	 * Frees the accelerate button from carrying a chord at all. */
 #endif

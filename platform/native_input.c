@@ -103,6 +103,20 @@ global_variable s32 s_installedSnapshotsActive;
 global_variable s32 s_keyboardControllerSlot = NATIVE_INPUT_DEFAULT_KEYBOARD_SLOT;
 global_variable s32 s_lastActiveControllerSlot = -1;
 
+/* Virtual multitap ("padmux"): report every pad slot as a connected digital
+ * pad, so the game opens the VS/battle player counts a lone 3DS could never
+ * assemble, and route the single physical input to a selectable slot
+ * (s_keyboardControllerSlot -- 3DS HID arrives through the keyboard path,
+ * sdl3_compat_3ds.c). To the game this is indistinguishable from a retail
+ * multitap with four digital pads plugged in, three of them idle. Default
+ * OFF everywhere: it briefly defaulted ON for 3DS, but
+ * the 3DS renderer doesn't handle split-screen yet, and with the mux off
+ * retail's own "insert controller" gate keeps VS/battle unenterable -- the
+ * desired hiding, with no game/ menu surgery. Deliberate opt-in for renderer
+ * work stays via Platform_InputDebugPadMux: on 3DS dumpreq `padmux [N]` and
+ * the SELECT+ZR active-pad cycle. */
+global_variable s32 s_padMuxAll = 0;
+
 extern s32 g_padCommEnable;
 
 internal u16 NativeInput_GetSnapshotButtons(const struct PlatformInputPadSnapshot *snapshot)
@@ -824,8 +838,46 @@ void Platform_InputUpdate(void)
 		NativeInput_ResetSnapshot(slot);
 		NativeInput_ApplyController(slot);
 		NativeInput_ApplyKeyboard(slot, keyboardButtons);
+
+		/* Virtual multitap: any slot nothing physical claimed reports as a
+		 * connected, idle digital pad (ResetSnapshot already left neutral
+		 * buttons/sticks in it). */
+		if ((s_padMuxAll != 0) && (s_controllers[slot].snapshot.connected == 0))
+		{
+			s_controllers[slot].snapshot.connected = 1;
+			s_controllers[slot].snapshot.status = 0;
+			s_controllers[slot].snapshot.id = NATIVE_INPUT_PAD_DIGITAL;
+		}
 	}
 	NativeInput_WritePadBus();
+}
+
+int Platform_InputDebugPadMux(int op)
+{
+	if (op == 0)
+	{
+		s_padMuxAll = 0;
+		s_keyboardControllerSlot = NATIVE_INPUT_DEFAULT_KEYBOARD_SLOT;
+	}
+	else if ((op >= 1) && (op <= NATIVE_INPUT_MAX_CONTROLLERS))
+	{
+		s_padMuxAll = 1;
+		s_keyboardControllerSlot = op - 1;
+	}
+	else /* advance: cycle the driven pad, enabling the mux if it was off */
+	{
+		if (s_padMuxAll == 0)
+		{
+			s_padMuxAll = 1;
+			s_keyboardControllerSlot = NATIVE_INPUT_DEFAULT_KEYBOARD_SLOT;
+		}
+		else
+		{
+			s_keyboardControllerSlot = NativeInput_NextControllerSlot(s_keyboardControllerSlot);
+		}
+	}
+
+	return s_padMuxAll ? (s_keyboardControllerSlot + 1) : 0;
 }
 
 void Platform_InputControllerAdded(int deviceIndex)

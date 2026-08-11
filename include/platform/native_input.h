@@ -23,6 +23,15 @@ void Platform_InputControllerRemoved(int instanceId);
 int Platform_InputCycleKeyboardController(void);
 int Platform_InputCycleGamepadController(void);
 
+/* Virtual multitap control ("padmux", default OFF -- the 3DS renderer has no
+ * split-screen support yet, and off means retail's own "insert controller"
+ * gate keeps VS/battle unenterable): op 0 = off (retail single-pad bus),
+ * 1..4 = on with the physical input driving that pad, anything else =
+ * advance (cycle the driven pad, enabling if off). Returns the driven pad
+ * number 1..4, or 0 when off. Plain-int signature on purpose: the 3DS
+ * backend TU calls it across the enum-width ABI boundary. */
+int Platform_InputDebugPadMux(int op);
+
 void Platform_InputPadInit(int slot, unsigned char *padData);
 int Platform_InputPadGetState(int port);
 void Platform_InputPadVibrate(int port, unsigned char *table, int len);
