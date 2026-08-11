@@ -1,61 +1,17 @@
 /*
  * Direct-emit fast path (retained-geometry campaign, transitional form --
- * docs/RETAINED_GEOMETRY_V2_DESIGN.md, session 26).
- *
- * The render thread (cec9ca5) made the worker's OT walk the whole frame on
- * heavy tracks, and the core-2 profile localized the tax to the
- * translate/convert/emit half: DrawAllSplits ~27ms on core 2 vs ~10 on core 0,
- * parse small. What that half actually does per opaque triangle is build a
- * 20-byte GrVertex per vertex into a 1.3MB frame array (write), re-read it in
- * DrawTriangles (L2 miss -- the array outlives any cache), resolve its texture,
- * and convert to a 12-byte N3DS_Vertex in a merge bin. The GrVertex
- * intermediate plus the split/run machinery around it IS the cost; the
- * arithmetic is trivial and the resolve is measured cheap (~2ms/frame,
- * session 24 -- the "36us/triangle" number was the tri-scope syscall tax).
- *
- * So the v2 "retained sub-mesh" transitional form degenerates into something
- * simpler and strictly better: for an OT node whose payload is nothing but
- * OPAQUE POLY prims, emit packet -> merge bin directly and skip the GrVertex/
- * split path entirely. No stability hash, no cross-frame cache, no
- * invalidation: every emitted byte is derived fresh each frame from the packet
- * plus a per-frame texture resolve, so stale data is impossible by
- * construction, and it covers 100%% of eligible content instead of the ~50%%
- * frame-over-frame stability rate a cache would hit. The full retained form
- * (model-space verts, camera matrix on PICA -- deletes the packet read too)
- * remains future work gated on double-buffering the GTE capture table.
- *
- * Byte-parity with the normal path is the design invariant, argued hunk by
- * hunk in DirectEmit_WalkNode: same triangulation order (packet-index tris
- * (0,1,2)+(1,2,3) -- the MakeVertexQuad x0,x1,x3,x2 argument order and
- * TriangulateQuad's swaps cancel to exactly that), same float DrawEnvOffset
- * XY math, same GetTPageBase/GetTPageFormat inputs, same per-prim emit
- * ordinal advance (including null-FT3 prims, which consume an ordinal and
- * write activeDrawEnv.tpage without emitting), same resolve call per
- * triangle. Bins are order-free under the depth substrate, so fast-path
- * triangles entering a bin before split-path triangles of earlier prims is
- * legal for the same reason the merge itself is.
- *
- * A node stays on the normal path ("skip") when it contains: any draw-env
- * prim (0xE0-0xE7 mutate state the fast path won't replay), any non-poly
- * prim (lines/tiles/sprites/fills/MoveImage -- positions are screen content
- * and several have side effects), any semi-trans poly (blend content must
- * keep OT order through the run machinery), any textured poly whose page is
- * TF_16_BIT (framebuffer-feedback semantics: PrepareFramebufferFeedback can
- * barrier mid-walk), or malformed tiling. Diagnostics that observe the
- * normal path (tridump, textureless, single-texture, atlasview) and the
- * override texture disable the fast path for the frame so their picture
- * stays complete.
- *
- * PC: count-only. The scanner runs and reports the [DEMIT] window line (the
- * eligibility ceiling, measurable from replays -- s24 rule: content counts
- * transfer from PC, timings do not), but TryNode always returns 0, so PC
- * output stays byte-identical with the gate compiled in.
+ * docs/RETAINED_GEOMETRY_V2_DESIGN.md). For an OT node whose payload is
+ * nothing but opaque poly prims, emits packet -> merge bin directly, skipping
+ * the GrVertex/split path. Byte-parity with the normal path is the design
+ * invariant (see DirectEmit_WalkNode). A node with any draw-env prim,
+ * non-poly prim, semi-trans poly, TF_16_BIT textured poly (framebuffer
+ * feedback), or malformed tiling stays on the normal path. PC: count-only,
+ * TryNode always returns 0.
  *
  * This file is part of the main.c unity TU and is included AFTER
  * native_gpu.c and platform/n3ds/native_renderer_3ds.c so it can see their
  * file-scope state (s_gpu, activeDrawEnv, merge bins, the decode-cache
- * resolve). The walk calls in through forward declarations at the top of
- * native_gpu.c.
+ * resolve).
  */
 
 #ifndef CTR_NATIVE_DIRECT_EMIT
@@ -71,8 +27,8 @@
  * semantics), both legs here produce byte-identical bins, so a mid-frame
  * flip just splits one frame's content between two equivalent paths.
  *
- * PC defaults 0: with the gate promoted to a default-ON build option
- * (owner ruling 2026-07-28), a PC default of 1 would put the count-only
+ * PC defaults 0: with the gate promoted to a default-ON build option,
+ * a PC default of 1 would put the count-only
  * scan and a [DEMIT] line in every PC user's run for no benefit -- the win
  * is 3DS-only. Flip to 1 in source when a PC replay needs the eligibility
  * counts (edit-and-build diagnostic, same convention as
@@ -222,7 +178,7 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				u16 ordinal;
 				s16 z;
 				s16 zPerVert[4];
-				/* Parallax channel twin (s40b, docs/FLAG_SPLIT_CHANNEL_SPEC.md):
+				/* Parallax channel twin (docs/FLAG_SPLIT_CHANNEL_SPEC.md):
 				 * same indices, same validity flag -- the resolver fills both
 				 * or neither. */
 				s16 wPerVert[4];
@@ -252,13 +208,13 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				 * to be off. */
 				NativeGpu_RecordContentAdvance();
 				z = (s16)((int)ordinal - 32768);
-				/* Per-vertex depth (s29). Stays invalid -- and every vertex
+				/* Per-vertex depth. Stays invalid -- and every vertex
 				 * keeps the flat z above -- unless the resolver below fills it,
 				 * so the feature-off and fallback paths are byte-unchanged. */
 				zPerVertValid = 0;
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-				/* s29 depth model (docs/PACKET_DEPTH_DESIGN.md 3.4b). This path
+				/* Depth model (docs/PACKET_DEPTH_DESIGN.md 3.4b). This path
 				 * writes its own z and handles most of a heavy track's opaque
 				 * content, so it MUST resolve depth exactly as the parse path
 				 * does -- if only one of the two moves onto the true-depth
@@ -275,7 +231,7 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 						int v;
 
 						z = (s16)((int)depthStamp - 32768);
-						/* s29 per-vertex depth: keep each corner's own depth so
+						/* Per-vertex depth: keep each corner's own depth so
 						 * the GPU interpolates across the polygon, instead of
 						 * flattening the whole primitive onto its FARTHEST
 						 * corner (retail's OT-bucket convention, which loses to
@@ -337,14 +293,10 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 							bin = N3DS_MERGE_UNTEX_BIN;
 						}
 
-						/* s43 sky-first: the skybox (tagged by s_skyNodeActive
-						 * during the walk, native_gpu.c) accumulates into its own
-						 * buffer so N3DS_DrawSkyPass can draw it BEFORE the track
-						 * pass -- otherwise, binned as ordinary opaque, it flushes
-						 * after the track and paints over the depth-less waterfall.
-						 * Overflow drops the tri (a few backdrop tris are
-						 * invisible) rather than flush mid-walk. Toggle off routes
-						 * the sky back to the opaque bin (the punch-through leg). */
+						/* Sky-first: the skybox (tagged by s_skyNodeActive during the walk,
+						 * native_gpu.c) accumulates into its own buffer so N3DS_DrawSkyPass can
+						 * draw it before the track pass -- otherwise, binned as ordinary opaque,
+						 * it flushes after the track and paints over the depth-less waterfall. */
 						if (g_dbg_skyFirst && s_skyNodeActive)
 						{
 							if ((s_skyVertUsed + 3) > N3DS_SKY_VERT_CAP)
@@ -369,14 +321,11 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 							s16 dx = (s16)((float)(s16)(xyWord & 0xFFFFu) + ofsX);
 							const s16 dz = zPerVertValid ? zPerVert[idx[k]] : z;
 
-							/* s37 widescreen UI relocation -- same rule as
-							 * N3DS_ConvertTriangleVerts's: UI-band stamps
-							 * (biased z >= 32704 = raw 0xFFC0) get the X
-							 * ramp (NativeWide_UiShiftX, native_gpu.c).
-							 * zPerVertValid doubles as the packet-depth-live
-							 * gate: an ordinal z cannot reach the band (no
-							 * frame emits 65472 prims). No-op with wide off,
-							 * so PC/[DEMIT] goldens are untouched. */
+							/* Widescreen UI relocation -- same rule as N3DS_ConvertTriangleVerts's:
+							 * UI-band stamps (biased z >= 32704 = raw 0xFFC0) get the X ramp
+							 * (NativeWide_UiShiftX). zPerVertValid doubles as the packet-depth-live
+							 * gate: an ordinal z cannot reach the band. No-op with wide off, so
+							 * PC/[DEMIT] goldens are untouched. */
 							if (zPerVertValid && (dz >= 32704))
 							{
 								extern int NativeWide_UiShiftX(int x);
@@ -386,7 +335,7 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 							dst[k].x = dx;
 							dst[k].y = (s16)((float)(s16)(xyWord >> 16) + ofsY);
 							dst[k].z = dz;
-							/* Parallax channel (s40b): the resolver's second
+							/* Parallax channel: the resolver's second
 							 * output where it exists, otherwise the same value
 							 * as z -- an ordinal-stamped or unresolved prim has
 							 * no separate stereo depth to carry. */
@@ -417,7 +366,7 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 								dst[k].b = (u8)((col >> 16) & 0xFFu);
 							}
 						}
-						/* s43: advance whichever buffer this tri went to. */
+						/* Advance whichever buffer this tri went to. */
 						if (g_dbg_skyFirst && s_skyNodeActive)
 						{
 							s_skyVertUsed += 3;
@@ -483,37 +432,19 @@ internal int NativeDirectEmit_TryNode(const u8 *packet, u32 tagLength)
 #endif
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 	/*
-	 * s44 ORDERED UI PASS: stand aside for 2D/UI nodes so UI has exactly ONE
-	 * producer.
-	 *
-	 * THE BUG THIS FIXES (owner-confirmed on Azahar by toggling this whole path
-	 * off): the ordered UI list is only correct if appends arrive in OT-WALK
-	 * order, and the two paths that produce UI do not interleave. Direct emit
-	 * writes its vertices DURING the parse, while the packet path's prims are
-	 * replayed later from splits (DrawOTag parses, THEN calls DrawAllSplits).
-	 * So a list fed by both is ordered [all direct-emit UI][all packet UI], not
-	 * walk order -- and menu text (opaque, taken by this path) ended up beneath
-	 * the translucent panel behind it (blended, so packet path), which is the
-	 * inverse of retail.
-	 *
-	 * Declining the node sends it down the packet path, which preserves walk
-	 * order within itself, so ordering is right by construction rather than by
-	 * a sort. Costs ~nothing: UI is a tiny share of a frame's prims, and this
-	 * path exists for heavy opaque WORLD content.
-	 *
-	 * s_gteCaptureSuppress (the sticky "walk is in 2D/UI territory" flag) is the
-	 * same predicate PacketDepth_ResolveXY uses to decide a prim belongs in the
-	 * UI band, so the two cannot disagree about what counts as UI.
-	 *
-	 * UNCONDITIONAL, not gated on g_dbg_uiOrder (s45b, the minimap regression):
-	 * the same two-producer defect breaks UI with uiorder OFF too -- the in-race
-	 * minimap's racer dots (opaque, this path) were buried under the map sheet
-	 * (blended, packet path), and the sheet's dark texels drew as a solid black
-	 * box. Owner-reported 2026-08-08; root-caused by the 'directemit' A/B in
-	 * Azahar (box + buried dots track the toggle exactly). The sky cannot be
-	 * caught here: the suppress flag latches only once the walk enters the UI
-	 * push-buffer address band, and the sky walks before it -- so the s43
-	 * sky-first accumulator (which lives on this path) keeps its feed.
+	 * Stand aside for 2D/UI nodes so UI has exactly one producer. The ordered UI
+	 * list is only correct if appends arrive in OT-walk order, and the two
+	 * producing paths do not interleave: direct emit writes vertices DURING the
+	 * parse, while the packet path's prims replay later from splits (DrawOTag
+	 * parses, then DrawAllSplits runs) -- so a list fed by both is ordered
+	 * [all direct-emit UI][all packet UI], not walk order. Declining the node
+	 * routes it through the packet path instead, which preserves walk order
+	 * within itself. Unconditional (not gated on g_dbg_uiOrder): the same
+	 * two-producer defect breaks UI either way. s_gteCaptureSuppress is the same
+	 * predicate PacketDepth_ResolveXY uses for the UI band, so the two paths
+	 * cannot disagree about what counts as UI. The sky is not caught here
+	 * because the suppress flag latches only once the walk enters the UI
+	 * pushbuffer address band, and the sky walks before it.
 	 */
 	if (GTECapture_LookupSuppressed())
 	{
@@ -542,7 +473,7 @@ internal int NativeDirectEmit_TryNode(const u8 *packet, u32 tagLength)
 #ifdef __3DS__
 	/* One scope per handled node (~1-1.5k/frame in a race) under the same
 	 * runtime flag as the other per-call scopes: splits the moved emit work
-	 * out of draw_otag_parse_ms (the s26 finding this bucket exists for). */
+	 * out of draw_otag_parse_ms (the finding this bucket exists for). */
 	if (g_dbg_perfTriScopes)
 	{
 		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DIRECT_EMIT);
@@ -559,7 +490,7 @@ internal int NativeDirectEmit_TryNode(const u8 *packet, u32 tagLength)
 /*
  * Per content-frame fold + 64-frame window report, called from ClearSplits
  * (same cadence as [OTPROF]). Printed via Platform_Log so it reaches the 3DS
- * SD log -- the [OTPROF] console-only gap (session 25) is exactly what this
+ * SD log -- the [OTPROF] console-only gap is exactly what this
  * line must not repeat, PC replays and hardware need the same instrument.
  */
 internal void DirectEmit_FoldFrame(void)
@@ -602,8 +533,8 @@ internal void DirectEmit_FoldFrame(void)
 #ifdef __3DS__
 	/* N3DS_DebugLog, NOT Platform_Log: on real hardware the Platform_Log app
 	 * log file never gets created (netloaded runs have no writable cwd for
-	 * the relative fopen), so its lines exist nowhere pullable -- measured
-	 * s26 first netload: Azahar had the [DEMIT] stream, the console had
+	 * the relative fopen), so its lines exist nowhere pullable -- measured on
+	 * first netload: Azahar had the [DEMIT] stream, the console had
 	 * none. Same gap class as [OTPROF]; ctr3ds.log is the sink that works. */
 	{
 		char line[224];

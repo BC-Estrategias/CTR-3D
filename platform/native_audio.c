@@ -30,7 +30,7 @@
 
 #if defined(__3DS__)
 /*
- * Hardware voices (plan B, session 20; see n3ds_audio_thread.h): decoded
+ * Hardware voices (plan B; see n3ds_audio_thread.h): decoded
  * PCM lives in the DSP-readable linear store, decoded ONCE per (addr,
  * loop_addr) instead of per key-on -- SpuWrite already invalidates
  * everything through NativeAudio_ResetVoicePcmArenaNoLock, which is the
@@ -125,15 +125,13 @@ global_variable struct
 #define NATIVE_AUDIO_FP_SHIFT               16
 #define NATIVE_AUDIO_FP_ONE                 (1 << NATIVE_AUDIO_FP_SHIFT)
 #define NATIVE_AUDIO_GAUSS_INDEX_SHIFT      8
-// NOTE(aalhendi): Matches PSX SPU Q15 direct-volume semantics. The SPU treats
-// each volume register (voice VOLL/VOLR, CD CDVOLL/CDVOLR, master MVOLL/MVOR)
-// as a signed 16-bit value with effective gain = value / 0x8000, so two stages
-// (per-voice then master) divide by 0x8000^2 = 0x40000000. The previous 0x4000
-// value mirrored the legacy OpenAL backend, which made every voice/XA ~4x
-// louder than retail and clipped heavily. Retail HOWL ships vol_Music=175,
+// Matches PSX SPU Q15 direct-volume semantics: each volume register (voice
+// VOLL/VOLR, CD CDVOLL/CDVOLR, master MVOLL/MVOR) is a signed 16-bit value
+// with effective gain = value / 0x8000, and two stages (per-voice then
+// master) divide by 0x8000^2 = 0x40000000. Retail HOWL ships vol_Music=175,
 // vol_FX=215, vol_Voice=255, master=0x3fff, and Channel_SetVolume caps each
-// voice at 0x3fff; under this divisor those reach the same amplitude as PSX
-// hardware (e.g. 0x3fff^2 / 0x40000000 ~= 0.25 per voice at defaults).
+// voice at 0x3fff; this divisor reproduces PSX hardware amplitude at those
+// defaults (e.g. 0x3fff^2 / 0x40000000 ~= 0.25 per voice).
 #define NATIVE_AUDIO_DIRECT_VOL_MAX         0x8000
 #define NATIVE_AUDIO_VBLANK_FRAMES          (NATIVE_AUDIO_SAMPLE_RATE / 60)
 #define NATIVE_AUDIO_SCHEDULED_QUEUE_FRAMES (NATIVE_AUDIO_VBLANK_FRAMES * 16)
@@ -169,55 +167,50 @@ global_variable struct
 #define XA_SAMPLE_RATE_37800                37800
 #define XA_SAMPLE_RATE_18900                18900
 
-// NOTE(aalhendi): Streaming ring for decoded XA PCM (replaces the old
-// whole-track arenas, see docs/archive/BUGREPORT_audio_arena_growth.md for history).
-// One physical sector's worth of ring-slot capacity: 18*8*28 = 4032. This is
-// the MONO decode count (DecodeXASectorMono pushes 18*8*28 raw mono samples,
-// which after L=R duplication become 4032 output frames). A STEREO sector
-// only fills the first 2016 of those 4032 slots (DecodeXASectorStereo already
-// interleaves L/R while decoding: 18*4*28 = 2016 output frames). Sizing the
-// slot for the mono (larger) case and pinning the real per-track stride in
-// struct NativeAudioXaStream.framesPerSector keeps both formats correct --
-// see the session report for why a single hardcoded stride would corrupt
-// stereo frameIndex<->sector math.
+// Streaming ring for decoded XA PCM. One physical sector's worth of ring-slot
+// capacity: 18*8*28 = 4032, the MONO decode count (DecodeXASectorMono pushes
+// 18*8*28 raw mono samples, which after L=R duplication become 4032 output
+// frames). A STEREO sector only fills the first 2016 of those 4032 slots
+// (DecodeXASectorStereo already interleaves L/R while decoding: 18*4*28 =
+// 2016 output frames). Size the slot for the mono (larger) case and pin the
+// real per-track stride in struct NativeAudioXaStream.framesPerSector -- a
+// single hardcoded stride would corrupt stereo frameIndex<->sector math.
 #define NATIVE_AUDIO_XA_SECTOR_FRAMES      4032  // 18*8*28, one ring slot's worst-case (mono) capacity in stereo output frames
 #if defined(__3DS__)
 /*
- * Hardware runs 2/3 (session 20): the announcer/music "slow and stop-n-go"
- * was this ring running dry -- 6 sectors is ~0.3s of cushion, and the
- * worker's refill reads share the SD card (and its FAT mutex) with bulk
- * scene loads that monopolize it for whole seconds. 32 sectors â‰ˆ 1.5-3s
- * rides out those bursts; the memory (~2MB across both stream buffers) is
- * cheap now that the decoded-voice arena is gone. The synchronous prime at
- * track open stays SMALL (see NATIVE_AUDIO_XA_PRIME_TARGET) so starts do
- * not stall the main thread; the worker's burst pump tops the rest up
- * within a few wakes. PC keeps the original geometry: replay determinism
- * depends on ring residency/underrun timing staying exactly as it was.
+ * 3DS ring is much deeper than PC: 6 sectors is only ~0.3s of cushion, and
+ * the worker's refill reads share the SD card (and its FAT mutex) with bulk
+ * scene loads that can monopolize it for whole seconds. 32+ sectors rides
+ * out those bursts; the memory (~2MB across both stream buffers) is cheap
+ * now that the decoded-voice arena is gone. The synchronous prime at track
+ * open stays SMALL (NATIVE_AUDIO_XA_PRIME_TARGET) so opens do not stall the
+ * main thread; the worker's burst pump tops the rest up. PC must keep the
+ * original ring geometry: replay determinism depends on ring
+ * residency/underrun timing staying exactly as it was.
  */
 #define NATIVE_AUDIO_XA_RING_SECTORS       64
 #define NATIVE_AUDIO_XA_RING_AHEAD_TARGET  56
 #define NATIVE_AUDIO_XA_PRIME_TARGET       8
 /*
- * Span read-ahead (session 21). The hardware budget decomposition caught the
- * worker spending 73% of the whole session inside the XA pump's SD reads --
- * one wait measured 8.5 SECONDS -- and the mechanism is granularity: XA
- * channels are interleaved on disc, so fetching ONE audio sector means up to
- * 8+ separate 2.3KB reads (most discarded as other channels), each crossing
- * the FAT driver's global mutex against main-thread bulk loads. ~150 tiny
- * reads/sec for one music stream. The span layer replaces them with one
- * 32-sector (~75KB) sequential read cached per stream; the decode loop then
- * consumes physical sectors from memory. Fewer mutex crossings by ~32x, and
- * each crossing does useful work. The deeper ring above (64 slots, ~3.4s of
- * 37.8kHz stereo) is the cushion that rides out the load-burst stalls the
- * span reads cannot avoid entirely.
+ * Span read-ahead. XA channels are interleaved on disc, so fetching ONE audio
+ * sector means up to 8+ separate 2.3KB reads (most discarded as other
+ * channels), each crossing the FAT driver's global mutex against main-thread
+ * bulk loads -- ~150 tiny reads/sec for one music stream. This layer replaces
+ * them with one 32-sector (~75KB) sequential read cached per stream; the
+ * decode loop then consumes physical sectors from memory, cutting mutex
+ * crossings by ~32x with each crossing doing useful work. The deeper ring
+ * above is the cushion that rides out load-burst stalls the span reads
+ * cannot avoid entirely.
  */
-/* 64, raised from 32 once the disc reader's chunk reached 64 (session 23):
- * a span fill is one read either way, and an SD read costs ~26ms fixed +
- * ~0.24ms/sector, so covering twice the sectors per fill costs ~15ms more on
- * a call that already costs ~45ms -- half the calls for a fifth more time
- * each. The single blocking read the worker sits inside grows with it, which
- * is why this tracks the chunk rather than exceeding it: the DSP cushion is
- * ~200ms and a ~52ms fill sits comfortably under that. */
+/*
+ * Tracks the disc reader's chunk size: a span fill is one read either way,
+ * and an SD read costs ~26ms fixed + ~0.24ms/sector, so covering twice the
+ * sectors per fill costs ~15ms more on a call that already costs ~45ms --
+ * half the calls for a fifth more time each. The single blocking read the
+ * worker sits inside grows with it, which is why this tracks the chunk
+ * rather than exceeding it: the DSP cushion is ~200ms and a ~52ms fill sits
+ * comfortably under that.
+ */
 #define NATIVE_AUDIO_XA_SPAN_SECTORS       64
 #else
 #define NATIVE_AUDIO_XA_RING_SECTORS       6     // resident sector-slots per stream (~94.5 KiB @ mono capacity)
@@ -2346,14 +2339,12 @@ internal void NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock(void)
 	int i;
 
 	/*
-	 * Was `used == 0`: the arena reset fired the instant nothing was
-	 * sounding -- i.e. precisely the gap BETWEEN sounds -- so every sound
-	 * paid a full re-decode on its next key-on (docs/
-	 * VOICE_START_DECODE_DESIGN.md step 4). Below the high-water mark the
-	 * decoded PCM now survives idle gaps and a re-triggered sound re-keys
-	 * for free; the reset still runs (only ever with no voice live, the
-	 * guard loop below is untouched) once a genuinely large session pushes
-	 * past the mark.
+	 * Reset only fires once idle usage exceeds
+	 * NATIVE_AUDIO_VOICE_ARENA_RECLAIM_KEEP, not the instant nothing is
+	 * sounding: below the high-water mark, decoded PCM survives idle gaps so a
+	 * re-triggered sound re-keys for free (docs/VOICE_START_DECODE_DESIGN.md
+	 * step 4). The reset still runs -- only ever with no voice live -- once a
+	 * genuinely large session pushes past the mark.
 	 */
 	if (s_audio.voicePcmArena.used <= NATIVE_AUDIO_VOICE_ARENA_RECLAIM_KEEP)
 	{
@@ -2573,8 +2564,8 @@ internal int NativeAudio_VoiceHasSample(const struct NativeAudioVoice *voice)
  * handle plus whether it was open -- nothing else survives the free. It
  * used to be the whole stream struct, which was genuinely "a small struct
  * copy" at ~100 bytes and silently became a 37KB stack object per caller
- * when the decode scratch moved into the stream (session 20's stack-smash
- * lesson, same as NativeAudio_XAStreamSwap). */
+ * when the decode scratch moved into the stream (same as
+ * NativeAudio_XAStreamSwap). */
 struct NativeAudioXaClosedSource
 {
 	struct NativeAudioXaSource source;
@@ -3129,8 +3120,7 @@ internal void NativeAudio_XAStreamSwap(struct NativeAudioXaStream *a, struct Nat
 	 * swap. Doing it this way is not an optimization -- a whole-struct
 	 * temporary here is a ~37KB stack local now that the scratch lives in
 	 * the struct, and it smashed the thread stack at the first
-	 * pending->live track promote (session 20, wild PC=0 in Azahar the
-	 * moment the run-5 race fix landed).
+	 * pending->live track promote.
 	 */
 	unsigned char tmp[offsetof(struct NativeAudioXaStream, sectorBuf)];
 
@@ -3180,9 +3170,9 @@ internal int NativeAudio_XASourceOpen(struct NativeAudioXaSource *source, const 
 		return 0;
 	}
 
-	// Ground truth verified this session: NativeDiscImage_ReadRawSectors
-	// always normalizes to NATIVE_DISC_IMAGE_MODE2_USER_SIZE (2336) bytes per
-	// sector, so hardcode the disc-image layout instead of autodetecting via
+	// NativeDiscImage_ReadRawSectors always normalizes to
+	// NATIVE_DISC_IMAGE_MODE2_USER_SIZE (2336) bytes per sector, so hardcode
+	// the disc-image layout instead of autodetecting via
 	// NativeAudio_GetXASectorLayout (that autodetection is for raw host-file
 	// byte layouts, which can genuinely be either 2352 or 2336).
 	source->useDiscImage = 1;
@@ -3412,7 +3402,7 @@ internal int NativeAudio_XAStreamCountAudioSectors(struct NativeAudioXaSource *s
 
 #if defined(__3DS__)
 /*
- * XA voice cache (session 35, the audio preloader). Mid-race character voice
+ * XA voice cache (the audio preloader). Mid-race character voice
  * lines, announcer calls, and the wrong-way barks are CD-XA streams opened
  * per PLAY, and every open cost two XNF reads, a whole-file channel scan, and
  * a prime read -- ~26ms fixed per SD call, synchronously on the main thread
@@ -3878,8 +3868,8 @@ internal int NativeAudio_XARingReadSampleNoLock(struct NativeAudioXaStream *stre
  * resampler called it 29 taps x 2 channels x 735 frames = 42,630 times per
  * parcel -- 42,630 software __aeabi_uldivmod calls per 16.7ms of music on a
  * CPU with no divide instruction, plus 42,630 scattered reads across a ~1MB
- * ring. Session 21 measured that parcel at 52-56ms on hardware (1,670
- * parcels, two runs): production ran at a third of real time, which is what
+ * ring. That parcel measured 52-56ms on hardware (1,670 parcels, two runs):
+ * production ran at a third of real time, which is what
  * the owner heard as the announcer "talking into a fan". Here the divide
  * happens once per sector the span touches -- one or two per parcel -- and
  * the samples move by memcpy.
@@ -4095,20 +4085,14 @@ internal int NativeAudio_XAStreamOpenTrack(struct NativeAudioXaStream *stream, i
 			stream->source.totalSectors = info.numSectors;
 		}
 
-		// NOTE(aalhendi): info.numSectors (just clamped above) bounds the
-		// PHYSICAL scan range, but some categories share one physical file across
-		// many xaIDs, interleaved by channel (e.g. CDSYS_XA_TYPE_EXTRA voice
-		// lines) -- exactly like MM_Scrapbook.c's TEST.STR case below, just
-		// reached through the XNF/category path instead of an explicit path.
-		// Measured case: a boot voice line's file scanned 827 physical sectors
-		// for only 51 actual channelFilter matches. Assuming every scanned
-		// sector is audio (frameCount = totalSectors * framesPerSector) made the
-		// track appear ~16x longer than its real content, so once the true 51
-		// sectors were exhausted the ring sat on endOfStream while outputFrame
-		// climbed toward a frameCount that was never going to be reached on any
-		// reasonable timescale -- indistinguishable from a hang in
-		// deterministicRenderMode. Count real audio sectors instead, exactly
-		// like NativeAudio_XAStreamOpenFile already does.
+		// info.numSectors bounds the PHYSICAL scan range, but some categories
+		// share one physical file across many xaIDs, interleaved by channel
+		// (e.g. CDSYS_XA_TYPE_EXTRA voice lines, like MM_Scrapbook.c's TEST.STR
+		// case below). Treating totalSectors as frameCount overstates track
+		// length for these files and can leave outputFrame chasing a target the
+		// ring will never reach. Count real audio sectors matching
+		// channelFilter instead, exactly like NativeAudio_XAStreamOpenFile
+		// already does.
 #if defined(__3DS__)
 		if ((info.entryIndex >= 0) && (info.entryIndex < NATIVE_AUDIO_XA_TRACK_INDEX_MAX) && (s_xaAudioSectorCountMemo[info.entryIndex] > 0))
 		{
@@ -4798,8 +4782,8 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 	 * When the worker thread is alive, XA does NOT advance here: it runs on
 	 * the worker's own wall-clock via NativeAudio_RenderXAParcelNoLock --
 	 * real time regardless of frame rate, which is what the PS1's CD
-	 * hardware did (session 20, hardware run 3: per-vblank advance chopped
-	 * the boot announcer into starved fragments whenever frames ran slow).
+	 * hardware did (per-vblank advance chopped the boot announcer into
+	 * starved fragments whenever frames ran slow).
 	 * The no-worker fallback still advances XA here, per vblank, exactly
 	 * as before.
 	 */
@@ -4892,7 +4876,7 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 
 #if defined(__3DS__)
 			/*
-			 * Hardware voices (plan B, session 20): this voice is PLAYED by
+			 * Hardware voices (plan B): this voice is PLAYED by
 			 * its own ndsp channel -- see NativeAudio_HwVoiceMirrorNoLock.
 			 * The per-sample loop keeps only the lifecycle arithmetic (ADSR
 			 * advance, position advance, loop wrap, stop detection) because
@@ -4961,7 +4945,7 @@ internal void NativeAudio_MixFrame(s16 *outLeft, s16 *outRight)
 /*
  * ===================================================== lifecycle fast path ===
  *
- * On 3DS the DSP plays the voices (plan B, session 20), so MixFrame's inner
+ * On 3DS the DSP plays the voices (plan B), so MixFrame's inner
  * loop generates nothing -- it exists purely to advance the state the GAME
  * polls: ADSR level/phase, sample position, loop wraps, ENDX-by-way-of
  * voice->active. Hardware run 6 measured what that bookkeeping costs when
@@ -5200,7 +5184,7 @@ internal int NativeAudio_RenderFramesNoLock(s16 *out, int frameCount)
 
 #if defined(__3DS__)
 /*
- * Hardware-voice mirror (plan B, session 20): once per vblank, translate
+ * Hardware-voice mirror (plan B): once per vblank, translate
  * the 24 software voices' state into DSP channel pokes. The lifecycle loop
  * in MixFrame remains the AUTHORITY on game-visible state (ADSR phases,
  * ENDX, position); the DSP channel is only the renderer. Because the DSP
@@ -5363,11 +5347,11 @@ void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *lifecycleTi
  * Renders one vblank's worth of the XA/CD music stream and submits it to
  * the music channel; a starved game loop no longer starves the music.
  *
- * "Renders" is now nearly a memcpy. Session 22: the parcel carries SOURCE
+ * "Renders" is now nearly a memcpy. The parcel carries SOURCE
  * PCM at the XA rate (37800/18900) and the DSP resamples it in hardware,
  * per-channel, for free -- deleting the 29-tap zig-zag resampler that
- * measured 52-56ms per 16.7ms parcel on the ARM11 (session 21, the
- * "announcer talking into a fan" finding). What stays CPU-side is the
+ * measured 52-56ms per 16.7ms parcel on the ARM11 (the "announcer talking
+ * into a fan" finding). What stays CPU-side is the
  * game-visible XA clock, advanced in one step per parcel instead of 735.
  * Volume moves to the channel (ndspChnSetMix) instead of every sample.
  * PC is untouched and still runs the resampler -- see
@@ -5669,15 +5653,11 @@ internal int NativeAudio_GoldenRun(const char *statePath, const char *rawPath)
 	 * This MUST happen before RestoreState, not after it. Platform_Init has
 	 * already opened and resumed the output device by the time --audio-golden
 	 * is handled (main.c), and outside deterministic mode the device thread's
-	 * callback mixes directly -- NativeAudio_StreamCallback's else branch calls
-	 * NativeAudio_RenderFramesNoLock. With the flip after the restore, any
-	 * callback firing in between advanced the very snapshot under test, and
-	 * whether it won that window was a scheduling coin flip. That was this
-	 * gate's long-standing flake, measured s29 at 15 runs -> 13x bbe92bbc, 2x
-	 * 1c9d6254, uncorrelated with anything under test. In deterministic mode
-	 * the same callback only drains already-rendered PCM and cannot touch mixer
-	 * state, so ordering alone closes it -- no SDL call, and nothing here the
-	 * 3DS build cannot compile.
+	 * callback mixes directly via NativeAudio_RenderFramesNoLock. Flipping
+	 * after the restore lets a callback race the restored snapshot, making the
+	 * golden hash non-deterministic. In deterministic mode the same callback
+	 * only drains already-rendered PCM and cannot touch mixer state, so
+	 * ordering alone closes it.
 	 */
 	NativeAudio_SetDeterministicRenderMode(1);
 
@@ -5973,12 +5953,12 @@ int NativeAudio_LifecycleBench(const char *statePath)
 	fclose(file);
 
 	/*
-	 * The audio device is open and its callback thread mixes s_audio -- it
-	 * will advance these very voices underneath the comparison and turn a
-	 * clean equivalence into noise (it did: the "divergence" moved vblank
-	 * every run). Deterministic mode is how --audio-golden already keeps the
-	 * callback off the mixer -- in that mode SDL only drains already-queued
-	 * PCM and never calls the mixer itself.
+	 * The audio device is open and its callback thread mixes s_audio -- without
+	 * deterministic mode it will advance these very voices underneath the
+	 * comparison, turning a clean equivalence check into noise. Deterministic
+	 * mode is how --audio-golden already keeps the callback off the mixer: in
+	 * that mode SDL only drains already-queued PCM and never calls the mixer
+	 * itself.
 	 */
 	NativeAudio_SetDeterministicRenderMode(1);
 

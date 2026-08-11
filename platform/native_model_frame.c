@@ -1,32 +1,14 @@
 /*
- * native_model_frame.c -- per-frame instance sampler (s30 rung 0).
+ * native_model_frame.c -- per-frame instance sampler. Distinct from native_model_census.c, which
+ * weighs the whole level's model population once per level -- the wrong number for a frame
+ * budget, since most of a level's models are never on screen together and hardware instance cost
+ * is a per-frame cost. This counts what a frame actually commits to drawing; a population total
+ * would mask which content is actually paid for.
  *
- * WHY THIS EXISTS SEPARATELY FROM THE CENSUS
- *
- * platform/native_model_census.c weighs the whole model population once per
- * level. That is the wrong number for a frame budget: most of a level's models
- * are never on screen together, and the ~9ms instance cost measured on hardware
- * is a per-frame cost. This counts what a frame actually commits to drawing.
- *
- * The distinction is not pedantic. The s29 sweep read one cycle of a rotating
- * config as proof that karts were free, and was wrong because the thing being
- * counted was not the thing being paid for. A population total would make the
- * same mistake in the other direction.
- *
- * WHAT THE NUMBERS MEAN
- *
- * `tris` is the topology maximum of every header this frame selected -- see
- * native_model_mesh.c's header comment for why a static scan cannot subtract
- * the runtime's backface and off-screen rejections. It is an upper bound on
- * what a PICA-native model path would submit, and a proportional-not-absolute
- * signal for what the packet path is currently spending.
- *
- * `rung+1` answers the owner's question directly: if every instance drew one
- * LOD rung coarser than the game chose -- racers in their multiplayer models --
- * this is the triangle count that would result. Nothing here CHANGES the rung;
- * it prices the trade before anyone takes it.
- *
- * Counts only -- no allocation, no game state touched.
+ * `tris` is the topology maximum of every header this frame selected (see native_model_mesh.c),
+ * an upper bound, not the runtime's post-rejection count. `rung+1` is the triangle count if every
+ * instance drew one LOD rung coarser than the game chose. Counts only -- no allocation, no game
+ * state touched.
  */
 
 #include "platform/native_model_frame.h"

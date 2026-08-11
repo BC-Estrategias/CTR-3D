@@ -1,35 +1,31 @@
 /*
  * Native track renderer -- per-frame camera + visibility snapshot recorder
- * (rung 3a step 1, docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b).
+ * and draw side (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b).
  *
- * This is the piece the design doc's first draft got wrong (brief correction
- * (a), doc erratum): there is no pre-existing "recorded leaf list the mesh
- * builder already latches" to read from. The mesh builder (native_track_mesh.c)
- * only knows the level's STATIC per-leaf ranges, built once at load; which of
- * those leaves are actually VISIBLE this frame comes from the game's own
+ * There is no pre-existing "recorded leaf list the mesh builder already
+ * latches" to read from. The mesh builder (native_track_mesh.c) only knows
+ * the level's STATIC per-leaf ranges, built once at load; which of those
+ * leaves are actually VISIBLE this frame comes from the game's own
  * RenderLists_Init1P2P traversal, which runs every frame and links visible
- * BSP leaves into gGT->LevRenderLists' six slot lists. This file is what
- * turns that per-frame traversal into something the draw side (step 2) can
- * read as a flat, double-buffered snapshot.
- *
- * Ladder step 1 (plumbing only): records the snapshot and counts what it
- * would draw into a periodic [TRKFRAME] log line. Nothing is drawn on any
- * platform yet, and the gate is OFF by default, so golden output is
- * untouched even when the CTR_NATIVE_TRACK_RENDERER build option is on.
+ * BSP leaves into gGT->LevRenderLists' six slot lists. This file turns that
+ * per-frame traversal into a flat, double-buffered snapshot, which
+ * NativeTrackDraw_IssueForWalk (below) consumes to project and draw the
+ * resident mesh -- two-pass opaque/blend, 3DS only. Recording also counts
+ * what it would draw into a periodic [TRKFRAME] log line. The toggle is OFF
+ * by default, so golden output is untouched even when the
+ * CTR_NATIVE_TRACK_RENDERER build option is on.
  */
 
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 
 #include "platform/native_track_frame.h"
 #include "platform/native_track_mesh.h"
-#include "platform/native_gpu.h" /* NativeGpu_GetOtBucketOrdinal -- rung 3a step 2's depth compose */
+#include "platform/native_gpu.h" /* NativeGpu_GetOtBucketOrdinal -- draw-side depth compose */
 
 /* Runtime toggle (0 off / 1 on / 2 both) -- see the header comment for what
- * each state means. Starts OFF: an enabled build must be inert until a
- * dumpreq token, hardware combo, PC argv flag, or PC debug key turns it on. */
-/* Boot default; see CTR_NATIVE_RENDERER_DEFAULT_ON in CMakeLists.txt. Normally
- * 0 so an enabled build is inert until a dumpreq token, hardware combo, PC argv
- * flag or PC debug key turns it on. */
+ * each state means. Boot default via CTR_NATIVE_RENDERER_DEFAULT_ON
+ * (CMakeLists.txt), normally 0 so an enabled build is inert until a dumpreq
+ * token, hardware combo, PC argv flag or PC debug key turns it on. */
 #ifndef CTR_NATIVE_RENDERER_DEFAULT_ON
 #define CTR_NATIVE_RENDERER_DEFAULT_ON 0
 #endif
@@ -46,20 +42,17 @@ global_variable int s_trackFrameWriteIdx;
 global_variable int s_trackFrameReadIdx;
 global_variable u32 s_trackFrameSeq;
 
-/* Cumulative, session-lifetime totals -- review fix: a per-frame drop count
- * only surfacing on 1-in-64 [TRKFRAME] lines means 63/64 frames that dropped
- * leaves did so invisibly (the periodic line could land on a frame that
- * happened to drop 0 even though the frame right before it dropped 40). The
- * running total is always in the line instead, plus a one-shot warning the
- * first time it ever happens so a drop shows up even between periodic
- * lines. */
+/* Cumulative, session-lifetime totals: a per-frame-only drop count would stay invisible on any
+ * periodic [TRKFRAME] line that happens to land on a frame with zero drops. The running total is
+ * always in the line, plus a one-shot warning the first time a drop ever happens, so a drop is
+ * visible even between periodic lines. */
 global_variable u32 s_trackFrameDroppedTotal;
 global_variable int s_trackFrameDroppedWarned;
 
-/* s33 leaf keep-alive (see the block in NativeTrackFrame_Record). Frames a
- * leaf survives past its last appearance in the visible lists; 0 disables.
- * dumpreq 'leafkeep N'. Default 15 (~half a second at 30fps) -- enough to
- * cover a drift swing, small enough that the extra draws stay bounded. */
+/* Leaf keep-alive (see the block in NativeTrackFrame_Record): frames a leaf survives past its
+ * last appearance in the visible lists; 0 disables. dumpreq 'leafkeep N'. Default 15 (~half a
+ * second at 30fps) -- enough to cover a drift swing, small enough that the extra draws stay
+ * bounded. */
 int g_dbg_trackLeafKeep = 15;
 
 #define TRACKFRAME_KEEP_MAX_SLOTS 4096
@@ -68,32 +61,17 @@ global_variable u16 s_leafKeepNow;
 global_variable const struct mesh_info *s_leafKeepMesh;
 
 /*
- * Walk one DrawLevelOvr1PRenderListSlot's linked list of visible BSP leaves,
- * appending every one that has a resident mesh range to dst->leafSlot.
+ * Walk one DrawLevelOvr1PRenderListSlot's linked list of visible BSP leaves, appending every one
+ * with a resident mesh range to dst->leafSlot.
  *
- * bspIndex recovery: RenderLists_LinkBsp (game/RenderLevel/RenderLists.c)
- * links `node = &bspList[bsp - bspRoot]` into the slot head, so a node's
- * offset from bspListBase (gGT->visMem1->bspList[0]) IS its bspIndex with no
- * extra table -- exactly the anchor this brief verified against that
- * function.
+ * bspIndex recovery: a node's offset from bspListBase (gGT->visMem1->bspList[0]) IS its bspIndex
+ * (RenderLists_LinkBsp links nodes at that offset).
  *
- * Iteration cap: review fix -- these lists are built fresh every frame from
- * a fixed-size VisMem arena walking the SAME BSP tree the mesh was built
- * from, so no list can legitimately hold more than the level's own BSP node
- * count (nodeCap, the mesh's numBspNodes at build time); a list still going
- * past that is definitely a cycle, not just unlikely content. Bounding the
- * cap to actual level size means a corrupt list aborts almost immediately
- * instead of chasing a fixed 65536-iteration ceiling copied from the OT
- * walk's own guard (native_gpu.c, otWalkIterations) -- that number made
- * sense there (OTs are a few thousand entries at most, so 65536 is "clearly
- * too many" for ANY level) but is not remotely tight for this walk, whose
- * real per-level ceiling is already known and much smaller. A silent
- * infinite loop here would hang the GAME thread (this runs synchronously
- * inside RenderAllLevelGeometry, never on the render worker), which is worse
- * than the OT walk's case, not better -- hence a cap at all, just a tighter
- * one. Also marks the snapshot `degraded` on abort: a walk that had to bail
- * mid-list produced an incomplete leaf set, and a consumer must not treat
- * that the same as a clean, fully-walked frame.
+ * Iteration cap: bounded to nodeCap (the level's own BSP node count), not a fixed constant --
+ * these lists can never legitimately exceed the level's own node count, so exceeding it means a
+ * cycle. This runs synchronously on the game thread, so an unbounded loop here would hang the
+ * game, not just a worker. Marks the snapshot `degraded` on abort since an aborted walk produced
+ * an incomplete leaf set.
  */
 internal void NativeTrackFrame_WalkList(const struct VisMemBspListNode *bspListBase, struct VisMemBspListNode *head, struct NativeTrackFrameSnapshot *dst,
                                         u32 nodeCap)
@@ -118,24 +96,15 @@ internal void NativeTrackFrame_WalkList(const struct VisMemBspListNode *bspListB
 			{
 				if (dst->leafCount < NATIVE_TRACK_FRAME_MAX_LEAVES)
 				{
-					/* (u16) truncation: leafIdx is a leaf-RANGE index (into
-					 * the mesh's leafRanges array), not a leaf COUNT -- real
-					 * tracks measure a few hundred at most (s27 [TRKMESH]
-					 * census), so this mirrors the pre-existing u16 bspIndex
-					 * field in struct NativeTrackLeafRange rather than
-					 * introducing a new risk. No assert: a level large enough
-					 * to overflow this would already have tripped
-					 * NativeTrackMesh_Frame's own u16-index-buffer guard
-					 * (native_track_mesh.c) at BUILD time, long before a
-					 * frame gets here. */
-					/* Rung 3b: one leaf is now one range PER ATLAS UNIT, and
-					 * the reverse map points at the first of them. The
-					 * binning pass emits a leaf's sub-ranges contiguously and
-					 * in ascending bin order (native_track_mesh.c), so walking
-					 * forward while bspIndex matches collects exactly this
-					 * leaf's ranges and stops at the next leaf's. A leaf that
-					 * fits in one atlas unit still yields one range, i.e. this
-					 * degenerates to the rung-3a behaviour. */
+					/* (u16) truncation: leafIdx is a leaf-RANGE index (into the mesh's leafRanges
+					 * array), not a leaf COUNT -- real tracks measure a few hundred at most
+					 * ([TRKMESH] census), so this mirrors the pre-existing u16 bspIndex field in
+					 * struct NativeTrackLeafRange. No assert: a level large enough to overflow this
+					 * would already have tripped NativeTrackMesh_Frame's own u16-index-buffer guard
+					 * at BUILD time. One leaf is one range per atlas unit; the reverse map points at
+					 * the first of them, and the binning pass emits a leaf's sub-ranges contiguously
+					 * in ascending bin order, so walking forward while bspIndex matches collects
+					 * exactly this leaf's ranges. */
 					unsigned slot = (unsigned)leafIdx;
 					unsigned slotBsp, slotFirst, slotCount;
 
@@ -165,42 +134,16 @@ internal void NativeTrackFrame_WalkList(const struct VisMemBspListNode *bspListB
 /*
  * ----------------------------------------------------------------- [TRKNEAR]
  *
- * Road-side half of the sinking-kart investigation. s32 measured the MODEL
- * side to be exact: [MDLDEPTH] compared this renderer's per-vertex view.z
- * against the GTE's own SZ for the same vertex and got maxErr=0 over 263,517
- * samples, so the kart's depth is provably retail's own number. That leaves
- * the road, which is where the owner pointed before the code did.
- *
- * The specific suspect is already written down in ctr_track.v.pica and has
- * been since s29, filed as a leftover rather than as the cause: track
- * visibility is LEAF-granular and retail's per-polygon near-clip was deleted
- * for track content, so a leaf straddling the eye is drawn WHOLE, and
- * depthMinWorld then maps every vertex with view.z < 256 onto exactly 256 --
- * the nearest depth the axis can express. Geometry that should not be on
- * screen at all therefore outranks a kart that genuinely is.
- *
- * Interpolation was eliminated as an alternative before writing this: depth
- * is exact at a triangle's vertices and screen-linear between them, and
- * screen-linear interpolation of view.z always over-estimates (the true value
- * is the harmonic blend, which is smaller). So interpolation can only push the
- * road AWAY mid-triangle, never nearer -- it cannot bury anything.
- *
- * What this counts, per drawn leaf, over the exact index list the 3DS draw
- * would issue:
+ * Per-drawn-leaf census of near-plane behavior, over the exact index list the 3DS draw would issue.
  *   behind   -- triangles with all three vertices at view.z <= 0
  *   straddle -- triangles with some but not all vertices at view.z <= 0
- *   clamped  -- triangles with at least one vertex in (0, 256), i.e. one the
- *               near-band floor moves
- * Counts, not screen area: a count is what promotes or kills the theory, and
- * an area estimate would need the rasteriser. If `behind` and `straddle` are
- * ~zero in a race, this theory is dead and the road is not the cause either.
+ *   clamped  -- triangles with at least one vertex in (0, 256), i.e. one the near-band floor moves
+ * Counts, not screen area, since a count is what promotes or kills a near-clip theory without
+ * needing the rasteriser.
  *
- * PC-side deliberately (no __3DS__ guard): the snapshot, the mesh and the
- * camera all exist on PC, so this needs no hardware and no emulator, and PC
- * is where a wrong instrument is cheapest to catch. It is off unless
- * --track-near-census is passed, and it samples 1 frame in 8 -- walking every
- * vertex of every visible leaf every frame is real work, and the failure being
- * measured is a steady-state property of the camera, not a transient.
+ * PC-side deliberately (no __3DS__ guard): snapshot/mesh/camera all exist on PC. Off unless
+ * --track-near-census; samples 1 frame in 8 since this measures a steady-state camera property,
+ * not a transient.
  */
 int g_dbg_trackNearCensus;
 
@@ -222,37 +165,14 @@ global_variable double s_trkDordNegSum;
 /*
  * -------------------------------------------------------------- [TRKDEPTHCHK]
  *
- * The road-side twin of [MDLDEPTH], and the measurement three sessions of
- * assumption skipped.
+ * Compares, for the same source vertex in the same frame, ours = (snapshot.rot[2].pos)/4096 +
+ * snapshot.trans[2] (what the track shader will use) against retail = the GTE's own SZ for that
+ * vertex (Ovr226_800a0f78_ProjectVertexTripleFullDepth's gte_stsz3). Called from retail's own
+ * projection site, so there is no vertex-matching step.
  *
- * [MDLDEPTH] proved the MODEL path's view.z is bit-identical to the GTE's own
- * SZ for the same vertex (242 windows, maxErr=0). Nothing equivalent was ever
- * run for the ROAD -- its depth was trusted because "our renderer computes it
- * properly", which is a description of intent, not a measurement. Meanwhile
- * every symptom points at the road: dumpreq `depthtest 2` (road tests but does
- * not write depth) makes racers sit cleanly on the surface, and the racers'
- * own numbers are provably right, so the road must be reading nearer than it
- * should.
- *
- * This compares, for the SAME source vertex in the SAME frame:
- *   ours   = (snapshot.rot[2] . pos)/4096 + snapshot.trans[2]   -- what the
- *            track shader will use, from the matrix we snapshotted
- *   retail = the GTE's SZ, which retail just computed for that vertex
- *            (Ovr226_800a0f78_ProjectVertexTripleFullDepth's gte_stsz3)
- *
- * Called from retail's own projection site, so there is no vertex matching to
- * get wrong and no second copy of the geometry -- the two numbers describe one
- * vertex by construction. A nonzero error IS the sinking bug, and its shape
- * says which kind: a constant difference means we snapshot the wrong matrix
- * (a candidate is already written down -- Ovr226_800aa790_TerminalPreamble
- * loads IDENTITY into GTE R/TR and puts matrix_ViewProj in the LIGHT matrix
- * registers instead), a proportional one means a units/scale mismatch.
- *
- * The snapshot read is the WRITE buffer, not ForWalk()'s published one:
- * NativeTrackFrame_Record runs earlier in the same MainFrame_RenderFrame pass
- * that is about to call DrawLevelOvr1P, so the write buffer is this frame's
- * camera. Using the published buffer would compare against the PREVIOUS
- * frame's camera and manufacture a motion-dependent error that isn't real.
+ * Reads the WRITE buffer, not ForWalk()'s published one: Record runs earlier in the same
+ * RenderFrame pass, so the write buffer is this frame's camera -- the published buffer would
+ * compare against the previous frame's camera and manufacture a motion-dependent error.
  */
 int g_dbg_trackDepthCheck;
 
@@ -552,12 +472,12 @@ internal void NativeTrackFrame_NearCensus(const struct NativeTrackFrameSnapshot 
 			 * angle, which is the shape the owner reported (sunk on aerial
 			 * sweeps too).
 			 *
-			 * It was dismissed twice by argument and never measured. s29 cut
-			 * the weight 64 -> 1 after it "buried the player kart to the neck"
-			 * and asserted 1 was "far too small to outrank a kart" -- an
-			 * assertion about magnitudes made without ever looking at the
-			 * VALUES. If real faces carry drawOrder of -20, the road is being
-			 * pulled 20 units toward the camera and nothing else is.
+			 * The weight was cut 64 -> 1 after it "buried the player kart to
+			 * the neck", on the assumption that 1 was "far too small to
+			 * outrank a kart" -- an assertion about magnitudes made without
+			 * ever looking at the VALUES. If real faces carry drawOrder of
+			 * -20, the road is being pulled 20 units toward the camera and
+			 * nothing else is.
 			 *
 			 * Reported as a signed range plus the mean of the NEGATIVE side
 			 * specifically: only negative drawOrder pulls a face nearer, and
@@ -681,7 +601,7 @@ void NativeTrackFrame_Record(struct GameTracker *gGT, struct mesh_info *mesh, st
 		dst->trans[1] = pushBuffer->matrix_ViewProj.t[1];
 		dst->trans[2] = pushBuffer->matrix_ViewProj.t[2];
 
-		/* visFaceList (review fix, design 4.2/12): recorded now so step 2
+		/* visFaceList (design 4.2/12): recorded now so step 2
 		 * doesn't have to reopen this struct/protocol later. RECORD ONLY --
 		 * see the struct comment on why nothing may dereference this yet. */
 		dst->visFaceList = gGT->visMem1->visFaceList[0];
@@ -694,45 +614,25 @@ void NativeTrackFrame_Record(struct GameTracker *gGT, struct mesh_info *mesh, st
 		}
 
 		/*
-		 * FULL_DYNAMIC (design erratum (b) territory, and brief correction
-		 * over design doc 4.4's fade language): included here as an
-		 * ORDINARY resident leaf, not excluded and not drawn at reduced
-		 * density. Two reasons this is right rather than a shortcut:
-		 *   1. The CTR_NATIVE_LOD_BIAS instrument (MainFrame_RenderFrame.c)
-		 *      already measured that FULL_DYNAMIC is a different DRAWING
-		 *      STYLE for a quadblock (the retail fade-from-color_lo), not a
-		 *      lower-density one -- so "excluding" it would not even be
-		 *      approximating a real LOD tier, just dropping geometry.
-		 *   2. Design 4.4 already rules the fade itself out of v1 (uniform
-		 *      mid-LOD everywhere, no fade, no mosaic -- perf-over-parity),
-		 *      so there is no retail behavior left for FULL_DYNAMIC leaves
-		 *      to approximate differently from any other resident leaf.
-		 *
-		 * WATER slot leaves are ordinary resident leaves too, as of the owner's
-		 * s30 ruling. This comment used to assert the opposite -- that the mesh
-		 * builder never creates a resident range for a BSP_LEAF_FLAG_WATER leaf,
-		 * so the walk dropped them by construction. It does now, so the water
-		 * slot walked in the loop above contributes real leaves, and they draw
-		 * opaque until the semi-transparency work lands. Nothing here needed to
-		 * change for that; the note is corrected because a reader trusting the
-		 * old wording would conclude a whole render-list slot was dead.
+		 * FULL_DYNAMIC leaves are included here as ORDINARY resident leaves, not excluded or drawn
+		 * at reduced density: CTR_NATIVE_LOD_BIAS already measured that FULL_DYNAMIC is a different
+		 * drawing style (retail's fade-from-color_lo), not a lower-density tier, and design 4.4
+		 * rules the fade itself out of v1, so there is no retail behavior left for these leaves to
+		 * approximate differently. WATER slot leaves are ordinary resident leaves too: the mesh
+		 * builder now creates a resident range for BSP_LEAF_FLAG_WATER leaves, so the walk above
+		 * includes them and they draw opaque until semi-transparency lands.
 		 */
 		NativeTrackFrame_WalkList(bspListBase, renderList->bspListStart_FullDynamic, dst, nodeCap);
 
 		/*
-		 * s33 leaf keep-alive -- the drift-corruption fix. Owner diagnosed the
-		 * artifact as HOLES (geometry missing behind the kart mid-drift), which
-		 * convicts the visibility list lagging fast camera swings, not the
-		 * behind-eye clamp class. A leaf therefore stays in the draw set for
-		 * g_dbg_trackLeafKeep frames after it last appeared in retail's own
-		 * visible lists ("visible union recently-visible"), which covers the
-		 * swing-behind-you case for a bounded cost instead of drawing the whole
-		 * level. Appended AFTER the real walks so visible leaves always win the
-		 * cap, and NEVER through the droppedLeaves/degraded path: stale leaves
-		 * are garnish, and running out of room for them must not blank the
-		 * frame the way a real visible-leaf drop does. Stamp 0 means "never
-		 * seen"; the counter skips 0 on wrap (one leaf mis-aged every ~36
-		 * minutes at 30fps is the accepted cost of a u16 stamp).
+		 * Leaf keep-alive covers geometry going missing behind the kart mid-drift: the visibility
+		 * list can lag a fast camera swing (a HOLES artifact, not a behind-eye clamp issue). A leaf
+		 * stays in the draw set for g_dbg_trackLeafKeep frames after it last appeared in retail's
+		 * own visible lists ("visible union recently-visible"), bounded cost instead of drawing the
+		 * whole level. Appended AFTER the real walks so visible leaves always win the cap, and
+		 * never through the droppedLeaves/degraded path -- stale leaves are garnish and must not
+		 * blank the frame the way a real visible-leaf drop does. Stamp 0 means "never seen"; the
+		 * counter skips 0 on wrap.
 		 */
 		if (g_dbg_trackLeafKeep > 0)
 		{
@@ -906,22 +806,13 @@ int NativeTrackFrame_SkipRetailDraw(void)
 
 #if defined(__3DS__)
 /*
- * Rung 3a step 2: the CPU-side per-frame draw issuer (docs/
- * NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b). Turns the double-buffered
- * snapshot above into the resident track's actual draw calls, via the
- * plain-scalar N3DS_TrackDraw_* API (platform/n3ds/n3ds_backend.c) --
- * everything below is ordinary game-domain math (matrix rows, retail's OT
- * formula), never a citro3d/libctru call, matching this project's TU/ABI
- * boundary rule.
- *
- * Called from NativeRenderer_EndScene (platform/n3ds/native_renderer_3ds.c),
- * which on render-thread builds runs on the WORKER thread -- every input
- * here is either a copy-by-value from the double-buffered snapshot (rot/
- * trans/h/ofx/ofy) or the mesh builder's own static per-level tables
- * (NativeTrackMesh_LeafAt/LeafBox), never a live gGT/PushBuffer/mesh_info
- * pointer. This is exactly the boundary native_track_frame.h's file
- * comment and native_track_mesh.h's NativeTrackMesh_LeafIndexForBsp comment
- * already establish for the rest of this file.
+ * The CPU-side per-frame draw issuer (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b). Turns
+ * the double-buffered snapshot above into the resident track's actual draw calls via the
+ * plain-scalar N3DS_TrackDraw_* API -- ordinary game-domain math, never a citro3d/libctru call,
+ * matching this project's TU/ABI boundary rule. Called from NativeRenderer_EndScene, which on
+ * render-thread builds runs on the WORKER thread -- every input here is copy-by-value from the
+ * snapshot or the mesh builder's own static per-level tables, never a live gGT/PushBuffer/mesh_info
+ * pointer.
  */
 
 /*
@@ -943,43 +834,22 @@ int NativeTrackFrame_SkipRetailDraw(void)
  * failure contract (recorder not active, slot/content never recorded this
  * walk).
  *
- * REVIEW FIX (FIX 1a -- correctness, not cosmetic): drawOrderMin/drawOrderMax
- * used to be omitted entirely on the reasoning that drawOrder is a per-FACE
- * term the shader adds back per vertex, so the leaf-level range only needed
- * the box's own geometry. That reasoning was incomplete: the box bounds
- * where the leaf's geometry SITS, but says nothing about how far a face's
- * OWN drawOrder can additionally push that face's vertices along the OT
- * axis in the shader. A leaf whose box-derived range spans only one or two
- * OT buckets has a large invIndexSpan; a face whose drawOrder pushed its
- * own otIndex_v outside [otIndexLo, otIndexLo+span] made the shader's lerp
- * EXTRAPOLATE by a large multiple, and because a valid ordinal (0..65535)
- * already saturates the vertex-z clip range, an extrapolated ordinal lands
- * outside the clip volume and the GPU DISCARDS those triangles -- geometry
- * silently vanishes, not merely mis-layers. The prior comment in
- * ctr_track.v.pica called this "the same harmless residual...within-bucket
- * ties", which was wrong: the failure isn't a tie-break, it's clipped-away
- * geometry, and it's proportional to how narrow a leaf's OWN box-derived
- * range is (worse on small leaves, exactly where a single wrong-signed
- * drawOrder byte is most visible). Widening the leaf's [otIndexLo, otIndexHi]
- * by its own [drawOrderMin, drawOrderMax] (tracked per-leaf at BUILD time,
- * native_track_mesh.c) before the retail clamp below guarantees every vertex
- * this leaf can ever emit falls inside the range its draw uniform describes
- * -- no extrapolation, by construction. The shader's own fraction clamp
- * (ctr_track.v.pica) is belt-and-braces on top of this, not a substitute for
- * it.
+ * drawOrderMin/drawOrderMax must widen the leaf's OT-bucket range, not just the box geometry: the
+ * box bounds where a leaf's geometry sits, but a face's own drawOrder additionally shifts that
+ * face's vertices along the OT axis in the shader. A leaf whose box-derived range spans few OT
+ * buckets has a large invIndexSpan; a face whose drawOrder pushes its vertex outside [otIndexLo,
+ * otIndexLo+span] makes the shader's lerp extrapolate past the valid ordinal range, and the GPU
+ * discards those triangles -- geometry vanishes rather than merely mis-layering. Widening
+ * [otIndexLo, otIndexHi] by the leaf's own [drawOrderMin, drawOrderMax] before the retail clamp
+ * guarantees every vertex the leaf can emit falls inside the range its draw uniform describes.
  */
 /*
- * DIAGNOSTIC-ONLY out-params added below (outOtIndexHi, outOrdinalHi,
- * outViewZLo, outViewZHi, outWalkOtCount) -- uncommitted rung 3a occlusion
- * investigation (2026-07-30): the resident track draws but occludes
- * everything (retail track, karts, HUD, minimap) even though every leaf's
- * bucket->ordinal lookup reports success. These mirror values this function
- * ALREADY computes for the real (non-diagnostic) outputs -- nothing here
- * changes what's computed for drawing, or what N3DS_TrackDraw_Leaf receives;
- * every existing statement and return value is untouched. Caller
- * (NativeTrackDraw_IssueForWalk) uses these to log per-leaf and per-frame
- * depth-compose numbers without duplicating this math a second time, which
- * would risk the log silently drifting from what actually got drawn.
+ * DIAGNOSTIC-ONLY out-params (outOtIndexHi, outOrdinalHi, outViewZLo, outViewZHi,
+ * outWalkOtCount): mirror values this function already computes for the real outputs -- nothing
+ * here changes what's computed for drawing or what N3DS_TrackDraw_Leaf receives. The caller
+ * (NativeTrackDraw_IssueForWalk) uses these to log per-leaf/per-frame depth-compose numbers
+ * without duplicating this math a second time, which would risk the log drifting from what
+ * actually got drawn.
  */
 internal int NativeTrackDraw_ComputeLeafDepthRange(const struct NativeTrackFrameSnapshot *snap, const s16 boxMin[3], const s16 boxMax[3], s8 drawOrderMin,
                                                     s8 drawOrderMax, float *outOtIndexLo, float *outOrdinalLo, float *outOrdinalSpan, float *outInvIndexSpan,
@@ -1039,31 +909,15 @@ internal int NativeTrackDraw_ComputeLeafDepthRange(const struct NativeTrackFrame
 	if (otIndexHiInt > DRAW_LEVEL_OVR1P_MAX_OT_INDEX) { otIndexHiInt = DRAW_LEVEL_OVR1P_MAX_OT_INDEX; }
 
 	/*
-	 * Depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3, confirmed
-	 * 2026-07-30 in a N. Gin Labs race): a bucket nearer than all real packet
-	 * content is not a meaningful depth anchor. The camera sits ON the
-	 * track, so this leaf's own box can reach bucket 0 -- a bucket retail
-	 * never draws anything into -- and native_gpu.c's otBucketOrdinal table
-	 * still has an entry for it (the walk crosses its marker node), but that
-	 * entry is just whatever the emit counter had reached by the END of the
-	 * walk (markers are crossed in descending index order), i.e. a value
-	 * PAST every real primitive this frame. Measured: otIdxMin=0 recorded
-	 * ordinal 931 vs finalOrdinal 930 -- the track drew in front of
-	 * literally everything, including the HUD.
-	 *
-	 * Clamping both ends UP to the nearest bucket that actually held content
-	 * (NativeGpu_GetMinContentBucket) means a leaf can be at most as near as
-	 * the nearest real content this frame, never nearer -- and because a
-	 * bucket's recorded ordinal is captured BEFORE that bucket's own
-	 * primitives are emitted (the walk crosses the marker, then parses/
-	 * direct-emits the bucket's content), the clamped leaf sorts BEHIND
-	 * whatever real content shares its now-nearest bucket, which is exactly
-	 * right for the HUD and other near-camera UI that must stay on top.
-	 *
-	 * If no content-advance was recorded at all this walk (recorder not
-	 * active, or a genuinely empty walk), there is nothing to clamp against
-	 * -- guessing a depth here would be exactly the failure mode this fix
-	 * closes, so the leaf is skipped like any other ordinal-lookup failure.
+	 * Depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3): a bucket nearer than all real
+	 * packet content is not a meaningful depth anchor. The camera sits on the track, so a leaf's
+	 * own box can reach bucket 0 -- a bucket retail never draws into -- and the otBucketOrdinal
+	 * table's entry for it is just whatever the emit counter had reached by the END of the walk,
+	 * i.e. a value past every real primitive. Clamping both ends UP to the nearest bucket that
+	 * actually held content (NativeGpu_GetMinContentBucket) means a leaf can be at most as near as
+	 * the nearest real content this frame, never nearer, and sorts correctly behind near-camera UI.
+	 * If no content-advance was recorded at all this walk, there is nothing to clamp against, so
+	 * the leaf is skipped like any other ordinal-lookup failure.
 	 */
 	{
 		u32 minContentBucket;
@@ -1131,18 +985,11 @@ void NativeTrackDraw_IssueForWalk(void)
 		return;
 	}
 
-	/* Review fix (FIX 5): this write used to sit in NativeRenderer_EndScene
-	 * OUTSIDE the toggle check, so it ran every frame even at toggle 0 --
-	 * the A/B baseline every fps number is measured against, which must be
-	 * indistinguishable from a build with this feature compiled out. Toggle
-	 * 0 already returned above, so this line only runs on the toggle-on
-	 * path now. s_runUntextured lives in native_renderer_3ds.c
-	 * (`global_variable` = static) but that file is #include'd into main.c's
-	 * unity TU BEFORE this one (main.c's include order), so it's an ordinary
-	 * in-TU reference, not a cross-TU reach. Effect is near-nil either way --
-	 * N3DS_MergeFlush's own lastDoubling=-1 reasserts regardless -- but
-	 * near-nil is not identical, and identical is the bar toggle 0 has to
-	 * clear. */
+	/* This write must happen only on the toggle-on path (toggle 0 returns above): the toggle-off
+	 * leg is the A/B baseline every fps number is measured against, and it must be
+	 * indistinguishable from a build with this feature compiled out. s_runUntextured lives in
+	 * native_renderer_3ds.c, #include'd into main.c's unity TU before this file, so it's an
+	 * ordinary in-TU reference. */
 	s_runUntextured = -1;
 
 	/* A degraded snapshot is an INCOMPLETE leaf list (the leaf cap or the
@@ -1222,18 +1069,13 @@ void NativeTrackDraw_IssueForWalk(void)
 	N3DS_TrackDraw_Begin(qx, qy, qw, h);
 
 	/*
-	 * DIAGNOSTIC ONLY (uncommitted rung 3a occlusion investigation, no
-	 * behavior change below this comment through the loop's end): running
-	 * min/max of the ordinal and OT-bucket-index values this frame's leaves
-	 * actually got back from NativeGpu_GetOtBucketOrdinal, plus a one-leaf
-	 * detail snapshot (the first leaf drawn, matching [TRKDRAW]'s existing
-	 * "first" convention), all folded into the periodic log below. Ordinal
-	 * min/max is taken over {ordinalLo, ordinalLo+ordinalSpan} per leaf, NOT
-	 * assumed ordinalLo <= that sum -- ordinalSpan can be negative (the OT
-	 * walk's own near/far convention makes a NEAR otIndex map to a HIGHER
-	 * ordinal than a FAR one; see docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3
-	 * and this task's own writeup), so treating outOrdinalLo as always the
-	 * smaller end would silently mis-aggregate.
+	 * DIAGNOSTIC ONLY, no behavior change below this comment through the loop's end: running
+	 * min/max of the ordinal and OT-bucket-index values this frame's leaves got back from
+	 * NativeGpu_GetOtBucketOrdinal, plus a one-leaf detail snapshot, folded into the periodic log
+	 * below. Ordinal min/max is taken over {ordinalLo, ordinalLo+ordinalSpan} per leaf, not
+	 * assumed ordinalLo <= that sum -- ordinalSpan can be negative (a near otIndex maps to a
+	 * HIGHER ordinal than a far one), so treating outOrdinalLo as always the smaller end would
+	 * mis-aggregate.
 	 */
 	int dbgAggValid = 0;
 	float dbgOrdMin = 0.0f, dbgOrdMax = 0.0f;
@@ -1281,21 +1123,13 @@ void NativeTrackDraw_IssueForWalk(void)
 		int drawBlend;
 
 		/*
-		 * A semi-transparent range is drawn TWICE, because that is what PS1
-		 * textured semi-transparency IS: only the texels whose sampled colour has
-		 * the STP bit set are blended, and the rest stay opaque. Pass 0 draws its
-		 * PASS1 half (the opaque body, from the PRIMARY placement, so uvOffset
-		 * stays 0 and blending stays off); pass 1 draws its PASS2 half (the
-		 * translucent texels, from the second placement, blended).
-		 *
-		 * So pass 0 draws EVERY range and only pass 1 filters. The first cut of
-		 * this skipped blended ranges in pass 0 -- which uploaded a PASS1 view at
-		 * level load and then never sampled it, leaving Crash Cove's waterfalls
-		 * showing their translucent texels with the solid part of the sheet
-		 * missing. It reads as "transparent" at a glance, which is exactly why it
-		 * needed the log rather than an eyeball to catch. The same mistake was
-		 * made and caught independently in the model path
-		 * (NativeModelDraw_IssueForWalk); the note there is the same note.
+		 * A semi-transparent range must be drawn twice: only texels whose sampled colour has the
+		 * STP bit set are blended, the rest stay opaque, matching PS1 textured semi-transparency.
+		 * Pass 0 draws every range's opaque body (PASS1 placement, uvOffset 0, blending off); pass 1
+		 * draws only blended ranges' translucent texels (PASS2 placement, blended). Pass 0 must
+		 * draw EVERY range, not just non-blended ones -- skipping blended ranges in pass 0 leaves
+		 * only the translucent texels visible with the solid part missing, which reads as
+		 * "transparent" at a glance rather than broken.
 		 */
 		if ((pass == 1) && !leafIsBlended)
 		{

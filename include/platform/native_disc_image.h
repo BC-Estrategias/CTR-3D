@@ -35,7 +35,7 @@
  * separating the music stream's steady drip from the level loader's bursts.
  */
 /*
- * 64, raised from 16 on hardware evidence (session 23 runs 1-2). An SD read
+ * 64, raised from 16 on hardware evidence. An SD read
  * costs ~45ms per CALL and barely notices the size: measured, the read half
  * is ~26ms fixed + ~0.24ms per sector, and the seek half is ~11.5ms flat, so
  * 12.7x the data cost 14% more time. Both halves are per-call, so call count

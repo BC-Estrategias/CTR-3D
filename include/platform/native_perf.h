@@ -86,27 +86,27 @@ enum NativePerfBucket
 	 * Direct-emit fast path (CTR_NATIVE_DIRECT_EMIT): the emit pass of
 	 * NativeDirectEmit_TryNode, i.e. the per-triangle resolve + bin-write
 	 * work running INSIDE the walk. Behind g_dbg_perfTriScopes (one scope
-	 * per handled node, ~1-1.5k/frame in a race) because the s26 hardware
-	 * sitting showed this work is what grew draw_otag_parse_ms when the
-	 * fast path went ON -- this bucket splits true parse from moved emit.
+	 * per handled node, ~1-1.5k/frame in a race) because this work is what
+	 * grows draw_otag_parse_ms when the fast path is ON -- this bucket splits
+	 * true parse from moved emit.
 	 */
 	NATIVE_PERF_BUCKET_DIRECT_EMIT,
 	/*
 	 * Per-instance bounding-box projection + OT range allocation
 	 * (RenderBucket_BuildDepthRange), nested inside
-	 * mainframe_queue_instances_ms. Exists to answer one question s30 turns on:
-	 * of the per-object setup cost, how much SURVIVES a PICA-native model path?
-	 * This slice does not -- the bbox's OT-bucket-range purpose is erased by a
-	 * depth buffer, and its off-screen reject becomes two dot products on the
-	 * GPU instead of nine projections through our software-emulated GTE. What
-	 * stays (matrix compose, LOD pick, anim-frame pick) is the remainder of the
-	 * parent bucket. Reading the parent alone would price work we intend to
-	 * delete as work we have to keep. Appended, never inserted: s_bucketInfo is
+	 * mainframe_queue_instances_ms. Exists to answer: of the per-object setup
+	 * cost, how much SURVIVES a PICA-native model path? This slice does not --
+	 * the bbox's OT-bucket-range purpose is erased by a depth buffer, and its
+	 * off-screen reject becomes two dot products on the GPU instead of nine
+	 * projections through the software-emulated GTE. What stays (matrix
+	 * compose, LOD pick, anim-frame pick) is the remainder of the parent
+	 * bucket. Reading the parent alone would price work intended for deletion
+	 * as work that must be kept. Appended, never inserted: s_bucketInfo is
 	 * indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_MODEL_DEPTH_RANGE,
 	/*
-	 * s30 per-frame track-animation patch (NativeTrackAnim_PatchFrame): the
+	 * Per-frame track-animation patch (NativeTrackAnim_PatchFrame): the
 	 * scatter writes that make turbo pads, waterfalls and lava move under the
 	 * resident renderer, plus the cache flush each batch needs before the GPU
 	 * reads it. Measured because the flush cost is range-proportional and the
@@ -117,45 +117,29 @@ enum NativePerfBucket
 	 */
 	NATIVE_PERF_BUCKET_TRACK_ANIM,
 	/*
-	 * s36: the resident renderers' own GPU-issue passes, and the merge flush
-	 * that precedes them. These are THE feature of the whole render campaign
-	 * -- the track and every kart -- and until now they had no bucket at all
-	 * (native_model_emit.c contained zero scopes). The cost of that: on Roo's
-	 * Tubes the game thread blocks ~29ms waiting for the render worker while
-	 * the worker's accounted buckets sum to ~12-15ms, and the missing half
-	 * had nowhere it could even show up. Owner, correctly: "we gotta find out
-	 * how to make that work more efficient" -- which needs it visible first.
-	 *
-	 * All three sit INSIDE platform_end_scene_ms, so dominantCandidate is 0:
-	 * they are slices of a bucket that is already a candidate.
-	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
+	 * The resident renderers' own GPU-issue passes, and the merge flush that
+	 * precedes them, all sit INSIDE platform_end_scene_ms, so dominantCandidate
+	 * is 0 for all three: they are slices of a bucket that is already a
+	 * candidate. Appended, never inserted: s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_NATIVE_TRACK_DRAW,
 	NATIVE_PERF_BUCKET_NATIVE_MODEL_DRAW,
 	NATIVE_PERF_BUCKET_MERGE_FLUSH,
 	/*
-	 * s36: DrawSync(0) inside RenderVSYNC's poll loop -- the game thread
-	 * waiting for the RENDER WORKER, as opposed to waiting for the 30fps
-	 * clock (which is vsync_wait_ms). Splitting them is the whole question:
-	 * mainframe_render_vsync_ms is ~27ms on BOTH Roo's Tubes and the light
-	 * track, but vsync_wait accounts for 23.7ms of it on the light track and
-	 * only 2.4ms on Tubes. So ~25ms of Tubes' loop is something else, and
-	 * this bucket says whether that something is the worker.
+	 * DrawSync(0) inside RenderVSYNC's poll loop -- the game thread waiting for
+	 * the RENDER WORKER, as opposed to waiting for the 30fps clock (which is
+	 * vsync_wait_ms). Splitting them distinguishes worker-bound stalls from
+	 * clock-bound idle time within mainframe_render_vsync_ms.
 	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_RENDER_VSYNC_DRAWSYNC,
 	/*
-	 * s36: total time the render worker spends INSIDE job executors, summed
-	 * over every job in the frame. The closing question of the hunt: the game
-	 * thread blocks 25.7ms in DrawSync on Roo's Tubes (vs 3ms on Coco Park),
-	 * but the worker's own buckets sum to ~8ms of CPU and the PICA is busy
-	 * 8.7ms -- 16.7ms accounted, ~9ms not.
-	 *
-	 * If this lands near 25ms the worker is genuinely busy and the missing
-	 * time is inside an executor with no scope of its own. If it lands near
-	 * 16ms the gap is the queue handshake -- two lock/unlock pairs and a
-	 * signal PER JOB, with the game thread parked on each round trip -- which
-	 * is fixed by batching, not by drawing less.
+	 * Total time the render worker spends INSIDE job executors, summed over
+	 * every job in the frame. If this lands near the game thread's DrawSync
+	 * block time, the worker is genuinely busy and the missing time is inside
+	 * an executor with no scope of its own. If it lands well under that, the
+	 * gap is the queue handshake (lock/unlock + signal per job), fixed by
+	 * batching rather than by drawing less.
 	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_WORKER_EXEC,
@@ -183,9 +167,7 @@ void NativePerf_Shutdown(void);
 /*
  * The levelID [PERF] itself stamps on every window (s_frameBeginInfo, captured
  * at frame begin). Exposed so other instruments tag their lines from the SAME
- * source rather than a lookalike field: s29's [SWEEP] first used the save-data
- * struct's levelID and logged 39 for a race that was demonstrably N. Gin Labs
- * (11), which cost a round of hand-correlating two log streams to recover.
+ * source rather than a lookalike level field, which can silently diverge.
  */
 int NativePerf_CurrentLevelID(void);
 

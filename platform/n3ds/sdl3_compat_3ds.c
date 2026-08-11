@@ -361,8 +361,9 @@ SDL_JoystickID SDL_GetJoystickID(SDL_Joystick *joystick)
  * A null sink that satisfies the fixed PCM contract native_audio.c asserts on
  * (S16 stereo at the native rate). Opening "succeeds" so the SPU emulation
  * stays fully live -- voices, ADSR, reverb and XA all still mix each vblank --
- * and only the final handoff to hardware is dropped. Wiring ndsp in later means
- * replacing this section alone.
+ * and only the final handoff to hardware is dropped. Real 3DS audio output is
+ * the separate ndsp path in n3ds_audio_thread.c, which bypasses this shim
+ * entirely.
  */
 
 struct SDL_AudioStream

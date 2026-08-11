@@ -51,14 +51,13 @@
  * runs and a shutdown-only summary would produce nothing at all.
  */
 #define NATIVE_PERF_3DS_REPORT_FRAMES 64
-/* 12, up from 6 (session 17): the report ranks ALL buckets together, and the
- * top of that ranking is chronically saturated by the ~6 nested aggregates
- * that wrap every frame (render_frame > render_submit > draw_otag >
- * draw_all_splits > renderer_draw_triangles, plus mainframe_render_vsync) --
- * at 6, leaf buckets like the new draw_triangles_* sub-slices could never
- * print at all (verified in Azahar: race windows showed the parent at ~21ms
- * and not one sub-bucket line). 12 = four full 3-per-line rows; the extra
- * visibility costs two more SD-card log lines per 64-frame window. */
+/* 12 buckets: the report ranks ALL buckets together, and the top of that
+ * ranking is chronically saturated by the ~6 nested aggregates that wrap
+ * every frame (render_frame > render_submit > draw_otag > draw_all_splits >
+ * renderer_draw_triangles, plus mainframe_render_vsync) -- at a lower count,
+ * leaf buckets like the draw_triangles_* sub-slices could never print at
+ * all. 12 = four full 3-per-line rows; the extra visibility costs two more
+ * SD-card log lines per 64-frame window. */
 #define NATIVE_PERF_3DS_TOP_BUCKETS   12
 #endif
 
@@ -187,12 +186,10 @@ global_variable struct NativePerfWorstFrame s_worstFrames[NATIVE_PERF_TOP_FRAME_
 global_variable s32 s_worstFrameCount;
 #if defined(__3DS__)
 /*
- * s36: this variable's name is part of its correctness. A same-named
+ * This variable's name is part of its correctness. A same-named
  * uninitialized file-scope static in another unity-TU file silently MERGES
- * with this one (C tentative definitions) -- native_model_frame.c's window
- * counter did exactly that, and its worker-side reset starved every [PERF]
- * report during model-visible gameplay from s30 until 2026-08-05. Keep
- * cross-file static names unique; see CLAUDE.md.
+ * with this one (C tentative definitions). Keep cross-file static names
+ * unique; see CLAUDE.md's unity-build hazard note.
  */
 global_variable u32 s_windowFrames;
 global_variable f64 s_windowTotalMs;
@@ -467,18 +464,16 @@ internal void NativePerf_Report3DSWindow(void)
 	// context has already misled this project once.
 	s_perfConsoleTotalUs = (int)(s_windowTotalMs * toAvgUs);
 	/* The window's WORST single frame, for the bottom screen. With SD logging
-	 * off (g_dbg_sdLog, the s36 default) the console is the only readout, and
-	 * an average cannot show a hitch -- six sessions of averages hid a 150ms
-	 * frame per window that the owner could feel the whole time. Not scaled by
-	 * toAvgUs: it is one frame, not a per-frame mean. */
+	 * off (g_dbg_sdLog, the default) the console is the only readout, and an
+	 * average cannot show a hitch. Not scaled by toAvgUs: it is one frame, not
+	 * a per-frame mean. */
 	s_perfConsoleWorstUs = (int)(s_windowMaxTotalMs * 1000.0);
 	s_perfConsoleWorkUs = (int)(s_windowWorkMs * toAvgUs);
 
 	/*
-	 * lvl/mode identify WHAT was on screen for this window. Without them a log
-	 * cannot tell a menu from a race, and every performance number this
-	 * project has recorded so far came from menu/attract content -- three of
-	 * its wrong conclusions came from exactly that gap.
+	 * lvl/mode identify WHAT was on screen for this window -- without them a log
+	 * cannot distinguish a menu/attract window from a race window when comparing
+	 * performance numbers.
 	 */
 	snprintf(header, sizeof(header), "[PERF] cfg=%s frames=%u avgTotalUs=%d avgWorkUs=%d spuMix=%s lvl=%d mode=%d load=%d audioBacklog=%d audioDropped=%d",
 	         s_windowCfg ? s_windowCfg : "none", s_windowFrames, s_perfConsoleTotalUs,
@@ -541,7 +536,7 @@ internal void NativePerf_Report3DSWindow(void)
 		N3DS_DebugLog(out);
 	}
 
-	/* s36 CPU-vs-GPU split (see N3DS_C3DGpuTimeWindow). cpuUs ~ the worker's
+	/* CPU-vs-GPU split (see N3DS_C3DGpuTimeWindow). cpuUs ~ the worker's
 	 * whole frame (FrameBegin..FrameEnd), gpuUs = PICA hardware execution --
 	 * the number no CPU bucket can see. gpuUs approaching avgWorkUs means the
 	 * frame is GPU-bound and walk-side optimization cannot help. */
@@ -800,13 +795,10 @@ int NativePerf_CurrentLevelID(void)
 void NativePerf_BeginFrame(const struct NativePerfFrameInfo *info)
 {
 	/*
-	 * levelID is latched BEFORE the enabled check, because
-	 * NativePerf_CurrentLevelID is now the single source every instrument tags
-	 * from -- including instruments that run in builds with the frame profiler
-	 * switched off. Behind the guard it reported a confident 0 (Dingo Canyon)
-	 * for every track on PC, which is the same lookalike-level-field trap that
-	 * made [SWEEP] print 39 for a race that was demonstrably N. Gin Labs, only
-	 * harder to notice because 0 is a real level.
+	 * levelID is latched BEFORE the enabled check: NativePerf_CurrentLevelID is
+	 * the single source every instrument tags from, including instruments that
+	 * run in builds with the frame profiler switched off. Latching behind the
+	 * guard would silently read the wrong level in those builds.
 	 */
 	if (info != NULL)
 	{

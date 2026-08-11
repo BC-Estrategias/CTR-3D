@@ -221,16 +221,9 @@ internal void NativePlatform_LodBiasConfigureFromArgs(int argc, char *argv[])
 #endif
 
 #if defined(CTR_INTERNAL) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
-// Review fix, FIX 1 (highest severity): the PC counterpart of the 3DS
-// dumpreq 'trackrender'/SELECT+ZR toggle, copying NativePlatform_LodBias-
-// ConfigureFromArgs's template exactly. Before this, g_dbg_trackRender had
-// NO PC setter at all -- an enabled build's toggle could never leave 0 on
-// PC, so NativeTrackFrame_Record's `if (g_dbg_trackRender != 0)` gate always
-// bailed and the leaf walk / bspIndex mapping / camera copy had never
-// executed a single time on any platform, on PC or 3DS, despite step 1's own
-// verification claiming otherwise. This is what makes step 1 verifiable at
-// all: without it there is no way to drive the recorder on PC, where the
-// golden/[TRKMESH]/[TRKFRAME] loop actually runs.
+// PC surface for g_dbg_trackRender (3DS: dumpreq 'trackrender'/SELECT+ZR
+// toggle). Without a PC setter this can never leave 0 here, and PC is where
+// the recorder is actually verified.
 internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[])
 {
 	extern int g_dbg_trackRender;
@@ -322,12 +315,10 @@ internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[]
 #endif
 
 #if defined(CTR_INTERNAL) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
-// --model-render 0|1|2: PC surface for g_dbg_modelRender, the PICA-native model
-// renderer's runtime toggle (docs/NATIVE_MODEL_RENDERER_DESIGN.md section 9).
-// Same template as --track-render above, and it exists for the same reason: a
-// toggle with no PC setter can never leave 0 on PC, which is where rung 1 is
-// verified. The track renderer shipped a step whose recorder had never once
-// executed on any platform because this was missing; that is not repeated here.
+// --model-render 0|1|2: PC surface for g_dbg_modelRender, the PICA-native
+// model renderer's runtime toggle (docs/NATIVE_MODEL_RENDERER_DESIGN.md
+// section 9). A toggle with no PC setter can never leave 0 here, and PC is
+// where rung 1 is verified.
 internal void NativePlatform_ModelRenderConfigureFromArgs(int argc, char *argv[])
 {
 	extern int g_dbg_modelRender;
@@ -417,8 +408,8 @@ internal void NativePlatform_GteCaptureConfigureFromArgs(int argc, char *argv[])
 }
 
 // --sz-probe arms the [SZPROBE] stamp-time hit-rate counters (native_gpu.c).
-// PC-only by intent: the question is a content question, and content counts
-// transfer off-device (s24), so this never needs to cost a netload.
+// PC-only by intent: content counts transfer off-device, so this never needs
+// to cost a netload.
 internal void NativePlatform_SzProbeConfigureFromArgs(int argc, char *argv[])
 {
 	extern int g_dbg_szProbe;
@@ -496,10 +487,10 @@ internal void Platform_HandleKey(int key, char down)
 			NativeSaveState_RequestLoad();
 			break;
 #if defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
-		// PC counterpart of the 3DS 'lodgeo'/'lodtex' dumpreq words. Worth having
-		// on PC even though the payoff is a 3DS one: [OTPROF] counts prims and OT
-		// nodes per window, and those are game content, so PC can measure how much
-		// geometry a scale actually deletes before anyone spends a netload on it.
+		// PC counterpart of the 3DS 'lodgeo'/'lodtex' dumpreq words -- but these
+		// case labels are UNREACHABLE: this switch runs on key-up only, and
+		// Platform_PollHostEvents eats F4/F6 key-ups for controller cycling
+		// before Platform_HandleKey is called. Use --lod-geo/--lod-tex instead.
 		case SDL_SCANCODE_F4:
 			g_ctrLodGeoScale = CTR_LodBias_Step(g_ctrLodGeoScale);
 			Platform_LogWarn("[CTR Native] level LOD scale: %d%%\n", g_ctrLodGeoScale);
@@ -510,18 +501,11 @@ internal void Platform_HandleKey(int key, char down)
 			break;
 #endif
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
-		// Review fix, FIX 1: PC debug key for the native track renderer's
-		// runtime toggle, --track-render N's mid-run companion (same
-		// rationale as the LOD-bias keys just above). F1-F12 are all already
-		// spoken for in this switch (wireframe/textureless/filtering/LOD/
-		// savestate/replay/screenshot) or intercepted earlier in the event
-		// loop before Platform_HandleKey ever runs (F4/F6 controller-cycling,
-		// F11 fullscreen -- see Platform_PollHostEvents) -- F13 is the one
-		// scancode in the extended function-key range nothing else in this
-		// file touches. It's a convenience for a PC dev without a launch
-		// script handy; --track-render on the command line is the interface
-		// the verification loop actually depends on, since most keyboards
-		// don't have a physical F13 key at all.
+		// F13 is used because F1-F12 are already claimed in this switch or
+		// intercepted earlier in Platform_PollHostEvents (F4/F6
+		// controller-cycling, F11 fullscreen). Convenience for a PC dev
+		// without a launch script; --track-render on the command line is the
+		// interface verification depends on.
 		case SDL_SCANCODE_F13:
 		{
 			extern int g_dbg_trackRender;
@@ -1061,29 +1045,12 @@ int VSync(int mode)
 	emittedVBlanks += Native_CatchUpDueVBlanks();
 
 	/*
-	 * CREDIT THE CATCH-UP (s29). Native_CatchUpDueVBlanks emits, without
-	 * waiting, every vblank whose 60Hz deadline has ALREADY passed while this
-	 * frame was being drawn. Those are real vblanks -- the game's clock has
-	 * advanced by them. Starting the loop below at 0 then waited for
-	 * requestedVBlanks MORE on top, so a frame that had already overrun its
-	 * deadline by two vblank periods still sat idle until the next boundary.
-	 *
-	 * That idle is what NATIVE_PERF_BUCKET_VSYNC_WAIT was measuring: 8.8ms per
-	 * frame on Polar Pass at 18fps, which is half a 16.67ms period -- exactly
-	 * the average phase offset to the next boundary, and the signature of
-	 * waiting for a deadline that had nothing to do with the request.
-	 *
-	 * Crediting them does NOT let the game run fast. Emits stay locked to the
-	 * 60Hz target counter either way (both paths advance it by exactly one
-	 * period per emit), so vblanks-per-second of real time is unchanged -- and
-	 * with it HOWL's per-vblank music tempo and every timer the game drives off
-	 * the vblank count. What changes is only that a late frame stops paying for
-	 * a deadline that already went by.
-	 *
-	 * Under-budget frames are unaffected: nothing is overdue, catch-up emits
-	 * zero, and the loop waits exactly as it always did.
-	 *
-	 * The replay path above is deliberately NOT changed -- it consumes a
+	 * Credit already-elapsed vblanks: a frame that overran its 60Hz deadline
+	 * should not also wait a full period for the next boundary. Emits stay
+	 * locked to the 60Hz target counter either way, so vblanks-per-second
+	 * (and HOWL's tempo/timers) are unchanged -- only a late frame stops
+	 * paying for a deadline that already passed. Under-budget frames are
+	 * unaffected. The replay path is deliberately NOT changed: it consumes a
 	 * recorded vblank count and must stay bit-reproducible.
 	 */
 	for (s32 i = g_dbg_vsyncCredit ? emittedVBlanks : 0; i < requestedVBlanks; i++)

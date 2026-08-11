@@ -139,8 +139,8 @@ static void NativeRenderQueue_WorkerMain(void)
 			stop = (job.kind == NATIVE_RENDER_JOB_STOP);
 			if (!stop)
 			{
-				/* s36: the worker's side of the fence -- see the bucket's
-				 * comment. Everything OUTSIDE this scope in the loop is queue
+				/* The worker's side of the fence -- see NATIVE_PERF_BUCKET_WORKER_EXEC's
+				 * comment. Everything outside this scope in the loop is queue
 				 * handshake: the lock pairs above and below, the done-signal,
 				 * and the wake wait. */
 				NativePerf_BeginScope(NATIVE_PERF_BUCKET_WORKER_EXEC);
@@ -243,10 +243,10 @@ int NativeRenderQueue_Route(void)
 
 void NativeRenderQueue_Init(void)
 {
-	/* GTE-capture builds no longer force the sync fallback: the capture
-	 * table is double-buffered (s26, native_gte_capture.c) -- ResetDB's
-	 * Clear() flips the write buffer while the in-flight walk keeps reading
-	 * the one DrawOTag published for it. */
+	/* GTE-capture builds do not need a sync fallback here: the capture table
+	 * is double-buffered (native_gte_capture.c) -- ResetDB's Clear() flips
+	 * the write buffer while the in-flight walk keeps reading the buffer
+	 * DrawOTag published for it. */
 	s_workerUp = N3DS_RenderWorkerStart(NativeRenderQueue_WorkerMain);
 }
 

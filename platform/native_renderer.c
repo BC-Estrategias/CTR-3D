@@ -1730,13 +1730,11 @@ int NativeRenderer_CaptureVRAMState(void *dst, int dstSize)
 #ifdef CTR_INTERNAL
 /*
  * --vram-capture <file> [--vram-capture-vblank N]: dump the CPU-side PSX VRAM
- * mirror (post framebuffer-readback pull, via CaptureVRAMState) to a raw
- * 1024x512xu16-LE file at vblank N, then exit. Same file format as the 3DS
- * SELECT+R/dumpreq vramdump.bin, so tools/texdump/* work on both -- built for
- * the PC-vs-3DS same-scene VRAM diff (session 15b: wrong-texture mapping is
- * established at load time and reshuffles per reload, so the first question
- * is whether the two platforms even agree on what's IN VRAM). Mirrors the
- * --audio-capture flag pattern exactly.
+ * mirror (via CaptureVRAMState) to a raw 1024x512xu16-LE file at vblank N,
+ * then exit. Same format as the 3DS SELECT+R/dumpreq vramdump.bin, so
+ * tools/texdump/* work on both -- built for PC-vs-3DS same-scene VRAM diffs,
+ * since texture mapping is established at load time and reshuffles per
+ * reload.
  */
 #define VRAM_CAPTURE_MAX_VBLANKS 8
 

@@ -1,5 +1,5 @@
 /*
- * Bake-parity diff (s38) -- see include/platform/native_bake_parity.h for the
+ * Bake-parity diff -- see include/platform/native_bake_parity.h for the
  * contract and docs/PORT_FEASIBILITY_3DS.md "track bake pre-export" for the
  * campaign context. Unity-TU file, included from main.c AFTER
  * native_track_mesh.c on purpose: the perm-conviction report reads that
@@ -97,7 +97,7 @@ struct BpGeoExemplar
 static struct BpGeoExemplar s_bpExNoFace[BP_EXEMPLARS];
 static u32 s_bpExNoFaceSeen;
 
-/* Empirical face-table map (s38, the Coco Park stripe class): retail indexes
+/* Empirical face-table map (the Coco Park stripe class): retail indexes
  * the face's FULL 5-bit value (rot | mode<<3) into a 24-word corner-selection
  * table (R226.scratchInitTable) -- modes 1/2 select corner REPEATS, i.e.
  * triangles drawn as degenerate quads -- while the bake applies rotation-only

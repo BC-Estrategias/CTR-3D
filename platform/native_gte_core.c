@@ -312,17 +312,11 @@ internal int GTE_RotTransPers(int idx, int lm)
 
 	// Matrix-class probe: R11..R33 + TRX/Y/Z are CP2C words 0..7, contiguous
 	// (gtereg.h). One memcmp per projected vertex tags this frame's Stores
-	// with which matrix state produced them.
-	//
-	// g_dbg_gteCapture gates this and the Store below for the cost A/B. The
-	// test itself is paid on every side of that A/B, so a measured delta is
-	// the capture work alone and not the branch.
-	//
-	// State 2 keeps Store but drops this memcmp, because the two are priced
-	// separately on purpose: NoteMatrix serves only the s26 matrix-class
-	// probe, and the depth model that is about to depend on this table needs
-	// sz3, not mtxId. Without the 1-vs-2 split, instrumentation this project
-	// is free to delete would be charged against the design being decided.
+	// with which matrix state produced them. g_dbg_gteCapture gates this and
+	// the Store below for the cost A/B; the test itself is paid on every side
+	// of that A/B, so a measured delta is the capture work alone. State 2
+	// keeps Store but drops this memcmp: NoteMatrix serves only the
+	// matrix-class probe, while the depth model needs sz3, not mtxId.
 	if (g_dbg_gteCapture == 1)
 	{
 		GTECapture_NoteMatrix(&gteRegs.CP2C.p[0]);

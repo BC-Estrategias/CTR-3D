@@ -9,10 +9,10 @@
 // when CTR_NATIVE_TRACK_RENDERER is off (the .c file's gate simply never
 // populates s_trackMesh), so callers don't need their own #ifdef.
 //
-// Deliberately narrow: this exposes what a draw side (rung 3a's frame
+// Deliberately narrow: this exposes what a draw side (the frame
 // recorder, later the 3DS upload/draw path) needs to READ, not the mesh
 // builder's internal build-time state (weld table, atlas packer, texture
-// intern table). NativeTrackVert itself is exposed -- rung 3a's 3DS upload
+// intern table). NativeTrackVert itself is exposed -- the 3DS upload
 // re-packs it into a citro3d attribute layout and needs the real field
 // layout to do that, so a void* here would just move the same knowledge into
 // an untyped cast at every call site instead of removing it.
@@ -55,7 +55,7 @@ unsigned NativeTrackMesh_LeafCount(void);
 // never need to search -- see NativeTrackMesh_LeafIndexForBsp for the
 // reverse direction.
 int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirstIndex, unsigned *outIndexCount);
-// Rung 3b: atlas unit this range samples; >= the unit count means untextured.
+// Atlas unit this range samples; >= the unit count means untextured.
 //
 // wantPass2 picks WHICH placement for a blended range (see LeafBlend), because
 // such a range is drawn twice: 0 gives the primary placement, holding its PASS1
@@ -82,7 +82,7 @@ void NativeTrackMesh_LeafUvOffset(unsigned i, int *outDx, int *outDy);
 
 // Leaf i's STATIC BSP bounding box (model-space corners, copied from
 // mesh->bspRoot[bspIndex].box at BUILD time -- see native_track_mesh.c's
-// struct NativeTrackLeafRange comment). Exists so the rung 3a step 2 draw
+// struct NativeTrackLeafRange comment). Exists so the draw
 // side (platform/native_track_frame.c) can compute a leaf's view-z range for
 // the depth compose WITHOUT dereferencing a raw mesh_info/BSP pointer on the
 // worker thread -- this flat copy is validated/latched by the exact same
@@ -94,7 +94,7 @@ int NativeTrackMesh_LeafBox(unsigned i, s16 outMin[3], s16 outMax[3]);
 // Leaf i's signed per-face drawOrder range (min/max over every face the
 // build-time emit loop actually wrote into this leaf -- native_track_mesh.c's
 // struct NativeTrackLeafRange comment), copied at BUILD time exactly like
-// LeafBox above. Review fix (FIX 1a): the draw side's per-leaf OT-bucket
+// LeafBox above. The draw side's per-leaf OT-bucket
 // depth range used to come from the leaf's bounding box ALONE, which does
 // not account for the per-face signed drawOrder byte each vertex's own
 // otIndex adds in the shader (ctr_track.v.pica) -- a face whose drawOrder
@@ -111,14 +111,14 @@ int NativeTrackMesh_LeafDrawOrderRange(unsigned i, s8 *outMin, s8 *outMax);
 // Reverse lookup: BSP index -> leaf-range index (into LeafAt), or -1 if that
 // BSP index has no resident range (excluded leaf -- water/animated-vertex,
 // design 4.4 -- or simply not a leaf). Built once per mesh build, alongside
-// the mesh itself, specifically so the per-frame visibility walk (rung 3a's
+// the mesh itself, specifically so the per-frame visibility walk (the
 // frame recorder) is O(visible leaves) rather than O(leaves x ranges): a
 // frame's visible-leaf list comes from the game's own render-list traversal
 // as BSP indices, and this is how those get turned into leaf-range indices
 // without a linear search per frame.
 int NativeTrackMesh_LeafIndexForBsp(unsigned bspIndex);
 
-// s30: advance every animated track texture (turbo-pad arrows, waterfall
+// Advance every animated track texture (turbo-pad arrows, waterfall
 // sheets, lava) to the frame the game has cycled to, rewriting the affected
 // resident vertices' UVs in the GPU-resident buffer. Without this the resident
 // renderer shows whichever frame happened to be active when the level loaded,

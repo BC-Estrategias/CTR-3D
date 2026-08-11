@@ -103,8 +103,8 @@ typedef struct
 
 	const char *debugText;
 
-	/* s42b: this split is driver-local exhaust smoke (Particle.c tagged its
-	 * packet with code bit 0x01). Forces a dedicated split via the AddSplit
+	/* This split is driver-local exhaust smoke (Particle.c tagged its packet
+	 * with code bit 0x01). Forces a dedicated split via the AddSplit
 	 * coalescing check and makes DrawAllSplits hold it out of the normal pass
 	 * for a redraw after the native model pass. Always 0 off 3DS. */
 	bool deferredSmoke;
@@ -117,19 +117,11 @@ typedef struct
  * window are simply not recorded. */
 #define OTZ_TABLE_SLOTS 4224
 
-/* Review fix (FIX 4): "never crossed" sentinel for otBucketOrdinal entries.
- * The table used to be memset to 0 every clear, which is indistinguishable
- * from a real recorded ordinal of 0 (the first prim of a walk legitimately
- * stamps at ordinal 0) -- NativeGpu_GetOtBucketOrdinal could not tell "this
- * slot was crossed at the very start of the walk" from "this slot was never
- * crossed at all" and would hand step 2 a plausible-looking zero either way.
- * 0xFFFF is a real value NativeGpu_NextDepthStamp can produce (its own clamp,
- * once s_gpu.emitOrdinal reaches the u16 max), so this sentinel is not
- * airtight in principle -- but that requires 65535+ prims stamped in ONE
- * walk, versus this design doc's own measured content (~1000-1200 prims/f on
- * the heaviest tracks), so in practice the one ordinal value this trades
- * away is unreachable. Documented rather than silently assumed, same
- * disclosure style native_gte_capture.c uses for its GTE_CAPTURE_MTX_IDS cap. */
+/* Sentinel for otBucketOrdinal entries: 0 is ambiguous with a legitimately-
+ * recorded ordinal-0 crossing at the very start of a walk, so 0xFFFF marks
+ * "never crossed." Not airtight in principle (65535+ prims stamped in one
+ * walk would collide) but unreachable given measured content (~1000-1200
+ * prims/frame on the heaviest tracks). */
 #define NATIVE_GPU_OTZ_SENTINEL 0xFFFFu
 
 /* Sentinel for otCurrentSlotIdx / minContentBucket (both u32): "no bucket
@@ -164,7 +156,7 @@ typedef struct
 	u32 emitOrdinal;
 
 	/*
-	 * Ordinal widening (track-renderer rung 1, docs/
+	 * Ordinal widening (docs/
 	 * NATIVE_TRACK_RENDERER_DESIGN.md 12): when g_dbg_otzWiden is on, the
 	 * stamp becomes walkZBase + (otSlotsCrossed << OTZ_K | intraClamped)
 	 * instead of a bare sequence number. Every zero-length node the OT walk
@@ -223,43 +215,28 @@ typedef struct
 	u32 walkOtCount;
 
 	/*
-	 * Review fix (FIX 7): whether the bucket->ordinal recorder is active for
-	 * THIS walk, latched exactly once at the top of the walk (where the
-	 * clear below runs) rather than re-evaluated at every zero-length node.
-	 * Without this, the walk runs on the worker thread while the game thread
-	 * can flip g_dbg_trackRender (button/dumpreq handler) at any time; a
-	 * press landing between the clear and the walk's first zero-length node
-	 * would make `g_dbg_otzWiden || NATIVE_GPU_TRACK_RENDER_ACTIVE` read
-	 * false at the clear (table left stale from the PREVIOUS walk) but true
-	 * moments later at the first record site -- a walk that records into a
-	 * table it never cleared, exactly the stale-ordinal bug the clear-must-
-	 * match-record comment already warns about, just reintroduced through a
-	 * mid-walk toggle flip instead of a code mismatch. Precedent: s_mergeActive
-	 * is latched at BeginScene for the identical reason (platform/n3ds/
-	 * n3ds_backend.c, native_renderer_3ds.c's matching comment).
+	 * Whether the bucket->ordinal recorder is active for THIS walk, latched
+	 * once at the top of the walk (matching the clear below) rather than
+	 * re-evaluated per node: the walk can run on the worker thread while the
+	 * game thread flips g_dbg_trackRender at any time, so re-reading live
+	 * state at two points could clear with the flag off then record with it
+	 * on, filling a table it never cleared. Precedent: s_mergeActive is
+	 * latched at BeginScene the same way (n3ds_backend.c,
+	 * native_renderer_3ds.c).
 	 */
 	int otRecorderActive;
 
 	/*
-	 * rung 3a depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3,
-	 * measured bug 2026-07-30, N. Gin Labs): otBucketOrdinal above records
-	 * EVERY slot the walk crosses, including buckets nearer than any real
-	 * primitive this frame emitted -- the camera sits ON the track, so the
-	 * leaf under the kart reaches bucket 0, which retail never puts content
-	 * in. Because markers are crossed in descending index order, an empty
-	 * near bucket's recorded ordinal is just whatever the emit counter had
-	 * reached by the END of the walk -- past every real primitive, i.e.
-	 * "nearer than everything in the frame" (measured: otIdxMin=0 recorded
-	 * ordinal 931 vs finalOrdinal 930). otCurrentSlotIdx/minContentBucket
-	 * close that hole: otCurrentSlotIdx tracks which bucket the walk is
-	 * PASSING THROUGH right now (set at the same marker-crossing site that
-	 * fills otBucketOrdinal); minContentBucket is stamped from it only when
-	 * real primitive content actually advances the emit ordinal (see
-	 * NativeGpu_RecordContentAdvance), so by the time the walk ends it holds
-	 * the LOWEST bucket that ever had real content, not just the lowest
-	 * bucket the walk merely visited. native_track_frame.c's depth-range
-	 * compose clamps a leaf's bucket range up to this floor before trusting
-	 * otBucketOrdinal for either end.
+	 * otCurrentSlotIdx tracks which OT bucket the walk is currently passing
+	 * through (set at each marker-crossing). minContentBucket is stamped from
+	 * it only when real primitive content advances the emit ordinal, so it
+	 * holds the lowest bucket that ever had real content -- not just the
+	 * lowest bucket visited. Needed because an empty near bucket (e.g. bucket
+	 * 0, under the camera) otherwise records whatever ordinal the emit
+	 * counter reached by the end of the walk, which reads as nearer than
+	 * everything in the frame. native_track_frame.c's depth-range compose
+	 * clamps a leaf's bucket range to this floor before trusting
+	 * otBucketOrdinal.
 	 */
 	u32 otCurrentSlotIdx;
 	u32 minContentBucket;
@@ -300,7 +277,7 @@ int g_dbg_flagStyle = FLAG_STYLE_RETAIL;
 const char *g_dbg_ablateConfig = "none";
 
 /*
- * Rung 3a step 1: the bucket->ordinal recorder above was built for the
+ * The bucket->ordinal recorder above was built for the
  * standalone 'otz' instrument (g_dbg_otzWiden), but the track renderer's
  * depth compose (design 4.3) needs the exact same table -- so recording
  * must also run whenever the track renderer is actually active, not just
@@ -382,7 +359,7 @@ typedef struct
 	u32 frameMHashCount;
 	u32 frameMHashes[OTPROF_MAX_HASHES];
 	u32 frameMNoModel;
-	/* Matrix-class probe (s26, full-form open Q1): among nodes that got an
+	/* Matrix-class probe (full-form open Q1): among nodes that got an
 	 * mshape hash, how many were projected under ONE matrix state, and
 	 * which id. 64 = GTE_CAPTURE_MTX_IDS (native_gte_capture.c). The
 	 * per-hash id array lets the fold count the intersection that actually
@@ -1077,7 +1054,7 @@ internal u16 NativeGpu_NextDepthStamp(void)
  *
  * Per-primitive, never per-vertex (design 3.2): one missing vertex disqualifies
  * the whole primitive, because splitting a face across two depth axes puts a
- * seam in the middle of it -- the failure class s28 spent a session chasing.
+ * seam in the middle of it.
  * Measured cost of the whole-primitive rule: 97.09% of primitives covered.
  *
  * max(), not average, because that is what retail does: both
@@ -1089,8 +1066,7 @@ internal u16 NativeGpu_NextDepthStamp(void)
  * SENSE INVERSION -- the one thing here reasoned rather than measured, and the
  * first thing to check if this looks wrong in Azahar. sz3 INCREASES with
  * distance (it is view.z). Emit ordinals INCREASE with proximity: the OT walk
- * descends, so later emissions are nearer, which is why s28 saw a leaf's
- * ordinals run 225 -> 166 as it receded. The axes run opposite ways, and the
+ * descends, so later emissions are nearer. The axes run opposite ways, and the
  * depth test's sense is already fixed by the ordinal convention, so the lookup
  * is flipped to match the test rather than the other way round.
  *
@@ -1130,7 +1106,7 @@ int g_dbg_packetDepth = CTR_NATIVE_RENDERER_DEFAULT_ON;
  * of view.z -- and that cost is NOT free: at 256 it was inside the range the
  * stopped-camera reaches, so everything nearer than 256 units flattened onto
  * one depth plane and draw order decided (kart parts through the back of the
- * driver's head, found 2026-08-06). 64 units is nearer than the camera ever
+ * driver's head). 64 units is nearer than the camera ever
  * sits. UI ordinals are packed 4-per-stamp (>> 2 below) so the band still
  * orders 256 UI prims -- the same capacity and same wrap point as the old
  * 256-wide band. ctr_track.v.pica and ctr_model.v.pica apply the identical
@@ -1142,30 +1118,13 @@ enum
 	/*
 	 * 4 UI prims per stamp -> the band orders 64*4 = 256 primitives.
 	 *
-	 * Raising this to buy capacity does not work. It was tried (16/stamp, 1024 prims,
-	 * 2026-08-07) to stop the band overflowing once HUD models were routed
-	 * through it, and it made UI layering MUCH WORSE on hardware: the menu
-	 * glyph/panel ordering degraded further, the level-preview video was
-	 * covered by a black box, and character-select elements swapped order
-	 * frame to frame.
-	 *
-	 * WHY IT BACKFIRES, and the thing to understand before touching this
-	 * again: prims sharing a stamp TIE, and a tie is resolved by draw order --
-	 * but with CTR_NATIVE_DRAW_MERGE, opaque content is BINNED BY STATE and
-	 * replayed per bin, so submission order only holds WITHIN a bin. A glyph
-	 * and the panel behind it are different states, hence different bins, so
-	 * their tie resolves arbitrarily. At 4/stamp that collision is rare; at
-	 * 16/stamp it is constant. Coarser packing does not trade "a little
-	 * ordering precision" for capacity -- it trades CORRECTNESS for capacity,
-	 * and only for content whose neighbours differ in state, which is exactly
-	 * what UI is.
-	 *
-	 * The real fix for capacity is therefore NOT more packing and NOT a wider
-	 * band (s39 cut the band 256->64 view.z units because world content nearer
-	 * than the band flattens onto one plane -- the kart-through-head bug). It
-	 * is to stop UI depending on the depth test for its ordering at all: draw
-	 * UI in submission order outside the merge bins, the same shape the s41
-	 * ground-decal design proposes for decals. Queued, not attempted here.
+	 * Do not widen this packing to buy capacity: with CTR_NATIVE_DRAW_MERGE,
+	 * opaque content is binned by state and replayed per bin, so submission
+	 * order only holds within a bin. Prims sharing a stamp tie and resolve by
+	 * draw order; coarser packing turns that into cross-bin ordering
+	 * corruption for UI (glyph/panel swaps), not just lost precision. The
+	 * real fix for capacity is to stop UI depending on the depth test for
+	 * ordering at all -- draw UI in submission order outside the merge bins.
 	 */
 	PKTDEPTH_UI_ORD_SHIFT = 2,                        /* 4 UI prims share a stamp */
 	PKTDEPTH_UI_BASE = 0xFFFF - PKTDEPTH_UI_BAND + 1, /* 0xFFC0 */
@@ -1237,31 +1196,15 @@ internal u16 PacketDepth_UiStamp(u32 uiOrdinal)
 
 #if defined(__3DS__)
 	/*
-	 * s44 ORDERED UI PASS: every UI primitive gets the SAME stamp, the nearest
-	 * value in the band. The ordinal -- and with it the 256-prim budget, the
-	 * wrap, and the saturation below -- stops mattering, because UI no longer
-	 * depends on the depth test for its layering at all: it is routed out of the
-	 * state bins into one ordered list and replayed in submission order at the
-	 * end of the frame (N3DS_DrawUiPass, native_renderer_3ds.c, where the whole
-	 * design is written up).
-	 *
-	 * These two halves are only correct TOGETHER. Pinning alone would tie all UI
-	 * at one depth and hand the tie to arbitrary bin order; the ordered pass
-	 * alone would leave these stamps fighting submission order, since a later
-	 * prim carrying a farther stamp fails LEQUAL against an earlier nearer one.
-	 * With both, GPU_LEQUAL passes on equal and the later draw wins -- painter's
-	 * order, which is what retail does. One toggle gates both (dumpreq 'uiorder').
-	 *
-	 * The band is KEPT as a classifier: the stereo flatten (ctr.v.pica) and the
-	 * widescreen X ramp (NativeWide_UiShiftX) both ask "is this stamp >= 0xFFC0?"
-	 * and 0xFFFF answers yes. Only the ordering role is retired.
-	 *
-	 * 3DS-only by construction: the merge bins that made UI order state-dependent
-	 * exist only there, and PC's packet depth must stay byte-identical.
+	 * ORDERED UI PASS: every UI primitive gets the SAME stamp, the nearest
+	 * value in the band. UI layering no longer depends on the depth test at
+	 * all -- it is routed out of the state bins into one ordered list and
+	 * replayed in submission order at the end of the frame (N3DS_DrawUiPass,
+	 * native_renderer_3ds.c).
 	 */
 	{
 		extern int g_dbg_uiOrder;
-		extern int g_dbg_uiPin; /* s44 bisect: pin half, split off from routing */
+		extern int g_dbg_uiPin; /* bisect: pin half, split off from routing */
 
 		if (g_dbg_uiOrder && g_dbg_uiPin)
 		{
@@ -1281,7 +1224,7 @@ internal u16 PacketDepth_UiStamp(u32 uiOrdinal)
 global_variable u16 s_pendingDepth;
 global_variable int s_pendingDepthValid;
 /*
- * s29 PER-VERTEX depth. The flat stamp above is the primitive's FARTHEST
+ * PER-VERTEX depth. The flat stamp above is the primitive's FARTHEST
  * vertex (maxSz3, retail's own maxDepth convention -- correct for choosing an
  * OT bucket, wrong for a z-buffer). Against the resident track renderer, which
  * gives every vertex real depth and lets the GPU interpolate it across the
@@ -1306,7 +1249,7 @@ global_variable u16 s_pendingDepthPerVert[6];
 global_variable u16 s_pendingDepthPerVertParallax[6];
 global_variable int s_pendingDepthCount;
 
-/* s29 per-vertex-vs-flat accounting -- see NativeGpu_StampEmitOrdinal. */
+/* Per-vertex-vs-flat accounting -- see NativeGpu_StampEmitOrdinal. */
 global_variable u32 s_pktDepthPerVertHits;
 global_variable u32 s_pktDepthFlatFallback;
 global_variable int s_pktDepthLastAppended;
@@ -1350,7 +1293,7 @@ global_variable u16 s_pktMissSampOccZ[PKTMISS_SAMPLE_N];
 global_variable u8 s_pktMissSampOccGen[PKTMISS_SAMPLE_N];
 
 /*
- * s29 owner-requested depth bias, in view.z units (stamp units are the same
+ * Owner-requested depth bias, in view.z units (stamp units are the same
  * scale: stamp = 0xFFFF - sz3, so +1 stamp == 1 unit NEARER the camera).
  *
  * Applies to WORLD packet content only -- this is the single funnel every
@@ -1369,7 +1312,7 @@ global_variable u8 s_pktMissSampOccGen[PKTMISS_SAMPLE_N];
  */
 int g_dbg_pktDepthBias = 0;
 
-/* s42 deferred driver-local exhaust-smoke pass. External linkage (the dumpreq
+/* Deferred driver-local exhaust-smoke pass. External linkage (the dumpreq
  * handler lives in the separate n3ds_backend.c TU). A/B master, default ON:
  * 1 = driver-local smoke is held out of the normal merge and redrawn AFTER the
  * native model pass so it paints over its own kart body (retail's painter's
@@ -1378,18 +1321,18 @@ int g_dbg_pktDepthBias = 0;
  *
  * NO near-bias: the smoke's own captured view.z depth
  * (GTECapture_StoreParticleCorner), drawn after the body, is sufficient on its
- * own -- owner tested bias 0 and it was perfect, so the dial was removed (s42f).
+ * own -- owner tested bias 0 and it was perfect, so the dial was removed.
  * The depth CAPTURE is still essential: without it the smoke falls back to the
  * parse-order ordinal axis, reads as infinitely far, and is occluded by all. */
 int g_dbg_smokeDefer = 1;
 
-/* s43 skybox far-pin A/B (dumpreq 'skyfar'). Default ON. Defined out here beside
+/* Skybox far-pin A/B (dumpreq 'skyfar'). Default ON. Defined out here beside
  * g_dbg_smokeDefer, not inside the CTR_NATIVE_GTE_CAPTURE block below, so the
  * dumpreq extern resolves in any 3DS config -- same placement as smokeDefer. The
  * range table and resolver branch it gates live in that guarded block. */
 int g_dbg_skyFar = 1;
 
-/* s46 minimap-box probe (dumpreq 'stpass1' / 'stpass2'): skip pass 1 or pass 2
+/* Minimap-box probe (dumpreq 'stpass1' / 'stpass2'): skip pass 1 or pass 2
  * of every textured-semi-trans two-pass split (DrawSplit below). Whichever skip
  * removes the minimap's black box names the guilty pass -- PASS1 is the
  * opaque-body view drawn blending-off (a box there means 0x0000/STP texels are
@@ -1460,29 +1403,13 @@ internal int NativeGpu_IsSmokePacket(uintptr_t addr)
 }
 
 /*
- * SKYBOX packet range (s43). DrawSky_Full's packets, identified by their
- * contiguous ADDRESS RANGE in primMem for this frame -- same address-tag
- * discipline as the smoke table above, but a single [start,end) span because
- * DrawSky emits all its pieces back-to-back with nothing interleaved.
- *
- * WHY. The skybox is projected with the GTE translation vector zeroed
- * (DrawSky.c, `CTC2(0, 5..7)`): it lives at infinity and has no real depth, so
- * its stores are suppressed (GTECapture_SetStoreSuppressed) and the resolver
- * treats every sky vertex as a miss. The miss path derives depth from the OT
- * bucket (0xFFFF - (otIndex << 6)) -- but the sky's bucket is not guaranteed to
- * out-distance genuinely-far real geometry, and a translucent surface that only
- * TESTS depth (the Crash Cove / N. Gin Labs waterfalls -- textured animated
- * TRACK geometry, on real captured depth) then loses to the sky's stamp and
- * vanishes, showing the sky through the waterfall. Pinning the sky to the
- * absolute far plane (stamp 0) makes it lose to every real surface by
- * construction, which is exactly retail's behaviour: no depth buffer, sky
- * simply painted first. Runtime A/B: dumpreq 'skyfar' (g_dbg_skyFar, defined
- * above beside g_dbg_smokeDefer).
- *
- * Double-buffered like the smoke table: MarkSkyRange on the game thread during
- * DrawSky_Full, PublishSkyRange (read=write) at DrawOTag before the walk is
- * posted, ClearSkyRange (flip write) at the frame boundary; the walk (worker
- * thread on 3DS) reads the published span.
+ * Skybox packet range. DrawSky_Full's and CAM_SkyboxGlow's packets, identified
+ * by their contiguous ADDRESS RANGE in primMem for this frame -- they emit
+ * back-to-back with nothing interleaved, so [min start, max end) is exactly
+ * the backdrop. The sky has no real depth (GTE translation zeroed) and its
+ * stores are suppressed, so pinning it to the absolute far plane (stamp 0)
+ * makes it lose to every real surface by construction, matching retail's
+ * paint-first behavior. Runtime A/B: dumpreq 'skyfar' (g_dbg_skyFar).
  */
 global_variable uintptr_t s_skyRangeStart[2];
 global_variable uintptr_t s_skyRangeEnd[2];
@@ -1583,34 +1510,14 @@ global_variable struct
 } s_pktDepth;
 
 /*
- * s32 PROVENANCE SPLIT -- [PKTDEPTH2].
- *
- * The counters above are frame-wide totals, and a frame-wide total cannot
- * answer the only question left about the sinking racers: is it the ROAD or the
- * KART that is getting the wrong distance? Owner measurement (s32.5) put the
- * defect inside this feature and nowhere else -- the sink reproduces with the
- * retail track path AND the retail model path drawing everything, so neither
- * native renderer is involved. Two mechanisms survive, and they are told apart
- * by splitting these counts by which object a resolved depth came from:
- *
- *   1. EVICTION. The capture table is one entry per screen coordinate, last
- *      writer wins. A kart vertex and the road vertex under it share a screen
- *      coordinate by construction, so one overwrites the other and the loser
- *      reads back a depth belonging to something else. Signature here: 'mixed'
- *      non-zero (a primitive whose own vertices resolve to two different
- *      objects), plus a non-zero evict census from the capture side.
- *
- *   2. FALLBACK QUANTISATION. On a miss the whole primitive takes
- *      0xFFFF - (otSlotIdx << 6), and >>6 is retail's rule for TRACK geometry
- *      (maxDepth >> 6). Retail bins model instances by MAC0 >> 17 -- a
- *      different scale -- so a kart that misses gets a distance reconstructed
- *      with the road's ruler. Signature here: mdlFellBack large.
- *
- * Provenance comes from the matrix-state id the capture stored: the frame's
- * dominant matrix is the camera (world/track geometry), anything else is a
- * per-object instance (karts, crates, pickups). Refreshed once per presented
- * frame -- per primitive would mean walking the 64-entry census in the hottest
- * loop in the renderer.
+ * PROVENANCE SPLIT -- [PKTDEPTH2]. Frame-wide totals cannot tell whether a
+ * wrong depth belongs to the road or the kart, so these counts are split by
+ * which object a resolved depth came from (camera matrix = world, other
+ * matrix = per-object instance). Two mechanisms are distinguished: EVICTION
+ * (a kart vertex and the road vertex under it share a screen coordinate,
+ * last writer wins -- signature: 'mixed' nonzero) and FALLBACK QUANTISATION
+ * (a miss reconstructs depth with the track's >>6 ruler, wrong scale for
+ * model instances -- signature: mdlFellBack large).
  */
 global_variable u8 s_pktDepthDomMtx;
 
@@ -1659,7 +1566,7 @@ global_variable int s_pendingDepthIsModel;
 global_variable u32 s_pendingDepthSpread;
 
 /*
- * s32 A/B switches, both default OFF so the first thing on screen is today's
+ * A/B switches, both default OFF so the first thing on screen is today's
  * behaviour. Neither is a proposed fix; each removes one suspect so the owner
  * can say whether the karts come out of the road.
  *
@@ -1667,7 +1574,7 @@ global_variable u32 s_pendingDepthSpread;
  *               own stated rule ("a miss is always a miss, never a wrong
  *               value"), which eviction is the sole violator of.
  * missordinal-- on a miss, keep the emit ordinal instead of reconstructing from
- *               the OT bucket. KNOWN LOUD SIDE EFFECT: this is the s29 defect
+ *               the OT bucket. KNOWN LOUD SIDE EFFECT: this is the defect
  *               deliberately reintroduced -- geometry that never GTE-projects
  *               (AnimateWater, so the waterfalls and lava) lands on the ordinal
  *               axis and draws over everything including the HUD. Expected, not
@@ -1695,7 +1602,7 @@ internal void PacketDepth_NoteExtent(u16 stamp, u16 *lo, u16 *hi)
 }
 
 /*
- * PARALLAX-channel fill for flag-range primitives (s40b channel split,
+ * PARALLAX-channel fill for flag-range primitives (channel split,
  * docs/FLAG_SPLIT_CHANNEL_SPEC.md).
  *
  * These primitives resolved their OCCLUSION above as if their captures did not
@@ -1708,7 +1615,7 @@ internal void PacketDepth_NoteExtent(u16 stamp, u16 *lo, u16 *hi)
  * A miss leaves the caller's occlusion stamp in that slot. That is deliberate
  * and it is the safe direction: one flat vertex inside an otherwise rippling
  * face is invisible, whereas a fabricated depth for it would tear the face
- * across two stereo planes -- the seam class s28 lost a session to.
+ * across two stereo planes.
  */
 internal void PacketDepth_FillParallaxFromCapture(const s16 *xs, const s16 *ys, int n, u16 *perVertPar)
 {
@@ -1747,7 +1654,7 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 	u16 maxSz3 = 0;
 	u16 minSz3 = 0xFFFFu;
 	int i;
-	/* s32 provenance: gathered as the loop runs rather than in a second pass,
+	/* Provenance: gathered as the loop runs rather than in a second pass,
 	 * because a miss exits early and the vertices resolved BEFORE it are the
 	 * only evidence of who the primitive belonged to. Scalars on purpose -- an
 	 * array indexed by i would need its own bound, and n is only guaranteed
@@ -1756,7 +1663,7 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 	int hits = 0;
 	int mixed = 0;
 	int missed = 0;
-	/* s40b: is this primitive part of the checkered flag's registered prim
+	/* Is this primitive part of the checkered flag's registered prim
 	 * range? Latched once here rather than re-queried per branch -- it decides
 	 * BOTH that the occlusion pass must ignore the captures and that the
 	 * parallax pass must read them. */
@@ -1782,7 +1689,7 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 	if (g_dbg_skyFar && s_skyNodeActive)
 	{
 		/*
-		 * SKYBOX -> absolute far plane (s43, block above NativeGpu_MarkSkyRange).
+		 * SKYBOX -> absolute far plane (block above NativeGpu_MarkSkyRange).
 		 * Taken before the suppressed/exempt/miss machinery below: the sky has no
 		 * real depth to resolve, and the OT-bucket fallback those paths would give
 		 * it is not guaranteed to lose to distant real geometry -- the waterfall
@@ -2144,7 +2051,7 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		if ((u32)maxSz3 > *hi) { *hi = maxSz3; }
 	}
 	/*
-	 * The whole point (s29): every vertex keeps its OWN depth instead of
+	 * The whole point: every vertex keeps its OWN depth instead of
 	 * inheriting the primitive's farthest corner, so the GPU interpolates
 	 * across the polygon exactly as it already does for resident track
 	 * geometry. *out stays the flat max so callers that cannot carry
@@ -2222,7 +2129,7 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 		s_pendingDepthValid = 0;
 
 		/*
-		 * s29 per-vertex depth. Only when the parse loop appended EXACTLY one
+		 * Per-vertex depth. Only when the parse loop appended EXACTLY one
 		 * vertex per resolved source vertex, in order -- checked here rather
 		 * than assumed, because a path that appends a different count (or
 		 * reorders) would otherwise pair each vertex with a stranger's depth,
@@ -2236,7 +2143,7 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 			for (k = 0; k < s_pendingDepthCount; k++)
 			{
 				s_gpu.vertexBuffer[firstVertex + k].emitOrdinal = s_pendingDepthPerVert[k];
-				/* Parallax channel rides the same guarded index (s40b): it is
+				/* Parallax channel rides the same guarded index: it is
 				 * only trustworthy under the exact one-appended-per-resolved
 				 * rule this branch just verified, same as the occlusion depth
 				 * beside it. */
@@ -2257,7 +2164,7 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 		}
 
 		/*
-		 * s29 INSTRUMENT. The guard above is silent by design, and silence is
+		 * INSTRUMENT. The guard above is silent by design, and silence is
 		 * how it hid: falling back writes ONE depth for the whole primitive,
 		 * and that depth is the running MAXIMUM over its vertices (retail's
 		 * rule, correct for choosing an OT bucket, wrong for a depth buffer).
@@ -2324,7 +2231,7 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 }
 
 /*
- * rung 3a depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3): call
+ * Depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3): call
  * at every point real primitive content actually advances the emit ordinal --
  * the parse loop's two NativeGpu_StampEmitOrdinal call sites below (tagged
  * first primitive, tagless primitives loop) and the direct-emit fast path's
@@ -2372,14 +2279,14 @@ internal void NativeGpu_RecordContentAdvance(void)
 }
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-/* [SZPROBE] -- stamp-time depth-source probe (s29, PC-first; content counts
+/* [SZPROBE] -- stamp-time depth-source probe (PC-first; content counts
  * transfer, so this never needs to run on a device).
  *
- * The s28 handoff proposes giving the packet path real depth by looking up the
+ * One proposal for the packet path is real depth by looking up the
  * GTE's sz3 at stamp time, keyed by the screen XY already in the packet. That
- * plan rests on a hit rate NOBODY HAS MEASURED: the 60%/47% figures in the
- * session notes are for the s24 model-space SHAPE hash, a different lookup with
- * a different key over a different population. Measure the real one before the
+ * plan rests on a hit rate NOBODY HAS MEASURED: the 60%/47% figures on record
+ * are for a different lookup (the model-space SHAPE hash), with a different key
+ * over a different population. Measure the real one before the
  * design commits to it.
  *
  * The counting sites are MakeVertexTriangle/Quad/Rect, further down: they
@@ -2392,7 +2299,7 @@ internal void NativeGpu_RecordContentAdvance(void)
  * depth fallback; a miss on a HUD glyph is correct behavior, since 2D content
  * has no depth and must keep ordinal treatment in a near band. So 2D is
  * counted separately, using the parallelogram discriminator MakeVertexQuad
- * already relies on -- which is itself a candidate answer to the handoff's open
+ * already relies on -- which is itself a candidate answer to the open
  * question about how to classify 2D content.
  *
  * Declared up here rather than beside those sites because the [SZPROBE] report
@@ -2542,10 +2449,9 @@ void NativeGpu_ResetEmitOrdinal(void)
 			 * the HUD. It should be 0. */
 			const u32 seen = prims + s_pktDepth.suppressed2d;
 
-			/* s45: was Platform_Log, which never reaches ctr3ds.log on 3DS (the
-			 * s35 lesson) -- so backZ-vs-realZ, the number that would have named
-			 * the fallback-depth lie two sessions earlier, was dark on the only
-			 * platform with a depth test. LogInstrument like every line beside it. */
+			/* Use Platform_LogInstrument here, not Platform_Log -- Platform_Log
+			 * never reaches ctr3ds.log on 3DS, the only platform with a depth
+			 * test to validate this against. */
 			Platform_LogInstrument("[PKTDEPTHZ] realZ=%u..%u backZ=%u..%u uiZ=%u..%u (larger = nearer)\n", s_pktDepth.realMin, s_pktDepth.realMax,
 			             s_pktDepth.backMin, s_pktDepth.backMax, s_pktDepth.uiMin, s_pktDepth.uiMax);
 			/* s45 miss forensics flush -- see the sample declarations for the
@@ -3427,33 +3333,13 @@ void TriangulateQuad()
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 	/*
-	 * s32: expand the pending PER-VERTEX depths through the identical
-	 * permutation, so a 4-corner face keeps its corners' own depths instead of
-	 * silently collapsing onto the flat far-corner stamp.
-	 *
-	 * This was NOT a hypothetical. s29 wrote the suspicion into
-	 * NativeGpu_StampEmitOrdinal's fallback comment -- "a 4-sided face resolves
-	 * 4 vertices but is drawn as two triangles = 6 appended, so 6 != 4 and
-	 * every quad silently takes the flat maximum" -- and then nobody measured
-	 * it. The counter it left behind says `appended=6 resolved=4` with
-	 * **94% of parse-path primitives flat**, i.e. the guard was rejecting
-	 * essentially all quad content, which on a PS1 model set is most of it.
-	 * A primitive flattened onto its farthest corner sits as far away as its
-	 * own back edge and loses to any surface it rests on -- at every camera
-	 * distance and angle, which is what makes it survive an aerial shot.
-	 *
-	 * Written as the SAME four statements in the SAME order rather than as a
-	 * lookup table of indices. That is the point: the permutation cannot drift
-	 * from the vertex expansion it has to match, because it IS the expansion,
-	 * with `d` substituted for the vertex buffer. A table would have to be
-	 * re-derived by hand every time the triangulation above is touched, and
-	 * pairing a vertex with a stranger's depth reads as subtle z-fighting
-	 * rather than as an obvious break -- exactly why StampEmitOrdinal's guard
-	 * was written to reject a mismatch instead of guessing at one.
-	 *
-	 * Count 4 exactly: the line path also lands here (MakeLineArray builds a
-	 * degenerate quad) but resolves 2, and 2 != 4 leaves it on today's flat
-	 * stamp untouched. Triangles never reach this function at all.
+	 * Expand the pending PER-VERTEX depths through the identical permutation,
+	 * so a 4-corner face keeps its corners' own depths instead of collapsing
+	 * onto the flat far-corner stamp. Written as the SAME four statements in
+	 * the SAME order as the vertex expansion above (not a lookup table) so
+	 * the permutation cannot drift from it -- a mismatched pairing reads as
+	 * subtle z-fighting, not an obvious break. Count 4 exactly: lines resolve
+	 * 2 and are unaffected; triangles never reach this function.
 	 */
 	if (s_pendingDepthCount == 4)
 	{
@@ -3859,7 +3745,7 @@ void DrawAllSplits()
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 	/*
-	 * s29 per-vertex depth coverage, once every 64 frames. Reports how many
+	 * Per-vertex depth coverage, once every 64 frames. Reports how many
 	 * primitives actually received per-vertex depth versus how many silently
 	 * fell back to the flat per-primitive MAXIMUM, plus the appended/resolved
 	 * vertex counts from the last fallback so the cause is readable rather
@@ -4064,7 +3950,7 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 #endif
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-		/* Gate widened from VERTEX_DESNAP to GTE_CAPTURE (s29): the UI band
+		/* Gate widened from VERTEX_DESNAP to GTE_CAPTURE: the UI band
 		 * describes the capture TABLE -- which screen coordinates in it are
 		 * trustworthy -- not the one feature that read it first. Desnap builds
 		 * are unaffected (CMake forces CAPTURE on for them), and any other
@@ -4085,20 +3971,13 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 #endif
 
 		/*
-		 * DIAGNOSTIC (2026-07-20, session 10): this loop's only exits are the
-		 * terminator tag (isendprim) and the invalid-link check below -- both
-		 * assume the OT is a simple forward chain. Neither catches a genuine
-		 * CYCLE: a chain of otherwise-legitimate, individually-registered
-		 * pointers that loops back on itself instead of ever reaching the
-		 * terminator. Every node in such a cycle passes NativeGpu_IsValidOTLink
-		 * (it really is a registered pointer), so that check can never trip,
-		 * and the walk spins forever with no log output -- a silent hang.
-		 * Real OTs here are at most a few thousand entries (RenderSubmit uses
-		 * ptrOT[0x3ff]; MainFrame.c sizes the swapchain OT at
-		 * numPlyrCurrGame<<10 | 6, i.e. ~1030-4102 for 1-4 players), so a
-		 * 65536-iteration cap is far above any legitimate walk and costs
-		 * nothing to check (a few cycles per node) -- but it turns an
-		 * unrecoverable freeze into a diagnosable one.
+		 * This loop's only exits are the terminator tag (isendprim) and the
+		 * invalid-link check below -- neither catches a genuine CYCLE among
+		 * otherwise-legitimate, individually-registered pointers, which would
+		 * pass NativeGpu_IsValidOTLink forever and spin with no log output.
+		 * Real OTs are at most a few thousand entries, so a 65536-iteration
+		 * cap turns an unrecoverable freeze into a diagnosable one at
+		 * negligible cost.
 		 */
 		u32 otWalkIterations = 0;
 
@@ -4150,7 +4029,7 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 
 		if (s_gpu.otRecorderActive)
 		{
-			/* Fill with the sentinel, not 0 (review fix, FIX 4) -- see
+			/* Fill with the sentinel, not 0 -- see
 			 * NATIVE_GPU_OTZ_SENTINEL's comment for why 0 is ambiguous with a
 			 * real recorded ordinal. memset's byte value 0xFF replicated
 			 * across both bytes of every u16 entry gives exactly 0xFFFF. */
@@ -4194,12 +4073,12 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 #endif
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-			GTECapture_MarkOTNode(basePacket); /* gate widened with BeginOTWalk above (s29) */
-			/* s43 skybox tag: set before the direct-emit fast path AND the parse
+			GTECapture_MarkOTNode(basePacket); /* gate widened with BeginOTWalk above */
+			/* Skybox tag: set before the direct-emit fast path AND the parse
 			 * path below, so whichever one resolves this node's depth sees it.
 			 * Self-resetting -- 0 for every non-sky node -- so no per-walk clear.
-			 * (s46 verified the range does NOT over-catch UI-band nodes in-race:
-			 * a walk-order guard here counted zero rescues across a full sitting
+			 * (Verified the range does NOT over-catch UI-band nodes in-race:
+			 * a walk-order guard here counted zero rescues across a full test run
 			 * -- the minimap black box was the sky PASS clobbering the open blend
 			 * run's state memo, fixed in N3DS_DrawSkyPass.) */
 			s_skyNodeActive = NativeGpu_IsSkyPacket((uintptr_t)basePacket);
@@ -4267,13 +4146,13 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 				/* Zero-length node: either an OT slot or a len-0 filler
 				 * packet (v1 conflated them; primMem sits contiguous with
 				 * the OT arena, so only the game's own ClearOTag bounds
-				 * discriminate -- measured, [OTZ2] s27). slotIdx = plain
+				 * discriminate -- measured, [OTZ2]). slotIdx = plain
 				 * array index = the retail otIndex GetProjectedOtIndex
 				 * computes from depth. */
 				s_gpu.otSlotsCrossed++;
 
-				/* Read the SAME latched value the clear above used (review
-				 * fix, FIX 7) -- never re-evaluate g_dbg_otzWiden /
+				/* Read the SAME latched value the clear above used --
+				 * never re-evaluate g_dbg_otzWiden /
 				 * NATIVE_GPU_TRACK_RENDER_ACTIVE live here, see
 				 * otRecorderActive's field comment for why. */
 				if (s_gpu.otRecorderActive)
@@ -4342,13 +4221,13 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 }
 
 /*
- * Track-renderer accessor (rung 3a step 1, design 12/12b): per-draw CPU-side
+ * Track-renderer accessor (design 12/12b): per-draw CPU-side
  * lookup of the bucket->ordinal table the walk above records into
  * s_gpu.otBucketOrdinal. Step 2's draw side looks up a leaf's OT bucket ONCE
  * PER DRAW (not per fragment) to compose its depth against the packet path's
  * ordinals, so this stays a narrow read accessor, not a bulk copy.
  *
- * Returns 0 (nothing written to the outputs, contract review fix FIX 4) when
+ * Returns 0 (nothing written to the outputs) when
  * the table has nothing trustworthy for this slot:
  *   - the recorder was not latched active for the LAST walk (otRecorderActive
  *     false) -- previously this accessor ignored that entirely and reported
@@ -4391,7 +4270,7 @@ int NativeGpu_GetOtBucketOrdinal(u32 slotIdx, u16 *outOrdinal, u32 *outWalkOtCou
 }
 
 /*
- * Track-renderer accessor (rung 3a depth-compose fix, docs/
+ * Track-renderer accessor (docs/
  * NATIVE_TRACK_RENDERER_DESIGN.md 4.3): the lowest OT bucket index that held
  * real primitive content during the last walk the recorder ran for -- see
  * minContentBucket's field comment on NativeGpuState for why
@@ -4420,7 +4299,7 @@ int NativeGpu_GetMinContentBucket(u32 *outMinContentBucket)
 }
 
 /*
- * DIAGNOSTIC ONLY (uncommitted rung 3a occlusion investigation, no behavior
+ * DIAGNOSTIC ONLY (uncommitted occlusion investigation, no behavior
  * change) -- see the header comment (include/platform/native_gpu.h) for the
  * full contract. emitOrdinal is the NEXT ordinal NativeGpu_StampEmitOrdinal
  * will hand out, so the highest ordinal actually STAMPED this frame is one
@@ -5257,7 +5136,7 @@ int ParseTaglessPrimitive(u32 *command)
 }
 
 /*
- * s37 widescreen: how much wider (PSX px, per side) a game-side screen-bounds
+ * Widescreen: how much wider (PSX px, per side) a game-side screen-bounds
  * cull should accept than the retail viewport. Non-zero only while the 3DS
  * REAL-wide ortho window is live, and exactly its extension -- rectW *
  * (400-320)/(2*320) = rectW/8, the -64..576 window at rectW=512 -- so what
@@ -5283,7 +5162,7 @@ int NativeWide_CullMarginX(int rectW)
 }
 
 /*
- * s37 strips hunt: per-mechanism kill switches for the widescreen margin
+ * Strips hunt: per-mechanism kill switches for the widescreen margin
  * machinery, so a live repro can bisect which mechanism draws garbage
  * without rebuilding. Bits: 1 = instance bbox margin
  * (RenderBucket_AcceptProjectedBounds), 2 = per-triangle margin
@@ -5301,7 +5180,7 @@ int NativeWide_MarginClassOn(int bit)
 }
 
 /*
- * s37 widescreen UI relocation (owner request): remap a UI-band vertex's
+ * Widescreen UI relocation (owner request): remap a UI-band vertex's
  * screen X so the HUD occupies the wide window instead of floating at the
  * old 4:3 edges. Piecewise-linear ramp about screen centre:
  *

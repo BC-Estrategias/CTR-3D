@@ -41,22 +41,15 @@ global_variable char s_nativeDiscImagePath[NATIVE_DISC_IMAGE_PATH_MAX];
 #if defined(__3DS__)
 /*
  * On 3DS the image is read through raw devoptab fds, one per reader role
- * (NATIVE_DISC_IMAGE_OWNER_*), not through stdio. Two reasons, both from
- * session 23's hardware runs plus a read of libctru's devoptab source:
+ * (NATIVE_DISC_IMAGE_OWNER_*), not through stdio. Two reasons:
  *
- * 1. The measured ~11.5ms flat per-call seek cost was a newlib stdio
- *    artifact, not an SD cost: the devoptab's seek(SEEK_SET) is pure local
- *    bookkeeping (no FS service call), and its read hands the stored offset
- *    straight to FSFILE_Read(fd, &bytes, offset, ptr, len). An lseek+read
- *    pair therefore costs ONE SD round trip where fseek+fread cost the
- *    equivalent of two.
+ * 1. The devoptab's seek(SEEK_SET) is pure local bookkeeping with no FS
+ *    service call, and its read hands the stored offset straight to
+ *    FSFILE_Read, so an lseek+read pair costs one SD round trip where
+ *    fseek+fread cost the equivalent of two.
  *
- * 2. One fd per role deletes the shared-file-position hazard (the hdrFail
- *    counter's reason to exist) by construction: each role's fd has exactly
- *    one thread using it at a time -- the same disjointness contract the
- *    read scratches already rely on (owner names a role; on 3DS the roles
- *    are the threads, and the main-thread XA-pump fallback only runs when
- *    the worker does not). This supersedes the planned "handle split".
+ * 2. One fd per role deletes the shared-file-position hazard by construction,
+ *    since each role's fd has exactly one thread using it at a time.
  */
 global_variable int s_nativeDiscImageFd[NATIVE_DISC_IMAGE_OWNER_COUNT] = {-1, -1};
 #else
@@ -116,13 +109,10 @@ struct NativeDiscImageIoProf
 	u64 ticks;
 	u64 worstTicks;
 	/*
-	 * The seek/read split. Session 23 hardware measured the fseek at ~11.5ms
-	 * flat per call; libctru's devoptab source then showed the underlying
-	 * seek is pure local bookkeeping, indicting newlib stdio itself. The
-	 * stdio path is gone on 3DS (raw per-role fds, lseek+read), and this
-	 * split is now the verdict instrument: seekUs ~0 with total per-call
-	 * cost down confirms the theory; the cost migrating into readUs
-	 * refutes it and points back at the FS-service round trip.
+	 * The seek/read split is the verdict instrument for the stdio-artifact
+	 * theory: seekUs collapsing to ~0 confirms the seek itself was free and
+	 * the flat per-call cost was a newlib stdio artifact; the cost migrating
+	 * into readUs instead would point back at the FS-service round trip.
 	 */
 	u64 seekTicks;
 	u64 readTicks;
@@ -145,20 +135,14 @@ global_variable u32 s_nativeDiscIoDirCalls;
 global_variable u32 s_nativeDiscIoDirSectors;
 
 /*
- * Call-site tallies. 95% of reads being single-sector says the batching has
- * nothing to batch, but not WHY -- and the fix differs completely depending
- * on which caller is asking one sector at a time. These are bumped at every
- * site that can put a read in the MAIN owner bucket, so the counter names
- * the caller instead of leaving it to be inferred. Coverage must stay
- * exhaustive: session 23 hardware run 4 had two windows of ~363 single-sector
- * reads (~4.8s) that NO site tag explained, because file/STR/XA-single reads
- * were untagged -- an untagged site turns the whole instrument into a guess.
- * The audio owner bucket needs no tags: its only caller family is the XA
- * worker, and its runs1 field already separates fallback singles from span
- * fills. Declared here because native_disc_image.c is first in the unity
- * include order (main.c), so native_audio.c, native_cd.c, and native_str.c
- * can all reach them. Single writer (main thread) each, like the prof
- * buckets.
+ * Call-site tallies. A high single-sector-read percentage says the batching
+ * has nothing to batch, but not why, and the fix differs by caller, so these
+ * name the caller instead of leaving it to be inferred. Coverage must stay
+ * exhaustive, or an untagged site turns the whole instrument into a guess.
+ * The audio owner bucket needs no tags (only caller is the XA worker; runs1
+ * separates fallback singles from span fills). Declared here because
+ * native_disc_image.c is first in the unity include order, so native_audio.c,
+ * native_cd.c, and native_str.c can all reach them. Single writer each.
  */
 global_variable u32 s_nativeDiscIoSiteCd;          /* NativeCD_ReadSectors -- the game's CdRead */
 global_variable u32 s_nativeDiscIoSiteCdSectors;   /* ...and the sector counts it asks for */
@@ -335,12 +319,9 @@ internal int NativeDiscImage_CheckRawSectorHeader(const u8 *sector)
 
 /*
  * THE choke point: every byte the game reads off the disc image arrives
- * through here, and each call is one seek plus one read. Before this took a
- * run, the caller-facing "bulk" reads were loops around a single-sector
- * version of it, so a 2000-sector level load cost 2000 SD round trips and
- * the XA pump's 32-sector span cost 32. Reading the whole run at once is the
- * entire point -- keep it that way; do not reintroduce a per-sector loop
- * above a per-sector read.
+ * through here, and each call is one seek plus one read. Reading a whole run
+ * at once is the entire point -- keep it that way; do not reintroduce a
+ * per-sector loop above a per-sector read.
  */
 internal int NativeDiscImage_ReadRawRun(u32 lba, u32 count, u8 *raw, int owner)
 {
@@ -749,26 +730,14 @@ int NativeDiscImage_Init(const char *assetsDir)
 }
 
 /*
- * Path lookup cache, and by session 23's third hardware run the single
- * biggest remaining cost in a boot. Every FindFile re-walks the ISO tree from
- * the root, one ReadDirectoryBytes per path component, and nothing remembered
- * the answer -- 137 single-sector directory reads in the boot window alone,
- * which at the measured ~40ms per-call floor is ~5.5s of the black screen.
- * Once the payload reads were batched, those 137 calls were 62% of the
- * window's calls and effectively all of its remaining time.
+ * Path lookup cache. Every FindFile re-walks the ISO tree from the root, one
+ * ReadDirectoryBytes per path component, with nothing remembering the answer.
+ * Negative results are cached too, since NativeAssets probes for files not on
+ * the disc and a miss costs a full tree walk.
  *
- * Negative results are cached too: NativeAssets probes the disc image for
- * files that are not on it (host-file-first precedence), and a miss costs a
- * FULL tree walk, so misses were never the cheap case.
- *
- * The image is read-only for the process lifetime, so no invalidation exists
- * beyond Init clearing it. Round-robin eviction rather than first-64-wins, so
- * a boot-time working set cannot pin the table against a later one.
- *
- * MAIN THREAD ONLY, like every other FindFile caller (NativeCD_OpenFile,
- * NativeAssets, native_str, and the XA track-open path, which all run there).
- * A second writer would tear an entry; if a disc reader ever appears on the
- * audio worker this needs a lock or a per-thread table.
+ * Read-only image, so no invalidation beyond Init clearing it; round-robin
+ * eviction so a boot-time working set can't pin the table. MAIN THREAD ONLY,
+ * like every FindFile caller.
  */
 internal struct NativeDiscImagePathCacheEntry *NativeDiscImage_PathCacheFind(NativeStr8 key)
 {

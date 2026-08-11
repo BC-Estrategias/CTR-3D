@@ -92,8 +92,8 @@ extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *life
  * (native_audio.c: 44100/60 = 735) the same way the extern prototypes above
  * are hand-matched -- the game-side header cannot cross this boundary.
  *
- * A parcel is now "one vblank of audio", NOT "735 frames": session 22 feeds
- * this channel XA source PCM at its native 37800/18900 rate (630/315 frames
+ * A parcel is now "one vblank of audio", NOT "735 frames": this channel is
+ * fed XA source PCM at its native 37800/18900 rate (630/315 frames
  * per vblank) so the DSP resamples in hardware and the CPU resampler --
  * measured at 52-56ms per 16.7ms parcel on the ARM11, i.e. the "talking into
  * a fan" announcer -- disappears entirely. The full-mixer StepVBlank
@@ -111,40 +111,13 @@ extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *life
  * starting rate before any producer has submitted. */
 #define N3DS_NDSP_MIXER_RATE_HZ     44100
 /*
- * Aggregation (session 21): the submit API still takes one 735-frame parcel
- * per call, but the sink now accumulates N3DS_NDSP_AGG_PARCELS of them into
- * one large wave buffer before handing it to the DSP.
- *
- * Why: the music channel was the ONLY channel fed as 60 separate wave
- * buffers per second -- every SFX voice plays one long buffer -- and it was
- * the only channel with the fluttery "talking into a fan" artifact, on
- * hardware AND in Azahar (same submission structure, same artifact; the PC
- * build plays byte-identical parcel content cleanly through SDL, pinning
- * the defect to this hand-off, not the samples). Each wave-buffer seam is a
- * stitch point for the DSP's resampler (44100 -> its native 32728 Hz);
- * 60 seams/sec IS a 60 Hz flutter. Aggregating 8 parcels (~133ms) cuts
- * that to ~7.5 seams/sec, and each seam sits between contiguous large
- * blocks the polyphase filter can stride across.
- *
- * Latency cost: up to ~133ms extra before a parcel is audible, on top of
- * the worker's ~200ms cushion -- fine for music/announcer (SFX latency is
- * untouched; voices 0..22 are their own channels). To keep a track start
- * from waiting for a full aggregate, a partial buffer is flushed early
- * whenever the DSP is about to run dry (see SubmitMusicParcel).
- *
- * Pool: 6 aggregate buffers x 5880 frames ~= 800ms capacity, comfortably
- * above the worker's 12-parcel cushion target. Full pool drops the newest
- * parcel (counted), never blocks the mixer. Sized for the worst case
- * (8 x 735); native-rate XA parcels are smaller, so a full aggregate is
- * 8 x 630 = 5040 frames and the slot simply has slack -- aggregation tracks
- * FRAMES accumulated, not parcels x a fixed stride, so a variable (or even
- * mid-track changing) parcel size stays contiguous inside the slot.
- *
- * Session-21 note that now becomes testable: aggFull was 0 on every hardware
- * log because parcel production ran at 1/3 real time and the DSP was always
- * about to run dry, so every flush was an early one. If the native-rate
- * change lands, production reaches real time and aggFull should finally
- * dominate -- that is the second receipt to read on the next log.
+ * The sink accumulates N3DS_NDSP_AGG_PARCELS parcels into one wave buffer
+ * before handing off to the DSP, to reduce resampler seam frequency (fewer,
+ * larger buffers = fewer stitch points for the DSP's polyphase filter).
+ * Costs up to ~133ms extra latency; a partial buffer flushes early when the
+ * DSP is about to run dry so track starts aren't delayed a full aggregate.
+ * Pool: N3DS_NDSP_BLOCK_COUNT aggregate buffers; full pool drops the newest
+ * parcel (counted), never blocks the mixer.
  */
 #define N3DS_NDSP_AGG_PARCELS  8
 #define N3DS_NDSP_AGG_FRAMES   (N3DS_NDSP_PARCEL_FRAMES_MAX * N3DS_NDSP_AGG_PARCELS)
@@ -536,11 +509,11 @@ void N3DS_NdspGetFlushCounts(int *fullFlushes, int *earlyFlushes)
 }
 
 /*
- * ---- Hardware voices (plan B, session 20) -------------------------------
+ * ---- Hardware voices (plan B) --------------------------------------------
  *
  * The PS1's SPU was an autonomous mixer chip; software-mixing its 24 voices
  * at 44.1kHz measured ~4x over real-time on this CPU even on a dedicated
- * core (see PORT_FEASIBILITY_3DS.md, session 20). So the DSP's own 24
+ * core (see PORT_FEASIBILITY_3DS.md). So the DSP's own 24
  * channels do the playing, and the CPU is reduced to what it was on retail
  * hardware: poking pitch/volume registers and starting/stopping notes.
  * native_audio.c's per-vblank mirror decides WHAT to poke (it owns voice
@@ -723,8 +696,7 @@ int N3DS_HwVoiceStoreGetUsedKiB(void)
  *
  * Cost of the instrumentation itself: ~6 svcGetSystemTick calls per wake, so
  * ~360/sec -- three orders of magnitude below the per-triangle scope tax
- * session 19 had to gate off, and this is the measurement the session exists
- * to take.
+ * the renderer had to gate off.
  */
 static u64 s_profLockWaitTicks;
 static u64 s_profRenderTicks;
@@ -961,13 +933,11 @@ void N3DS_AudioThreadInit(void)
 	}
 
 	/*
-	 * NOTE: SDL's own n3ds audio backend uses 30 here (SDL_systhread.c) for
-	 * a LIGHT callback thread that mostly sleeps waiting on DSP completion.
-	 * Our mixer is compute-bound at ~221% of the real-time budget even alone
-	 * (session 8 measurement) -- 30% of core 1 would starve it far more than
-	 * SDL's use case. Starting at 80 as a first guess; this is a genuine
-	 * tunable, not a settled number -- measure actual backlog/drop-rate
-	 * during verification and adjust.
+	 * SDL's own n3ds audio backend uses 30 here for a light callback thread
+	 * that mostly sleeps waiting on DSP completion; this mixer is
+	 * compute-bound well over 100% of real-time even alone, so a light-thread
+	 * budget would starve it. 80 is a first-guess tunable, not a settled
+	 * number -- adjust from measured backlog/drop-rate.
 	 */
 	if (!R_SUCCEEDED(APT_SetAppCpuTimeLimit(80)))
 	{

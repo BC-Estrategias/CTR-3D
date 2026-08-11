@@ -1,27 +1,9 @@
 /*
- * native_model_emit.c -- per-frame model triangle capture (s32 rung 1).
- *
- * docs/NATIVE_MODEL_RENDERER_DESIGN.md. The header states where the capture
- * hooks and why; this file is the buffer and its ownership rules.
- *
- * WHAT THIS PRODUCES
- *
- * A double-buffered snapshot of one frame's model geometry in MODEL SPACE,
- * plus one composed camera record per instance. That is the whole input a PICA
- * vertex shader needs: rung 2 binds a program, uploads an instance's rows as
- * uniforms, and draws its triangle range. Nothing in the snapshot is a live
- * pointer into game state, so the render worker can read it exactly the way it
- * already reads NativeTrackFrame's snapshot.
- *
- * WHAT IT DOES NOT DO
- *
- * It does not draw, does not change game state, and does not remove any work
- * from the packet path. At this rung the packet path still runs in full and the
- * capture rides along beside it. That is the point: the numbers it reports can
- * be checked against a renderer that is known to be correct, on PC, before any
- * shader exists. This project's own history is the argument -- s28's per-leaf
- * ordinal lerp and s29's near-plane reject both shipped before anyone could
- * check them against something that already worked.
+ * native_model_emit.c -- per-frame model triangle capture. docs/NATIVE_MODEL_RENDERER_DESIGN.md
+ * documents the capture hooks and design; this file is the buffer and its ownership rules.
+ * Produces a double-buffered snapshot of one frame's model geometry in model space plus
+ * per-instance camera records, captured alongside the packet path so it can be checked against a
+ * renderer already known correct before any shader exists.
  */
 
 #include "platform/native_model_emit.h"
@@ -45,21 +27,10 @@ int g_dbg_modelRender = CTR_NATIVE_RENDERER_DEFAULT_ON;
 int g_dbg_hudModelsAsUi = 1;
 
 /*
- * CAPS. Measured (s30 [MODELFRAME], hardware): ~1500 triangles/frame across
- * ~9 instances in Arcade on N. Gin Labs, ~440 across ~5 in Time Trial. Note
- * that figure is the TOPOLOGY MAXIMUM of the headers the frame selected, and
- * what lands here is the post-rejection subset, so 1500 is an upper bound on
- * the real capture rate, not a typical one.
- *
- * 4096 triangles is ~2.7x the measured worst case. Instances: N. Gin Labs
- * carries 26 in Arcade and 75 in Time Trial as level INSTANCE LISTS, of which
- * far fewer are queued per frame; 128 covers the list itself with room over.
- *
- * Overflow is reported, never silent. A truncated capture that reads as
- * complete is how this project said "the retained-models campaign is dead" out
- * loud once already -- and at rung 2 an overflow would show up as models
- * flickering out of existence, which is exactly the kind of symptom that gets
- * blamed on the shader.
+ * CAPS. Measured via [MODELFRAME] on hardware: ~1500 triangles/frame across ~9 instances in
+ * Arcade on N. Gin Labs, ~440 across ~5 in Time Trial. That figure is the topology maximum of
+ * the headers selected, not the post-rejection capture rate, so treat 1500 as an upper bound,
+ * not typical. 4096 is ~2.7x the measured worst case; overflow is reported, never silent.
  */
 #define MODELEMIT_MAX_TRIS      4096
 #define MODELEMIT_MAX_VERTS     (MODELEMIT_MAX_TRIS * 3)
@@ -123,76 +94,30 @@ struct NativeModelEmitInstance
 	s32 h;
 	s32 ofx, ofy;
 	/*
-	 * This instance's primitive WRITER forces semi-transparency regardless of
-	 * what its textures say.
-	 *
-	 * Found by N. Tropy's ghost coming out solid. Classifying by the texture
-	 * page's ABR field is correct for the normal writer -- RenderBucket's own
-	 * selection (`(texWord1 & 0x00600000) == 0x00600000 ? 0x34 : 0x36`,
-	 * QueueExecute:2928/3534) is the same rule and the same polarity as the
-	 * track's -- but models have SEVEN primitive writers, and two of them never
-	 * consult the texture at all: RB_RETAIL_INST_PRIM_GHOST and
-	 * RB_RETAIL_INST_PRIM_DEPTH_FADE write the semi-transparent code 0x36
-	 * unconditionally (:3141/:3365 and their split twins :3683/:3770).
-	 *
-	 * So this is not "which texture", it is "which writer", and the writer is an
-	 * instance property (`inst->funcPtr[1]`, the DispatchDrawInstPrim switch at
-	 * :3419) -- hence a per-instance flag rather than anything per face. The
-	 * game side computes the boolean so the RB_RETAIL_INST_PRIM_* constants stay
-	 * in game/ where they belong.
+	 * This instance's primitive writer forces semi-transparency regardless of what its textures
+	 * say. Two of the seven model primitive writers (RB_RETAIL_INST_PRIM_GHOST,
+	 * RB_RETAIL_INST_PRIM_DEPTH_FADE) write semi-transparent code 0x36 unconditionally without
+	 * consulting the texture's ABR field, so this must be a per-instance flag driven by the writer
+	 * (inst->funcPtr[1]), not derived per-face from the texture page.
 	 */
 	u8 forceSemiTrans;
 
 	/*
-	 * Depth-axis regime of this instance's mvp, the s33 sink fix.
-	 *
-	 * Retail's instance pipeline is regime-scaled: RenderBucket_
-	 * AdjustViewPositionForMvp shifts the MVP translation <<2 when the
-	 * instance origin is nearer than 0x1000 view units ("to match the
-	 * full-scale model matrix"; RenderBucket_BuildM3x3's depthShift applies
-	 * the matching scale to the rotation), and DRAW_HUGE shifts >>2. So the
-	 * SZ axis this capture inherits is view.z TIMES 4 for near instances --
-	 * measured, not inferred: [AXISCHK] reads ratio 4.0000 exactly below
-	 * 4096 and 1.0000 exactly above, hundreds of samples per window. Retail
-	 * never notices because instances are OT-placed by the queue-phase depth
-	 * bin (unshifted), never by per-prim SZ -- a painter's algorithm is blind
-	 * to a class-wide monotone scale. A z-buffer is not: this is what buried
-	 * every near kart under the road (the s32 sink).
-	 *
-	 * trueViewZ = mvpViewZ >> depthShift. 2 = near regime (mvp is 4x), 0 =
-	 * far regime (mvp is true), -2 = far DRAW_HUGE (mvp is true/4). The draw
-	 * side divides hParam.x by the factor, which corrects depth WITHOUT
-	 * touching screen position -- the model shader uses hParam.x only to
-	 * recover view.z; screen x/y come from the qx/qy dp4s and the divide.
+	 * Depth-axis regime of this instance's mvp. Retail's instance pipeline is regime-scaled:
+	 * RenderBucket_AdjustViewPositionForMvp shifts MVP translation <<2 when the instance origin is
+	 * nearer than 0x1000 view units, and DRAW_HUGE shifts >>2. trueViewZ = mvpViewZ >> depthShift;
+	 * 2 = near regime (mvp is 4x), 0 = far regime (mvp is true), -2 = far DRAW_HUGE (mvp is
+	 * true/4). The draw side divides hParam.x by the factor to correct depth without touching
+	 * screen position.
 	 */
 	s8 depthShift;
 
 	/*
-	 * Instance fade inputs, the rung-3 colour gap (s33).
-	 *
-	 * The design doc's ladder calls this rung "fog", and it is not distance
-	 * fog: RenderBucket_LoadPrimColors loads IR0 from idpp->alphaScale -- NOT
-	 * from the projection's depth-cue -- and gte_dpct interpolates the three
-	 * primitive colours toward the FAR COLOUR the instance's setup callback
-	 * put in RFC/GFC/BFC. It is the per-INSTANCE fade/tint mechanism (spawn
-	 * fade-ins, fade-outs, tinted sections), constant across the instance's
-	 * primitives. Captured colours are pre-dpct, so without a replay the
-	 * native draw shows a fading instance at full brightness.
-	 *
-	 * Both inputs are captured at BeginInstance time, which runs after
-	 * RenderBucket_RunInstanceSetupCallback in the dispatch order -- so
-	 * whatever the callback loaded is what we read, with no re-derivation of
-	 * the callback zoo. alphaScale == 0 means the writer skips dpct entirely
-	 * (its own gate), so 0 doubles as this struct's "no fade" state.
-	 *
-	 * Residual, deliberate: the writer's second gate bit (the OT-entry
-	 * address test in RenderBucket_OTEntryPassesDpctGate) is per prim and per
-	 * depth bin, and the capture runs before the OT entry exists. That test
-	 * exists to reject sentinel OT addresses, which real drawn content never
-	 * is, so the replay treats it as always-pass. The ghost and depth-fade
-	 * WRITERS (gte_dpcs per prim) are a different mechanism and are NOT
-	 * replayed here -- their content is forceSemiTrans, bounded, and listed
-	 * as a known gap in the design doc.
+	 * Instance fade inputs. RenderBucket_LoadPrimColors loads IR0 from idpp->alphaScale (not the
+	 * projection's depth-cue) and gte_dpct interpolates the three primitive colours toward the far
+	 * colour in RFC/GFC/BFC -- the per-instance fade/tint mechanism, constant across the instance's
+	 * primitives. Captured colours are pre-dpct; alphaScale == 0 means the writer skips dpct (and
+	 * doubles as this struct's "no fade" state).
 	 */
 	s16 alphaScale;
 	s32 fcR, fcG, fcB;
@@ -272,15 +197,13 @@ global_variable int s_modelEmitDropWarned;
  * native_platform.c, which precedes this file in the unity TU. */
 int g_dbg_modelDepthCheck;
 
-/* The s33 sink fix (see NativeModelEmitInstance.depthShift). Not static: the
- * 3DS dumpreq handler ('axisfix', n3ds_backend.c -- a separate TU) flips it
- * for the hardware A/B. Default ON because OFF is the sink. */
+/* The depth-axis unscale fix (see NativeModelEmitInstance.depthShift). Not static: the 3DS
+ * dumpreq handler ('axisfix', n3ds_backend.c -- a separate TU) flips it for the hardware A/B. */
 int g_dbg_modelAxisFix = 1;
 
-/* Rung 3: replay the normal writer's gte_dpct on captured colours (see
- * NativeModelEmitInstance.alphaScale). Same cross-TU story as axisfix;
- * dumpreq 'modelfade'. Default ON: OFF shows fading instances at full
- * brightness on the native path. */
+/* Replays the normal writer's gte_dpct on captured colours (see NativeModelEmitInstance.
+ * alphaScale). Default ON: OFF shows fading instances at full brightness on the native path.
+ * dumpreq 'modelfade'. */
 int g_dbg_modelFade = 1;
 
 /*
@@ -420,43 +343,13 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 	}
 
 	/*
-	 * HUD MODELS ARE UI, NOT WORLD GEOMETRY (s41, owner UI pass).
-	 *
-	 * The place numeral (STATIC_BIG1), the Wumpa counter (STATIC_FRUITDISP),
-	 * the CTR letters, tokens, relics, keys and trophies are all born through
-	 * UI_INSTANCE_BirthWithThread -> INSTANCE_Birth2D, whose defining act is
-	 * `idpp[0].pushBuffer = &gGT->pushBuffer_UI` (game/INSTANCE.c). Drawing
-	 * into the UI pushbuffer is what makes a thing UI: its packets land in the
-	 * UI OT, the walk crosses into the UI band, and everything downstream that
-	 * asks "is this UI?" -- the stereo flatten and the widescreen X ramp
-	 * (NativeWide_UiShiftX) both test the UI-band stamp -- answers yes.
-	 *
-	 * Capturing them here bypasses the OT walk entirely, so they never enter
-	 * the band and are invisible to BOTH rules at once. Owner-reported on
-	 * hardware as four separate complaints that are one bug: the elements pop
-	 * out of the screen while flat UI sits at screen level; the widescreen
-	 * shift moves the "ST" suffix but not the numeral model, giving "ST 1"
-	 * instead of "1ST"; the numeral is intersected by the track (which no UI
-	 * element can ever legitimately lose to); and they generally read as not
-	 * belonging to the HUD.
-	 *
-	 * Declining capture is the conservative fix: mdlCapture == 0 leaves
-	 * mdlReplaces == 0 at the call site (RenderBucket_QueueExecute.c), so the
-	 * retail packet write runs untouched and these elements behave exactly as
-	 * they do on the retail path -- which is the behaviour being asked for.
-	 * The alternative, teaching the native path the UI rules, is strictly more
-	 * work for models this small (a numeral, a fruit, three letters) and buys
-	 * nothing the owner asked for.
-	 *
-	 * NOT keyed on SCREENSPACE_INSTANCE, even though Birth2D sets it (flags
-	 * 0x40f includes 0x400): that flag is also set by hand on menu instances
-	 * born through Birth3D -- the character-select and main-menu characters
-	 * among them -- and dropping those to the retail path would be a visible
-	 * downgrade nobody asked for. The pushbuffer identity is the narrow test.
-	 *
-	 * pushBuffer_DecalMP is the multiplayer Wumpa display's pushbuffer
-	 * (UI_INSTANCE_InitAll routes fruitDisp through it at >= 2 players), so it
-	 * is UI by the same argument.
+	 * HUD models are UI, not world geometry. Drawing into the UI pushbuffer (pb == &gGT->
+	 * pushBuffer_UI or &sdata->pushBuffer_DecalMP) is what makes a thing UI: its packets land in
+	 * the UI OT, and everything downstream that tests the UI-band stamp (stereo flatten,
+	 * widescreen X ramp) depends on that. Declining capture routes these instances to the retail
+	 * packet path so those rules still apply to them. Not keyed on SCREENSPACE_INSTANCE: that flag
+	 * is also set on menu instances born through Birth3D, which must NOT be dropped to the retail
+	 * path.
 	 */
 	if (g_dbg_hudModelsAsUi)
 	{
@@ -503,13 +396,11 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 			}
 			else
 			{
-				/* s45: s16-truncate the deltas like the GTE's vertex registers
-				 * do. Retail-faithful upper-bit garbage exists in instance
-				 * matrices (the warp-pad prize spin's u32 sines write ~+2^20
-				 * into negative-phase components) and every retail consumer
-				 * truncates it away; this full-width read was misclassifying
-				 * exactly that content. Lockstep twin of the fix in
-				 * GTECapture_BeginInstanceDepth -- see its comment. */
+				/* s16-truncate the deltas like the GTE's vertex registers do: retail-faithful
+				 * upper-bit garbage exists in instance matrices (e.g. warp-pad spin writes
+				 * ~+2^20 into negative-phase components) that every retail consumer truncates
+				 * away; a full-width read misclassifies that content. Lockstep with the twin
+				 * fix in GTECapture_BeginInstanceDepth. */
 				s64 dx = (s64)(s16)((s64)worldInst->matrix.t[0] - (s64)pb->pos.x);
 				s64 dy = (s64)(s16)((s64)worldInst->matrix.t[1] - (s64)pb->pos.y);
 				s64 dz = (s64)(s16)((s64)worldInst->matrix.t[2] - (s64)pb->pos.z);
@@ -620,31 +511,14 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 	inst->trans[2] = idpp->mvp.t[2];
 
 	/*
-	 * Camera terms. h and the half-extents match NativeTrackFrame_Record's, but
-	 * the VIEWPORT ORIGIN (rect.x/rect.y) is added here and is NOT optional.
-	 *
-	 * The GTE is handed OFX/OFY = half the viewport (RenderBucket_Prepare-
-	 * DrawContext's gte_SetGeomOffset), so its screen coordinates are relative
-	 * to the viewport's own top-left, and the packet path picks up the
-	 * viewport's position on screen further downstream. This path projects
-	 * straight to final screen coordinates, so if it does not add that origin
-	 * itself the model is drawn relative to the SCREEN corner instead.
-	 *
-	 * Owner-found, character select (2026-08-03): Crash rendered up and to the
-	 * left of his preview window, and the diagnosis -- "maybe we're treating
-	 * the top-left of the screen as the origin when we should be treating the
-	 * top-left of the blue box as the origin" -- was exactly right.
-	 * MM_Characters.c:215 sets pb->rect.x/y to that window's position.
-	 *
-	 * Adding it to OFX/OFY is the whole fix, not an approximation: the shader's
-	 * qx row folds OFX as `OFX * qw` (see ctr_model.v.pica's derivation), and
-	 * a = w*screenX, so a constant added to OFX adds exactly that constant to
-	 * the final screen X after the perspective divide.
-	 *
-	 * NOTE FOR THE TRACK RENDERER: platform/native_track_frame.c has the same
-	 * omission. It has never shown because a 1P race viewport sits at the
-	 * screen origin -- but a 2P split-screen lower viewport does not, so this
-	 * is a live latent bug there, not a difference between the two paths.
+	 * Camera terms. h and the half-extents match NativeTrackFrame_Record's, but the viewport
+	 * origin (rect.x/rect.y) is added here and is NOT optional: the GTE gets OFX/OFY = half the
+	 * viewport (RenderBucket_PrepareDrawContext's gte_SetGeomOffset), relative to the viewport's
+	 * own top-left, while this path projects straight to final screen coordinates. Without adding
+	 * the origin, a 2P split-screen viewport not anchored at the screen origin renders relative to
+	 * the screen corner instead of its own window (a 1P race viewport happens to sit at the
+	 * origin, which is why the omission is invisible there). platform/native_track_frame.c has the
+	 * same omission and the same latent 2P bug.
 	 */
 	inst->h = pb->distanceToScreen_PREV;
 	inst->ofx = (pb->rect.w >> 1) + pb->rect.x;
@@ -677,28 +551,13 @@ internal void NativeModelEmit_UnpackVertex(u32 packedXY, u32 packedZ, s16 *outX,
  * skip its packet write. Returns 0 to mean "not ours -- draw it the retail way",
  * which is the safe answer and the one every early-out below gives.
  *
- * The return value exists because "captured" and "will be drawn" used to be
- * assumed identical and are not. Two cases where they diverge, both of which
- * silently DELETED geometry in native-only mode before this returned anything:
- *
- *   - the triangle cap. An overflowing snapshot dropped the triangle here while
- *     the caller, told nothing, also skipped the packet -- so a frame that
- *     exceeded MODELEMIT_MAX_TRIS lost those triangles from the screen entirely
- *     rather than degrading to the retail draw. Cap overflow is now a
- *     performance event, not a correctness one.
- *   - semi-transparency. The native draw path asserts opaque blend for the whole
- *     pass (N3DS_ModelDraw_Begin) and carries no per-run blend mode, so a
- *     claimed semi-transparent triangle would draw SOLID -- a filled rectangle
- *     where a particle, shadow or item glow belongs. Declining it hands it back
- *     to the packet path, which has done PS1 two-pass STP correctly since s17
- *     (native_gpu.c:2670).
- *
- * The second is a stopgap with a known end state, not the design: rung 3 should
- * carry ABR through to N3DS_ModelDraw_Run and blend properly. Models sample the
- * shared decode cache, which already materialises PASS1/PASS2 views on demand,
- * so that costs no new atlas pool -- see docs/TRANSPARENCY_DESIGN.md section 5.
- * Until then this keeps native-only mode HONEST: what it draws, it draws right,
- * and what it cannot draw right it does not draw at all.
+ * The return value exists because "captured" and "will be drawn" can diverge:
+ * a snapshot that overflows MODELEMIT_MAX_TRIS drops the triangle here, and
+ * without the return the caller would skip the packet too, deleting the
+ * triangle from the screen entirely instead of degrading to the retail draw.
+ * Cap overflow is a performance event, not a correctness one. Semi-transparent
+ * triangles are claimed like any other: the draw side does real two-pass PS1
+ * blending (NativeModelDraw_IssueForWalk).
  */
 int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex)
 {
@@ -798,8 +657,7 @@ int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const in
 			 * leaves its result in GTE registers and never touches
 			 * ctx->tempColor).
 			 *
-			 * Rung 3 (s33): the dpct is now replayed here in C, exactly as the
-			 * rung-1 comment predicted it could be -- IR0 is idpp->alphaScale
+			 * The dpct is replayed here in C: IR0 is idpp->alphaScale
 			 * and FC is whatever the instance's setup callback loaded, both
 			 * captured at BeginInstance. The stored colour is therefore
 			 * POST-fade, matching the packet the writer is about to build, and
@@ -816,8 +674,8 @@ int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const in
 			 * -- so replaying the NORMAL writer's fade on their content is
 			 * applying a colour transform retail never applies. Shipping
 			 * without this test made TT ghosts nearly invisible and put an
-			 * unintended tint on Hot Air Skyway's depth-fade barriers
-			 * (owner-reported, s33). Their own dpcs replay is the known gap
+			 * unintended tint on Hot Air Skyway's depth-fade barriers.
+			 * Their own dpcs replay is the known gap
 			 * recorded in the field comment above; until it lands, their
 			 * captured colours stay pre-fade, which is yesterday's behaviour. */
 			if (g_dbg_modelFade && (mi->alphaScale != 0) && !mi->forceSemiTrans)
@@ -1166,25 +1024,11 @@ void NativeModelEmit_PublishForWalk(void)
 /*
  * Does the native model path REPLACE the packet draw for this instance?
  *
- * Owner-reported design defect, and it was a real one: rung 1 shipped with
- * states 1 and 2 both meaning "capture alongside", so the native models were
- * drawn ON TOP of the packet ones and there was no way to tell which path any
- * pixel came from. An A/B where both legs draw the same thing is not an A/B,
- * and every question this campaign exists to answer -- do karts still sink, is
- * the geometry right, is it faster -- was unanswerable by construction.
- *
- * The three states now mean what their names always claimed:
- *   0 = packets only (the baseline every measurement is against)
- *   1 = NATIVE ONLY -- the packet write is skipped, so what you see is ours
- *   2 = both, kept deliberately as the overlay diagnostic: two renderers
- *       disagreeing about a position show up as a visible double image in one
- *       frame instead of having to be inferred.
- *
- * The platform test lives here, not in game/, and it is the same guard the
- * track renderer needs for the same reason: the native model DRAW is 3DS-only,
- * so on PC state 1 would switch the packet path off with nothing to take its
- * place and models would simply vanish. That is exactly how the track
- * renderer's state 1 once left Oxide floating in space with no ship.
+ * States 1 and 2 mean: 0 = packets only (baseline), 1 = native only (packet write skipped),
+ * 2 = both drawn (overlay diagnostic -- a position disagreement between the two renderers shows
+ * as a visible double image). The platform test lives here rather than in game/ because native
+ * model DRAW is 3DS-only; on PC, state 1 would disable the packet path with nothing to replace
+ * it, and models would vanish.
  */
 int NativeModelEmit_SkipRetailDraw(void)
 {
@@ -1265,17 +1109,11 @@ internal void NativeModelDraw_ComposeRows(const struct NativeModelEmitInstance *
 	qw[3] = trz / h;
 
 	/*
-	 * Depth-axis correction (the s33 sink fix -- see the depthShift field
-	 * comment). The shader recovers depth as viewZ = hParam.x * dp4(qw, v),
-	 * and hParam.x is used for NOTHING else -- screen x/y come from the
-	 * qx/qy dp4s and the GPU's divide, whose w is dp4(qw, v) alone. So
-	 * handing the draw side h scaled by the inverse regime factor puts this
-	 * instance's depth on the track's view.z axis while leaving its screen
-	 * position bit-identical. qx/qy/qw stay composed with the UNSCALED h:
-	 * they encode retail's own projection and must keep doing so.
-	 *
-	 * Toggle for the hardware A/B (dumpreq `axisfix`); default ON because
-	 * OFF is the sink.
+	 * Depth-axis correction (see the depthShift field comment). The shader recovers depth as
+	 * viewZ = hParam.x * dp4(qw, v); handing the draw side h scaled by the inverse regime factor
+	 * puts this instance's depth on the track's view.z axis while leaving screen position
+	 * bit-identical. Toggle for the hardware A/B (dumpreq `axisfix`); default ON because OFF is
+	 * the sink.
 	 */
 	if (g_dbg_modelAxisFix)
 	{
@@ -1334,13 +1172,11 @@ internal void NativeModelDraw_FlushRun(struct NativeModelDrawRun *run, u32 *draw
 internal int NativeModelDraw_FaceBlend(const struct NativeModelEmitFace *face, const struct NativeModelEmitInstance *inst)
 {
 	/*
-	 * Returns a BlendMode directly (0 = opaque, else PSX ABR + 1, matching
-	 * native_gpu.c:49's GET_TPAGE_BLEND) rather than an ABR, because "ABR 3"
-	 * and "opaque" are NOT the same thing once a writer can force blending:
-	 * a forced face whose page carries ABR 3 blends as B+F/4
-	 * (BM_ADD_QUATER_SOURCE), it does not become opaque. The earlier version of
-	 * this function returned an ABR and used 3 as its opaque sentinel, which
-	 * made that state impossible to express.
+	 * Returns a BlendMode directly (0 = opaque, else PSX ABR + 1, matching native_gpu.c:49's
+	 * GET_TPAGE_BLEND) rather than an ABR: "ABR 3" and "opaque" are not the same thing once a
+	 * writer can force blending -- a forced face whose page carries ABR 3 blends as B+F/4
+	 * (BM_ADD_QUATER_SOURCE), it does not become opaque, and only a BlendMode return can express
+	 * that state.
 	 */
 	if (inst->forceSemiTrans)
 	{
@@ -1399,7 +1235,7 @@ void NativeModelDraw_IssueForWalk(void)
 	 *   pass 0: PASS1 view (its non-STP texels), blending OFF, depth written
 	 *   pass 1: PASS2 view (its STP texels), blending ON, depth NOT written
 	 *
-	 * -- which is exactly what the packet path has done per-primitive since s17
+	 * -- which is exactly what the packet path has done per-primitive
 	 * (native_gpu.c:2670). Opaque faces draw once, in pass 0, with the OPAQUE
 	 * view, unchanged from before this feature.
 	 *
@@ -1518,21 +1354,16 @@ void NativeModelDraw_IssueForWalk(void)
 				out[v].x = src[v].x;
 				out[v].y = src[v].y;
 				out[v].z = src[v].z;
-				/* Single-channel for now (s40b): the model path computes its
-				 * own depth rather than reading a packet stamp, so occlusion
-				 * and parallax are the same number here. The dmodel stereo
-				 * fix (s34's open split-channel item) is what would give this
-				 * one a value of its own. */
+				/* Single-channel for now: the model path computes its own depth rather than
+				 * reading a packet stamp, so occlusion and parallax are the same number here. */
 				out[v].w = src[v].z;
 
 				if (textured)
 				{
-					/* Identical encoding to N3DS_ConvertTriangleVerts: texel-
-					 * CENTRE numerators (2a+1) against a 1/2048 shader scale,
-					 * with V flipped as 2047-2a because the PICA samples the
-					 * atlas bottom-up. Both facts were paid for in blood --
-					 * see that function's comments for the two separate
-					 * multi-session bugs behind them. */
+					/* Identical encoding to N3DS_ConvertTriangleVerts: texel-centre numerators
+					 * (2a+1) against a 1/2048 shader scale, with V flipped as 2047-2a because the
+					 * PICA samples the atlas bottom-up. See that function's comments for the
+					 * derivation. */
 					out[v].u = (s16)(((pixelBaseU + ((int)src[v].u - originU)) << 1) + 1);
 					out[v].v = (s16)(2047 - ((pixelBaseV + ((int)src[v].v - originV)) << 1));
 				}
@@ -1621,12 +1452,10 @@ void NativeModelDraw_IssueForWalk(void)
 #else
 
 int g_dbg_modelRender = 0;
-/* Referenced by native_gte_capture.c's s33 instance-depth bracket, which is
- * gated on GTE_CAPTURE, not MODEL_RENDERER -- so the definition must exist in
- * a capture-on/model-off build (the PC golden config). Found in s34: that
- * combination had never been compiled between s33 and the piranha-plant hunt,
- * and it failed at link. Stays 0 here; the --model-depth-check arg that sets
- * it lives with the real implementation above. */
+/* Referenced by native_gte_capture.c's instance-depth bracket, which is gated on GTE_CAPTURE, not
+ * MODEL_RENDERER -- so the definition must exist in a capture-on/model-off build (the PC golden
+ * config), or the link fails. Stays 0 here; the --model-depth-check arg that sets it lives with
+ * the real implementation above. */
 int g_dbg_modelDepthCheck = 0;
 
 int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *worldInst)

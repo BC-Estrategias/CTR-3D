@@ -96,17 +96,17 @@
 // file-scope state on 3DS, and is count-only on PC (see its header comment).
 #include "platform/native_direct_emit.c"
 // Track censuses + resident mesh builder for the native-track-renderer
-// campaign (s27). Both read game level structs, so they must come after
+// campaign. Both read game level structs, so they must come after
 // game_unity.h like everything here.
 #include "platform/native_track_census.c"
-// Model/keyframe accounting for the retained-models question (s29). Sits with
+// Model/keyframe accounting for the retained-models question. Sits with
 // the track censuses because it is the same kind of thing -- a once-per-level
 // read of game data that answers a "does this fit" question with a number
 // instead of an estimate. Called from MainFrame_RenderFrame, NOT from the
 // track mesh builder -- it must run on a plain PC build, where
 // CTR_NATIVE_TRACK_RENDERER is off.
 // Model topology scan + per-frame instance sampler for the PICA-native model
-// renderer (s30, docs/HANDOFF_s30_pica_native.md). The scanner comes FIRST so
+// renderer (docs/NATIVE_MODEL_RENDERER_DESIGN.md). The scanner comes FIRST so
 // the census below can fold each header's triangle counts into the same walk
 // that already has the deduped model population; the frame sampler comes after
 // both because it looks scans up rather than producing them. Both are
@@ -114,16 +114,16 @@
 #include "platform/native_model_mesh.c"
 #include "platform/native_model_census.c"
 #include "platform/native_model_frame.c"
-// Per-frame model triangle capture (s32 rung 1, docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+// Per-frame model triangle capture (docs/NATIVE_MODEL_RENDERER_DESIGN.md).
 // After the two above only for readability -- it shares no symbols with them,
 // unlike the track pair below.
 #include "platform/native_model_emit.c"
 #include "platform/native_track_mesh.c"
-// Per-frame camera/visibility snapshot recorder (rung 3a step 1) -- after
+// Per-frame camera/visibility snapshot recorder -- after
 // native_track_mesh.c so it can call the mesh accessors (NativeTrackMesh_*)
 // directly, same include-order reasoning as the line above.
 #include "platform/native_track_frame.c"
-// Bake-parity diff (s38): after native_track_mesh.c because its perm report
+// Bake-parity diff: after native_track_mesh.c because its perm report
 // reads that file's sTrackUvPerm table directly (same same-TU reasoning as
 // the frame recorder above). Whole body gated on CTR_NATIVE_BAKE_PARITY.
 #include "platform/native_bake_parity.c"
@@ -241,19 +241,12 @@ int main(int argc, char *argv[])
 	N3DS_DebugLog(NativeAssets_GetAssetDir());
 
 	/*
-	 * Stamp the build's identity into BOTH SD logs at boot.
-	 *
-	 * The printf below carries this already, but on 3DS stdout goes nowhere --
-	 * so every hardware log ever pulled off this console has been anonymous. A
-	 * day of "is this the fixed build or the one from an hour ago?" is what this
-	 * one line answers, and it answers it retroactively: a log harvested next
-	 * week still says which commit produced it. CTR_NATIVE_BUILD_ID is the git
-	 * hash plus -dirty-<timestamp> for an unclean tree, so it distinguishes two
-	 * builds from the same commit as well as two commits.
-	 *
-	 * Both sinks deliberately -- Platform_Log and Platform_LogInstrument write to
-	 * different files ("Crash Team Racing.log" and ctr3ds.log), and whichever one
-	 * gets read first should identify itself without needing the other.
+	 * Stamp the build's identity into BOTH SD logs at boot. Platform_Log and
+	 * Platform_LogInstrument write to different files ("Crash Team Racing.log"
+	 * and ctr3ds.log), and whichever one gets read first must identify itself
+	 * without needing the other. CTR_NATIVE_BUILD_ID is the git hash plus
+	 * -dirty-<timestamp> for an unclean tree, so it distinguishes two builds
+	 * from the same commit as well as two commits.
 	 */
 	Platform_Log("[BUILD] %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
 	Platform_LogInstrument("[BUILD] %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
@@ -337,15 +330,15 @@ int main(int argc, char *argv[])
 
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 	// --track-render N (0/1/2) is the PC surface for the native track
-	// renderer's runtime toggle (review fix, FIX 1) -- see
-	// NativePlatform_TrackRenderConfigureFromArgs for why this is what makes
-	// rung 3a step 1 verifiable at all. F13 steps the same toggle mid-run.
+	// renderer's runtime toggle -- see NativePlatform_TrackRenderConfigureFromArgs
+	// for why this is what makes the recorder verifiable at all. F13 steps the
+	// same toggle mid-run.
 	NativePlatform_TrackRenderConfigureFromArgs(argc, argv);
 #endif
 
 #if defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
 	// --model-render N (0/1/2): the PC surface for the model capture's runtime
-	// toggle. Rung 1 is verified here, so this is what makes it drivable.
+	// toggle, verified here, so this is what makes it drivable.
 	NativePlatform_ModelRenderConfigureFromArgs(argc, argv);
 #endif
 

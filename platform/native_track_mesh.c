@@ -1,23 +1,23 @@
 /*
- * Native track renderer -- load-time mesh builder (s27 scaffold).
+ * Native track renderer -- load-time mesh builder.
  * docs/NATIVE_TRACK_RENDERER_DESIGN.md sections 4.1/4.2.
  *
- * Ladder step 1 (PC count-only): builds the resident-mesh representation --
- * per-static-leaf vertex/index ranges over the game's own quadblock data --
- * and logs a [TRKMESH] block. Nothing is drawn yet on any platform and the
- * gate is OFF by default, so golden output is untouched. The 3DS draw side
- * (linear-heap upload, track atlas, the (otIndex<<k)|bias depth shader)
- * lands on top of exactly these structures in a later step.
+ * Builds the resident-mesh representation -- per-static-leaf vertex/index
+ * ranges over the game's own quadblock data -- and logs a [TRKMESH] block.
+ * The 3DS draw side (linear-heap upload, track atlas, depth compose --
+ * native_track_frame.c's NativeTrackDraw_IssueForWalk) draws directly from
+ * these structures. The toggle is OFF by default, so golden output is
+ * untouched.
  *
  * Leaf classification mirrors the v1 packet-path exclusions (design 4.4):
  * water-flagged leaves and leaves referencing water/scenery-animated
- * vertices are skipped here and keep their retail draw. The s27 census
- * measured one scenery-heavy level where that excludes ~2/3 of quads --
- * the planned v2 answer is re-uploading those verts (they're enumerable),
- * not widening the exclusion.
+ * vertices are skipped here and keep their retail draw. A census measured
+ * one scenery-heavy level where that excludes ~2/3 of quads -- the planned
+ * v2 answer is re-uploading those verts (they're enumerable), not widening
+ * the exclusion.
  */
 
-/* Included unconditionally (review fix, FIX 5): the accessor stubs in the
+/* Included unconditionally: the accessor stubs in the
  * #else branch far below need struct NativeTrackVert's real definition too
  * (it's a complete type in the header regardless of the gate), and pulling
  * the include out from inside the #if is what lets the SAME header serve
@@ -25,24 +25,19 @@
  * different implicit tag for the same struct name. */
 #include "platform/native_track_mesh.h"
 
-/* Bake-parity hooks (s38): declarations only; every call below is gated on
+/* Bake-parity hooks: declarations only; every call below is gated on
  * CTR_NATIVE_BAKE_PARITY, so this costs nothing when that gate is off. */
 #include "platform/native_bake_parity.h"
 
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 
-/* struct NativeTrackVert itself now lives in the header above (rung 3a step
- * 1) -- the read-only accessor surface at the end of this file hands a
- * draw side a typed `const struct NativeTrackVert *`, and a 3DS re-packer
- * needs the real field layout to do that, so the definition moved out of
- * this file's private section rather than being duplicated. Everything
- * about it is unchanged: 16 bytes, matches the design's budget. Positions
- * are model-space straight from LevVertex; colors are the near set
- * (color_hi); u/v are page-space texel bytes from the near-variant
- * TextureLayout corner assigned to this grid vertex (atlas translation
- * happens at upload, not here); texRef indexes the per-level layout table
- * below; drawOrder is the signed per-face OT byte folded into depth by the
- * shader (GetProjectedOtIndex's own formula, 226:1956). */
+/* struct NativeTrackVert lives in the header above -- the read-only accessor surface at the end of
+ * this file hands a draw side a typed `const struct NativeTrackVert *`, and a 3DS re-packer needs
+ * the real field layout, so the definition lives in the header rather than being duplicated. 16
+ * bytes, matches the design's budget: positions are model-space from LevVertex; colors are the
+ * near set (color_hi); u/v are page-space texel bytes from the near-variant TextureLayout corner;
+ * texRef indexes the per-level layout table; drawOrder is the signed per-face OT byte folded into
+ * depth by the shader. */
 
 struct NativeTrackLeafRange
 {
@@ -50,44 +45,33 @@ struct NativeTrackLeafRange
 	u16 atlasBin;    /* reserved: draws are binned per (leaf x atlas) */
 	u32 firstIndex;  /* into s_trackIndices */
 	u32 indexCount;
-	/* Rung 3a step 2: copied from mesh->bspRoot[bspIndex].box at BUILD time
-	 * (NOT re-read from the BSP tree per frame) so the draw side's per-leaf
-	 * depth-range compose (platform/native_track_frame.c, design 4.3/12b)
-	 * never has to dereference a raw mesh_info/BSP pointer on the worker --
-	 * this flat copy enjoys the same build-or-nothing validity contract every
-	 * other field in this struct already does. */
+	/* Copied from mesh->bspRoot[bspIndex].box at BUILD time (NOT re-read from the BSP tree per
+	 * frame) so the draw side's per-leaf depth-range compose never has to dereference a raw
+	 * mesh_info/BSP pointer on the worker -- this flat copy enjoys the same build-or-nothing
+	 * validity contract every other field in this struct already does. */
 	s16 boxMin[3], boxMax[3];
-	/* Review fix (FIX 1a): running min/max of the signed per-face drawOrder
-	 * byte over every face THIS leaf actually emits (same loop that already
-	 * reads block->draw_order_high per face below -- tracked alongside it,
-	 * not re-derived). The box alone bounds where a leaf's geometry SITS;
-	 * it says nothing about how far a face's own drawOrder can additionally
-	 * push that leaf's vertices along the OT axis in the shader. Widening
-	 * the draw-side range by [drawOrderMin, drawOrderMax] before it reaches
-	 * the shader is what stops a vertex from extrapolating past a valid
-	 * ordinal and being clipped away -- see native_track_mesh.h's accessor
-	 * comment for the full failure mode. Sentinel-initialized to
-	 * [127, -128] (the widest-possible empty range) before the emit loop; a
-	 * leaf that ends up with indexCount == 0 never has these read. */
+	/* Running min/max of the signed per-face drawOrder byte over every face this leaf emits
+	 * (tracked alongside the existing per-face draw_order_high read). The box alone bounds where a
+	 * leaf's geometry sits; it says nothing about how far a face's own drawOrder can push its
+	 * vertices along the OT axis in the shader. Widening the draw-side range by [drawOrderMin,
+	 * drawOrderMax] before it reaches the shader stops a vertex from extrapolating past a valid
+	 * ordinal and being clipped away. Sentinel-initialized to [127, -128] before the emit loop; a
+	 * leaf with indexCount == 0 never has these read. */
 	s8 drawOrderMin, drawOrderMax;
 };
 
-/* Grew this session (FIX 1a added drawOrderMin/drawOrderMax): 24B -> 28B
- * (2 bytes of struct-alignment padding after the two s8 fields, since a u32
- * member forces 4-byte alignment). Tripwire so the next field added here
- * doesn't silently drift the size assumed by every allocation/log line that
- * sizes off this struct without anyone noticing, the same reasoning
- * NativeTrackVert's own assert (native_track_mesh.h) already applies. */
+/* 28B struct with 2 bytes of alignment padding after the two s8 fields (a u32 member forces 4-byte
+ * alignment). Tripwire so the next field added here doesn't silently drift the size assumed by
+ * every allocation/log line that sizes off this struct, the same reasoning NativeTrackVert's own
+ * assert (native_track_mesh.h) applies. */
 CTR_STATIC_ASSERT(sizeof(struct NativeTrackLeafRange) == 28);
 
 /*
- * Rung 2a: track atlas LAYOUT (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12).
- * Platform-neutral half of the dedicated track atlas: per-(tpage,clut)
- * union UV rectangles gathered from the resident verts, shelf-packed into
- * 512x512 atlas units, with a translation entry per rect so upload (rung
- * 2b, 3DS) can rewrite baked page-space UVs into atlas coordinates. The
- * census bound the working set (<=120 pairs, ~0.5-1.2MB near-variant
- * decoded), so fixed-size tables suffice; overflow logs and truncates
+ * Track atlas LAYOUT (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12): platform-neutral half of the
+ * dedicated track atlas -- per-(tpage,clut) union UV rectangles gathered from the resident verts,
+ * shelf-packed into 512x512 atlas units, with a translation entry per rect so upload can rewrite
+ * baked page-space UVs into atlas coordinates. The census bound the working set (<=120 pairs,
+ * ~0.5-1.2MB near-variant decoded), so fixed-size tables suffice; overflow logs and truncates
  * rather than growing.
  */
 #define TRKMESH_MIN(a, b) (((a) < (b)) ? (a) : (b))
@@ -108,15 +92,15 @@ struct NativeTrackAtlasRect
 	                              * (a horizontal decode overrun wraps in-bounds -- PS1 VRAM row addressing, harmless). srcV is
 	                              * pulled UP from minV whenever minV+allocH would overrun the page half: N3DS_DecodeAndTilePage
 	                              * wraps the COLUMN but not the ROW (native_renderer_3ds.c ~:1151), so decoding from minV with
-	                              * a tall allocH can read vram[] past the end of the page half (review finding #1). Rung 3's UV
+	                              * a tall allocH can read vram[] past the end of the page half. The UV
 	                              * translation must read THESE fields, never minU/minV: atlasU = atlasX + (u - srcU),
 	                              * atlasV = atlasY + (v - srcV). */
 	u8 atlasUnit;                /* TRACK_ATLAS_UNIT_INVALID until placed by NativeTrackAtlas_Pack, or if the backend
 	                               * couldn't/didn't upload this rect (NativeTrackAtlas_UploadToBackend resets it on every
-	                               * skip path) -- rung 3 must never bind a unit for a rect carrying this sentinel. */
+	                               * skip path) -- the draw side must never bind a unit for a rect carrying this sentinel. */
 	u16 atlasX, atlasY; /* placement of (srcU,srcV) inside the unit -- always a multiple of 8, see NativeTrackAtlas_Pack */
 	u16 allocW, allocH; /* (maxU-minU+1)/(maxV-minV+1) rounded UP to multiples of 8 and capped at 256 (one PSX page) -- the
-	                      * shelf-packed/uploaded size, distinct from the true bbox above (rung 2b, upload needs 8x8-tile-
+	                      * shelf-packed/uploaded size, distinct from the true bbox above (upload needs 8x8-tile-
 	                      * aligned rects) */
 	/* SEMI-TRANSPARENCY (docs/TRANSPARENCY_DESIGN.md 3): a rect whose tpage ABR
 	 * field is not 3 draws in TWO passes on PS1 -- its non-STP texels opaque,
@@ -221,7 +205,7 @@ struct NativeTrackMeshState
 	struct NativeTrackLeafRange *leafRanges;
 	u32 leafCount;
 
-	/* Reverse lookup, bspIndex -> leafRanges index (rung 3a step 1,
+	/* Reverse lookup, bspIndex -> leafRanges index (see
 	 * include/platform/native_track_mesh.h's NativeTrackMesh_LeafIndexForBsp):
 	 * numBspNodes entries, -1 = no resident range for that BSP index (an
 	 * excluded leaf per design 4.4, or simply not a leaf). Built once per
@@ -231,15 +215,10 @@ struct NativeTrackMeshState
 	 * leaves) instead of O(leaves x ranges). */
 	s32 *bspToLeafIndex;
 
-	/* bspToLeafIndex's allocated element count, latched at the SAME time as
-	 * the allocation itself (review fix: NativeTrackMesh_LeafIndexForBsp used
-	 * to bound bspIndex against builtFor->numBspNodes read LIVE at call time,
-	 * but that can silently drift from what this table was actually sized
-	 * for -- a level reloading into the same mesh_info arena slot with equal
-	 * quad/vertex counts but a different bsp node count would read past the
-	 * allocation before the rebuild latch above ever catches it. Bound
-	 * against THIS field instead, which only ever changes alongside the
-	 * allocation it describes. */
+	/* bspToLeafIndex's allocated element count, latched at the SAME time as the allocation itself.
+	 * Bound lookups against THIS field, not builtFor->numBspNodes read live: a level reloading into
+	 * the same mesh_info arena slot with equal quad/vertex counts but a different bsp node count
+	 * would otherwise read past the allocation before the rebuild latch above catches it. */
 	u32 bspNodeCount;
 
 	/* Per-level table of near-variant TextureLayout pointers; texRef fields
@@ -254,24 +233,16 @@ struct NativeTrackMeshState
 	struct NativeTrackAtlasLayout atlas;
 
 	/*
-	 * s30 animated-vertex patching. Leaves touching an animated vertex used to
-	 * be dropped whole (Polar Pass: 43 of 77 missing leaves); they are kept now,
-	 * which means the few genuinely moving vertices inside them have to be
-	 * refreshed per frame or they sit frozen.
+	 * Animated-vertex patching. Leaves touching an animated vertex are kept (previously dropped
+	 * whole), so the few genuinely moving vertices inside them must be refreshed per frame or they
+	 * sit frozen. AnimateWater1P/AnimateQuad (game/RenderLevel/AnimateWater.c) write straight into
+	 * LevVertex.pos/.color_hi every frame for 1P regardless of which renderer draws.
 	 *
-	 * The source data really does move under us: AnimateWater1P / AnimateQuad
-	 * (game/RenderLevel/AnimateWater.c) write straight into LevVertex.pos and
-	 * .color_hi, and MainFrame_RenderFrame.c:1174-1181 calls them every frame
-	 * for 1P regardless of which renderer draws -- checked, because a patcher
-	 * reading an array nobody animates would look like it worked.
-	 *
-	 * srcVert is parallel to verts (NOT a field on it -- NativeTrackVert is
-	 * pinned at 16 bytes by a static assert). TRACK_SRCVERT_NONE means "never
-	 * animate this one", which covers both non-animated vertices and, more
-	 * importantly, WELDED ones: the emit loop may replace a vertex's position
-	 * with an edge's canonical mid to close a T-junction crack, and re-copying
-	 * the raw source every frame would silently undo that repair and reopen the
-	 * crack on exactly the water edges this feature exists to animate.
+	 * srcVert is parallel to verts (not a field on it -- NativeTrackVert is pinned at 16 bytes).
+	 * TRACK_SRCVERT_NONE covers both non-animated vertices and WELDED ones: the emit loop may
+	 * replace a vertex's position with an edge's canonical mid to close a T-junction crack, and
+	 * re-copying the raw source every frame would undo that repair and reopen the crack on exactly
+	 * the water edges this feature animates.
 	 */
 	u16 *srcVert;
 	u32 *animVerts; /* indices into verts[] that need a per-frame refresh */
@@ -285,38 +256,22 @@ struct NativeTrackMeshState
 	u32 animSrcCount;
 
 	/*
-	 * s30 AnimTex ("picture flip") patching -- turbo-pad arrows, waterfall
-	 * sheets, lava. Distinct from the animated-VERTEX case above and far more
-	 * visible: nothing moves, the game just repoints a face at the next frame
-	 * of a texture chain every vblank (CTR_CycleTex_LEV, called unconditionally
-	 * from MainFrame_RenderFrame.c:102). Checked that this is the ONLY runtime
-	 * appearance change a track face can have: nothing in game/ ever writes
-	 * QuadBlock.ptr_texture_mid, so every scrolling/blinking track surface in
-	 * the game reaches the screen through this one indirection.
+	 * AnimTex ("picture flip") patching -- turbo-pad arrows, waterfall sheets, lava. Distinct from
+	 * the animated-vertex case above: nothing moves, the game repoints a face at the next frame of
+	 * a texture chain every vblank (CTR_CycleTex_LEV, called unconditionally from
+	 * MainFrame_RenderFrame.c:102). This is the only runtime appearance change a track face can
+	 * have: nothing in game/ ever writes QuadBlock.ptr_texture_mid outside this indirection.
 	 *
-	 * The expensive half was already done at load: EVERY frame of every chain
-	 * is decoded and packed into the track atlas (the AddLayout loop below).
-	 * Only the ACTIVE frame's rect index was kept, which is exactly why the
-	 * resident renderer freezes them on whatever frame happened to be up when
-	 * the level loaded.
+	 * Every frame of every chain is decoded and packed into the track atlas at load; only the
+	 * active frame's rect index was kept, which is why the resident renderer freezes them on
+	 * whatever frame was up at load. animFrameRect records every frame's rect index (slot f = frame
+	 * f, always allocated, -1 if that frame was unusable); animTexVerts records which resident
+	 * vertices belong to each animated texRef.
 	 *
-	 * Two things are needed per frame and both are recorded here at build time:
-	 *   - animFrameRect: every frame's rect index, not just the active one.
-	 *     Slot f of an entry is frame f, ALWAYS allocated even when that frame
-	 *     was unusable (NULL icon group, bad tpage) -- it holds -1 then, so the
-	 *     frame index the game hands us indexes straight in with no remap.
-	 *   - animTexVerts: which resident vertices belong to each animated texRef,
-	 *     so the patch is O(that texture's vertices), not O(track).
-	 *
-	 * A frame swap is NOT just a rect swap. Atlas rects are keyed by
-	 * (tpage, clut) and MERGED (NativeTrackAtlas_AddLayout), so two frames of
-	 * one chain may share a rect and differ only in their page-space corner
-	 * UVs -- which is what the baked NativeTrackVert.u/.v came from. So the
-	 * patch re-reads the frame's own TextureLayout corners and re-encodes,
-	 * rather than translating the old UV into a new rect. The corner each
-	 * vertex used is stashed in faceFlags bits 3-4 at emit time (the field's
-	 * own comment already reserved them as "rotation scratch"; nothing outside
-	 * this file reads it, and the GPU mirror does not carry it at all).
+	 * A frame swap is not just a rect swap: atlas rects are keyed by (tpage, clut) and merged, so
+	 * two frames of one chain may share a rect and differ only in page-space corner UVs. The patch
+	 * re-reads the frame's own TextureLayout corners and re-encodes; the corner each vertex used is
+	 * stashed in faceFlags bits 3-4 at emit time.
 	 */
 	struct NativeTrackAnimTexEntry *animTex;
 	u32 animTexCount;
@@ -471,7 +426,7 @@ static const u8 sTrackUvPerm[8][4] = {
 static const u8 sTrackUvByteOfs[4] = {0, 4, 8, 10};
 
 /*
- * faceMode 1/2 faces are TRIANGLES, not quads (s38, the Coco Park stripe +
+ * faceMode 1/2 faces are TRIANGLES, not quads (the Coco Park stripe +
  * Crash Cove sky-plank classes). Retail indexes the face's full 5-bit value
  * into a 24-word corner-selection table (R226.scratchInitTable); the mode 1/2
  * words repeat a corner slot -- a degenerate quad, i.e. a triangle -- and
@@ -486,7 +441,7 @@ static const u8 sTrackUvByteOfs[4] = {0, 4, 8, 10};
  * (platform/native_bake_parity.c) recorded, for every matched mode 1/2 face
  * across five tracks plus the intro cutscene levels, which grid corner and
  * which layout UV index retail put at each packet corner -- all 16 rows
- * unanimous (disagree=0) at n up to ~800 faces per row, s38 facemap run.
+ * unanimous (disagree=0) at n up to ~800 faces per row.
  * Row index is (faceBits & 0x1f) - 8. Corner order here is retail's packet
  * order; the index emission below applies the same swap-last-two that maps
  * retail's (0,1,2)/(1,3,2) tri order onto this file's (0,2,1)/(1,2,3) split.
@@ -565,13 +520,12 @@ static int NativeTrackMesh_WeldSlot(struct NativeTrackWeldTable *table, u64 key)
 static void NativeTrackMesh_Free(void)
 {
 #if defined(__3DS__)
-	/* Release the dedicated atlas pool's linear-heap textures too (review
-	 * finding #8) -- this is the only teardown path a level currently has
-	 * (called both on rebuild and on allocation-failure unwind below), so
-	 * it's also the only place leaving a track can release that memory.
-	 * Rung 3a step 2: the resident geometry buffer (N3DS_TrackGeom_Upload)
-	 * is the SAME per-level linear-heap allocation shape, freed here for
-	 * exactly the same reason. */
+	/* Release the dedicated atlas pool's linear-heap textures too -- this is
+	 * the only teardown path a level currently has (called both on rebuild
+	 * and on allocation-failure unwind below), so it's also the only place
+	 * leaving a track can release that memory. The resident geometry buffer
+	 * (N3DS_TrackGeom_Upload) is the SAME per-level linear-heap allocation
+	 * shape, freed here for exactly the same reason. */
 	N3DS_TrackAtlas_Free();
 	N3DS_TrackGeom_Free();
 #endif
@@ -688,7 +642,7 @@ static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *
  * Shelf-pack the gathered rects into 512x512 units. Census-sized: ~120
  * pairs, ~0.5-1.2MB of near-variant texels -- a plain shelf is plenty.
  *
- * 8-texel alignment (rung 2b): the 3DS upload path writes whole 8x8
+ * 8-texel alignment: the 3DS upload path writes whole 8x8
  * PICA200 tile blocks (N3DS_TrackAtlas_UploadRect), so both the allocated
  * SIZE of each rect and its PLACEMENT must be multiples of 8 -- an
  * unaligned destination offset would address the wrong tile entirely, not
@@ -705,7 +659,7 @@ static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *
  * never allocW/allocH -- so the rounding only affects how much atlas space
  * a rect reserves and how many texels the decoder produces, not addressing.
  *
- * Two review fixes (post rung-2b-first-cut) folded in here:
+ * Two constraints folded in here:
  *   - allocW/allocH are capped at 256 after rounding. Uncapped, a
  *     near-full-page union (trueW/trueH up to 256, the likeliest-large rect
  *     shape) rounds to 264 and would otherwise trip the TRACK_ATLAS_DIM
@@ -797,7 +751,7 @@ static void NativeTrackAtlas_Pack(void)
 			break;
 		}
 
-		/* Decode origin (review finding #1): pull srcV up from minV just far
+		/* Decode origin: pull srcV up from minV just far
 		 * enough that the whole h-tall decode window stays inside the page
 		 * half (pageOriginY + srcV + h <= pageOriginY + 256), never past the
 		 * end of vram[]. srcU never needs this treatment -- see the struct
@@ -843,8 +797,8 @@ static void NativeTrackAtlas_Pack(void)
 	}
 
 	/* unit can reach TRACK_ATLAS_MAX_UNITS exactly at the overflow break
-	 * above (review finding #7) -- clamp rather than report one more unit
-	 * than the pool actually has. */
+	 * above -- clamp rather than report one more unit than the pool
+	 * actually has. */
 	atlas->unitsUsed = (atlas->rectCount > 0) ? TRKMESH_MIN(cur.unit + 1, TRACK_ATLAS_MAX_UNITS) : 0;
 }
 
@@ -1392,24 +1346,23 @@ static void NativeTrackAnim_Report(void)
 
 #if defined(__3DS__)
 /*
- * Rung 2b: decode + upload driver. Reuses N3DS_DecodeAndTilePage
+ * Decode + upload driver. Reuses N3DS_DecodeAndTilePage
  * (native_renderer_3ds.c, included earlier in this unity TU -- see main.c's
  * include order) for CLUT resolution and per-texel visibility, so the track
  * atlas's texel results are IDENTICAL to the decode cache's, not a
  * reimplementation of the same rules. N3DS_TEXVIEW_OPAQUE (any non-zero
- * texel visible, punch-through alpha) is the only view baked here: nothing
- * samples these atlases yet (rung 3 draws), and which of the decode cache's
- * three STP views a track triangle would need is a per-draw blend-mode
- * question, not something a one-time load-time upload can predict.
+ * texel visible, punch-through alpha) is the base view baked here;
+ * semi-transparent rects additionally bake a PASS2 view (further below),
+ * because which STP view a track triangle needs is a per-draw blend-mode
+ * question the draw side answers at draw time.
  *
  * One-time per level load, called right after NativeTrackAtlas_Pack from
  * NativeTrackMesh_Frame. The static staging buffer is sized to one PSX page
- * (256x256 texels) -- NativeTrackAtlas_Pack caps allocW/allocH at 256 itself
- * (review finding #2), so the >256 guard in the loop below is defensive,
- * not reachable.
+ * (256x256 texels) -- NativeTrackAtlas_Pack caps allocW/allocH at 256 itself,
+ * so the >256 guard in the loop below is defensive, not reachable.
  */
 
-/* Cross-TU constant check (review finding #5): the packer's own
+/* Cross-TU constant check: the packer's own
  * TRACK_ATLAS_DIM/MAX_UNITS and the backend pool's N3DS_TRACK_ATLAS_DIM/
  * MAX_UNITS (n3ds_backend.h) must agree -- both size the SAME pool from
  * opposite sides of the plain-scalar boundary, so a drift between them
@@ -1430,18 +1383,13 @@ static u16 s_trackAtlasStaging[256 * 256]; /* one PSX page, RGBA5551 tiled -- 12
  * this content -- withholding the latch over those would rebuild forever
  * without ever latching.
  *
- * GIVEUP (Azahar validation, post review round): the alloc shortfall above
- * is NOT reliably transient -- nothing frees the linear heap between
- * frames on its own, so an unconditional "withhold the latch and retry"
- * can retry forever, rerunning the entire census+mesh+pack+decode+upload
- * (~50ms observed) every single frame. mesh/numQuadBlock/numVertex
- * fingerprint THIS level (reset the attempt counter when it changes, same
- * fingerprint the outer latch uses) so repeated genuine failures on the
- * same content are distinguishable from a fresh level's first attempt.
- * After 4 failed attempts on the same level, latch anyway with whatever
- * partial atlas is currently uploaded (better than a permanently pegged
- * frame time) and log a distinct GIVEUP line so the condition shows up in
- * any log harvest, not just as a wall of repeated normal lines.
+ * GIVEUP: the alloc shortfall above is not reliably transient -- nothing frees the linear heap
+ * between frames on its own, so an unconditional "withhold the latch and retry" can retry
+ * forever, rerunning the entire census+mesh+pack+decode+upload every frame. mesh/numQuadBlock/
+ * numVertex fingerprint this level (reset the attempt counter when it changes) so repeated
+ * genuine failures are distinguishable from a fresh level's first attempt. After 4 failed
+ * attempts on the same level, latch anyway with whatever partial atlas is currently uploaded and
+ * log a distinct GIVEUP line.
  */
 /*
  * Which atlas unit a triangle samples, keyed off its first vertex (all three
@@ -1517,31 +1465,23 @@ static u32 NativeTrackMesh_DrawBinForIndex(u16 vertexIndex)
 }
 
 /*
- * Rung 3b: split each leaf's index range into one sub-range per ATLAS UNIT.
+ * Split each leaf's index range into one sub-range per ATLAS UNIT. A draw binds exactly one
+ * texture, and a leaf's faces routinely land in different atlas units, so "one draw per leaf" and
+ * "textured" are mutually exclusive. NativeTrackLeafRange has carried a reserved `atlasBin` field
+ * for exactly this; this is what fills it.
  *
- * A draw binds exactly one texture, and a leaf's faces routinely land in
- * different atlas units, so "one draw per leaf" and "textured" are mutually
- * exclusive. NativeTrackLeafRange has carried a reserved `atlasBin` field since
- * rung 2a for exactly this; this is what fills it.
+ * POST-pass, not binned inside the emit loop: the rect set is gathered by that loop and only
+ * packed afterwards, so no face knows its atlas unit while it is being emitted. Running after
+ * NativeTrackAtlas_UploadToBackend matters too -- that function resets atlasUnit to the sentinel
+ * on every skip path.
  *
- * Why a POST-pass rather than binning inside the emit loop: the rect set is
- * gathered *by* that loop and only packed afterwards, so no face knows its
- * atlas unit while it is being emitted. Running after
- * NativeTrackAtlas_UploadToBackend matters too -- that function resets
- * atlasUnit to the sentinel on every skip path, so binning any earlier could
- * bin against placements the backend then declined to upload.
+ * Triangles whose rect never got placed keep the sentinel bin and still draw, untextured.
  *
- * Triangles whose rect never got placed keep the sentinel bin. They are not
- * dropped: they still draw, untextured, exactly as rung 3a drew everything.
+ * Exact sizing, two passes: count the distinct units per leaf to get the final range count,
+ * allocate that, then fill.
  *
- * Exact sizing, two passes: count the distinct units per leaf to get the final
- * range count, allocate that, then fill. The old code sized leafRanges at one
- * per BSP node; binning can only grow that, and guessing a multiplier would
- * either waste heap the atlas needs or overflow on a track nobody tested.
- *
- * Returns 0 on allocation failure, which the caller treats like every other
- * upload failure here: withhold the latch and retry the whole build next frame
- * rather than latch a half-binned mesh.
+ * Returns 0 on allocation failure, which the caller treats like every other upload failure here:
+ * withhold the latch and retry the whole build next frame rather than latch a half-binned mesh.
  */
 static int NativeTrackMesh_BinLeavesByAtlasUnit(void)
 {
@@ -1704,9 +1644,9 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 
 		/* Unplaced (dropped by the packer) or in a unit the pool failed to
 		 * allocate -- never a partial/garbage upload. Reset the sentinel
-		 * explicitly (review finding #3): a rect the packer DID place still
-		 * carries a real-looking unit index here if its unit's allocation
-		 * failed, and rung 3 must never bind that. */
+		 * explicitly: a rect the packer DID place still carries a
+		 * real-looking unit index here if its unit's allocation failed, and
+		 * the draw side must never bind that. */
 		if ((rect->atlasUnit == TRACK_ATLAS_UNIT_INVALID) || ((int)rect->atlasUnit >= allocated))
 		{
 			rect->atlasUnit = TRACK_ATLAS_UNIT_INVALID;
@@ -1735,7 +1675,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 		 * with blending OFF in the normal walk) into the primary placement, and
 		 * PASS2 (STP texels only, drawn blended by the blend pass) into the
 		 * second. Drawing both composes the full PS1 result, which is what the
-		 * packet path has done per-primitive since s17 (native_gpu.c:2670); the
+		 * packet path has done per-primitive (native_gpu.c:2670); the
 		 * only difference here is that the split is baked at load instead of
 		 * being decided per draw.
 		 *
@@ -1758,7 +1698,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 			}
 
 			/* srcU/srcV, NOT minU/minV -- see the struct comment on
-			 * NativeTrackAtlasRect (review finding #1: minV can put the decode
+			 * NativeTrackAtlasRect (minV can put the decode
 			 * window past the end of vram[] for a bottom-half page). */
 			N3DS_DecodeAndTilePage((s16)rect->tpage, (s16)rect->clut, format, primaryView, rect->srcU, rect->srcV, rect->allocW, rect->allocH,
 			                       rect->allocW / 8, s_trackAtlasStaging);
@@ -1779,7 +1719,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 		}
 	}
 
-	/* us, not ms (review finding #9): an ms-rounded field silently prints 0
+	/* us, not ms: an ms-rounded field silently prints 0
 	 * for a light level's upload, and hardware has since shown the heavy
 	 * end (57 rects / 330KB decoded) running ~50ms -- us reads correctly at
 	 * either extreme instead of rounding one of them away. */
@@ -1815,7 +1755,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 }
 
 /*
- * Rung 3a step 2: repack + upload the resident mesh's GPU-visible geometry.
+ * Repack + upload the resident mesh's GPU-visible geometry.
  * struct NativeTrackVert (this file's own 16B build-time layout, above) still
  * carries texRef/faceFlags the GPU never reads; N3DS_TrackVertex
  * (n3ds_backend.h, 14B) is the plain-scalar mirror N3DS_C3DInit's
@@ -1824,7 +1764,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
  * into its own linearAlloc block immediately, so nothing here needs to
  * outlive this call.
  *
- * GIVEUP (review fix, FIX 3 -- mirrors NativeTrackAtlas_UploadToBackend's own
+ * GIVEUP (mirrors NativeTrackAtlas_UploadToBackend's own
  * mechanism above, same reasoning): a persistently full linear heap makes a
  * bare "return 0 on failure" retry FOREVER, since nothing frees the heap
  * between frames on its own -- every one of those retries reruns the WHOLE
@@ -1886,7 +1826,7 @@ static int NativeTrackGeom_UploadToBackend(struct mesh_info *mesh, int numQuadBl
 			dst->y = src->y;
 			dst->z = src->z;
 
-			/* Rung 3b: rewrite the baked PAGE-space UV into ABSOLUTE ATLAS
+			/* Rewrite the baked PAGE-space UV into ABSOLUTE ATLAS
 			 * texel coords, which is why the GPU-side field is s16 while the
 			 * resident one is u8 -- a page coordinate is 0..255, an atlas one
 			 * is 0..511 and carries the rect's placement.
@@ -1997,8 +1937,8 @@ static int NativeTrackGeom_UploadToBackend(struct mesh_info *mesh, int numQuadBl
 
 static u16 NativeTrackMesh_InternTexture(uintptr_t texPtr)
 {
-	/* Small linear intern -- track texture tables measured at <=119 pairs
-	 * (s27 census), so linear search at build time is fine. */
+	/* Small linear intern -- track texture tables measured at <=119 pairs,
+	 * so linear search at build time is fine. */
 	for (u32 i = 0; i < s_trackMesh.texCount; i++)
 	{
 		if (s_trackMesh.texTable[i] == texPtr)
@@ -2016,7 +1956,7 @@ static int NativeTrackMesh_LeafTouchesAnim(const struct BSP *bsp, const u8 *anim
 	int numQuads = bsp->data.leaf.numQuads;
 	struct QuadBlock *range = bsp->data.leaf.ptrQuadBlockArray;
 
-	/* Upper bound included (s27 review finding): a leaf's numQuads is asset
+	/* Upper bound included: a leaf's numQuads is asset
 	 * data; never trust it past the mesh's real array size. */
 	if ((range == NULL) || (numQuads <= 0) || (numQuads > numQuadBlock))
 	{
@@ -2040,7 +1980,7 @@ static int NativeTrackMesh_LeafTouchesAnim(const struct BSP *bsp, const u8 *anim
 }
 
 /*
- * GAP FILL (s29). The builder drops a WHOLE BSP leaf if it is flagged water or
+ * GAP FILL. The builder drops a WHOLE BSP leaf if it is flagged water or
  * if any one of its vertices is animated, and with the retail track draw
  * switched off nothing draws those leaves at all: Polar Pass loses 77 of 526.
  * The owner reported the missing pieces as ordinary road, which the exclusion
@@ -2057,7 +1997,7 @@ static int NativeTrackMesh_LeafTouchesAnim(const struct BSP *bsp, const u8 *anim
  * silent fix, because "solved" has been claimed for this twice already
  * without either claim being checked.
  *
- * DEFAULT 0 -- BROKEN AS WRITTEN, s29. Filtering in RenderLists_LinkBsp is the
+ * DEFAULT 0 -- BROKEN AS WRITTEN. Filtering in RenderLists_LinkBsp is the
  * wrong place: NativeTrackFrame_Record derives the RESIDENT renderer's own
  * visible-leaf set by walking that same render list (see its bspListBase walk),
  * so withholding resident leaves from the list to prevent double-drawing also
@@ -2074,7 +2014,7 @@ int g_dbg_trackGapFill = 0;
 #if defined(CTR_NATIVE_TRACK_BAKE_EXPORT) && CTR_NATIVE_TRACK_BAKE_EXPORT
 
 /*
- * .ctrbake v1 (s38) -- the serialized form of exactly what this file just
+ * .ctrbake v1 -- the serialized form of exactly what this file just
  * built. Sections, all little-endian, in order:
  *   magic "CTRBAKE1", u32 version,
  *   u32 levelID, numQuadBlock, numVertex, bspNodeCount   (source fingerprint)
@@ -2396,12 +2336,12 @@ static void NativeTrackBake_Export(int levelID, int numQuadBlock, int numVertex)
 
 void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 {
-	/* Latch = pointer + content fingerprint (arena heaps reuse addresses --
-	 * s27 review finding), and it is only recorded on SUCCESSFUL builds; the
+	/* Latch = pointer + content fingerprint (arena heaps reuse addresses),
+	 * and it is only recorded on SUCCESSFUL builds; the
 	 * cheap-validation and calloc-failure paths below return unlatched so a
 	 * transient failure retries next frame instead of pinning an empty mesh
-	 * to that level forever. numBspNodes joined the fingerprint after a
-	 * review finding: a level reloading into the same arena address with
+	 * to that level forever. numBspNodes joined the fingerprint because
+	 * a level reloading into the same arena address with
 	 * equal quad/vertex counts but a DIFFERENT bsp node count would otherwise
 	 * pass this check while bspToLeafIndex (sized from the OLD numBspNodes)
 	 * is still allocated at the old size -- see NativeTrackMesh_LeafIndexForBsp's
@@ -2422,9 +2362,9 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	}
 
 	/*
-	 * Review fix (FIX 7, comment only): this closes the specific
-	 * arena-address-reuse bug it was written for (a stale mesh at the SAME
-	 * pointer with a DIFFERENT shape), but it is still a heuristic, not a
+	 * This closes the specific arena-address-reuse bug it was written for
+	 * (a stale mesh at the SAME pointer with a DIFFERENT shape), but it is
+	 * still a heuristic, not a
 	 * guarantee -- two DIFFERENT levels sharing all three counts (quad,
 	 * vertex, bsp-node) AND landing at the same reused arena address would
 	 * pass this check and skip the rebuild, drawing a stale mesh. Low
@@ -2442,7 +2382,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	NativeTrackMesh_Free();
 
 #if defined(CTR_NATIVE_TRACK_BAKE_EXPORT) && CTR_NATIVE_TRACK_BAKE_EXPORT && !defined(__3DS__)
-	/* Build-time measurement (s38): sizes what a .ctrbake LOADER would
+	/* Build-time measurement: sizes what a .ctrbake LOADER would
 	 * actually buy at runtime. Starts here -- past the already-built
 	 * early-out above, so only real builds are timed -- and is read by the
 	 * export call at the end of this function. */
@@ -2498,7 +2438,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	/* Worst case: every quadblock in a static leaf, 4 faces x 4 verts and
 	 * 4 faces x 6 indices. Allocate flat, log the real usage. */
 	size_t maxVerts = (size_t)numQuadBlock * 16;
-	/* s43: up from 24 (6 idx/face). Backface culling gives triangles and
+	/* Backface culling gives triangles and
 	 * double-sided faces a reverse-wound copy (see the index emission below), so
 	 * the worst case is 4 double-sided quads/block = 48. Temporary bake buffer --
 	 * compacted to the actual index count after the draw-bin sort, so the extra
@@ -2574,17 +2514,17 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 	int leavesTotal = 0, leavesExcluded = 0, facesDoubleSided = 0, facesNoTexture = 0, facesAnimTex = 0, facesModeTri = 0, facesMode3 = 0;
 	/* keptWater and keptAnim are both populations that USED to be dropped whole
-	 * and now are not -- the two halves of the s30 hole fix, kept as separate
+	 * and now are not -- the two halves of the hole fix, kept as separate
 	 * columns because they answer different questions. keptWater is how much
 	 * geometry is being drawn opaque that shouldn't be (the transparency work's
 	 * scope); keptAnim is what the vertex patcher has to cover. leavesExcluded
 	 * is now only ever incremented by guards that are genuinely errors, so a
 	 * non-zero value in the log is a real signal rather than routine. */
 	int leavesKeptWater = 0, leavesKeptAnim = 0, leavesSkippedEmpty = 0;
-	/* Both were silent `continue`s before s30 -- see their guard comments. */
+	/* Both are counted now rather than silent `continue`s -- see their guard comments. */
 	int facesDroppedIndexCap = 0, facesDroppedCapacity = 0;
 	int animVertsWelded = 0, leavesEmittedNothing = 0;
-	/* notex classification (s27: the water track reported 368 unclassified
+	/* notex classification (the water track reported 368 unclassified
 	 * faces): null pointer / AnimTex with null active frame / implausible
 	 * tpage word. Two raw samples of the bad-tpage case ride in the log. */
 	int notexNull = 0, notexAnimNull = 0, notexBadWord = 0;
@@ -2602,7 +2542,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		leavesTotal++;
 
 		/*
-		 * s30: animated-vertex leaves are now KEPT. The old rule dropped a whole
+		 * Animated-vertex leaves are now KEPT. The old rule dropped a whole
 		 * leaf if any ONE of its vertices was in the level's animated list, and
 		 * the owner reported the resulting Polar Pass gaps as ordinary road --
 		 * which the rule permits, because it discards the leaf, not the moving
@@ -2612,13 +2552,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		 * and reviving the retail draw to paint them (g_dbg_trackGapFill's
 		 * approach). Owner rejected it on direction -- the whole point of this
 		 * renderer is that the PICA draws the track -- and the arithmetic agrees:
-		 * the resident renderer is worth ~6% (s29 part 2's sweep: 25.5 vs 24.0
+		 * the resident renderer is worth ~6% (measured: 25.5 vs 24.0
 		 * fps Time Trial, 19.8 vs 18.8 Arcade, NOT the 18% an earlier reading
 		 * claimed), so running DrawLevelOvr1P again every frame for 15% of the
 		 * track spends a real fraction of the entire win to fix a hole.
 		 *
-		 * BSP_LEAF_FLAG_WATER leaves are kept too, as of the owner's ruling this
-		 * session ("in future don't skip the water-flagged chunks"). They used
+		 * BSP_LEAF_FLAG_WATER leaves are kept too, per the owner's ruling
+		 * ("in future don't skip the water-flagged chunks"). They used
 		 * to be excluded on the argument that this renderer bakes every face
 		 * opaque (dst->a = 0xff below; N3DS_TrackDraw_Begin asserts opaque blend
 		 * once for the whole draw), so drawing them would hide whatever should
@@ -2655,12 +2595,12 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 		if ((range == NULL) || (numQuads <= 0) || (numQuads > numQuadBlock))
 		{
-			/* s30: counted. This guard was silent, and the arithmetic exposed
+			/* Counted. This guard was silent, and the arithmetic exposed
 			 * it -- Crash Cove reported leaves=273/504 with excl=174, leaving
 			 * 57 leaves belonging to neither bucket and no line saying where
 			 * they went. An empty leaf is legitimate asset data, but "silently
 			 * absent" and "legitimately empty" have to be distinguishable in
-			 * the log, because the whole point of this session's work is
+			 * the log, because the whole point of this accounting is
 			 * telling missing geometry from geometry that was never there. */
 			leavesSkippedEmpty++;
 			continue;
@@ -2748,21 +2688,19 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				 * measured track builds ~44k verts; refuse past the format
 				 * limit rather than wrap.
 				 *
-				 * s30: counted explicitly rather than "logged via the vert
+				 * Counted explicitly rather than "logged via the vert
 				 * count below". Keeping animated-vertex leaves adds roughly a
 				 * tenth more geometry, which moves 44k nearer to 65535 without
 				 * reaching it -- and a silent `continue` here would present as
 				 * faces quietly missing from the track, i.e. the exact defect
-				 * this change exists to remove, wearing a different hat. This
-				 * session has already been fooled three times by a cap sitting
-				 * at its own value with nothing saying so. */
+				 * this guard exists to catch. */
 				if (s_trackMesh.vertCount + 4 > 0xffff)
 				{
 					facesDroppedIndexCap++;
 					continue;
 				}
 
-				/* Allocation capacity guard (s27 review finding): the flat
+				/* Allocation capacity guard: the flat
 				 * buffers are sized for a PARTITION of the quadblock array;
 				 * overlapping leaf ranges could exceed it. Never write past. */
 				if (((size_t)s_trackMesh.vertCount + 4 > maxVerts) || ((size_t)s_trackMesh.indexCount + 12 > maxIndices))
@@ -2836,7 +2774,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					u32 dstIndex = s_trackMesh.vertCount++;
 					struct NativeTrackVert *dst = &s_trackMesh.verts[dstIndex];
 
-					/* s30: remember which LevVertex this came from, so the
+					/* Remember which LevVertex this came from, so the
 					 * per-frame patcher can re-read a moving one. Set BEFORE the
 					 * weld snap below, which may revoke it. */
 					s_trackMesh.srcVert[dstIndex] = block->index[gridSlot];
@@ -2926,7 +2864,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					idx[0] = (u16)(baseVert + triGrid[0]);
 					idx[1] = (u16)(baseVert + triGrid[2]);
 					idx[2] = (u16)(baseVert + triGrid[1]);
-					/* s43 backface culling: reverse-wound copy so a triangle
+					/* Backface culling: reverse-wound copy so a triangle
 					 * survives GPU_CULL_BACK from EITHER side. Triangle faces
 					 * wind inconsistently vs quads (owner: they all pinholed
 					 * under culling), and retail's per-face NCLIP cull is
@@ -2953,7 +2891,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 					if (doubleSided)
 					{
-						/* s43 backface culling: reverse-wound copies so a
+						/* Backface culling: reverse-wound copies so a
 						 * DOUBLE-SIDED quad shows from both sides under
 						 * GPU_CULL_BACK. Retail always draws double-sided faces
 						 * regardless of facing (the bit means exactly "don't cull
@@ -2984,7 +2922,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		}
 		else
 		{
-			/* s30, and the last hole in the accounting: a leaf that was NOT
+			/* The last hole in the accounting: a leaf that was NOT
 			 * excluded, NOT empty, and still contributed nothing. Crash Cove
 			 * reported 273 resident of 504 with 174 excluded and 0 empty --
 			 * 57 leaves belonging to no bucket at all. They are these: every
@@ -3001,7 +2939,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	}
 
 	/*
-	 * s30: collect the resident vertices that need a per-frame refresh, now
+	 * Collect the resident vertices that need a per-frame refresh, now
 	 * that both the emit loop (which set provenance) and the weld snap (which
 	 * revokes it) have run. Built once per level, walked per frame -- the
 	 * alternative, testing animMark inside the frame loop, would mean keeping
@@ -3063,7 +3001,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	free(animMark);
 	free(weldTable);
 
-	/* Rung 2a: atlas layout over the interned texture table. Plain refs
+	/* Atlas layout over the interned texture table. Plain refs
 	 * contribute their near layout; AnimTex refs contribute EVERY frame's
 	 * near layout (all frames live in the atlas -- design 4.1), with the
 	 * texRef translation pointing at the active frame's rect. */
@@ -3074,7 +3012,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 	int atlasAnimFrames = 0;
 
-	/* s30: every frame's rect index is kept now, not just the active one --
+	/* Every frame's rect index is kept, not just the active one --
 	 * without them the resident renderer can only ever show the frame that
 	 * happened to be up at load, which is why turbo pads and waterfalls sit
 	 * frozen. Allocated lazily and capped; running out is a degrade (that
@@ -3179,12 +3117,12 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 #if defined(__3DS__)
 	int trackAtlasOk = NativeTrackAtlas_UploadToBackend(mesh, numQuadBlock, numVertex);
-	/* Rung 3a step 2: geometry upload shares the atlas's own withhold-latch-
+	/* Geometry upload shares the atlas's own withhold-latch-
 	 * on-failure contract (below) -- a transient linearAlloc shortfall
 	 * retries the WHOLE build next frame, same as the atlas's documented
 	 * linear-heap pressure case, rather than latching a level with no
 	 * resident geometry uploaded. */
-	/* Rung 3b: bin BEFORE the geometry upload, because binning rewrites the
+	/* Bin BEFORE the geometry upload, because binning rewrites the
 	 * index buffer (and leafRanges with it) and the upload is what hands that
 	 * buffer to the GPU. It must also come AFTER the atlas upload above, which
 	 * clears atlasUnit on any rect it skipped. Shares the same
@@ -3205,7 +3143,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * pressure) also withholds the latch so the WHOLE build -- mesh and
 	 * atlas together -- retries next frame, same contract as the
 	 * calloc-failure paths above; permanent per-rect skips (oversize,
-	 * unresolved unit) do not withhold it (review finding #4). */
+	 * unresolved unit) do not withhold it. */
 #if defined(__3DS__)
 	if (trackAtlasOk && trackGeomOk)
 #endif
@@ -3254,7 +3192,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 #endif
 
 #if defined(CTR_NATIVE_TRACK_BAKE_EXPORT) && CTR_NATIVE_TRACK_BAKE_EXPORT
-	/* Track bake pre-export (s38): serialize THIS builder's latched output --
+	/* Track bake pre-export: serialize THIS builder's latched output --
 	 * never a re-derivation of it -- so re-baking after any builder fix is
 	 * automatic and a baked file can never drift from the live path. Value
 	 * types only: texture-table entries are heap POINTERS live, so the file
@@ -3436,8 +3374,8 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 }
 
 /*
- * Read-only accessor surface (include/platform/native_track_mesh.h), rung 3a
- * step 1. Everything below is a plain read of state NativeTrackMesh_Frame
+ * Read-only accessor surface (include/platform/native_track_mesh.h).
+ * Everything below is a plain read of state NativeTrackMesh_Frame
  * above already owns and validates -- no new invariants, no new failure
  * modes. This is the only part of this file another translation unit (the
  * frame recorder, platform/native_track_frame.c) is meant to touch; every
@@ -3472,7 +3410,7 @@ int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirst
 	return 1;
 }
 
-/* Rung 3b: which atlas unit this range samples. Values at or above the unit
+/* Which atlas unit this range samples. Values at or above the unit
  * count mean "no placed texture" -- the draw side must leave texturing off for
  * those rather than binding a stale unit. */
 unsigned NativeTrackMesh_LeafAtlasBin(unsigned i, int wantPass2)
@@ -3567,7 +3505,7 @@ int NativeTrackMesh_LeafIndexForBsp(unsigned bspIndex)
 	/* bspIndex arrives from the game's own per-frame render-list traversal
 	 * (a BSP node index), not something this file bounds itself -- check it
 	 * against bspNodeCount, the element count THIS ALLOCATION was actually
-	 * sized for at build time (review fix: builtFor->numBspNodes read live
+	 * sized for at build time (builtFor->numBspNodes read live
 	 * here could silently drift from what bspToLeafIndex was sized for if a
 	 * level reloads into the same mesh_info arena slot with a different bsp
 	 * node count -- bspNodeCount only ever changes alongside the allocation

@@ -53,13 +53,10 @@
 #define MODELCENSUS_COMP_VERTEX  3
 
 /*
- * LOD rungs reported separately (s30 rung 0). RenderBucket_SelectModelHeader
- * (game/RenderBucket/RenderBucket_QueueExecute.c:1264) walks model->headers[]
- * in order and takes the first whose maxDistanceLOD exceeds the projected
- * distance, so header index IS the rung; InstDrawPerPlayer's own comment calls
- * lodIndex "(0,1,2,3)". Anything past that is bucketed rather than dropped, so
- * a model with more rungs than expected shows up as a number instead of
- * silently skewing rung 3.
+ * LOD rungs reported separately. RenderBucket_SelectModelHeader (game/RenderBucket/
+ * RenderBucket_QueueExecute.c:1264) walks model->headers[] in order and takes the first whose
+ * maxDistanceLOD exceeds the projected distance, so header index IS the rung. Anything past
+ * MODELCENSUS_MAX_RUNGS is bucketed rather than dropped.
  */
 #define MODELCENSUS_MAX_RUNGS 4
 
@@ -100,12 +97,9 @@ struct NativeModelCensusTotals
 	unsigned suspectFrameSizes;
 
 	/*
-	 * s30 rung 0 -- topology, from platform/native_model_mesh.c. Separate from
-	 * everything above: those fields are about whether ANIMATION DATA fits in
-	 * memory (the question the morph-target plan turned on), these are about
-	 * how much GEOMETRY a frame draws (the question the PICA-native plan turns
-	 * on). They are counted in the same walk only because it already has the
-	 * deduped model population.
+	 * Topology fields, from platform/native_model_mesh.c. Separate from the fields above: those
+	 * are about whether animation data fits in memory, these are about how much geometry a frame
+	 * draws. Counted in the same walk only because it already has the deduped model population.
 	 */
 	unsigned meshStatic;
 	unsigned meshAnimated;
@@ -126,8 +120,7 @@ static struct Level *s_censusLastLevel = NULL;
 
 /*
  * Content fingerprint, latched alongside the pointer. Two bugs made this
- * necessary and neither is hypothetical -- both were caught in attract runs
- * while building the s30 topology report on top of this census.
+ * necessary and neither is hypothetical -- both were caught in attract runs.
  *
  * 1. The Level allocation is REUSED across loads, so a pointer-only latch
  *    reported the first level of a session and then went quiet for every level
@@ -145,8 +138,8 @@ static struct Level *s_censusLastLevel = NULL;
  *    and this project has lost whole sessions to exactly that shape of error.
  *
  * So the latch is the level's own CONTENT, the same answer native_track_mesh.c
- * reached for the same reason (pointer + numQuadBlock/numVertex fingerprint,
- * s27 review finding). The ID is read at report time and only tags the output;
+ * reached for the same reason (pointer + numQuadBlock/numVertex fingerprint).
+ * The ID is read at report time and only tags the output;
  * it never decides whether to report, so it cannot lead the data it labels.
  */
 struct NativeModelCensusFingerprint
@@ -300,7 +293,7 @@ static unsigned NativeModelCensus_HeaderVerts(const struct ModelHeader *mh, unsi
 }
 
 /*
- * Topology half (s30 rung 0). Folds one header's command-list scan into the
+ * Topology half. Folds one header's command-list scan into the
  * per-rung totals. `rung` is the header's index within its Model, which is
  * exactly the lodIndex RenderBucket_SelectModelHeader would assign it.
  */
@@ -465,7 +458,7 @@ static void NativeModelCensus_Print(const char *tag, int levelID, const struct N
 	unsigned storedKiB = (t->storedPlainBytes + t->storedCompressedBytes) / 1024u;
 	unsigned gpuKiB = (t->gpuPlainBytes + t->gpuCompBytes) / 1024u;
 
-	/* lvl= on every line for the same reason [TRKMESH] gained it in s29: these
+	/* lvl= on every line for the same reason [TRKMESH] gained it: these
 	 * blocks now print once per level rather than once per session, and an
 	 * untagged number in a rotation log is a number nobody can attribute. */
 	Platform_Log("[MODELCENSUS] lvl=%d %s models=%u headers=%u anims=%u(plain %u) frames=%u verts=%u\n", levelID, tag, t->models, t->headers, t->anims,
@@ -475,15 +468,11 @@ static void NativeModelCensus_Print(const char *tag, int levelID, const struct N
 }
 
 /*
- * s30 rung 0 topology report. Split out from the byte report above because the
- * two answer different questions and mixing them is how the first version of
- * this file produced a doubled memory figure nobody could interpret.
- *
- * Read the rung columns as the price list for "racers use their multiplayer
- * models": rung 0 is what a close instance draws today, rung 1 what it would
- * draw one step down. The per-frame [MODELFRAME] line is what says how many
- * instances are actually sitting on each rung -- these totals are the whole
- * population, drawn or not.
+ * Topology report, split out from the byte report above because the two answer different
+ * questions. Read the rung columns as the price list for "racers use their multiplayer models":
+ * rung 0 is what a close instance draws today, rung 1 what it would draw one step down. The
+ * per-frame [MODELFRAME] line says how many instances actually sit on each rung -- these totals
+ * are the whole population, drawn or not.
  */
 static void NativeModelCensus_PrintMesh(const char *tag, int levelID, const struct NativeModelCensusTotals *t)
 {
@@ -504,37 +493,18 @@ static void NativeModelCensus_PrintMesh(const char *tag, int levelID, const stru
 }
 
 /*
- * Player-count gating (s30 rung 0, owner-requested).
- *
- * Bits 0-3 of Instance.flags are a per-instance visibility set indexed by
- * player count, not the "collision?" the decomp's comment guesses at:
- * RenderBucket_QueueDraw tests `inst->flags & lodMask` and returns early when
- * it is clear (RenderBucket_QueueExecute.c:2053), where lodMask is
- * sdata->LOD[] = {1,2,4,4,8,8,8,8} indexed by player count, or by
- * (players | 4) for Time Trial and Relic Race (regionsEXE.h:3209). So:
+ * Player-count gating. Bits 0-3 of Instance.flags are a per-instance visibility set indexed by
+ * player count: RenderBucket_QueueDraw tests `inst->flags & lodMask` (RenderBucket_QueueExecute.c:2053),
+ * lodMask = sdata->LOD[] = {1,2,4,4,8,8,8,8} indexed by player count, or (players | 4) for Time Trial
+ * and Relic Race (regionsEXE.h:3209):
  *
  *   bit 0 = drawn in 1P    bit 1 = drawn in 2P
  *   bit 2 = drawn in 3P/4P bit 3 = drawn in Time Trial / Relic Race
  *
- * This is the mechanism behind the observation that started this report --
- * Polar Pass's frozen polar bear is absent in multiplayer. `droppedAt4P` below
- * is therefore the price list for the reverse trade: running 1P with the 4P
- * mask would drop exactly these instances, and their triangle count is what
- * that would buy.
- *
- * First measured examples, for what the population actually looks like:
- * Roo's Tubes drops 17 mushrooms (flags 0x0b -- present in 1P, 2P and Time
- * Trial, absent only at 3P/4P) for 933 triangles; Tiger Temple drops 10
- * torches for 428; Crash Cove drops nothing but the three CTR letter tokens
- * (flags 0x09), which are gameplay pickups and not a candidate for removal.
- * So the lever is real, it is decorative scenery, and it is track-dependent.
- *
- * Read from InstDef rather than the live Instance deliberately: INSTANCE_
- * LevInitAll copies InstDef bytes [0,0x20) plus three more words to
- * Instance+8, which lands InstDef.flags (0x20) exactly on Instance.flags
- * (0x28), so these ARE the flags QueueDraw tests -- and the InstDef array is
- * walkable at level load without depending on instance-pool allocation having
- * succeeded.
+ * Read from InstDef rather than the live Instance: INSTANCE_LevInitAll copies InstDef bytes [0,0x20)
+ * plus three more words to Instance+8, landing InstDef.flags (0x20) on Instance.flags (0x28), so these
+ * ARE the flags QueueDraw tests -- and InstDef is walkable at level load without depending on
+ * instance-pool allocation having succeeded.
  */
 static void NativeModelCensus_ReportGating(struct Level *level, int levelID)
 {

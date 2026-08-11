@@ -4,58 +4,34 @@
 #include <macros.h>
 
 // Per-frame camera + visibility snapshot for the native track renderer's draw
-// side (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b, rung 3a). Ladder step 1
-// only RECORDS this snapshot and counts what it would draw -- no pixels move
-// yet; step 2 (a later task) consumes NativeTrackFrame_ForWalk() to actually
-// project and draw the resident mesh.
+// side (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b). Recording only counts
+// what it would draw -- no pixels move here; NativeTrackDraw_IssueForWalk
+// (declared below) consumes NativeTrackFrame_ForWalk() to project and draw
+// the resident mesh.
 //
-// Double-buffered like the GTE capture side table (platform/native_gte_capture.c),
-// but NOT identically -- a review of step 1 found the first cut copied GTE
-// capture's "who writes while the walk reads" reasoning without noticing that
-// reasoning alone is incomplete here, and shipped a real bug as a result (see
-// the correction below). The actual protocol:
-//   - NativeTrackFrame_Record (called once per frame from the 1P gate in
-//     RenderAllLevelGeometry) writes s_trackFrameBuf[write].
-//   - NativeTrackFrame_PublishForWalk (called from EVERY DrawOTag, same site
-//     as GTECapture_PublishForWalk) sets read = write. That's ALL it does now.
-//   - NativeTrackFrame_Clear (called from MainFrame_ResetDB, same site as
-//     GTECapture_Clear) does the flip: write ^= 1, then invalidates the NEW
-//     write buffer (valid = 0).
-//   - The walk -- main thread on PC, core-2 worker on 3DS render-thread
-//     builds -- only ever touches s_trackFrameBuf[read].
-//
-// THE BUG THE ORIGINAL VERSION OF THIS COMMENT MISSED: DrawOTag runs from far
-// more than the 1P race path -- FMV (game/230/MM_Video.c), the error screen
-// (game/CTR/CTR_Error.c), and load-time clears (game/MAIN/MainInit.c) all call
-// it, and NONE of them call NativeTrackFrame_Record first. The original design
-// had PublishForWalk itself do "read = write; write ^= 1", reasoning only
-// about concurrent access (game thread writes one buffer, worker reads the
-// other, DrawSync fences the handoff) and never asking what happens when a
-// frame publishes WITHOUT recording. Answer: nothing ever invalidated the
-// buffer, so the LAST race frame's snapshot stayed `valid = 1` forever,
-// including under the results screen, the next FMV, and so on -- a frozen
-// race track drawn permanently once step 2 exists to consume it. Moving the
-// flip-and-invalidate to the SAME reset boundary GTECapture_Clear uses (not
-// to publish) is what actually closes that gap: every frame that doesn't
-// record between one ResetDB and the next is guaranteed to publish a
-// still-invalid buffer, whether or not that frame ever calls DrawOTag.
-//
-// Two slots are enough because only one walk is ever in flight: the game's
-// own DrawSync fence guarantees the previous walk has finished reading a
-// buffer before the next MainFrame_ResetDB flips it -- the same argument
-// native_gte_capture.c's design comment (lines 21-22) makes for its own
-// double buffer.
+// Double-buffered like the GTE capture side table (platform/native_gte_capture.c).
+// Protocol:
+//   - NativeTrackFrame_Record (1P gate, RenderAllLevelGeometry) writes s_trackFrameBuf[write].
+//   - NativeTrackFrame_PublishForWalk (every DrawOTag, same site as GTECapture_PublishForWalk)
+//     only sets read = write.
+//   - NativeTrackFrame_Clear (MainFrame_ResetDB, same site as GTECapture_Clear) does the flip:
+//     write ^= 1, then invalidates the new write buffer (valid = 0). This must live in Clear,
+//     not PublishForWalk, because DrawOTag also runs from FMV/error-screen/load-time-clear paths
+//     that never call Record; only Clear's invalidate keeps those frames from republishing a
+//     stale valid=1 buffer.
+//   - The walk (main thread on PC, core-2 worker on 3DS render-thread builds) only ever touches
+//     s_trackFrameBuf[read].
+// Two slots suffice because only one walk is ever in flight: DrawSync fences the previous walk's
+// read before the next ResetDB flips the buffer, the same argument native_gte_capture.c makes for
+// its own double buffer.
 
 // Ceiling on visible resident leaves recorded per frame. Sized from the mesh
 // builder's own ceiling (NativeTrackLeafRange is allocated mesh->numBspNodes
-// entries -- every BSP node could theoretically be a resident leaf), but real
-// tracks measure far below that: the s27 [TRKMESH] census across the whole
-// attract rotation never reported more than a few hundred resident leaves on
-// any track. 1024 is headroom, not a tight fit; overflow past it is counted
-// in droppedLeaves rather than silently truncated (a recurring finding class
-// in this project is overflow being invisible until someone notices missing
-// content -- this counter exists so it shows up in the [TRKFRAME] line
-// instead).
+// entries), but real tracks measure far below that: the [TRKMESH] census
+// across the attract rotation never reported more than a few hundred
+// resident leaves on any track. 1024 is headroom, not a tight fit; overflow
+// past it is counted in droppedLeaves rather than silently truncated, so it
+// shows up in the [TRKFRAME] line.
 #define NATIVE_TRACK_FRAME_MAX_LEAVES 1024
 
 struct NativeTrackFrameSnapshot
@@ -119,16 +95,16 @@ struct NativeTrackFrameSnapshot
 
 // Runtime toggle, three states (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12b):
 //   0 = off. Retail path draws the track exactly as today. Record() still
-//       runs every frame (cheap, count-only at ladder step 1) but leaves
-//       `valid` at 0, so a step-2 draw consumer must treat state 0 as "draw
+//       runs every frame (cheap, count-only) but leaves
+//       `valid` at 0, so the draw consumer must treat state 0 as "draw
 //       nothing from here", not "draw whatever happens to be in the buffer".
-//   1 = on. Resident path REPLACES the retail track draw (step 2).
+//   1 = on. Resident path REPLACES the retail track draw.
 //   2 = both. Resident path draws IN ADDITION TO the retail draw -- a
 //       diagnostic overlay so a wrong projection ("track draws somewhere
 //       else") is visually distinguishable from nothing drawing at all
 //       ("track doesn't draw"), which state 1 alone cannot tell apart.
-// Step 1 wires the toggle and its plumbing only -- states 1 and 2 don't yet
-// differ in what's drawn, because nothing is drawn on any platform yet.
+// NativeTrackFrame_SkipRetailDraw returns true only for state 1 -- that is
+// what makes 1 REPLACE the retail draw and 2 OVERLAY it.
 // Declared here (not static) so n3ds_backend.c's dumpreq/button handlers and
 // native_platform.c's PC argv/key surface -- all outside this file -- can
 // reach it via a plain `extern int`, the same idiom every other runtime
@@ -172,18 +148,11 @@ void NativeTrackFrame_Clear(void);
 // NativeTrackFrame_Clear all leave a published buffer with valid=0.
 const struct NativeTrackFrameSnapshot *NativeTrackFrame_ForWalk(void);
 
-// Rung 3a step 2 (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b): the
-// CPU-side per-frame draw issuer. Reads NativeTrackFrame_ForWalk()'s
-// snapshot, composes the camera projection rows the shader needs, and
-// issues one N3DS_TrackDraw_Leaf per visible resident leaf with its own
-// per-leaf OT-bucket depth-range uniform -- see native_track_frame.c's own
-// comment for the full derivation. 3DS-only (CTR_NATIVE_TRACK_RENDERER &&
-// __3DS__); does not exist otherwise, matching this file's existing
-// contract that nothing calls these functions when the gate is compiled
-// out. Called from NativeRenderer_EndScene (platform/n3ds/native_renderer_3ds.c)
-// via the same inline-extern-forward-declare idiom
-// game/MAIN/MainFrame_RenderFrame.c already uses for NativeTrackFrame_Record
-// above -- main.c's unity order includes the 3DS renderer BEFORE this file.
+// The CPU-side per-frame draw issuer (docs/NATIVE_TRACK_RENDERER_DESIGN.md
+// 4.2/4.3/12b). Reads NativeTrackFrame_ForWalk()'s snapshot, composes the
+// camera projection rows the shader needs, and issues one N3DS_TrackDraw_Leaf
+// per visible resident leaf with its own per-leaf OT-bucket depth-range
+// uniform. 3DS-only (CTR_NATIVE_TRACK_RENDERER && __3DS__).
 void NativeTrackDraw_IssueForWalk(void);
 
 #endif

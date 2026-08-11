@@ -41,7 +41,7 @@ int NativeGpu_GetStateSize(void);
 int NativeGpu_CaptureState(void *dst, int dstSize);
 int NativeGpu_RestoreState(const void *src, int srcSize);
 
-// Track-renderer accessor (rung 3a, docs/NATIVE_TRACK_RENDERER_DESIGN.md 12):
+// Track-renderer accessor (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12):
 // per-draw CPU-side lookup of the bucket->ordinal table recorded during the
 // OT walk. Returns 0 -- nothing written to the outputs -- unless ALL of:
 // the recorder was latched active for the walk that most recently ran
@@ -54,7 +54,7 @@ int NativeGpu_RestoreState(const void *src, int srcSize);
 // *outWalkOtCount valid.
 int NativeGpu_GetOtBucketOrdinal(u32 slotIdx, u16 *outOrdinal, u32 *outWalkOtCount);
 
-// Track-renderer accessor (rung 3a depth-compose fix, docs/
+// Track-renderer accessor (docs/
 // NATIVE_TRACK_RENDERER_DESIGN.md 4.3): the lowest OT bucket index that held
 // real primitive content during the last walk the recorder ran for. Buckets
 // nearer than every real primitive this frame emitted (e.g. bucket 0, which
@@ -71,7 +71,7 @@ int NativeGpu_GetOtBucketOrdinal(u32 slotIdx, u16 *outOrdinal, u32 *outWalkOtCou
 // Returns 1 otherwise, with *outMinContentBucket valid.
 int NativeGpu_GetMinContentBucket(u32 *outMinContentBucket);
 
-// DIAGNOSTIC ONLY (uncommitted rung 3a occlusion investigation, no behavior
+// DIAGNOSTIC ONLY (uncommitted occlusion investigation, no behavior
 // change): read-only view of this frame's highest STAMPED emit ordinal, for
 // comparing the track renderer's own bucket->ordinal lookups against where
 // the packet path's stamping actually landed this same frame -- if the

@@ -144,13 +144,12 @@ void N3DS_C3DBeginFrame(void);
 void N3DS_C3DEndFrame(void);
 
 /*
- * s36 CPU-vs-GPU split: citro3d free-runs two per-frame timers -- processing
- * time (C3D_FrameBegin..C3D_FrameEnd on the submitting thread, i.e. the whole
- * worker frame including packet replay) and drawing time (PICA hardware
- * execution, stamped when the GX queue drains). The backend accumulates both
- * across frames; this fetches the window averages in integer microseconds and
- * resets. frames is the backend's own count -- it can differ from the [PERF]
- * window's 64 (menus, loads), so it's reported rather than assumed.
+ * citro3d free-runs two per-frame timers -- processing time
+ * (C3D_FrameBegin..C3D_FrameEnd, i.e. the whole worker frame including
+ * packet replay) and drawing time (PICA hardware execution, stamped when the
+ * GX queue drains). This fetches the window averages in integer microseconds
+ * and resets. frames is the backend's own count -- it can differ from the
+ * [PERF] window's 64 (menus, loads), so it's reported rather than assumed.
  */
 void N3DS_C3DGpuTimeWindow(int *cpuUs, int *gpuUs, unsigned *frames);
 
@@ -158,7 +157,7 @@ void N3DS_C3DGpuTimeWindow(int *cpuUs, int *gpuUs, unsigned *frames);
  * Cost of the SD-log flush inside N3DS_DebugLog, since the last call (which
  * resets). The flush is throttled to ~2s -- the same cadence as the [PERF]
  * window -- so if it is expensive it lands as exactly one monster frame per
- * window, which is what the 2026-08-06 Tubes log shows.
+ * window.
  */
 void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count);
 
@@ -167,7 +166,7 @@ void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count);
  * Depth-layered stereoscopic 3D (PORT_FEASIBILITY_3DS.md "Stereoscopic 3D",
  * Option A grown into per-vertex parallax): the physical 3D slider drives a
  * per-eye horizontal shift computed in all three vertex programs from the
- * shared view.z depth axis the s28-s33 depth campaign built. The left eye is
+ * shared view.z depth axis. The left eye is
  * the ordinary frame (drawn with the left eye's negative parallax when the
  * slider is up, zero when it is down); the right eye is a REPLAY of the same
  * frame's already-recorded draws -- merge-bin emits by (baseVertex, count)
@@ -204,36 +203,23 @@ void N3DS_StereoRenderRightEye(void);
  * of them actually executes. N3DS_C3DAppendVertices therefore writes each
  * caller's vertices into the NEXT free region of one persistent buffer and
  * returns where they landed; the caller must draw from that returned offset,
- * not 0. (A real bug from getting this wrong, found and fixed 2026-07-19:
- * an earlier version always wrote to offset 0 and always drew from offset 0,
- * on the mistaken assumption that C3D_FRAME_SYNCDRAW's frame-to-frame block
- * also serialised draws within one frame -- it doesn't. Every draw ended up
- * reading whichever run's vertices were written last, since GPU execution
- * only happens after ALL of a frame's CPU-side writes are already done.)
+ * not 0. C3D_FRAME_SYNCDRAW's frame-to-frame block does NOT serialise draws
+ * within one frame -- writing to and drawing from a fixed offset both work
+ * only if nothing else appends first, since GPU execution happens only
+ * after all of a frame's CPU-side writes are done.
  * N3DS_C3DBeginFrame resets the write cursor to 0 every frame.
  *
- * SIZING -- corrected 2026-07-19. This budget covers a whole FRAME, but the
- * PC ceiling it was originally copied from (MAX_VERTEX_BUFFER_SIZE, 65536)
- * is per DrawAllSplits PASS, not per frame. DrawOTag calls DrawAllSplits
- * once (native_gpu.c:856) and DrawSync can call it twice more (:1934,
- * :1954); every pass refills s_gpu.vertexBuffer from scratch and calls
- * UpdateVertexBuffer again, so PC's ceiling resets up to three times a
- * frame where this cursor resets only once. Matching PC's number therefore
- * under-budgeted a frame by up to 3x -- and the overflow was SILENT:
- * N3DS_C3DAppendVertices returns -1 and N3DS_FlushRun drops the run, so
- * geometry vanished with no error, no log line, nothing on screen. Budget
- * the true worst case instead, and report a high-water mark so the real
- * figure stops being a guess.
+ * This budget covers a whole FRAME. DrawOTag calls DrawAllSplits once and
+ * DrawSync can call it up to two more times, so a naive per-pass ceiling
+ * (PC's MAX_VERTEX_BUFFER_SIZE) would under-budget a frame by up to 3x;
+ * overflow is silent (N3DS_C3DAppendVertices returns -1, N3DS_FlushRun drops
+ * the run) so the budget must cover the true worst case and report a
+ * high-water mark.
  *
- * MEASURED 2026-07-19: peak occupancy in menu/attract content is 2937
- * vertices -- about 4% of the figure below, with zero dropped runs. So the
- * under-budgeting described above was real in principle but never actually
- * fired, and it is NOT the cause of any missing geometry seen so far.
- * Keeping PC's own 65536 (22x the observed peak) rather than inflating to
- * the 3x worst case, which would cost 4MB of linear memory to buy headroom
- * nothing has ever needed. The real defect was that overflow was SILENT;
- * droppedRuns below makes it loud, so if race content ever does exceed
- * this, it reports itself instead of quietly deleting models.
+ * Peak measured occupancy stays well under this budget (single-digit
+ * percent), so the ceiling is sized for the theoretical worst case, not
+ * observed content; overflow reporting (droppedRuns) exists so real content
+ * that does exceed it is loud instead of silently dropping geometry.
  *
  * Do NOT "fix" a future overflow by resetting the cursor per pass. Every
  * draw queued this frame is still unexecuted until C3D_FrameEnd, so reusing
@@ -259,22 +245,16 @@ int N3DS_C3DFrameVertexHighWater(void);
 /* CPU-decoded-texture cache backing store (design doc section 1), organised
  * as a small number of shared texture atlases rather than one dedicated
  * texture per decoded (page,clut,format) combo. Each atlas is a fixed
- * GPU_RGBA5551 texture (2026-07-20, was GPU_RGBA8 -- see N3DS_TILE_BYTES in
+ * GPU_RGBA5551 texture (see N3DS_TILE_BYTES in
  * n3ds_backend.c), nearest-filtered, clamped, holding a grid of
  * N3DS_DECODE_TEXTURE_DIM-sized cells; native_renderer_3ds.c owns cache-
  * replacement policy (which (page,clut,format) is decoded into which
  * (atlas,cell)) and calls UploadDecodedCell to overwrite one cell's content.
  *
- * Why atlases, not one texture per entry (2026-07-19, added after the first
- * real-content Azahar run measured ~150-290 separate draw calls/frame): PC's
- * AddSplit doesn't split by page/clut (native_gpu.c:895-901), so one PC
- * scene commonly touches many (page,clut) combos in an interleaved triangle
- * stream; citro3d can only bind one texture per draw, so without atlasing
- * every combo change forces a new bind+draw. Multiple combos sharing one
- * atlas need only ONE bind+draw for the whole run, addressed via UV offset
- * into the right cell -- draw ORDER is unchanged either way (no reordering,
- * no sorting), which matters because this renderer has no depth test enabled
- * (same as PC) and relies entirely on draw order for correct layering.
+ * Why atlases, not one texture per entry: PC's AddSplit doesn't split by
+ * page/clut, so one scene commonly touches many (page,clut) combos in an
+ * interleaved triangle stream; citro3d can bind only one texture per draw,
+ * so without atlasing every combo change forces a new bind+draw.
  *
  * N3DS_ATLAS_DIM is 1024 because citro3d's own checkTexSize caps any single
  * texture at 1024x1024 -- confirmed directly against citro3d's upstream
@@ -292,43 +272,18 @@ int N3DS_C3DFrameVertexHighWater(void);
  * per-call input) must already be tiled the same way a whole-texture upload
  * would need to be. */
 /*
- * CAPACITY, measured 2026-07-19. With 2 atlases (32 cells, 31 usable) real
- * track content evicted 2472 cells in a single 32-frame window -- 77 per
- * frame, i.e. the whole cache replaced ~2.5x every frame. That one number
- * caused BOTH visible problems at once: ~5M texel decodes/frame (the ~1fps),
- * and -- because an evicted cell is overwritten while draws referencing it
- * are still only queued -- nearly every textured triangle sampling some
- * other triangle's texture, which is what the red/green speckle was.
- * The working set is simply far larger than 31 entries, so give it room.
+ * Cell count is the binding constraint: an undersized cache causes both
+ * excessive re-decoding and eviction of cells a still-queued draw
+ * references, which reads as texture corruption. The working set is far
+ * larger than a small cell count can hold, hence the larger
+ * N3DS_ATLAS_COUNT/DIM below.
  */
 #define N3DS_DECODE_TEXTURE_DIM    256
 /*
- * 12 atlases at 2MB each (GPU_RGBA5551) = 24MB (2026-07-20, up from 8 = 16MB).
- * The boot log's own "linear free before atlases" line measured ~30169 KiB
- * (~29.5MB) free right before this allocation runs -- 8 atlases only ever used
- * 16MB of that, leaving ~14MB sitting unused. That headroom was never revisited
- * after the RGBA8->RGBA5551 switch that halved atlas cost; the "8 atlases
- * (32MB) does NOT allocate" note two paragraphs below is about the OLD, twice
- * -as-large RGBA8 format and stopped being the real ceiling once atlases got
- * cheaper. 12 leaves ~5.5MB of margin below the observed free figure, not the
- * whole thing -- if a future bump ever fails, N3DS_C3DBackend_InitialisePSX
- * logs exactly which atlas index failed and the free KiB at that point (see
- * its call to C3D_TexInit below), so this is safe to retune from real
- * boot-log numbers, not by guessing further.
- *
- * Why more atlases now, specifically (as opposed to more cells per atlas,
- * which N3DS_ATLAS_DIM's own comment says is already at citro3d's ceiling):
- * real race driving (2026-07-20, sub-page decode cache session) measured the
- * sub-page tier's capacity misses (954) dwarfing its stale misses (62) --
- * i.e. the cache is overwhelmingly serving genuinely-new content, not
- * re-decoding content that went stale. A whole race's total distinct texture
- * footprint, accumulated over the full route, exceeds any single moment's
- * working set (peak concurrent usage stayed well under budget) -- so old,
- * still-visible-from-some-angles cells get reclaimed for new track ahead
- * before they're actually done being needed, which reads as a texture
- * visibly changing as you approach new geometry. See
- * docs/SUBPAGE_DECODE_CACHE_DESIGN.md and the ctr-pc-poc-workspace memory for
- * the full diagnosis.
+ * N3DS_ATLAS_COUNT is retuned from the boot log's own "linear free before
+ * atlases" line, not guessed -- N3DS_C3DBackend_InitialisePSX logs which
+ * atlas index fails and the free KiB remaining, so that log is the source of
+ * truth for this constant, not any number recorded here.
  *
  * The old note here said "8 atlases (32MB) does NOT allocate": true, and still
  * true, but that was 8 RGBA8 atlases. The real constraint is the linear
@@ -340,19 +295,10 @@ int N3DS_C3DFrameVertexHighWater(void);
  * cells that a queued draw still pointed at. Cell count was the binding
  * constraint on both the corruption and the decode cost.
  *
- * 11, not 12, when the native track renderer is compiled in (rung 2b
- * hardening, post-Azahar validation): the dedicated track-atlas pool
- * (N3DS_TrackAtlas_Alloc, below) competes with these 12x1024x1024 atlases
- * (24MB) for the SAME linear heap, and 12 of them leaves under 1MB free --
- * observed live as `[TRKATLAS3DS] units=1/2 ... freeKiB=463`, one 512KB
- * track unit allocated with no room for the second a typical level's pack
- * needs. Every number in the CAPACITY comment above was measured WITHOUT
- * the track renderer compiled in. Dropping to 11 gives back 2MB (four
- * 512KB track units), comfortably covering the measured 1-2 units/level
- * (worst case 2 so far). This is a net win, not just a trade: once rung 3
- * draws track geometry natively, track content stops flowing through this
- * decode cache at all, so the cache needs LESS capacity under the track
- * renderer, not the same amount minus one. */
+ * 11, not 12, when CTR_NATIVE_TRACK_RENDERER is compiled in: the dedicated
+ * track-atlas pool (N3DS_TrackAtlas_Alloc, below) competes with these
+ * atlases for the same linear heap, and 12 leaves too little free for a
+ * typical level's track-atlas units. */
 #ifdef CTR_NATIVE_TRACK_RENDERER
 #define N3DS_ATLAS_COUNT           11
 #else
@@ -419,7 +365,7 @@ void N3DS_C3DBindVramDisplayTex(int slotIndex);
 /* -------------------------------------------------- native track atlas --- */
 /* Dedicated pool for the native track renderer's atlas layout
  * (platform/native_track_mesh.c, docs/NATIVE_TRACK_RENDERER_DESIGN.md
- * section 12, rung 2b). Separate from the decode-cache atlases above --
+ * section 12). Separate from the decode-cache atlases above --
  * smaller units (512x512 vs 1024x1024), matching the packer's own
  * TRACK_ATLAS_DIM -- and (re)allocated per level load rather than once at
  * boot, since the packed layout itself is computed per level from that
@@ -432,8 +378,8 @@ void N3DS_C3DBindVramDisplayTex(int slotIndex);
  * native_track_mesh.c's packer (TRACK_ATLAS_DIM/MAX_UNITS, its own file-
  * local macros) sizes the SAME pool from the other side of the plain-scalar
  * boundary and must never drift from these -- native_track_mesh.c carries a
- * compile-time check (CTR_STATIC_ASSERT) against these two exact macros
- * (review finding #5). Plain integer macros, so exposing them here is
+ * compile-time check (CTR_STATIC_ASSERT) against these two exact macros.
+ * Plain integer macros, so exposing them here is
  * ABI-safe -- no libctru type crosses the boundary. */
 #define N3DS_TRACK_ATLAS_DIM       512
 #define N3DS_TRACK_ATLAS_MAX_UNITS 8
@@ -455,16 +401,16 @@ void N3DS_TrackAtlas_Free(void);
  * construction -- AND the rect must fit inside N3DS_TRACK_ATLAS_DIM; both
  * are validated and rejected (logged, no-op) rather than trusted, since a
  * violation here would silently corrupt neighbouring tile memory instead of
- * just this rect's content (review finding #6). tiledRGBA5551 must already
+ * just this rect's content. tiledRGBA5551 must already
  * be Z-order tiled with stride wTexels/8 tiles (exactly what
  * N3DS_DecodeAndTilePage produces when called with destStrideTiles =
  * wTexels/8). */
 void N3DS_TrackAtlas_UploadRect(int unit, int dstX, int dstY, int wTexels, int hTexels, const void *tiledRGBA5551);
-/* For rung 3 (drawing). Same bind pattern as N3DS_C3DBindAtlas. */
+/* For drawing. Same bind pattern as N3DS_C3DBindAtlas. */
 void N3DS_TrackAtlas_Bind(int unit);
 
 /* -------------------------------------------------- native track draw --- */
-/* Rung 3a step 2 (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b): the
+/* docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b: the
  * resident-mesh draw path, a SECOND vertex format/shader/attribute layout
  * living alongside the packet path's N3DS_Vertex/ctr.v.pica above. Plain
  * scalars only, same TU-boundary rule as everything else in this header.
@@ -472,7 +418,7 @@ void N3DS_TrackAtlas_Bind(int unit);
  * N3DS_TrackVertex mirrors platform/native_track_mesh.c's struct
  * NativeTrackVert (16B, carries texRef/faceFlags the GPU does not need) into
  * a 14-byte GPU-side layout: model-space position, page-space UV (unused
- * until rung 3b's textured draws), and color + the signed per-face draw-order
+ * until textured draws), and color + the signed per-face draw-order
  * byte BIASED BY +128 so it can ride in an UNSIGNED byte group without
  * clashing with r/g/b's own 0..255 range (a signed GPU_BYTE group would read
  * 255 as -1 for every color channel too -- see n3ds_backend.h's own
@@ -484,7 +430,7 @@ void N3DS_TrackAtlas_Bind(int unit);
 typedef struct
 {
 	s16 x, y, z; /* offset 0 -- model space, straight from LevVertex */
-	s16 u, v;    /* offset 6 -- page-space texel coords (rung 3b) */
+	s16 u, v;    /* offset 6 -- page-space texel coords */
 	u8 r, g, b;  /* offset 10 -- color_hi */
 	u8 drawOrder; /* offset 13 -- signed per-face OT byte, biased +128 */
 } N3DS_TrackVertex;
@@ -506,7 +452,7 @@ int N3DS_TrackGeom_Upload(const void *verts, int vertCount, int vertStride, cons
 /* Called from NativeTrackMesh_Free alongside N3DS_TrackAtlas_Free -- a
  * level's only teardown path. Safe to call with nothing uploaded. */
 void N3DS_TrackGeom_Free(void);
-/* s30: rewrite `count` already-uploaded vertices' UV pairs in place, batched.
+/* Rewrite `count` already-uploaded vertices' UV pairs in place, batched.
  * uvPairs holds two shorts per entry, in the same encoding the upload wrote
  * (2x fixed point, texel centre, V flipped -- one implementation of that lives
  * in native_track_mesh.c's NativeTrackAtlas_EncodeUV and BOTH writers go
@@ -515,14 +461,14 @@ void N3DS_TrackGeom_Free(void);
  * the thread rule. This is what makes animated track textures -- turbo pads,
  * waterfalls, lava -- move under the resident renderer. */
 void N3DS_TrackGeom_PatchUV(const unsigned short *vertIndices, const short *uvPairs, int count);
-/* s30: the same in-place batched rewrite for POSITION (three shorts per entry)
+/* The same in-place batched rewrite for POSITION (three shorts per entry)
  * and COLOR (three bytes per entry) -- the animated-VERTEX case, i.e. water
  * surfaces that physically move. Kept separate from PatchUV because the two
  * populations and cadences are nothing alike; see the .c definition. */
 void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short *xyz, const unsigned char *rgb, int count);
 
 /* Begin/Leaf/End bracket one frame's resident-track draw batch, called from
- * NativeRenderer_EndScene (rung 3a step 2) immediately before the packet
+ * NativeRenderer_EndScene immediately before the packet
  * path's own merge-bin barrier flush. Begin binds the track program/
  * attribute layout/vertex+index buffer, uploads the camera compose (qx/qy/qw
  * -- platform/native_track_frame.c derives these once per frame from the
@@ -536,7 +482,7 @@ void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short
  * list. No-op (Leaf silently skips its draw) if Upload was never called or
  * last failed. */
 /* -------------------------------------------------- native model draw --- */
-/* Rung 2 of docs/NATIVE_MODEL_RENDERER_DESIGN.md: model instances drawn from
+/* docs/NATIVE_MODEL_RENDERER_DESIGN.md: model instances drawn from
  * model-space geometry through ctr_model.v.pica, on the same depth axis as the
  * packets and the resident track.
  *
@@ -573,7 +519,7 @@ void N3DS_ModelDraw_Run(int startVertex, int triangleCount, int atlasIndex, int 
 void N3DS_ModelDraw_End(void);
 
 void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, float h);
-/* atlasBin: which atlas unit these indices sample (rung 3b). At or past the
+/* atlasBin: which atlas unit these indices sample. At or past the
  * allocated unit count means no placed texture -- drawn untextured. */
 void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin, int blend, int uvDx, int uvDy);
 void N3DS_TrackDraw_End(void);
@@ -637,9 +583,9 @@ int N3DS_NetloadStreamActive(void);
  * from the renderer TU (which owns vram[]) since the backend TU can't see
  * that global. bytes is sizeof(vram). frameCounter points at the renderer's
  * frame counter (plain unsigned int, so no ABI hazard) and stamps every
- * capture filename -- fixed names cost a race capture once (2026-07-21).
- * CTR_INTERNAL-only diagnostic (texture-corruption investigation,
- * 2026-07-20); no-op otherwise. */
+ * capture filename, so consecutive captures never overwrite each other.
+ * CTR_INTERNAL-only diagnostic (texture-corruption investigation);
+ * no-op otherwise. */
 void N3DS_DebugSetVRAMForDump(const void *vram, unsigned int bytes, const unsigned int *frameCounter);
 
 /* ---------------------------------------------------------------- memory --- */

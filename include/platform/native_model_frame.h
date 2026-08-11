@@ -3,7 +3,7 @@
 
 #include <macros.h>
 
-// Per-frame instance sampler for the s30 model-renderer campaign
+// Per-frame instance sampler for the model-renderer campaign
 // (platform/native_model_frame.c). Declarations always visible; both entry
 // points are no-ops when CTR_NATIVE_MODEL_RENDERER is off, so the two call
 // sites in game/ stay single unconditional calls inside one gate rather than

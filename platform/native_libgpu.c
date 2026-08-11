@@ -471,13 +471,12 @@ uint32_t DrawSyncCallback(void (*func)(void))
 void CtrGpu_ExecDrawOTag(void *p)
 {
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
-	// s30: advance animated track textures (turbo pads, waterfalls, lava) to
+	// Advance animated track textures (turbo pads, waterfalls, lava) to
 	// the frame the game has cycled to. Deliberately HERE and not next to the
 	// PublishForWalk above -- this writes into the GPU-resident vertex block
 	// that the core-2 worker draws from, and this function IS the walk. The
 	// render queue being FIFO with a single worker is what makes "previous
-	// walk finished, next one not started" true by construction rather than by
-	// an argument about whether some other call site is a barrier.
+	// walk finished, next one not started" true by construction.
 	//
 	// Outside the retry loop below: it is idempotent (the per-chain frame latch
 	// makes a repeat a no-op), so running it once per walk rather than once per
@@ -512,10 +511,10 @@ void DrawOTag(void *p)
 	// Hand the walk the capture buffer this frame just wrote -- game thread,
 	// before the post, so the queue's own lock orders it for the worker.
 	GTECapture_PublishForWalk();
-	// s42d: same publish point for the deferred-smoke packet-address set --
+	// Same publish point for the deferred-smoke packet-address set --
 	// same game-thread-before-post ordering guarantee.
 	NativeGpu_PublishSmokePackets();
-	// s43: same publish point for the skybox packet range.
+	// Same publish point for the skybox packet range.
 	NativeGpu_PublishSkyRange();
 #endif
 
@@ -528,9 +527,8 @@ void DrawOTag(void *p)
 #endif
 
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
-	// s32 rung 1: same publish point, same ordering argument, for the model
-	// capture the rung-2 draw side will read. Nothing consumes it yet; the pair
-	// is wired now so the draw side lands as a consumer and not as plumbing.
+	// Same publish point and ordering argument for the model capture, which
+	// the model draw side (NativeModelDraw_IssueForWalk) reads on the walk.
 	NativeModelEmit_PublishForWalk();
 #endif
 

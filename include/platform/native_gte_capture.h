@@ -23,13 +23,13 @@ extern int g_dbg_gteCapture;
 
 void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOverSz3, s16 vx, s16 vy, s16 vz);
 int GTECapture_Lookup(s16 sx, s16 sy, u8 *fracX8, u8 *fracY8);
-/* s42b: store one exhaust-smoke billboard corner's depth (sz3) keyed by its
+/* Store one exhaust-smoke billboard corner's depth (sz3) keyed by its
  * truncated screen coordinate, so the packet-depth resolver HITS for a
- * driver-local smoke quad and stamps it onto the shared view.z axis instead of
- * the parse-order ordinal it would otherwise fall back to. Particles project
- * with raw gte_rtps_b and never call GTECapture_Store themselves, so without
- * this a deferred smoke draw reads as infinitely far and loses every depth
- * test. Game-thread only, same ownership as Store. See ctr-3ds-s42 spec and
+ * driver-local smoke quad and stamps it onto the shared view.z axis instead
+ * of the parse-order ordinal it would otherwise fall back to. Particles
+ * project with raw gte_rtps_b and never call GTECapture_Store themselves,
+ * so without this a deferred smoke draw reads as infinitely far and loses
+ * every depth test. Game-thread only, same ownership as Store. See
  * game/Particle.c. */
 void GTECapture_StoreParticleCorner(s16 sx, s16 sy, u16 sz3);
 /* Deferred driver-local smoke pass (native_renderer_3ds): master A/B, default
@@ -49,13 +49,13 @@ void NativeGpu_ResetDeferredSmoke(void);
 void NativeGpu_MarkSmokePacket(uintptr_t addr);
 void NativeGpu_PublishSmokePackets(void);
 void NativeGpu_ClearSmokePackets(void);
-/* s43 skybox packet-range tag (native_gpu.c). Pins DrawSky_Full's packets to
+/* Skybox packet-range tag (native_gpu.c). Pins DrawSky_Full's packets to
  * the far depth plane so translucent track geometry (the waterfalls) stops
- * losing the depth test to the sky's OT-bucket fallback. Mark: game thread, once
- * per frame, around DrawSky_Full's emit. Publish: DrawOTag, read=write before
- * the walk is posted. Clear: MainFrame_ResetDB, flip write at frame start. Same
- * double-buffer contract as the smoke tag above. Runtime A/B: dumpreq 'skyfar'
- * (default ON). */
+ * losing the depth test to the sky's OT-bucket fallback. Mark: game thread,
+ * once per frame, around DrawSky_Full's emit. Publish: DrawOTag, read=write
+ * before the walk is posted. Clear: MainFrame_ResetDB, flip write at frame
+ * start. Same double-buffer contract as the smoke tag above. Runtime A/B:
+ * dumpreq 'skyfar' (default ON). */
 extern int g_dbg_skyFar;
 void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end);
 void NativeGpu_PublishSkyRange(void);
@@ -74,44 +74,43 @@ int GTECapture_LookupDepth(s16 sx, s16 sy, u16 *outSz3);
 // crates). A kart primitive whose vertices come back carrying the camera's id
 // is reading a depth that belongs to the road it is standing on.
 int GTECapture_LookupDepthEx(s16 sx, s16 sy, u16 *outSz3, u8 *outMtxId);
-// s45 miss forensics: stale-generation probe -- was this coordinate projected
+// Miss forensics: stale-generation probe -- was this coordinate projected
 // in a recent PRIOR frame? Diagnostic only; see the definition's comment.
 int GTECapture_LookupDepthStale(s16 sx, s16 sy, u16 *outSz3, u32 *outAgeFrames);
-// s45 iteration 4: raw hash-slot occupant for a coordinate -- distinguishes
+// Miss forensics iteration 4: raw hash-slot occupant for a coordinate -- distinguishes
 // never-stored from clobbered-by-collision. See the definition's comment.
 int GTECapture_ProbeSlot(s16 sx, s16 sy, s16 *outOccX, s16 *outOccY, int *outGenState, u16 *outOccSz3);
 int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3]);
 // Model vector plus the frame-scoped matrix-state id the projection ran
-// under (s26 matrix-class probe; the retained full form's matrix classes).
+// under (matrix-class probe; the retained full form's matrix classes).
 int GTECapture_LookupModelEx(s16 sx, s16 sy, s16 outV[3], u8 *outMtxId);
 // Per projected vertex, from the GTE: the 8 contiguous CP2C words (R+TR).
 void GTECapture_NoteMatrix(const void *words8);
 // Read-buffer census: returns dominant-id Store share in percent.
 u32 GTECapture_ReadMatrixCensus(u8 *outDomId, u32 *outIdsUsed);
 
-// s32 EVICTION CENSUS -- the direct measurement of the failure this file
+// EVICTION CENSUS -- the direct measurement of the failure this file
 // already documents for the skybox (see GTECapture_SetStoreSuppressed): the
 // table holds one entry per screen coordinate, last writer wins, so a vertex
-// can overwrite ANOTHER OBJECT's depth at the same pixel and every later lookup
-// there returns a foreign value. A kart's wheels and the road beneath them
-// occupy the same screen coordinates by construction, which makes this the
-// leading candidate for the sinking racers.
+// can overwrite ANOTHER OBJECT's depth at the same pixel and every later
+// lookup there returns a foreign value. A kart's wheels and the road
+// beneath them occupy the same screen coordinates by construction, which
+// makes this the leading candidate for the sinking racers.
 //
-// Counts same-key, same-generation overwrites, split by whether the incoming
-// store's matrix state differs from the resident entry's. Returns the
-// different-matrix count (the harmful population) and clears the accumulator;
-// *outSameMtx is the benign self-overwrite count, *outMaxDz the largest sz3
-// difference any harmful overwrite introduced -- i.e. how big the lie is, in
-// the same view.z units the stamps use.
+// Counts same-key, same-generation overwrites, split by whether the
+// incoming store's matrix state differs from the resident entry's. Returns
+// the different-matrix count (the harmful population) and clears the
+// accumulator; *outSameMtx is the benign self-overwrite count, *outMaxDz
+// the largest sz3 difference any harmful overwrite introduced.
 u32 GTECapture_ReadEvictCensus(u32 *outSameMtx, u32 *outMaxDz);
 
-// s32 mechanism-1 A/B. 1 = a store may not overwrite a live entry belonging to
-// a DIFFERENT matrix state (first writer keeps the slot). Not a proposed fix --
-// first-writer-wins is as arbitrary as last-writer-wins -- but if the sink
-// responds to it at all, eviction is in the causal chain.
+// Eviction-mechanism A/B. 1 = a store may not overwrite a live entry
+// belonging to a DIFFERENT matrix state (first writer keeps the slot). Not
+// a proposed fix -- first-writer-wins is as arbitrary as last-writer-wins --
+// but if the sink responds to it at all, eviction is in the causal chain.
 extern int g_dbg_gteNoEvict;
 
-// s33 instance depth-axis bracket: retail projects RenderBucket instances on
+// Instance depth-axis bracket: retail projects RenderBucket instances on
 // a regime-scaled depth axis (x4 nearer than 0x1000 view units, /4 for far
 // DRAW_HUGE), so their SZ3 stores were 4x wrong on the shared axis and a
 // table HIT buried the instance (the miss fallback is OT-bucket-derived and
@@ -126,7 +125,7 @@ extern int g_dbg_gteNoEvict;
 struct Instance;
 struct PushBuffer;
 void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct PushBuffer *pb, s32 mvpZIfNormal, int funcKind);
-/* s41: fixed-shift variant for producers whose regime is known from source
+/* Fixed-shift variant for producers whose regime is known from source
  * rather than measured -- the ground-decal trio (shadows, skids, tires), which
  * pre-multiply camera-relative position by 4 and run outside RenderBucket.
  * Same shift encoding as the classifier (2 = divide the stored SZ3 by 4).
@@ -138,7 +137,7 @@ void GTECapture_EndInstanceDepth(void);
 extern int g_dbg_pktAxisFix;
 
 void GTECapture_Clear(void);
-// Double-buffer publish (s26): called by the DrawOTag facade on the game
+// Double-buffer publish: called by the DrawOTag facade on the game
 // thread, before the walk is posted (3DS worker) or run (PC sync) -- the walk
 // then reads the buffer the frame just finished writing, while ResetDB's
 // Clear() flips subsequent Stores to the other one.
@@ -156,21 +155,22 @@ void GTECapture_BeginOTWalk(void);
 void GTECapture_MarkOTNode(const void *node);
 int GTECapture_LookupSuppressed(void);
 
-// DEPTHLESS-GEOMETRY suppression (s32). Bracket any producer whose GTE
-// projection runs with the translation vector zeroed -- i.e. geometry drawn as
-// if infinitely far, whose SZ3 is a function of the mesh's own radius and NOT
-// of its distance from the camera. DrawSky_Full is the one such producer in
-// the game. Stores are dropped between Set(1) and Set(0); lookups for those
-// screen coordinates then miss, and the packet-depth path falls back to
-// deriving depth from the OT bucket, which IS retail's own statement of how
-// far the content is. See GTECapture_SetStoreSuppressed's definition for the
-// bug this closes.
+// DEPTHLESS-GEOMETRY suppression. Bracket any producer whose GTE
+// projection runs with the translation vector zeroed -- i.e. geometry drawn
+// as if infinitely far, whose SZ3 is a function of the mesh's own radius and
+// NOT of its distance from the camera. DrawSky_Full is the one such producer
+// in the game. Stores are dropped between Set(1) and Set(0); lookups for
+// those screen coordinates then miss, and the packet-depth path falls back
+// to deriving depth from the OT bucket, which IS retail's own statement of
+// how far the content is. See GTECapture_SetStoreSuppressed's definition
+// for the bug this closes.
 //
-// Game-thread only, same ownership as Store itself. Not a runtime toggle: the
-// suppressed population has no valid depth to capture in any configuration.
+// Game-thread only, same ownership as Store itself. Not a runtime toggle:
+// the suppressed population has no valid depth to capture in any
+// configuration.
 void GTECapture_SetStoreSuppressed(int suppressed);
 
-// AFFINE DEPTH-REMAP bracket (s39, the menu/loading checkered flag). Where
+// AFFINE DEPTH-REMAP bracket (the menu/loading checkered flag). Where
 // suppression drops a producer's depths, this bracket KEEPS them, compressed
 // to ~1/4 relief and re-anchored just behind the stereo convergence plane --
 // the flag's wave stays 3D in stereo while its band can no longer cross a

@@ -194,13 +194,10 @@ void NormalColor3(SVECTOR *v0, SVECTOR *v1, SVECTOR *v2, CVECTOR *v3, CVECTOR *v
 
 void NormalColorDpq(SVECTOR *v0, CVECTOR *v1, int p, CVECTOR *v2)
 {
-	/* &p, not p (s34): gte_lddp's macro reads MEMORY (it always has in this
-	 * port -- DpqColor below already passes &p for exactly that reason).
-	 * Passing the int by value made the old raw cast dereference p's VALUE
-	 * as an address -- latently broken since the port began, never fired
-	 * because nothing calls this; surfaced when the s34 aliasing sweep
-	 * replaced the cast with CTR_ReadU32LE and the int stopped converting
-	 * to a pointer silently. */
+	/* &p, not p: gte_lddp's macro reads MEMORY (DpqColor below already passes
+	 * &p for exactly that reason). Passing the int by value made the old raw
+	 * cast dereference p's VALUE as an address -- latently broken since the
+	 * port began, never fired because nothing calls this. */
 	gte_NormalColorDpq(v0, v1, &p, v2);
 }
 

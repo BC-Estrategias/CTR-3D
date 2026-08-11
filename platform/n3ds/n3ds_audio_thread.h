@@ -118,27 +118,21 @@ void N3DS_AudioLock(void);
 void N3DS_AudioUnlock(void);
 
 /*
- * ndsp output sink. Submit one vblank's worth of stereo PCM (interleaved
- * L,R s16 -- passed as plain short to keep this header free of game or
- * libctru types) for playback.
+ * ndsp output sink for one vblank's worth of interleaved stereo PCM (plain
+ * short, not libctru types, to keep this header platform-free).
  *
- * sampleRate is the rate the samples were PRODUCED at, not 44100 by
- * assumption: session 22 feeds the music channel XA source PCM at its own
- * 37800/18900 rate and lets the DSP resample in hardware, which deleted the
- * CPU resampler that cost 52-56ms per 16.7ms parcel on the ARM11. The
- * worker's XA path therefore submits 630 (or 315) frames at 37800 (or
- * 18900); the no-worker StepVBlank fallback still submits 735 at 44100
- * because it runs the full software mixer. Both are valid -- the sink pokes
- * ndspChnSetRate on change and counts one vblank as one "parcel" either
- * way, so the worker's cushion accounting is unit-stable across rates.
- * Exactly one of those two producers exists for the whole process lifetime.
+ * sampleRate is the rate the samples were produced at, not assumed 44100:
+ * the XA path feeds this channel source PCM at its own 37800/18900 rate and
+ * lets the DSP resample in hardware, avoiding a CPU resampler. The worker's
+ * XA path submits 630 (or 315) frames at 37800 (or 18900); the no-worker
+ * StepVBlank fallback submits 735 at 44100 (full software mixer). Exactly
+ * one producer exists per process lifetime.
  *
- * gainLeft/gainRight scale the channel (ndspChnSetMix, poked on change):
- * the XA path hands its CD+master volume here instead of multiplying every
- * sample. The fallback passes 1.0f -- its mixer already applied volume.
+ * gainLeft/gainRight scale the channel (ndspChnSetMix); the fallback passes
+ * 1.0f since its mixer already applied volume.
  *
  * frameCount must be 1..N3DS_NDSP_PARCEL_FRAMES_MAX. Returns 1 if queued, 0
- * if dropped (sink down, bad size, or pool full -- all counted).
+ * if dropped (counted).
  */
 int N3DS_NdspSubmitMusicParcel(const short *frames, int frameCount, int sampleRate, float gainLeft, float gainRight);
 
@@ -154,7 +148,7 @@ int N3DS_NdspIsUp(void);
 int N3DS_NdspGetQueuedBlocks(void);
 int N3DS_NdspGetDroppedBlocks(void);
 
-/* Sink aggregation mode receipts (session 21): cumulative counts of full
+/* Sink aggregation mode receipts: cumulative counts of full
  * 8-parcel aggregate submissions vs early anti-underrun small flushes. On
  * hardware, full >> early means the seam-rate fix actually engaged; early
  * dominating means the DSP kept running dry and the sink degenerated to
@@ -163,7 +157,7 @@ int N3DS_NdspGetDroppedBlocks(void);
 void N3DS_NdspGetFlushCounts(int *fullFlushes, int *earlyFlushes);
 
 /*
- * Hardware voices (plan B, session 20): SPU voices 0..22 play on ndsp's
+ * Hardware voices (plan B): SPU voices 0..22 play on ndsp's
  * own channels; the parcel sink above becomes the music channel (23). SPU
  * voice 23 is sacrificed (lifecycle only, denials counted). All functions
  * are called from the single mixing thread (worker, or the StepVBlank

@@ -28,11 +28,11 @@
 #define NATIVE_STR_SCRAPBOOK_FRAME_COUNT    0x1148
 /*
  * Disc-source read-ahead depth. STR consumption is strictly sequential single
- * sectors, but on 3DS a disc-image read costs ~26ms per CALL almost regardless
- * of size (session 23), so a ~190-sector FMV consumed as singles paid ~5s of
+ * sectors, but on 3DS a disc-image read costs ~26ms per CALL almost
+ * regardless of size, so a ~190-sector FMV consumed as singles paid ~5s of
  * main-thread disc time. Refilling a full chunk at a time turns that into a
- * handful of calls; sized to the chunk so one refill is exactly one disc call,
- * which keeps the str= site tally equal to actual disc calls.
+ * handful of calls; sized to the chunk so one refill is exactly one disc
+ * call, which keeps the str= site tally equal to actual disc calls.
  */
 #define NATIVE_STR_READAHEAD_SECTORS        NATIVE_DISC_IMAGE_CHUNK_SECTORS
 

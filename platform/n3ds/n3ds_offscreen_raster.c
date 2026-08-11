@@ -129,7 +129,7 @@ internal u16 OfsRast_BlendPSX(BlendMode blendMode, u16 dstColor, int srcR5, int 
  * Wipe the accumulation rect to 0x0000 -- the PC-contract session start.
  * PC clears its FBO to transparent black at enable and its flush writes the
  * WHOLE rect back unconditionally (CopyRGBAFramebufferToVRAM has no alpha
- * test -- Phase 0 check, answered 2026-07-21), so undrawn pixels become
+ * test), so undrawn pixels become
  * 0x0000: PS1's transparent-black punch-through texel, which the decal
  * billboards rely on for their background. Retail never auto-cleared
  * (isbg=0 at both call sites) but PC's wipe is the proven-good behavior the

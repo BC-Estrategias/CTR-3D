@@ -1,6 +1,6 @@
 /*
  * dfe=0 offscreen-split capture -- see include/platform/native_offscreen_capture.h
- * for the format and purpose (Phase 0 of docs/OFFSCREEN_RENDER_VRAM_DESIGN.md).
+ * for the format and purpose (see docs/OFFSCREEN_RENDER_VRAM_DESIGN.md).
  * PC only: the 3DS is the platform whose missing compositing this data exists
  * to build and verify, so it has nothing to capture.
  */
@@ -151,7 +151,7 @@ void NativeOffscreenCapture_OnAnySplit(const GrVertex *verts, int numVerts, int 
 {
 	/* A 4-vblank window, not equality: the game renders at 30fps, so any
 	 * single vblank can be the non-render half of the pair and see zero
-	 * splits (the first run of this dumped 0 triangles exactly that way). */
+	 * splits. */
 	if (!s_triDumpArmed || (s_triDumpFile == NULL) || (s_ofscapVblank < s_triDumpVblank) || (s_ofscapVblank >= s_triDumpVblank + 4))
 	{
 		return;

@@ -64,7 +64,7 @@ void NativeVramTrace_Op(const char *op, int x, int y, int w, int h, int srcX, in
  * --tri-dump <file> --tri-dump-vblank N: dump one frame's triangles as the
  * same 36-byte records the 3DS writes to sdmc:/tridump_<frame>.bin (layout
  * documented in native_renderer_3ds.c; atlas-resolution fields are -1 on
- * PC). Session 16: content dumps proved the 3DS caches byte-correct while
+ * PC). Content dumps proved the 3DS caches byte-correct while
  * the screen quilts, so the platforms must disagree on the ADDRESSING side
  * -- per-triangle page/clut/UV -- and this is the PC half of that diff
  * (tools/texdump/tridump_diff.py compares).

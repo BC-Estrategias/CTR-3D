@@ -1,39 +1,13 @@
 /*
- * native_model_mesh.c -- per-ModelHeader topology scan (s30 rung 0).
+ * native_model_mesh.c -- per-ModelHeader topology scan. Nothing here draws: walks each model's
+ * command list once and reports vertices per header, triangles per LOD rung, textures per
+ * header, and static-versus-animated.
  *
- * WHY THIS EXISTS
- *
- * s30's direction (docs/HANDOFF_s30_pica_native.md) is to stop converting
- * instanced models into PS1 packets and hand the PICA real geometry instead --
- * the treatment the track already got. Instances were measured at ~9ms in an
- * Arcade frame on hardware, and `draw_all_splits` + `draw_otag_parse` together
- * are ~28ms of a 55ms frame with none of it track.
- *
- * Nothing here draws. This walks each model's command list once and reports
- * what the eventual draw side would have to move: vertices per header,
- * triangles per LOD rung, textures per header, and static-versus-animated.
- * The project's own history is the argument for measuring first -- three of the
- * last four confident performance conclusions came from content that did not
- * exercise the thing being measured.
- *
- * WHY A SCAN IS ENOUGH
- *
- * A model's command list is frame-invariant. RenderBucket_DrawFunc_Normal
- * (game/RenderBucket/RenderBucket_QueueExecute.c:4350) walks the same stream in
- * the same order on every frame of every animation: the same strip restarts,
- * the same vertex order, the same texture per primitive. What changes per frame
- * is only the vertex POSITIONS, which are delta-decoded serially against a
- * temporal accumulator. So topology is a load-time property, and this is the
- * load-time half of the model renderer.
- *
- * WHAT THE COUNTS ARE AND ARE NOT
- *
- * `tris` is a topology maximum. The retail walk additionally drops primitives
- * that fail projection (backfacing, off-screen, degenerate) or texture lookup,
- * and both are camera-dependent -- a static scan cannot know them. The per-
- * frame sampler is what turns this into "triangles actually queued"; treating
- * this number as a frame cost would repeat the exact mistake this file exists
- * to avoid.
+ * A model's command list is frame-invariant (RenderBucket_DrawFunc_Normal walks the same stream
+ * in the same order every frame; only vertex positions change), so topology is a load-time
+ * property. `tris` is a topology maximum -- the retail walk additionally drops primitives that
+ * fail projection or texture lookup, both camera-dependent and unknowable by a static scan; the
+ * per-frame sampler is what turns this into triangles actually queued.
  *
  * Counts only -- reads model metadata, allocates nothing, changes nothing.
  */
@@ -43,12 +17,8 @@
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
 
 /*
- * A level's whole model population is a few hundred headers (the s29 census
- * reported models in the low hundreds per level across both the level array and
- * the global library), so a fixed table is right and growth is not worth the
- * allocator. Overflow is reported, never silent -- a truncated census that
- * looks complete is how "the retained-models campaign is dead" got said out
- * loud once already.
+ * A level's whole model population is a few hundred headers, so a fixed table is right and
+ * growth is not worth the allocator. Overflow is reported, never silent.
  */
 #define MODELMESH_MAX_HEADERS 2048
 

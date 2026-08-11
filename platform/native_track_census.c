@@ -1,5 +1,5 @@
 /*
- * Track censuses for the native track renderer (s27) --
+ * Track censuses for the native track renderer --
  * docs/NATIVE_TRACK_RENDERER_DESIGN.md section 7, INST-1/2/3/6.
  *
  * Read-only over the game's own level structs, once per level (keyed on the
@@ -20,7 +20,7 @@
  *           subtiles per LOD variant; sizes the dedicated track atlas and
  *           the variants-as-mips plan.
  *
- * PC-first: counts transfer, no Azahar needed (session-24 convention).
+ * PC-first: counts transfer, no Azahar needed.
  */
 
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_TRACK_CENSUS) && CTR_NATIVE_TRACK_CENSUS
@@ -132,7 +132,7 @@ void NativeTrackCensus_Frame(struct Level *level, struct mesh_info *mesh)
 {
 	/* Latch on pointer + content fingerprint, not pointer identity alone:
 	 * under the arena heap model a different level's mesh_info can land at a
-	 * previously-seen address (s27 review finding). */
+	 * previously-seen address. */
 	static struct mesh_info *s_lastMesh = NULL;
 	static int s_lastQb = -1, s_lastVtx = -1;
 
@@ -367,7 +367,7 @@ void NativeTrackCensus_Frame(struct Level *level, struct mesh_info *mesh)
 	/* ---- INST-2: animated-vertex / water exclusion ----------------------
 	 * Retail branches every reader of these two systems on configFlags & 4
 	 * (water vs SCVert are mutually exclusive per level; the INACTIVE side's
-	 * fields are unvalidated asset data -- s27 review finding). Respect the
+	 * fields are unvalidated asset data). Respect the
 	 * same discriminant: read only the active side. */
 	int waterVtx = 0, scVtx = 0;
 

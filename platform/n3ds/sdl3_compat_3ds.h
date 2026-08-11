@@ -18,8 +18,9 @@
  *
  *   INERT    -- windowing, gamepad hotplug, audio device. These report "not
  *               present" so the shared code takes its own no-device paths.
- *               Audio still MIXES (the SPU emulation is SDL-free); the mixed
- *               PCM is simply discarded instead of reaching speakers.
+ *               Audio still MIXES (the SPU emulation is SDL-free); PCM pushed
+ *               into this shim's stream goes nowhere -- real output is the
+ *               separate ndsp path in n3ds_audio_thread.c.
  *
  * Values here do not have to match real SDL's numbering -- nothing links
  * against SDL on this target -- they only have to be self-consistent. The
@@ -63,8 +64,9 @@ void SDL_QuitSubSystem(SDL_InitFlags flags);
 const char *SDL_GetError(void);
 void SDL_free(void *mem);
 
-/* Asset root. A .3dsx launched from the Homebrew Launcher already has its own
- * directory as the working directory, so relative lookups resolve correctly. */
+/* Asset root. The startup working directory differs between the Homebrew
+ * Launcher, 3dslink and emulators, so the implementation probes plausible
+ * roots rather than trusting cwd (see sdl3_compat_3ds.c). */
 const char *SDL_GetBasePath(void);
 
 /* --------------------------------------------------------------- timer --- */

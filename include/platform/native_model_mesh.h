@@ -4,14 +4,14 @@
 #include <macros.h>
 
 // Read-only accessor surface over platform/native_model_mesh.c's per-ModelHeader
-// topology scan (s30 rung 0, docs/HANDOFF_s30_pica_native.md). Declarations are
+// topology scan (rung 0, docs/HANDOFF_s30_pica_native.md). Declarations are
 // always visible; every accessor is a zero-returning stub when
 // CTR_NATIVE_MODEL_RENDERER is off, so callers don't need their own #ifdef --
 // same contract as native_track_mesh.h.
 //
 // WHAT THIS IS FOR
 //
-// The s30 direction is to stop converting instanced models (karts, drivers,
+// The direction is to stop converting instanced models (karts, drivers,
 // crates, weapons) into PS1 packets and hand the PICA real geometry instead.
 // Before any of that is built, this answers what the model population actually
 // weighs: how many triangles each LOD rung of each model costs, and which

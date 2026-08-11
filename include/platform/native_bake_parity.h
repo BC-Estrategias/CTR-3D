@@ -3,7 +3,7 @@
 
 #include <macros.h>
 
-// Bake-parity diff (s38, roadmap "track bake pre-export"): verifies the
+// Bake-parity diff (roadmap "track bake pre-export"): verifies the
 // resident track mesh (platform/native_track_mesh.c) against retail's own
 // emitted packets, on PC, in one process. The retail track path transforms
 // the SAME LevVertex pool the builder read and emits POLY_FT4/GT4 packets
