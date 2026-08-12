@@ -143,6 +143,16 @@ enum NativePerfBucket
 	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_WORKER_EXEC,
+	/*
+	 * Torch_Main -- the heat-warp renderer (missiles/fire/warp pads). Its
+	 * prims texture from the LIVE FRAMEBUFFER with a fresh tpage per ring
+	 * sector, so its true cost lands downstream in draw_otag_parse /
+	 * renderer_begin_scene where it is indistinguishable from everything
+	 * else's; this bucket plus the [TORCH] window line exist to correlate
+	 * those spikes with torch activity. Nests inside mainframe_effects_ms.
+	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
+	 */
+	NATIVE_PERF_BUCKET_TORCH_MAIN,
 	NATIVE_PERF_BUCKET_COUNT
 };
 
@@ -175,6 +185,14 @@ void NativePerf_BeginFrame(const struct NativePerfFrameInfo *info);
 void NativePerf_EndFrame(const struct NativePerfFrameInfo *info);
 void NativePerf_BeginScope(enum NativePerfBucket bucket);
 void NativePerf_EndScope(enum NativePerfBucket bucket);
+/*
+ * Torch (heat-warp) activity counters, folded into the [TORCH] window line on
+ * 3DS. listed = particles walked (including ones culled before emit),
+ * emitted = particles that actually produced their 14 framebuffer-textured
+ * prims. Split so a spike can be attributed to emission (prims in the OT)
+ * rather than mere list presence (GTE projection only).
+ */
+void NativePerf_CountTorch(int listed, int emitted);
 #else
 static inline int NativePerf_ConfigureFromArgs(int argc, char **argv)
 {
@@ -205,6 +223,12 @@ static inline void NativePerf_BeginScope(enum NativePerfBucket bucket)
 static inline void NativePerf_EndScope(enum NativePerfBucket bucket)
 {
 	(void)bucket;
+}
+
+static inline void NativePerf_CountTorch(int listed, int emitted)
+{
+	(void)listed;
+	(void)emitted;
 }
 #endif
 

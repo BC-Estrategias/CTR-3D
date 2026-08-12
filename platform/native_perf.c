@@ -154,6 +154,9 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
     /* dominantCandidate 0: a re-timing of work already inside draw_otag_ms /
      * platform_end_scene_ms, from the worker's side of the fence. */
     {"worker_exec_ms", 0},
+    /* dominantCandidate 0: nests inside mainframe_effects_ms, which is
+     * already a candidate. */
+    {"torch_main_ms", 0},
 };
 
 global_variable FILE *s_csvFile;
@@ -184,6 +187,11 @@ global_variable char s_csvPath[NATIVE_PERF_PATH_MAX];
 global_variable char s_summaryPath[NATIVE_PERF_PATH_MAX];
 global_variable struct NativePerfWorstFrame s_worstFrames[NATIVE_PERF_TOP_FRAME_COUNT];
 global_variable s32 s_worstFrameCount;
+/* Torch (heat-warp) activity, see NativePerf_CountTorch. Frame counters reset
+ * every BeginFrame on all platforms; the window aggregates below them feed the
+ * 3DS [TORCH] line. */
+global_variable s32 s_torchFrameListed;
+global_variable s32 s_torchFrameEmitted;
 #if defined(__3DS__)
 /*
  * This variable's name is part of its correctness. A same-named
@@ -195,6 +203,12 @@ global_variable u32 s_windowFrames;
 global_variable f64 s_windowTotalMs;
 global_variable f64 s_windowWorkMs;
 global_variable f64 s_windowBucketMs[NATIVE_PERF_BUCKET_COUNT];
+global_variable u32 s_torchWindowListed;
+global_variable u32 s_torchWindowEmitted;
+/* Worst single frame's emit count: the window average smears a one-frame
+ * missile volley into nothing, same failure mode the voice-start profiler
+ * exists for. */
+global_variable s32 s_torchWindowMaxFrameEmitted;
 /* g_dbg_ablateConfig as it stood when this window opened; a change cuts the
  * window so no report ever averages two ablation configs together. */
 global_variable const char *s_windowCfg;
@@ -550,6 +564,21 @@ internal void NativePerf_Report3DSWindow(void)
 		N3DS_DebugLog(out);
 	}
 
+	/* Only when the effect was live: quiet windows would otherwise pay an SD
+	 * log line each to report zeros, and the absence of the line IS the null
+	 * reading. avgUs is torch_main_ms (the CPU emit walk only); the effect's
+	 * downstream cost stays in the parse/begin_scene buckets above -- this
+	 * line exists so those spikes can be correlated with emitted here. */
+	if (s_torchWindowListed > 0)
+	{
+		snprintf(out, sizeof(out), "[TORCH] listed=%u emitted=%u maxFrameEmitted=%d avgUs=%d", (unsigned)s_torchWindowListed, (unsigned)s_torchWindowEmitted,
+		         (int)s_torchWindowMaxFrameEmitted, (int)(s_windowBucketMs[NATIVE_PERF_BUCKET_TORCH_MAIN] * toAvgUs));
+		N3DS_DebugLog(out);
+	}
+	s_torchWindowListed = 0;
+	s_torchWindowEmitted = 0;
+	s_torchWindowMaxFrameEmitted = 0;
+
 	/* Trailing by one window by construction: these are the flushes that
 	 * happened DURING the window just reported, and this line is itself
 	 * logged before the flush it may trigger. Compare worstUs against the
@@ -818,6 +847,8 @@ void NativePerf_BeginFrame(const struct NativePerfFrameInfo *info)
 	memset(s_frameBucketMs, 0, sizeof(s_frameBucketMs));
 	memset(s_scopeDepth, 0, sizeof(s_scopeDepth));
 	memset(s_scopeStartCounter, 0, sizeof(s_scopeStartCounter));
+	s_torchFrameListed = 0;
+	s_torchFrameEmitted = 0;
 
 	s_frameBeginInfo = *info;
 	NativeAudio_GetOutputStats(&s_beginUnderrunFrames, &s_beginOverflowFrames, &s_beginQueuedFrames);
@@ -922,6 +953,13 @@ void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 		s_windowBucketMs[bucket] += s_frameBucketMs[bucket];
 	}
 
+	s_torchWindowListed += (u32)s_torchFrameListed;
+	s_torchWindowEmitted += (u32)s_torchFrameEmitted;
+	if (s_torchFrameEmitted > s_torchWindowMaxFrameEmitted)
+	{
+		s_torchWindowMaxFrameEmitted = s_torchFrameEmitted;
+	}
+
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 	{
 		/* Consumed (and so reset) EVERY frame, not just on a new max --
@@ -1017,5 +1055,16 @@ void NativePerf_EndScope(enum NativePerfBucket bucket)
 	{
 		s_frameBucketMs[bucket] += NativePerf_CounterToMs(SDL_GetPerformanceCounter() - s_scopeStartCounter[bucket]);
 	}
+}
+
+void NativePerf_CountTorch(int listed, int emitted)
+{
+	if (!s_enabled || !s_frameOpen)
+	{
+		return;
+	}
+
+	s_torchFrameListed += listed;
+	s_torchFrameEmitted += emitted;
 }
 #endif

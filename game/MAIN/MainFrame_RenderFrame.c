@@ -1041,7 +1041,9 @@ void RenderAllHeatParticles(struct GameTracker *gGT)
 		return;
 	}
 
+	MAINFRAME_PERF_BEGIN(NATIVE_PERF_BUCKET_TORCH_MAIN);
 	Torch_Main(gGT->particleList_heatWarp, &gGT->pushBuffer[0], &gGT->backBuffer->primMem, gGT->numPlyrCurrGame, gGT->swapchainIndex * 0x128);
+	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_TORCH_MAIN);
 }
 
 static s32 RenderAllLevelGeometry_ScaleDistanceShift8(s32 distToScreen, s32 scale)

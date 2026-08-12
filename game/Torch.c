@@ -1,5 +1,7 @@
 #include <common.h>
 
+#include <platform/native_perf.h>
+
 enum
 {
 	TORCH_RING0_SCRATCH_OFFSET = 0x68,
@@ -562,6 +564,7 @@ void Torch_Main(void *particleList_heatWarp, struct PushBuffer *pb, struct PrimM
 				s32 centerY;
 				struct TorchCardRegs card;
 
+				NativePerf_CountTorch(1, 0);
 				MTC2(Torch_PackXY(Torch_ReadS32(particle, 0x24) >> 8, Torch_ReadS32(particle, 0x2c) >> 8), 0);
 				MTC2((u32)(Torch_ReadS32(particle, 0x34) >> 8), 1);
 
@@ -640,6 +643,7 @@ void Torch_Main(void *particleList_heatWarp, struct PushBuffer *pb, struct PrimM
 							card = Torch_Subset1_BuildCard(centerX, centerY, sxy0, sxy1);
 							Torch_Subset2_StoreCard(&card, centerX, centerY, TORCH_RING_2);
 							prim = Torch_EmitParticle(prim, ot);
+							NativePerf_CountTorch(0, 1);
 						}
 					}
 				}
