@@ -1056,11 +1056,33 @@ typedef struct
  * either number.
  */
 #define N3DS_FULLPAGE_RESERVED_CELLS    96
-#define N3DS_SUBPAGE_PHYSICAL_CELLS     (N3DS_TOTAL_CELLS - 1 - N3DS_FULLPAGE_RESERVED_CELLS)
+/*
+ * The LAST N3DS_FBCAP_RESERVED_CELLS physical cells are carved out of the
+ * sub-page tier for the framebuffer-capture region (N3DS_FBCaptureEnsure
+ * below): two horizontally adjacent cells forming one contiguous 512x256
+ * texel rect that holds the last presented top-screen frame. Content whose
+ * sampled footprint lies inside an armed display rect (heat-warp rings,
+ * pause background, menu feedback) resolves straight into this region
+ * instead of round-tripping through the VRAM mirror + decode cache -- one
+ * capture per frame replaces per-page mirror refreshes, dirty-generation
+ * bumps and the full-page decodes that evict the live working set.
+ */
+#define N3DS_FBCAP_RESERVED_CELLS       2
+#define N3DS_SUBPAGE_PHYSICAL_CELLS     (N3DS_TOTAL_CELLS - 1 - N3DS_FULLPAGE_RESERVED_CELLS - N3DS_FBCAP_RESERVED_CELLS)
 #define N3DS_SUBPAGE_CELLS_PER_PHYSICAL 16
 #define N3DS_SUBPAGE_TOTAL_CELLS        (N3DS_SUBPAGE_PHYSICAL_CELLS * N3DS_SUBPAGE_CELLS_PER_PHYSICAL)
 #define N3DS_SUBPAGE_DIM                64
 #define N3DS_SUBPAGE_PHYSICAL_BASE      (1 + N3DS_FULLPAGE_RESERVED_CELLS)
+
+#define N3DS_FBCAP_CELL_FIRST (N3DS_TOTAL_CELLS - N3DS_FBCAP_RESERVED_CELLS)
+#define N3DS_FBCAP_ATLAS      (N3DS_FBCAP_CELL_FIRST / N3DS_ATLAS_CELLS_PER_ATLAS)
+#define N3DS_FBCAP_CELL_X     ((N3DS_FBCAP_CELL_FIRST % N3DS_ATLAS_CELLS_PER_ATLAS) % N3DS_ATLAS_CELLS_PER_ROW)
+#define N3DS_FBCAP_CELL_Y     ((N3DS_FBCAP_CELL_FIRST % N3DS_ATLAS_CELLS_PER_ATLAS) / N3DS_ATLAS_CELLS_PER_ROW)
+/* Atlas-texel origin of the capture region; the reserved cells must be
+ * horizontally adjacent in ONE atlas for the region to be contiguous. */
+#define N3DS_FBCAP_REGION_X   (N3DS_FBCAP_CELL_X * N3DS_DECODE_TEXTURE_DIM)
+#define N3DS_FBCAP_REGION_Y   (N3DS_FBCAP_CELL_Y * N3DS_DECODE_TEXTURE_DIM)
+CTR_STATIC_ASSERT((N3DS_FBCAP_CELL_X + N3DS_FBCAP_RESERVED_CELLS) <= N3DS_ATLAS_CELLS_PER_ROW);
 
 /* Sized for every physical cell, not just the full-page partition: with
  * g_dbg_disableSubPage the full-page tier scans the idle sub-tier cells too
@@ -1071,7 +1093,9 @@ global_variable N3DS_DecodeCacheEntry s_decodeCache[N3DS_TOTAL_CELLS];
 
 internal int N3DS_FullPageCellBound(void)
 {
-	return g_dbg_disableSubPage ? N3DS_TOTAL_CELLS : (1 + N3DS_FULLPAGE_RESERVED_CELLS);
+	/* The capture cells stay reserved even under the disable-sub-page
+	 * diagnostic -- the full-page tier must never allocate them. */
+	return g_dbg_disableSubPage ? (N3DS_TOTAL_CELLS - N3DS_FBCAP_RESERVED_CELLS) : (1 + N3DS_FULLPAGE_RESERVED_CELLS);
 }
 
 /* Flat cell index -> which atlas texture, and which cell within its grid. */
@@ -2999,12 +3023,193 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
  * the same output shape (pixelBase/origin), so the caller's UV assignment is
  * one formula for both tiers -- see NativeRenderer_DrawTriangles.
  */
+/*
+ * Framebuffer-capture region (the N3DS_FBCAP_* reserved cells above).
+ *
+ * Display-region texturing -- heat-warp rings (game/Torch.c), the pause
+ * background, menu feedback blur -- samples the last PRESENTED frame. The
+ * mirror+decode path serves that by re-packing the presented frame into the
+ * PSX VRAM mirror and decoding framebuffer pages through the LRU cache:
+ * per-page decodes whose keys churn every frame, evicting the live working
+ * set (measured: heat-warp windows tripled the track walk's resolve cost
+ * while the GPU sat idle). This path instead captures the presented frame
+ * ONCE per frame into the reserved atlas region and resolves qualifying
+ * triangles straight at it -- same convert formula, same merge/blend/stereo
+ * machinery, one texture state shared by every such triangle.
+ *
+ * One capture rect per frame: a second consumer wanting a DIFFERENT display
+ * rect in the same frame falls back to the mirror path rather than
+ * overwriting a region already-queued draws reference.
+ */
+int g_dbg_fbCapture = 1; /* dumpreq 'fbcap' */
+global_variable u32 s_fbCapFrame;
+global_variable int s_fbCapValid;
+global_variable s16 s_fbCapRectX, s_fbCapRectY, s_fbCapRectW, s_fbCapRectH;
+global_variable u32 s_fbCaptures;
+global_variable u32 s_fbCapRoutedTris;
+/* Frame number of the most recent capture-routed triangle. */
+global_variable u32 s_fbCapLastRoutedFrame;
+
+internal int N3DS_FBCaptureEnsure(const N3DS_FBStoreSlot *slot)
+{
+	int w = slot->w, h = slot->h;
+	int cell, row, col;
+	/* Dims only, NOT the rect origin: the display rect alternates between
+	 * the two buffers (y=0/y=296) every frame, but the capture holds ONE
+	 * picture -- the presented frame -- and the consumer's pixelBase math
+	 * subtracts its own slot origin, so the same capture serves either
+	 * rect. Keying the memo on origin made the feedback hold below never
+	 * match two frames running (the march survived it, owner-observed). */
+	const int rectMatches = s_fbCapValid && (s_fbCapRectW == (s16)slot->w) && (s_fbCapRectH == (s16)slot->h);
+
+	if (s_fbCapValid && (s_fbCapFrame == s_frameCounter))
+	{
+		/* Same-frame memo -- hit only when the rect matches; a different
+		 * rect must NOT recapture (queued draws reference the region). */
+		return rectMatches;
+	}
+
+	/*
+	 * Feedback breaker: while consumers sampled the capture last frame (the
+	 * effect is continuously live), HOLD the existing capture instead of
+	 * re-capturing. The presented frame contains the effect's own output --
+	 * re-ingesting it every frame made displaced copies of whatever the
+	 * rings touched (HUD portraits, minimap) MARCH across the screen, one
+	 * ring-displacement per frame (owner-observed; retail never had this
+	 * because it sampled the frame mid-draw, before HUD or effect output
+	 * existed in it). Freezing at effect onset serves a clean pre-effect
+	 * picture for the effect's whole run: no feedback, no recognizable-copy
+	 * artifacts; the cost is staleness bounded by the effect's duration.
+	 * For the pause background this freeze IS the wanted semantics.
+	 */
+	if (rectMatches && ((s_fbCapLastRoutedFrame + 1u) >= s_frameCounter))
+	{
+		return 1;
+	}
+
+	if (w > (N3DS_FBCAP_RESERVED_CELLS * N3DS_DECODE_TEXTURE_DIM)) { w = N3DS_FBCAP_RESERVED_CELLS * N3DS_DECODE_TEXTURE_DIM; }
+	if (h > N3DS_DECODE_TEXTURE_DIM) { h = N3DS_DECODE_TEXTURE_DIM; }
+	if ((w <= 0) || (h <= 0))
+	{
+		return 0;
+	}
+
+	/* The capture is at the display rect's own PSX resolution, so capture
+	 * texel (x,y) == VRAM texel (rect.x+x, rect.y+y) and the resolve's
+	 * pixelBase arithmetic maps sampled coords 1:1. Borrows the mirror
+	 * path's RGB scratch; both run on the walk thread, never concurrently. */
+	if (!N3DS_CopyDisplayedTopFrame(s_fbCopyScratch, w, h))
+	{
+		return 0;
+	}
+
+	for (cell = 0; cell < N3DS_FBCAP_RESERVED_CELLS; cell++)
+	{
+		const int colBase = cell * N3DS_DECODE_TEXTURE_DIM;
+
+		if (colBase >= w)
+		{
+			break;
+		}
+
+		/* Pack+tile one 256x256 cell from the RGB capture. Same memory
+		 * orientation as N3DS_DecodeAndTilePage (source row v -> tile row v;
+		 * the sampler's 2047-2a V flip handles PICA's bottom-up T axis).
+		 * Out-of-rect texels get opaque black; nothing samples them (the
+		 * routing test requires the footprint inside the display rect). */
+		for (row = 0; row < N3DS_DECODE_TEXTURE_DIM; row++)
+		{
+			const u8 *srcRow = s_fbCopyScratch + ((size_t)row * (size_t)w * 3);
+
+			for (col = 0; col < N3DS_DECODE_TEXTURE_DIM; col++)
+			{
+				const int srcX = colBase + col;
+				u16 packed = 1u;
+				int morton, tileIndex;
+
+				if ((srcX < w) && (row < h))
+				{
+					const u8 *p = srcRow + (srcX * 3);
+
+					packed = (u16)(((u16)(p[0] >> 3) << 11) | ((u16)(p[1] >> 3) << 6) | ((u16)(p[2] >> 3) << 1) | 1u);
+				}
+
+				morton = (col & 1) | ((row & 1) << 1) | ((col & 2) << 1) | ((row & 2) << 2) | ((col & 4) << 2) | ((row & 4) << 3);
+				tileIndex = (((row >> 3) * (N3DS_DECODE_TEXTURE_DIM / 8)) + (col >> 3)) * 64;
+				s_decodeScratch[tileIndex + morton] = packed;
+			}
+		}
+
+		N3DS_C3DUploadDecodedCell(N3DS_FBCAP_ATLAS, N3DS_FBCAP_CELL_X + cell, N3DS_FBCAP_CELL_Y, s_decodeScratch);
+	}
+
+	s_fbCapValid = 1;
+	s_fbCapFrame = s_frameCounter;
+	s_fbCapRectX = (s16)slot->x;
+	s_fbCapRectY = (s16)slot->y;
+	s_fbCapRectW = (s16)slot->w;
+	s_fbCapRectH = (s16)slot->h;
+	s_fbCaptures++;
+
+	if ((s_fbCaptures & 63u) == 1u)
+	{
+		char msg[96];
+
+		snprintf(msg, sizeof(msg), "[CTR-3DS] fb-capture #%lu rect=%d,%d %dx%d routedTris=%lu", (unsigned long)s_fbCaptures, slot->x, slot->y, w, h,
+		         (unsigned long)s_fbCapRoutedTris);
+		N3DS_DebugLog(msg);
+	}
+
+	return 1;
+}
+
 internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1, const GrVertex *v2, s16 texPage,
                                           s16 clut, TexFormat format, N3DS_TexView view, int *outAtlasIdx,
                                           int *outPixelBaseU, int *outPixelBaseV, int *outOriginU, int *outOriginV)
 {
 	const int minU = MIN3(v0->u, v1->u, v2->u), maxU = MAX3(v0->u, v1->u, v2->u);
 	const int minV = MIN3(v0->v, v1->v, v2->v), maxV = MAX3(v0->v, v1->v, v2->v);
+
+	/*
+	 * Display-region fast path: a 16-bit opaque-view triangle whose sampled
+	 * footprint lies entirely inside an armed display rect reads the last
+	 * presented frame -- serve it from the capture region instead of the
+	 * mirror+decode path (see N3DS_FBCaptureEnsure). 16-bit only: display
+	 * buffers are 1555, so framebuffer sampling always resolves texel==
+	 * halfword; opaque view only (PASS1/PASS2 STP semantics differ from the
+	 * capture's all-opaque texels -- those rare consumers keep the mirror
+	 * path). Tested against the slot RECTS, not the stale flags: a rect
+	 * stays a display buffer whether or not the mirror is current.
+	 */
+	if (g_dbg_fbCapture && (format == TF_16_BIT) && (view == N3DS_TEXVIEW_OPAQUE))
+	{
+		const int pageX = (texPage & 0xF) * 64;
+		const int pageY = (texPage & 0x10) ? 256 : 0;
+		const int absX0 = pageX + minU, absX1 = pageX + maxU;
+		const int absY0 = pageY + minV, absY1 = pageY + maxV;
+		int slotIdx;
+
+		for (slotIdx = 0; slotIdx < 2; slotIdx++)
+		{
+			const N3DS_FBStoreSlot *slot = &s_fbStore[slotIdx];
+
+			if ((slot->w > 0) && (absX0 >= slot->x) && (absX1 < (slot->x + slot->w)) && (absY0 >= slot->y) && (absY1 < (slot->y + slot->h)))
+			{
+				if (N3DS_FBCaptureEnsure(slot))
+				{
+					*outAtlasIdx = N3DS_FBCAP_ATLAS;
+					*outPixelBaseU = N3DS_FBCAP_REGION_X + (pageX - slot->x);
+					*outPixelBaseV = N3DS_FBCAP_REGION_Y + (pageY - slot->y);
+					*outOriginU = 0;
+					*outOriginV = 0;
+					s_fbCapRoutedTris++;
+					s_fbCapLastRoutedFrame = s_frameCounter;
+					return 0;
+				}
+				break;
+			}
+		}
+	}
 
 	/* Freeze-frame consumer trigger: this triangle is about to be decoded
 	 * from VRAM the armed display rect covers (pause background, screen-copy
@@ -4485,6 +4690,14 @@ void NativeRenderer_SwapWindow(void)
 void NativeRenderer_StoreFrameBuffer(int x, int y, int w, int h)
 {
 	N3DS_FBStoreSlot *slot;
+
+	/* Runs unconditionally every EndScene, so it doubles as the publish
+	 * point for the displayed-content region (see N3DS_SetTopContentFullWidth). */
+	{
+		extern int g_dbg_widescreen;
+
+		N3DS_SetTopContentFullWidth(g_dbg_widescreen == 2);
+	}
 
 	/* Record-and-arm only; the actual refresh is pull-based -- see
 	 * N3DS_RefreshFramebufferMirrorSlot. Slot selection by rect anchor:

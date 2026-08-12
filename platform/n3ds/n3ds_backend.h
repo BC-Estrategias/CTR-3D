@@ -536,6 +536,10 @@ void N3DS_TrackDraw_End(void);
  * lockstep with the C3D_SetViewport call in N3DS_C3DBeginFrame. */
 #define N3DS_TOP_CONTENT_X 40
 #define N3DS_TOP_CONTENT_W 320
+/* REAL-widescreen fills the whole panel instead of the content region above;
+ * the renderer publishes the mode every EndScene so N3DS_CopyDisplayedTopFrame
+ * samples the region the game actually drew. */
+void N3DS_SetTopContentFullWidth(int fullWidth);
 
 /* Copies the top screen's last completed frame (the gfx framebuffer the
  * present path fills every frame) into dstRGB as row-major RGB triplets,

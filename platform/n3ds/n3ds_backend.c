@@ -433,10 +433,28 @@ void N3DS_GfxPresent(void)
  * pixel at screen (sx, sy), y-down, lives at ((sx * 240) + (239 - sy)) * 3,
  * bytes B,G,R.
  */
+/*
+ * REAL-widescreen content fills the whole 400px panel; the 4:3 modes render
+ * into the pillarboxed N3DS_TOP_CONTENT region. The copy below must sample
+ * whichever region the game actually drew, or wide-mode consumers (pause
+ * background, fb-capture) re-ingest a crop of the picture and the draw side
+ * stretches it back out -- the reported crop-then-stretch pause background.
+ * Published by the renderer (NativeRenderer_StoreFrameBuffer, every
+ * EndScene); a plain int across the TU boundary like every other flag here.
+ */
+static int s_topContentFullWidth = 0;
+
+void N3DS_SetTopContentFullWidth(int fullWidth)
+{
+	s_topContentFullWidth = fullWidth;
+}
+
 int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH)
 {
 	u16 fbW = 0, fbH = 0;
 	u8 *fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, &fbW, &fbH);
+	const int contentX = s_topContentFullWidth ? 0 : N3DS_TOP_CONTENT_X;
+	const int contentW = s_topContentFullWidth ? 400 : N3DS_TOP_CONTENT_W;
 	int x, y;
 
 	if ((fb == NULL) || (dstRGB == NULL) || (dstW <= 0) || (dstH <= 0))
@@ -460,11 +478,12 @@ int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH)
 
 		for (x = 0; x < dstW; x++)
 		{
-			/* Sample the pillarboxed content region only (N3DS_TOP_CONTENT_*):
-			 * the full-panel form re-ingested the black side bars, so the
-			 * pause background showed them squeezed inside the picture
-			 * (user-reported on hardware). */
-			const int sx = N3DS_TOP_CONTENT_X + ((x * N3DS_TOP_CONTENT_W) / dstW);
+			/* Sample only the region the game drew (see s_topContentFullWidth
+			 * above): the pillarboxed content region in 4:3 modes -- the
+			 * full-panel form re-ingested the black side bars, so the pause
+			 * background showed them squeezed inside the picture
+			 * (user-reported on hardware) -- or the whole panel in REAL wide. */
+			const int sx = contentX + ((x * contentW) / dstW);
 			const u8 *p = fb + (((sx * 240) + (239 - sy)) * 3);
 
 			dstRow[(x * 3) + 0] = p[2]; /* R */
@@ -3283,6 +3302,14 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_fastPresent ^= 1;
 					N3DS_DebugLog(g_dbg_fastPresent ? "[CTR-3DS] fastpresent: ON (flush bottom framebuffer only)"
 					                                : "[CTR-3DS] fastpresent: off (whole-system gfxFlushBuffers)");
+				}
+				else if (strncmp(word, "fbcap", 5) == 0)
+				{
+					extern int g_dbg_fbCapture;
+
+					g_dbg_fbCapture ^= 1;
+					N3DS_DebugLog(g_dbg_fbCapture ? "[CTR-3DS] fbcap: ON (display-region draws sample the capture region)"
+					                              : "[CTR-3DS] fbcap: off (mirror+decode path)");
 				}
 				else if (strncmp(word, "subpage", 7) == 0)
 				{
