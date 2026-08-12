@@ -600,6 +600,8 @@ void NativeTrackFrame_Record(struct GameTracker *gGT, struct mesh_info *mesh, st
 		dst->trans[0] = pushBuffer->matrix_ViewProj.t[0];
 		dst->trans[1] = pushBuffer->matrix_ViewProj.t[1];
 		dst->trans[2] = pushBuffer->matrix_ViewProj.t[2];
+		dst->camX = pushBuffer->pos.x;
+		dst->camZ = pushBuffer->pos.z;
 
 		/* visFaceList (design 4.2/12): recorded now so step 2
 		 * doesn't have to reopen this struct/protocol later. RECORD ONLY --

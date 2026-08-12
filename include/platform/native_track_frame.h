@@ -59,6 +59,14 @@ struct NativeTrackFrameSnapshot
 	s32 ofx;
 	s32 ofy;
 
+	// Camera WORLD position (PushBuffer.pos, the same value
+	// PushBuffer_UpdateFrustum calls cameraPos), for the water
+	// distance-to-black fade the animated-vertex patcher applies
+	// (NativeTrackAnim_PatchVertices). Copied by value like the rest of the
+	// camera block; Y is unused -- retail's water fade is X/Z only.
+	s32 camX;
+	s32 camZ;
+
 	// Visible leaves, as MESH LEAF-RANGE indices (NativeTrackMesh_LeafAt's
 	// index space), NOT BSP indices -- the bspIndex -> leaf-range mapping is
 	// resolved once here at record time (via NativeTrackMesh_LeafIndexForBsp)

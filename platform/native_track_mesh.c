@@ -1230,7 +1230,56 @@ static void NativeTrackAnim_QueueVertexPos(u32 vertIndex, const struct NativeTra
  * .color_hi), so patching position alone would animate the shape of a water
  * surface while its shading stayed fixed at load.
  */
-static u32 NativeTrackAnim_PatchVertices(void)
+/*
+ * Retail's water camera-distance fade (Ovr226_800a2234_ApplyWaterListColorFade),
+ * per channel, in the GTE's own integer shape. Retail seeds the water pass's
+ * far colour to BLACK, so its per-vertex dpcs reduces to a downscale:
+ * out = (c * (0x1000 - factor)) >> 12 -- algebraically identical to the dpcs
+ * replay in NativeModelEmit_FadeComponent with FC = 0, no clamps reachable
+ * (c <= 255 keeps every intermediate in range). Under the water pass's
+ * ADDITIVE blend, black IS invisible, so this fade doubles as retail's
+ * draw-distance feathering -- without it the water pops out full-bright at
+ * the visibility edge.
+ */
+internal void NativeTrackAnim_WaterFade(struct NativeTrackVert *vert, s32 camX, s32 camZ)
+{
+	s32 dx = (s32)vert->x - camX;
+	s32 dz = (s32)vert->z - camZ;
+	s32 major, minor, falloff, factor;
+
+	if (dx < 0)
+	{
+		dx = -dx;
+	}
+	if (dz < 0)
+	{
+		dz = -dz;
+	}
+
+	major = (dx < dz) ? dz : dx;
+	minor = (dx < dz) ? dx : dz;
+
+	falloff = major + (minor >> 2) - 0x1000;
+	if (falloff >= 0)
+	{
+		vert->r = 0;
+		vert->g = 0;
+		vert->b = 0;
+		return;
+	}
+
+	factor = (falloff << 2) + 0x1000;
+	if (factor < 0)
+	{
+		return;
+	}
+
+	vert->r = (u8)(((u32)vert->r * (u32)(0x1000 - factor)) >> 12);
+	vert->g = (u8)(((u32)vert->g * (u32)(0x1000 - factor)) >> 12);
+	vert->b = (u8)(((u32)vert->b * (u32)(0x1000 - factor)) >> 12);
+}
+
+static u32 NativeTrackAnim_PatchVertices(s32 camX, s32 camZ)
 {
 	u32 i;
 	u32 patched = 0;
@@ -1280,6 +1329,11 @@ static u32 NativeTrackAnim_PatchVertices(void)
 		vert->r = src->color_hi[0];
 		vert->g = src->color_hi[1];
 		vert->b = src->color_hi[2];
+
+		if ((vert->faceFlags & 0x20) != 0)
+		{
+			NativeTrackAnim_WaterFade(vert, camX, camZ);
+		}
 
 		NativeTrackAnim_QueueVertexPos(vi, vert);
 		patched++;
@@ -1349,6 +1403,9 @@ void NativeTrackAnim_PatchFrame(void)
 	 * publishes valid=0 by construction. Reusing it here costs one load and
 	 * needs no new protocol.
 	 */
+	s32 camX;
+	s32 camZ;
+
 	if (s_trackMesh.builtFor == NULL)
 	{
 		return;
@@ -1361,11 +1418,14 @@ void NativeTrackAnim_PatchFrame(void)
 		{
 			return;
 		}
+
+		camX = snap->camX;
+		camZ = snap->camZ;
 	}
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_TRACK_ANIM);
 
-	patched = NativeTrackAnim_PatchVertices();
+	patched = NativeTrackAnim_PatchVertices(camX, camZ);
 
 	/* Deliberately NOT an early return: a track can have moving water and no
 	 * animated textures, and the heartbeat below is the only runtime evidence
@@ -3024,8 +3084,11 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					 * the SAME corner out of a different frame's layout. The
 					 * per-face rotation/flip is already resolved into it, which
 					 * is the point -- the patcher never has to re-derive
-					 * faceBits from a QuadBlock it no longer holds. */
-					dst->faceFlags = (u8)(doubleSided | (faceMode << 1) | ((uvIdxOf[c] & 3) << 3));
+					 * faceBits from a QuadBlock it no longer holds. Bit 5 marks
+					 * a water-surface vertex: the animated-vertex patcher
+					 * applies retail's camera-distance fade-to-black to those
+					 * (and only those) every frame. */
+					dst->faceFlags = (u8)(doubleSided | (faceMode << 1) | ((uvIdxOf[c] & 3) << 3) | (faceIsWater ? 0x20 : 0));
 					dst->r = src->color_hi[0];
 					dst->g = src->color_hi[1];
 					dst->b = src->color_hi[2];
