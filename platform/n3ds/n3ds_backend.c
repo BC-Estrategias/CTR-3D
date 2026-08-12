@@ -3222,13 +3222,14 @@ unsigned int N3DS_ReadButtons(void)
 				{
 					/* Strips-hunt kill switches: bit 1 = instance bbox
 					 * margin, 2 = per-tri margin, 4 = sky face margin,
-					 * 8 = sky extra sectors. `widemask N` (decimal 0-15)
-					 * sets; bare resets to all-on. MUST be matched before
-					 * the `wide` token -- shared prefix. */
+					 * 8 = sky extra sectors, 16 = BSP frustum corner X.
+					 * `widemask N` (decimal 0-31) sets; bare resets to
+					 * all-on. MUST be matched before the `wide` token --
+					 * shared prefix. */
 					extern int g_dbg_wideMarginMask;
 					char msg[48];
 
-					g_dbg_wideMarginMask = (word[8] == ' ') ? (atoi(&word[9]) & 0xF) : 0xF;
+					g_dbg_wideMarginMask = (word[8] == ' ') ? (atoi(&word[9]) & 0x1F) : 0x1F;
 					snprintf(msg, sizeof(msg), "[CTR-3DS] wide margin mask: 0x%X", (unsigned)g_dbg_wideMarginMask);
 					N3DS_DebugLog(msg);
 				}
@@ -3917,6 +3918,24 @@ unsigned int N3DS_ReadButtons(void)
 						g_dbg_modelFade ^= 1;
 					}
 					N3DS_DebugLog(g_dbg_modelFade ? "[CTR-3DS] model fade replay: ON" : "[CTR-3DS] model fade replay: off (captured colours stay pre-dpct)");
+				}
+				else if (strncmp(word, "spec", 4) == 0)
+				{
+					extern int g_dbg_modelSpecular;
+
+					/* Writer lighting for the specular model writers
+					 * (KEY_TOKEN/LIT_TEXTURE): lit colours + additive lit
+					 * front faces. 'spec N' sets, bare token flips. OFF = the
+					 * raw flat-colour capture, the A/B baseline. */
+					if (word[4] == ' ')
+					{
+						g_dbg_modelSpecular = (atoi(&word[5]) != 0);
+					}
+					else
+					{
+						g_dbg_modelSpecular ^= 1;
+					}
+					N3DS_DebugLog(g_dbg_modelSpecular ? "[CTR-3DS] model specular: ON" : "[CTR-3DS] model specular: off (raw flat colours)");
 				}
 #endif
 #ifdef CTR_NATIVE_TRACK_RENDERER

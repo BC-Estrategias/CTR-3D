@@ -53,12 +53,22 @@ extern int g_dbg_modelRender;
 // caller computes it because the writer identifiers live in game/. Getting it
 // wrong in the 0 direction is what made N. Tropy's ghost draw solid.
 //
+// specularLit: this instance uses one of the two specular writers (KEY_TOKEN /
+// LIT_TEXTURE). Those writers build their colour from their own lcir/dpcs on
+// the raw rolling colour and never consume LoadPrimColors' dpct, so the fade
+// replay must not run for them; the caller also hands Triangle pre-lit colours
+// and a per-face blend override for these instances. Computed in game/ for the
+// same reason as forceSemiTrans, and by WRITER rather than by testing
+// USE_SPECULAR_LIGHT -- instance-flag bits 16-18 are a combo index, and
+// GHOST_DRAW_TRANSPARENT sets the same bits.
+//
 // inst: the instance being drawn, for the [AXISCHK] cross-class depth-axis
 // check (its world translation is pushed through matrix_ViewProj -- the TRACK
 // renderer's axis -- and compared against mvp.t[2], the axis every per-prim SZ
 // this path and the packet stamps inherit). Only read under
 // --model-depth-check; may be NULL, which skips the check for this instance.
-int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *inst);
+int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, int specularLit,
+                                  const struct Instance *inst);
 
 // One triangle, in the exact form the software GTE was about to consume:
 // packedXY3[i] is that corner's GTE VXY register (VX in the low halfword, VY in
@@ -75,13 +85,24 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 // tex may be NULL: retail's explicit untextured path, and a null table entry
 // reaches the same writer.
 //
+// blendOverride: -1 to classify blending from the tpage as always, else the
+// BlendMode (0 = opaque, ABR+1 otherwise) the WRITER forces for this face.
+// The specular writers pick ABE per SIDE -- the lit front face of an ABR-0
+// page is emitted additive, every other side/page opaque -- which no
+// tpage-only rule can express.
+//
 // Returns 1 when the native path has CLAIMED this triangle, so the caller may
 // skip its packet write; 0 means "draw it the retail way". Callers must AND this
 // with their own replace-mode test rather than assuming a capture implies a
 // draw -- the two diverge on snapshot overflow and on semi-transparent textures,
 // and treating them as identical silently deleted geometry in both cases. See
 // the implementation comment and docs/TRANSPARENCY_DESIGN.md section 5.
-int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex);
+int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex, int blendOverride);
+
+// Runtime toggle for the specular writer treatment above (dumpreq 'spec',
+// default ON). Folded into the caller's per-instance classification so a flip
+// lands on an instance boundary.
+int NativeModelEmit_SpecularEnabled(void);
 
 // Closes the instance opened by BeginInstance. Safe to call after a
 // BeginInstance that returned 0.

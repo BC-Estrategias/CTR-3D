@@ -156,10 +156,12 @@ void CAM_SkyboxGlow(struct SkyboxGlowGradient *grad, struct PushBuffer *pb, stru
 	/* s43: the horizon gradient is backdrop at infinity, same as the skybox dome
 	 * (DrawSky_Full). Register its emitted span so the OT walk pins it to the far
 	 * depth plane and translucent track geometry (the waterfalls) wins against it.
-	 * Same local-extern idiom as DrawSky.c; the span is closed at function exit
-	 * and UNIONS with the dome's span (and the other players' glow) for the frame.
-	 * NativeGpu_MarkSkyRange's own comment has the contiguity argument. */
-	extern void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end);
+	 * Same local-extern idiom as DrawSky.c; the span is closed at function exit.
+	 * s46: marked through the GLOW entry point, which unions into the sky span
+	 * (same consumers as before) while also letting the 3DS emit path stretch
+	 * exactly these screen-space prims to the wide ortho window -- this function's
+	 * retail math is 512-wide by construction and stays byte-identical. */
+	extern void NativeGpu_MarkGlowRange(uintptr_t start, uintptr_t end);
 	uintptr_t glowPrimStart = (uintptr_t)primMem->cursor;
 #endif
 
@@ -306,7 +308,7 @@ void CAM_SkyboxGlow(struct SkyboxGlowGradient *grad, struct PushBuffer *pb, stru
 		}
 	}
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-	NativeGpu_MarkSkyRange(glowPrimStart, (uintptr_t)primMem->cursor);
+	NativeGpu_MarkGlowRange(glowPrimStart, (uintptr_t)primMem->cursor);
 #endif
 }
 

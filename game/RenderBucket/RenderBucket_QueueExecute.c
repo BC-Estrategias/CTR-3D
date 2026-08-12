@@ -29,10 +29,12 @@
 struct InstDrawPerPlayer;
 struct PushBuffer;
 struct TextureLayout;
-extern int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *inst);
-extern int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex);
+extern int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, int specularLit,
+                                         const struct Instance *inst);
+extern int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex, int blendOverride);
 extern void NativeModelEmit_EndInstance(void);
 extern int NativeModelEmit_SkipRetailDraw(void);
+extern int NativeModelEmit_SpecularEnabled(void);
 #endif
 
 #ifdef CTR_NATIVE
@@ -4579,7 +4581,15 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 	 * Missing this is what drew N. Tropy's Time Trial ghost solid. */
 	const u32 mdlPrimWriter = (u32)(uintptr_t)ctx->inst->funcPtr[1];
 	const int mdlForceBlend = (mdlPrimWriter == RB_RETAIL_INST_PRIM_GHOST) || (mdlPrimWriter == RB_RETAIL_INST_PRIM_DEPTH_FADE);
-	const int mdlCapture = NativeModelEmit_BeginInstance(ctx->idpp, ctx->pb, mdlForceBlend, ctx->inst);
+	/* The two specular-lit writers (USE_SPECULAR_LIGHT combos): flat colour
+	 * through the light-colour matrix, dpcs toward the instance colour, glint
+	 * ramp, additive lit front faces. Classified by WRITER, not by testing
+	 * USE_SPECULAR_LIGHT -- instance-flag bits 16-18 are a combo INDEX, and
+	 * GHOST_DRAW_TRANSPARENT sets the same two bits this flag is part of. The
+	 * runtime toggle is folded in here so a flip lands on an instance boundary. */
+	const int mdlSpecular = ((mdlPrimWriter == RB_RETAIL_INST_PRIM_KEY_TOKEN) || (mdlPrimWriter == RB_RETAIL_INST_PRIM_LIT_TEXTURE)) &&
+	                        NativeModelEmit_SpecularEnabled();
+	const int mdlCapture = NativeModelEmit_BeginInstance(ctx->idpp, ctx->pb, mdlForceBlend, mdlSpecular, ctx->inst);
 	/* State 1 means the native path REPLACES this one, so the packet write
 	 * below is skipped and what reaches the screen is unambiguously ours.
 	 * Evaluated once per instance, not per triangle, and only meaningful when
@@ -4703,13 +4713,41 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 			// and a declined triangle still needs its packet written.
 			int mdlClaimed = 0;
 
-			if (mdlCapture)
+			/* Specular writers draw NOTHING for an untextured triangle (both
+			 * bail on tex == 0), so the capture must decline it too --
+			 * claiming it would draw geometry retail never shows. Declined =
+			 * mdlClaimed stays 0, and the writer's own no-op handles the rest. */
+			if (mdlCapture && !(mdlSpecular && tex == 0))
 			{
 				const u32 mdlXY[3] = {ctx->tempPacked[1].xy, ctx->tempPacked[2].xy, ctx->tempPacked[3].xy};
 				const u32 mdlZ[3] = {ctx->tempPacked[1].z, ctx->tempPacked[2].z, ctx->tempPacked[3].z};
-				const int mdlColor[3] = {ctx->tempColor[1], ctx->tempColor[2], ctx->tempColor[3]};
+				int mdlColor[3] = {ctx->tempColor[1], ctx->tempColor[2], ctx->tempColor[3]};
+				int mdlBlend = -1;
 
-				mdlClaimed = NativeModelEmit_Triangle(mdlXY, mdlZ, mdlColor, tex);
+				/* Run the specular writer's own lighting here: state 1 skips
+				 * the writer, so this is the only place its colour math can
+				 * happen, and the capture must store the colour the packet
+				 * would have carried. Exact writer sequence (nclip side test,
+				 * lcir + dpcs + glint via the shared helper); in state 2 the
+				 * writer re-seeds every register these ops touch before using
+				 * it, so its packet output is unchanged. Flat colour: retail
+				 * writes ONE colour word per FT3 on these writers. */
+				if (mdlSpecular)
+				{
+					int mdlSigned;
+
+					gte_nclip();
+					mdlSigned = MFC2_S(24) ^ ((s16)ctx->idpp->instFlags ^ (int)(drawCommand << 2));
+					mdlColor[0] = (int)RenderBucket_LightFlatTextureColor((u32)ctx->tempColor[1], mdlSigned);
+					mdlColor[1] = mdlColor[0];
+					mdlColor[2] = mdlColor[0];
+					/* Both writers emit the lit FRONT face of an ABR-0 page
+					 * additive (code 0x26, tpage ABR forced to 1) and every
+					 * other side/page ABE-off opaque. BlendMode 2 = ABR 1 + 1. */
+					mdlBlend = ((mdlSigned >= 0) && ((RenderBucket_ReadTextureWord(tex, RENDER_BUCKET_TEX_WORD1_OFFSET) & 0x00600000u) == 0)) ? 2 : 0;
+				}
+
+				mdlClaimed = NativeModelEmit_Triangle(mdlXY, mdlZ, mdlColor, tex, mdlBlend);
 			}
 
 			// State 1: the native path draws this instance, so do not also

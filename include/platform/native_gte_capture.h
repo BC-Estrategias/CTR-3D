@@ -58,6 +58,16 @@ void NativeGpu_ClearSmokePackets(void);
  * dumpreq 'skyfar' (default ON). */
 extern int g_dbg_skyFar;
 void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end);
+/* s46: CAM_SkyboxGlow marks through this instead -- unions into the sky span
+ * (same consumers) AND records the glow-only slice, which the 3DS emit path
+ * stretches to the REAL-wide ortho window (the glow's retail emitter is
+ * screen-space, hardcoded 512 wide). Same lifecycle as the sky pair. */
+void NativeGpu_MarkGlowRange(uintptr_t start, uintptr_t end);
+/* RenderStars marks its tile span through this -- far-pin only, kept OUT of
+ * the backdrop union: stars emit at the top of the render frame, so the whole
+ * world sits between them and the sky pair and a union would swallow it.
+ * Same lifecycle as the sky pair. */
+void NativeGpu_MarkStarRange(uintptr_t start, uintptr_t end);
 void NativeGpu_PublishSkyRange(void);
 void NativeGpu_ClearSkyRange(void);
 // Model-space vector that produced this screen coordinate (same rendezvous

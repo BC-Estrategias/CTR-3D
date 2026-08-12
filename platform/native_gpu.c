@@ -1416,6 +1416,28 @@ global_variable uintptr_t s_skyRangeEnd[2];
 global_variable int s_skyRangeWriteIdx = 0;
 global_variable int s_skyRangeReadIdx = 0;
 
+/* s46: CAM_SkyboxGlow's slice of the sky span, tracked separately (same
+ * write/read indices as the sky pair). The glow is SCREEN-SPACE geometry
+ * hardcoded to the retail 512-wide rect by the ASM-verified emitter, so the
+ * REAL-wide window shows bare backdrop in the extra columns; the 3DS emit
+ * path stretches exactly these prims to the ortho edges
+ * (NativeWide_GlowStretchX). The dome must stay out of this span: it is
+ * projected 3D geometry that already reaches the wide margins on its own
+ * (DrawSky_IsVisibleWideMargin / the extra yaw sectors). */
+global_variable uintptr_t s_glowRangeStart[2];
+global_variable uintptr_t s_glowRangeEnd[2];
+
+/* RenderStars' star tiles: sky-class content that must NOT join the union
+ * above. Stars emit at the top of the render frame, the whole world away from
+ * the backdrop pair, so folding them into [min start, max end) would swallow
+ * every packet in between. Own span, same write/read indices and lifecycle.
+ * Their captured depth is real but wrong for occlusion: each star is a
+ * projected unit direction vector -- camera-adjacent -- while retail hides
+ * stars behind the world purely by OT slot, so only the far pin reproduces
+ * that. */
+global_variable uintptr_t s_starRangeStart[2];
+global_variable uintptr_t s_starRangeEnd[2];
+
 void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end)
 {
 	/* UNION across the frame's backdrop producers. Two register their spans:
@@ -1445,6 +1467,58 @@ void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end)
 	}
 }
 
+/* s46: the glow marks through here -- it lands in BOTH spans, so every sky
+ * consumer (far pin, sky-first routing) keeps seeing the union while the
+ * stretch can target the glow alone. */
+void NativeGpu_MarkGlowRange(uintptr_t start, uintptr_t end)
+{
+	if (end <= start)
+	{
+		return;
+	}
+	if (s_glowRangeEnd[s_skyRangeWriteIdx] == 0)
+	{
+		s_glowRangeStart[s_skyRangeWriteIdx] = start;
+		s_glowRangeEnd[s_skyRangeWriteIdx] = end;
+	}
+	else
+	{
+		if (start < s_glowRangeStart[s_skyRangeWriteIdx])
+		{
+			s_glowRangeStart[s_skyRangeWriteIdx] = start;
+		}
+		if (end > s_glowRangeEnd[s_skyRangeWriteIdx])
+		{
+			s_glowRangeEnd[s_skyRangeWriteIdx] = end;
+		}
+	}
+	NativeGpu_MarkSkyRange(start, end);
+}
+
+void NativeGpu_MarkStarRange(uintptr_t start, uintptr_t end)
+{
+	if (end <= start)
+	{
+		return;
+	}
+	if (s_starRangeEnd[s_skyRangeWriteIdx] == 0)
+	{
+		s_starRangeStart[s_skyRangeWriteIdx] = start;
+		s_starRangeEnd[s_skyRangeWriteIdx] = end;
+	}
+	else
+	{
+		if (start < s_starRangeStart[s_skyRangeWriteIdx])
+		{
+			s_starRangeStart[s_skyRangeWriteIdx] = start;
+		}
+		if (end > s_starRangeEnd[s_skyRangeWriteIdx])
+		{
+			s_starRangeEnd[s_skyRangeWriteIdx] = end;
+		}
+	}
+}
+
 void NativeGpu_PublishSkyRange(void)
 {
 	s_skyRangeReadIdx = s_skyRangeWriteIdx;
@@ -1455,6 +1529,10 @@ void NativeGpu_ClearSkyRange(void)
 	s_skyRangeWriteIdx ^= 1;
 	s_skyRangeStart[s_skyRangeWriteIdx] = 0;
 	s_skyRangeEnd[s_skyRangeWriteIdx] = 0;
+	s_glowRangeStart[s_skyRangeWriteIdx] = 0;
+	s_glowRangeEnd[s_skyRangeWriteIdx] = 0;
+	s_starRangeStart[s_skyRangeWriteIdx] = 0;
+	s_starRangeEnd[s_skyRangeWriteIdx] = 0;
 }
 
 internal int NativeGpu_IsSkyPacket(uintptr_t addr)
@@ -1462,12 +1540,25 @@ internal int NativeGpu_IsSkyPacket(uintptr_t addr)
 	return (addr >= s_skyRangeStart[s_skyRangeReadIdx]) && (addr < s_skyRangeEnd[s_skyRangeReadIdx]);
 }
 
+internal int NativeGpu_IsGlowPacket(uintptr_t addr)
+{
+	return (addr >= s_glowRangeStart[s_skyRangeReadIdx]) && (addr < s_glowRangeEnd[s_skyRangeReadIdx]);
+}
+
+internal int NativeGpu_IsStarPacket(uintptr_t addr)
+{
+	return (addr >= s_starRangeStart[s_skyRangeReadIdx]) && (addr < s_starRangeEnd[s_skyRangeReadIdx]);
+}
+
 /* Set per node by the OT walk (beside GTECapture_MarkOTNode): whether the node
- * the walk is about to hand to direct-emit or the parse path is skybox. Read by
- * PacketDepth_ResolveXY, which sees only screen coordinates, not the packet
- * address. Self-resetting -- assigned IsSkyPacket() every node -- so it needs no
- * separate per-walk clear. */
+ * the walk is about to hand to direct-emit or the parse path is sky-class (the
+ * backdrop union or the star slice). Read by PacketDepth_ResolveXY, which sees
+ * only screen coordinates, not the packet address. Self-resetting -- assigned
+ * every node -- so it needs no separate per-walk clear. */
 global_variable int s_skyNodeActive;
+/* s46: same per-packet tagging for the glow slice (subset of the sky span).
+ * Read by the direct-emit vertex loop to decide the wide-window X stretch. */
+global_variable int s_glowNodeActive;
 #endif
 
 internal u16 PacketDepth_ClampWorld(u32 stamp)
@@ -4074,14 +4165,16 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 			GTECapture_MarkOTNode(basePacket); /* gate widened with BeginOTWalk above */
-			/* Skybox tag: set before the direct-emit fast path AND the parse
-			 * path below, so whichever one resolves this node's depth sees it.
+			/* Sky-class tag (backdrop union or star slice): set before the
+			 * direct-emit fast path AND the parse path below, so whichever one
+			 * resolves this node's depth sees it.
 			 * Self-resetting -- 0 for every non-sky node -- so no per-walk clear.
 			 * (Verified the range does NOT over-catch UI-band nodes in-race:
 			 * a walk-order guard here counted zero rescues across a full test run
 			 * -- the minimap black box was the sky PASS clobbering the open blend
 			 * run's state memo, fixed in N3DS_DrawSkyPass.) */
-			s_skyNodeActive = NativeGpu_IsSkyPacket((uintptr_t)basePacket);
+			s_skyNodeActive = NativeGpu_IsSkyPacket((uintptr_t)basePacket) || NativeGpu_IsStarPacket((uintptr_t)basePacket);
+			s_glowNodeActive = NativeGpu_IsGlowPacket((uintptr_t)basePacket);
 #endif
 			if (tagLength > 0)
 			{
@@ -5140,11 +5233,13 @@ int ParseTaglessPrimitive(u32 *command)
  * cull should accept than the retail viewport. Non-zero only while the 3DS
  * REAL-wide ortho window is live, and exactly its extension -- rectW *
  * (400-320)/(2*320) = rectW/8, the -64..576 window at rectW=512 -- so what
- * the culls accept and what the window shows stay one number. Callers so far:
- * RenderBucket_AcceptProjectedBounds (instance queue) and DrawSky's
- * second-chance face test. Called on the game thread; the flag is a plain int
- * flipped by the same thread's button/dumpreq poll. PC: always 0, every
- * retail comparison is restored verbatim.
+ * the culls accept and what the window shows stay one number. Callers:
+ * RenderBucket_AcceptProjectedBounds (instance queue), DrawSky's
+ * second-chance face test, and PushBuffer_UpdateFrustum (BSP frustum corner
+ * X -- the most upstream widened cull; everything the BSP walk rejects is
+ * invisible to every later gate). Called on the game thread; the flag is a
+ * plain int flipped by the same thread's button/dumpreq poll. PC: always 0,
+ * every retail comparison is restored verbatim.
  */
 int NativeWide_CullMarginX(int rectW)
 {
@@ -5167,12 +5262,14 @@ int NativeWide_CullMarginX(int rectW)
  * without rebuilding. Bits: 1 = instance bbox margin
  * (RenderBucket_AcceptProjectedBounds), 2 = per-triangle margin
  * (RenderBucket_TriangleInWideMargin), 4 = sky per-face margin
- * (DrawSky_IsVisibleWideMargin), 8 = sky extra yaw sectors (DrawSky_Full).
+ * (DrawSky_IsVisibleWideMargin), 8 = sky extra yaw sectors (DrawSky_Full),
+ * 16 = BSP frustum corner X (PushBuffer_UpdateFrustum -- widens both the
+ * frustum planes and pb->bbox, so a kill here re-culls whole BSP leaves).
  * Default all-on. Set via dumpreq `widemask N` (n3ds_backend.c). Non-static:
  * written by the backend TU's dumpreq poll, read here and by the game-side
  * call sites.
  */
-int g_dbg_wideMarginMask = 0xF;
+int g_dbg_wideMarginMask = 0x1F;
 
 int NativeWide_MarginClassOn(int bit)
 {
@@ -5218,4 +5315,24 @@ int NativeWide_UiShiftX(int x)
 		shift = m;
 	}
 	return x + shift;
+}
+
+/*
+ * s46: stretch CAM_SkyboxGlow's screen-space verts to the wide ortho window.
+ * The glow's ASM-verified emitter spans x 0..512 by construction, so REAL
+ * wide (-64..576) showed bare backdrop in the margins wherever no dome
+ * geometry covers them (dome-less levels like Polar Pass most of all).
+ * Linear about screen centre -- x=0 lands on -m, x=512 on 512+m -- which is
+ * exact for the untilted horizontal bands and imperceptibly relaxes the
+ * tilt slope inside the margins for the tilted cases. Callers gate on the
+ * glow span (NativeGpu_IsGlowPacket / s_glowNodeActive), never the whole
+ * sky span: the dome is projected 3D geometry that already reaches the
+ * margins on its own and must not be distorted. Identity whenever the wide
+ * window is off, so PC and 4:3 output are untouched.
+ */
+int NativeWide_GlowStretchX(int x)
+{
+	const int m = NativeWide_CullMarginX(512); /* 64 while REAL wide, else 0 */
+
+	return x + (((x - 256) * m) / 256);
 }

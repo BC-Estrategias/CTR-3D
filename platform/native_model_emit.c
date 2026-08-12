@@ -72,7 +72,12 @@ struct NativeModelEmitFace
 	u16 tpage;
 	u16 clut;
 	u8 textured;
-	u8 _pad[3];
+	/* Writer-forced blend for this face as a BlendMode (0 = opaque, else
+	 * ABR+1); 0xFF = no override, classify by tpage. The specular writers
+	 * choose ABE per SIDE, so neither the instance nor the tpage can carry
+	 * this -- see NativeModelDraw_FaceBlend. */
+	u8 blendOverride;
+	u8 _pad[2];
 };
 
 /*
@@ -206,6 +211,17 @@ int g_dbg_modelAxisFix = 1;
  * dumpreq 'modelfade'. */
 int g_dbg_modelFade = 1;
 
+/* Writer lighting for the two specular primitive writers (KEY_TOKEN / LIT_TEXTURE) on the
+ * native model path: the capture site runs the writer's own lcir + far-colour dpcs + glint
+ * ramp and hands this file pre-lit colours plus a per-face blend override (additive lit
+ * front faces). OFF restores the raw-colour capture as the A/B baseline. dumpreq 'spec'. */
+int g_dbg_modelSpecular = 1;
+
+int NativeModelEmit_SpecularEnabled(void)
+{
+	return g_dbg_modelSpecular;
+}
+
 /*
  * One DPCS component, mirroring native_gte_core.c's case 0x2a EXACTLY
  * (gte_dpct is op 0x0F8002A: sf=1 so A() is >>12, lm=0 so Lm_B clamps to
@@ -331,7 +347,8 @@ internal int NativeModelEmit_TexIsSemiTrans(const struct TextureLayout *tex)
 	return (((CTR_ReadU16LE(&tex->tpage) >> 5) & 3) != 3);
 }
 
-int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *worldInst)
+int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, int specularLit,
+                                  const struct Instance *worldInst)
 {
 	struct NativeModelEmitSnapshot *dst = &s_modelEmitBuf[s_modelEmitWriteIdx];
 	struct NativeModelEmitInstance *inst;
@@ -494,7 +511,11 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 	 * the far-colour registers hold exactly what the writer's gte_dpct will
 	 * read for this instance. CFC2 is the facade's own control-reg read --
 	 * a read, not a GTE op; nothing here perturbs writer-visible state. */
-	inst->alphaScale = idpp->alphaScale;
+	/* Specular writers never consume LoadPrimColors' dpct -- their colour is
+	 * their own lcir/dpcs on the raw rolling value, applied by the capture
+	 * site -- so the fade replay must not run on top of it. alphaScale 0 is
+	 * the existing "no fade" state. */
+	inst->alphaScale = specularLit ? 0 : idpp->alphaScale;
 	inst->fcR = (s32)CFC2(21);
 	inst->fcG = (s32)CFC2(22);
 	inst->fcB = (s32)CFC2(23);
@@ -559,7 +580,7 @@ internal void NativeModelEmit_UnpackVertex(u32 packedXY, u32 packedZ, s16 *outX,
  * triangles are claimed like any other: the draw side does real two-pass PS1
  * blending (NativeModelDraw_IssueForWalk).
  */
-int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex)
+int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex, int blendOverride)
 {
 	struct NativeModelEmitSnapshot *dst = &s_modelEmitBuf[s_modelEmitWriteIdx];
 	struct NativeModelEmitFace *face;
@@ -637,9 +658,9 @@ int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const in
 			face->clut = 0;
 			face->textured = 0;
 		}
+		face->blendOverride = (blendOverride >= 0) ? (u8)blendOverride : 0xFF;
 		face->_pad[0] = 0;
 		face->_pad[1] = 0;
-		face->_pad[2] = 0;
 
 		const struct NativeModelEmitInstance *mi = &dst->insts[s_modelEmitCurInst];
 
@@ -655,7 +676,10 @@ int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const in
 			 * writer feeds gte_dpct -- so this is the colour BEFORE the depth
 			 * cue, even though the capture site runs after the writer (dpct
 			 * leaves its result in GTE registers and never touches
-			 * ctx->tempColor).
+			 * ctx->tempColor). Specular instances are the exception: the
+			 * capture site hands this function WRITER-LIT colours, and their
+			 * alphaScale is forced 0 at BeginInstance so the fade below stays
+			 * off (their writers never run the dpct being replayed).
 			 *
 			 * The dpct is replayed here in C: IR0 is idpp->alphaScale
 			 * and FC is whatever the instance's setup callback loaded, both
@@ -1178,6 +1202,14 @@ internal int NativeModelDraw_FaceBlend(const struct NativeModelEmitFace *face, c
 	 * (BM_ADD_QUATER_SOURCE), it does not become opaque, and only a BlendMode return can express
 	 * that state.
 	 */
+	/* A per-face override outranks everything: the specular writers choose
+	 * ABE by SIDE (lit front faces additive, the rest opaque), so neither the
+	 * per-instance flag below nor the tpage can answer for them. */
+	if (face->blendOverride != 0xFF)
+	{
+		return (int)face->blendOverride;
+	}
+
 	if (inst->forceSemiTrans)
 	{
 		/* The writer decided ABE; the tpage still decides HOW. An untextured
@@ -1458,21 +1490,29 @@ int g_dbg_modelRender = 0;
  * the real implementation above. */
 int g_dbg_modelDepthCheck = 0;
 
-int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, const struct Instance *worldInst)
+int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, int specularLit,
+                                  const struct Instance *worldInst)
 {
 	(void)idpp;
 	(void)pb;
 	(void)forceSemiTrans;
+	(void)specularLit;
 	(void)worldInst;
 	return 0;
 }
 
-int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex)
+int NativeModelEmit_SpecularEnabled(void)
+{
+	return 0;
+}
+
+int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex, int blendOverride)
 {
 	(void)packedXY3;
 	(void)packedZ3;
 	(void)color3;
 	(void)tex;
+	(void)blendOverride;
 	/* 0 = "not claimed", so a compiled-out build always writes the packet. */
 	return 0;
 }

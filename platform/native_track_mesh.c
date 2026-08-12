@@ -638,6 +638,162 @@ static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *
 	atlas->rectCount++;
 }
 
+/* True corner-bbox area of one layout, in the same page-space texel units
+ * NativeTrackAtlas_AddLayout gathers and packedTexels accumulates. */
+static u32 NativeTrackMesh_MosaicLayoutArea(const struct TextureLayout *layout)
+{
+	u8 minU = layout->u0, maxU = layout->u0, minV = layout->v0, maxV = layout->v0;
+	static const u8 cornerOfs[3] = {4, 8, 10};
+
+	for (int c = 0; c < 3; c++)
+	{
+		u8 u = (&layout->u0)[cornerOfs[c]];
+		u8 v = (&layout->u0)[cornerOfs[c] + 1];
+
+		minU = TRKMESH_MIN(minU, u);
+		maxU = TRKMESH_MAX(maxU, u);
+		minV = TRKMESH_MIN(minV, v);
+		maxV = TRKMESH_MAX(maxV, v);
+	}
+
+	return (u32)(maxU - minU + 1) * (u32)(maxV - minV + 1);
+}
+
+/*
+ * Mosaic census -- pre-work for the montage close-up experiment
+ * (docs/PORT_FEASIBILITY_3DS.md, "Mosaic"). Load-time, platform-neutral and
+ * output-neutral, same contract as the [TRKSTP] census: it only classifies
+ * each interned IconGroup4's mosaic slot and totals what compositing the hi
+ * tiles into per-texture montages would ask of the atlas.
+ *
+ * Slot semantics are retail's own (226_00_DrawLevelOvr1P.c):
+ * GetProjectedMidTexture steps far->middle->near by depth threshold and only
+ * steps onto the mosaic layout itself when the slot's first word is NOT a
+ * pointer; when it IS one (PS1 0x80xxxxxx, host-rebased by the native
+ * loader, so here it lands inside the mempack arena), the deepest
+ * subdivision frames instead index a per-sub-quad TextureLayout array at
+ * that address (PrepareDeepestMosaicUv). So: 0 = no close-up variant,
+ * plausible inline layout = single un-subdivided close-up variant, arena
+ * pointer = hi-tile array, i.e. the montage source.
+ *
+ * montKB is the montage space bound: per UNIQUE hi array, the near bbox x4
+ * (a 2x2 montage of near-sized tiles). tileKB sums the four probed tile
+ * bboxes for the same arrays -- if the two agree, the tiles really are
+ * near-sized and "montage = 2x resolution" holds; if tiles!=probed*4 some
+ * arrays carry implausible layouts and the mapping read needs another look.
+ */
+static void NativeTrackMesh_MosaicCensus(void)
+{
+	const struct PlatformMempackArena *arena = Platform_GetMempackArena();
+	uintptr_t arenaBase = (uintptr_t)arena->base;
+	uintptr_t arenaEnd = (uintptr_t)arena->endOfMemory;
+	u32 igCount = 0, none = 0, inlineVar = 0, hi = 0, uniqHi = 0, odd = 0;
+	u32 tilesOk = 0, tilesProbed = 0, montTexels = 0, tileTexels = 0;
+	int seenOverflow = 0;
+	u32 seenCount = 0;
+	uintptr_t *seen = (uintptr_t *)malloc(1024 * sizeof(uintptr_t));
+
+	for (u32 t = 0; t < s_trackMesh.texCount; t++)
+	{
+		uintptr_t texPtr = s_trackMesh.texTable[t];
+		const struct IconGroup4 *groups[256];
+		u32 groupCount = 0;
+
+		if ((texPtr & 1) != 0)
+		{
+			const struct AnimTex *anim = (const struct AnimTex *)(texPtr - 1);
+
+			if ((anim->numFrames > 0) && (anim->numFrames <= 256))
+			{
+				struct IconGroup4 **frames = ANIMTEX_GETARRAY((struct AnimTex *)anim);
+
+				for (int f = 0; f < anim->numFrames; f++)
+				{
+					if (frames[f] != NULL)
+					{
+						groups[groupCount++] = frames[f];
+					}
+				}
+			}
+		}
+		else
+		{
+			groups[groupCount++] = (const struct IconGroup4 *)texPtr;
+		}
+
+		for (u32 g = 0; g < groupCount; g++)
+		{
+			const struct TextureLayout *mos = (const struct TextureLayout *)groups[g] + 3; /* mosaic */
+			u32 word = CTR_ReadU32LE(&mos->u0);
+
+			igCount++;
+
+			if (word == 0)
+			{
+				none++;
+			}
+			else if (((uintptr_t)word >= arenaBase) && ((uintptr_t)word + 4 * sizeof(struct TextureLayout) <= arenaEnd))
+			{
+				hi++;
+
+				int dup = 0;
+
+				for (u32 s = 0; s < seenCount; s++)
+				{
+					if (seen[s] == (uintptr_t)word)
+					{
+						dup = 1;
+						break;
+					}
+				}
+
+				if (!dup && (seen != NULL))
+				{
+					if (seenCount >= 1024)
+					{
+						seenOverflow++;
+					}
+					else
+					{
+						const struct TextureLayout *tiles = (const struct TextureLayout *)(uintptr_t)word;
+
+						seen[seenCount++] = (uintptr_t)word;
+						uniqHi++;
+						montTexels += NativeTrackMesh_MosaicLayoutArea((const struct TextureLayout *)groups[g] + 2 /* near */) * 4u;
+
+						for (int i = 0; i < 4; i++)
+						{
+							tilesProbed++;
+
+							if ((CTR_ReadU16LE(&tiles[i].tpage) & 0xfe00) == 0)
+							{
+								tilesOk++;
+								tileTexels += NativeTrackMesh_MosaicLayoutArea(&tiles[i]);
+							}
+						}
+					}
+				}
+			}
+			else if ((CTR_ReadU16LE(&mos->tpage) & 0xfe00) == 0)
+			{
+				inlineVar++;
+			}
+			else
+			{
+				odd++;
+			}
+		}
+	}
+
+	free(seen);
+
+	Platform_Log("[MOSCEN] lvl=%d ig=%u none=%u inline=%u hi=%u uniqHi=%u odd=%u tiles=%u/%u montKB=%u tileKB=%u atlasKB=%u freeKB=%u%s\n",
+	             NativePerf_CurrentLevelID(), igCount, none, inlineVar, hi, uniqHi, odd, tilesOk, tilesProbed, (montTexels * 2u) / 1024u,
+	             (tileTexels * 2u) / 1024u, (s_trackMesh.atlas.packedTexels * 2u) / 1024u,
+	             (((u32)TRACK_ATLAS_MAX_UNITS * TRACK_ATLAS_DIM * TRACK_ATLAS_DIM - s_trackMesh.atlas.packedTexels) * 2u) / 1024u,
+	             seenOverflow ? " SEEN-OVERFLOW" : "");
+}
+
 /*
  * Shelf-pack the gathered rects into 512x512 units. Census-sized: ~120
  * pairs, ~0.5-1.2MB of near-variant texels -- a plain shelf is plenty.
@@ -3371,6 +3527,8 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	             s_trackMesh.atlas.rectCount, s_trackMesh.atlas.unitsUsed,
 	             TRACK_ATLAS_MAX_UNITS, s_trackMesh.atlas.unitsUsed ? (int)((s_trackMesh.atlas.packedTexels * 100u) / ((u32)s_trackMesh.atlas.unitsUsed * TRACK_ATLAS_DIM * TRACK_ATLAS_DIM)) : 0,
 	             (s_trackMesh.atlas.packedTexels * 2u) / 1024u, atlasAnimFrames, s_trackMesh.atlas.rectsDropped, s_trackMesh.atlas.p2Dropped);
+
+	NativeTrackMesh_MosaicCensus();
 }
 
 /*

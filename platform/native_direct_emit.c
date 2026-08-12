@@ -332,6 +332,18 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 
 								dx = (s16)NativeWide_UiShiftX((int)dx);
 							}
+							/* s46: the horizon gradient is screen-space geometry hardcoded
+							 * to the retail 512-wide rect; stretch it to the wide ortho
+							 * window (identity with wide off). Glow slice only -- see
+							 * NativeWide_GlowStretchX for why the dome must not take this.
+							 * Mutually exclusive with the UI ramp above by depth: glow is
+							 * far-pinned. */
+							if (s_glowNodeActive)
+							{
+								extern int NativeWide_GlowStretchX(int x);
+
+								dx = (s16)NativeWide_GlowStretchX((int)dx);
+							}
 							dst[k].x = dx;
 							dst[k].y = (s16)((float)(s16)(xyWord >> 16) + ofsY);
 							dst[k].z = dz;

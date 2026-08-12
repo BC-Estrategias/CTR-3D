@@ -5,6 +5,18 @@ CTR_STATIC_ASSERT(offsetof(TILE_1, tag) == 0x00);
 CTR_STATIC_ASSERT(offsetof(TILE_1, r0) == 0x04);
 CTR_STATIC_ASSERT(offsetof(TILE_1, x0) == 0x08);
 
+#ifndef CTR_NATIVE_GTE_CAPTURE
+#define CTR_NATIVE_GTE_CAPTURE 0
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+// Declared locally rather than by including platform/native_gte_capture.h:
+// same idiom and same reason as DrawSky.c -- this file sits earlier in
+// game_unity.h's include chain than the first file that pulls that header in,
+// and the prototype is checked against the real one at that point.
+extern void NativeGpu_MarkStarRange(uintptr_t start, uintptr_t end);
+#endif
+
 static s32 RenderStars_MulLowShift(s32 value, s32 scale)
 {
 	return (s32)(u32)((s64)value * (s64)scale) >> 12;
@@ -58,6 +70,9 @@ void RenderStars(struct PushBuffer *pb, struct PrimMem *primMem, struct Stars *s
 {
 	u32 *prim = (u32 *)primMem->cursor;
 	int playerCount = numPlyr;
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	uintptr_t starPrimStart = (uintptr_t)prim;
+#endif
 
 	// NOTE(aalhendi): PSX-backfeed blocker: retail uses 0x1f800000-0x1f80002c
 	// to spill callee-save registers. This C port relies on the compiler ABI
@@ -196,6 +211,15 @@ void RenderStars(struct PushBuffer *pb, struct PrimMem *primMem, struct Stars *s
 		CtrGpu_LinkPacket24(ot, &drawMode->tag, drawMode, 0x02000000);
 		prim = (u32 *)(drawMode + 1);
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	/* Sky-class span for the packet-depth far pin: a star's captured depth is
+	 * its projected unit direction vector -- camera-adjacent -- while retail
+	 * hides stars behind the world purely by the OT slot above. Own span, not
+	 * the backdrop union: the whole world emits between here and DrawSky. The
+	 * trailing draw-mode packets sit inside the span; they resolve no depth. */
+	NativeGpu_MarkStarRange(starPrimStart, (uintptr_t)prim);
+#endif
 
 	primMem->cursor = prim;
 }

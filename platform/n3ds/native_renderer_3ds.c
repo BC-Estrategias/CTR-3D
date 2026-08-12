@@ -2582,20 +2582,19 @@ internal void N3DS_DrawBackdropPass(void)
 	{
 		return;
 	}
-	/* Only under a frame that drew sky. Boot/load screens clear via the same
-	 * FILL packets but must present with ZERO draws -- the session-14 splash
-	 * hang class lived in the draw path -- and a frame with no sky content is
-	 * also the only case where the backdrop has nothing to be behind: the
-	 * walk's own draws cover whatever the fill would have shown. Read before
-	 * N3DS_DrawSkyPass zeroes the count. */
-	if (s_skyVertUsed <= 0)
-	{
-		s_backdropVertUsed = 0;
-		return;
-	}
 	N3DS_MergeCloseBlendRun(N3DS_BLEND_CLOSE_STATE);
 	baseVertex = N3DS_C3DAppendVertices(s_backdropVerts, s_backdropVertUsed);
-	if (baseVertex >= 0)
+	/* baseVertex > 0 doubles as the splash-frame gate: boot/load-splash
+	 * frames clear via the same FILL packets but must present with ZERO
+	 * draws (the session-14 hang class lived in the draw path -- an
+	 * ungated version of this pass hung Azahar boot at TenStages stage 5).
+	 * Position 0 in the frame VBO means nothing else drew this frame,
+	 * which is exactly that class; every real frame has walk content
+	 * appended long before EndScene. Cheaper and more honest than the
+	 * earlier requires-sky-content gate, which would have left a
+	 * hypothetical dome-less-and-gradient-less level black where retail
+	 * shows flat clearColor. */
+	if (baseVertex > 0)
 	{
 		N3DS_MergeEmit(0, 0, N3DS_WHITE_ATLAS, baseVertex, s_backdropVertUsed, &lastDoubling);
 	}

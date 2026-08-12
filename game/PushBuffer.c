@@ -610,6 +610,25 @@ void PushBuffer_UpdateFrustum(struct PushBuffer *pb)
 	val_X = pb->rect.w;
 	val_X = val_X / 2;
 
+#if defined(CTR_NATIVE)
+	/* The BSP visibility frustum must accept the same extra world content the
+	 * wide ortho window shows, or margin geometry is world-space-culled before
+	 * any renderer sees it. Widening the corner X here widens BOTH gates
+	 * derived from these corners: the frustum planes and pb->bbox
+	 * (RenderLists' coarse overlap pre-test). Y is never widened. The margin
+	 * is 0 whenever the wide window is off, restoring the retail frustum
+	 * verbatim (PC always; 3DS in 4:3). */
+	{
+		extern int NativeWide_CullMarginX(int rectW);
+		extern int NativeWide_MarginClassOn(int bit);
+
+		if (NativeWide_MarginClassOn(16))
+		{
+			val_X += NativeWide_CullMarginX((u16)pb->rect.w);
+		}
+	}
+#endif
+
 	val_Y = ((pb->rect.h * 0x600) / 0x360);
 	val_Y = val_Y / 2;
 
