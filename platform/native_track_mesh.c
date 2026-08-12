@@ -228,6 +228,13 @@ struct NativeTrackMeshState
 	uintptr_t *texTable;
 	u32 texCount;
 
+	/* The level's waterEnvMap when any water face was emitted; NULL otherwise.
+	 * Unlike every other plain texTable entry (an IconGroup4 triple whose near
+	 * variant lives at +2), this is a BARE TextureLayout read at +0 -- retail's
+	 * own water read (Ovr226_800a1e30_SeedWaterListState). Consumers that walk
+	 * texTable key on this pointer to skip the +2. */
+	const struct TextureLayout *waterEnvLayout;
+
 	/* texRef -> rect index into the atlas layout (-1 = unplaced). */
 	s16 texRectIndex[1024];
 	struct NativeTrackAtlasLayout atlas;
@@ -698,6 +705,13 @@ static void NativeTrackMesh_MosaicCensus(void)
 		uintptr_t texPtr = s_trackMesh.texTable[t];
 		const struct IconGroup4 *groups[256];
 		u32 groupCount = 0;
+
+		/* The water env-map ref is a bare layout, not an IconGroup4 --
+		 * reading it as one walks past its data. */
+		if (texPtr == (uintptr_t)s_trackMesh.waterEnvLayout)
+		{
+			continue;
+		}
 
 		if ((texPtr & 1) != 0)
 		{
@@ -2669,6 +2683,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	int weldCount = 0;
 
 	int leavesTotal = 0, leavesExcluded = 0, facesDoubleSided = 0, facesNoTexture = 0, facesAnimTex = 0, facesModeTri = 0, facesMode3 = 0;
+	int facesWater = 0;
 	/* keptWater and keptAnim are both populations that USED to be dropped whole
 	 * and now are not -- the two halves of the hole fix, kept as separate
 	 * columns because they answer different questions. keptWater is how much
@@ -2714,27 +2729,16 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		 * track spends a real fraction of the entire win to fix a hole.
 		 *
 		 * BSP_LEAF_FLAG_WATER leaves are kept too, per the owner's ruling
-		 * ("in future don't skip the water-flagged chunks"). They used
-		 * to be excluded on the argument that this renderer bakes every face
-		 * opaque (dst->a = 0xff below; N3DS_TrackDraw_Begin asserts opaque blend
-		 * once for the whole draw), so drawing them would hide whatever should
-		 * show through -- possibly worse than the gap.
-		 *
-		 * That argument does not survive the scale. Crash Cove flags 174 of its
-		 * 504 leaves as water: most of a beach track, and not just the sea
-		 * surface but everything binned into the water render-list slot with it.
-		 * A solid sea is a visual downgrade, which the standing perf-over-parity
-		 * ruling covers; a third of the level missing is a hole, which it does
-		 * not. Semi-transparency remains the real fix and is still deferred --
-		 * this makes the interim state the better-looking one, not the correct
-		 * one.
-		 *
-		 * Counted, not silent: `water=` in [TRKMESH] now reports water leaves
-		 * KEPT rather than dropped, because the number still matters -- it is
-		 * how much geometry is being drawn opaque that should not be, and it is
-		 * what the transparency work will have to cover.
+		 * ("in future don't skip the water-flagged chunks"). Crash Cove flags
+		 * 174 of its 504 leaves as water: most of a beach track, and not just
+		 * the sea surface but everything binned into the water render-list slot
+		 * with it. Their textured faces emit like any other; their NULL-texture
+		 * faces are the water surface itself and take the waterEnvMap route in
+		 * the face loop below.
 		 */
-		if ((bsp->flag & BSP_LEAF_FLAG_WATER) != 0)
+		int leafIsWater = (bsp->flag & BSP_LEAF_FLAG_WATER) != 0;
+
+		if (leafIsWater)
 		{
 			leavesKeptWater++;
 		}
@@ -2790,15 +2794,37 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 			{
 				uintptr_t texPtr = (uintptr_t)block->ptr_texture_mid[face];
 				const struct TextureLayout *layout = NULL;
+				int faceIsWater = 0;
 
 				if (texPtr == 0)
 				{
-					facesNoTexture++;
-					notexNull++;
-					continue;
+					/* Water surface: retail draws the NULL-texture faces of
+					 * water-flagged leaves through its water list, textured with
+					 * the level's single waterEnvMap layout and that layout's own
+					 * UV corners (Ovr226_800a1e30_SeedWaterListState seeds them
+					 * once; there is no per-face texture). Route these faces to
+					 * that layout so the ordinary rect/blend/animated-colour
+					 * machinery covers them -- the water colour cycle already
+					 * lands in LevVertex.color_hi via AnimateWaterVertex, and
+					 * water vertices are already in the patcher population.
+					 * NULL-texture faces OUTSIDE water leaves stay dropped:
+					 * retail has no path that draws those. */
+					if (leafIsWater && (level->ptr_tex_waterEnvMap != NULL))
+					{
+						texPtr = (uintptr_t)level->ptr_tex_waterEnvMap;
+						layout = level->ptr_tex_waterEnvMap;
+						s_trackMesh.waterEnvLayout = level->ptr_tex_waterEnvMap;
+						faceIsWater = 1;
+						facesWater++;
+					}
+					else
+					{
+						facesNoTexture++;
+						notexNull++;
+						continue;
+					}
 				}
-
-				if ((texPtr & 1) != 0)
+				else if ((texPtr & 1) != 0)
 				{
 					/* AnimTex face: intern the AnimTex itself (low bit
 					 * kept); resolve the live frame's near layout for the
@@ -2921,6 +2947,17 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				else if (faceMode == 3)
 				{
 					facesMode3++;
+				}
+
+				if (faceIsWater)
+				{
+					/* Retail water ignores the face's rotation/flip and
+					 * triangle-relearn bits entirely -- every water face gets
+					 * the layout's corners in fixed order. */
+					uvIdxOf[0] = 0;
+					uvIdxOf[1] = 1;
+					uvIdxOf[2] = 2;
+					uvIdxOf[3] = 3;
 				}
 
 				for (int c = 0; c < 4; c++)
@@ -3259,7 +3296,11 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		}
 		else
 		{
-			const struct TextureLayout *layout = (const struct TextureLayout *)texPtr + 2; /* near */
+			/* The water env-map ref is a bare layout read at +0 (see
+			 * waterEnvLayout); every other plain ref is a triple whose near
+			 * variant lives at +2. */
+			const struct TextureLayout *layout = (texPtr == (uintptr_t)s_trackMesh.waterEnvLayout) ? (const struct TextureLayout *)texPtr
+			                                                                                       : ((const struct TextureLayout *)texPtr + 2);
 
 			if ((CTR_ReadU16LE(&layout->tpage) & 0xfe00) == 0)
 			{
@@ -3385,13 +3426,14 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * an option.
 	 */
 	Platform_Log("[TRKMESH] lvl=%d lev=%p leaves=%u/%d (excl=%d keptWater=%d keptAnim=%d empty=%d noFaces=%d) verts=%u idx=%u tex=%u dropIdxCap=%d dropCap=%d "
-	             "animVerts=%u animWelded=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d modeTri=%d mode3=%d | welds=%d\n",
+	             "animVerts=%u animWelded=%u | KB verts=%u idx=%u | faces ds=%d animtex=%d notex=%d modeTri=%d mode3=%d water=%d(tpage=%04x) | welds=%d\n",
 	             NativePerf_CurrentLevelID(), (void *)level, s_trackMesh.leafCount, leavesTotal, leavesExcluded, leavesKeptWater, leavesKeptAnim,
 	             leavesSkippedEmpty, leavesEmittedNothing,
 	             s_trackMesh.vertCount, s_trackMesh.indexCount, s_trackMesh.texCount, facesDroppedIndexCap, facesDroppedCapacity,
 	             s_trackMesh.animVertCount, s_trackMesh.animVertWelded,
 	             (u32)(s_trackMesh.vertCount * sizeof(struct NativeTrackVert) / 1024), (u32)(s_trackMesh.indexCount * sizeof(u16) / 1024), facesDoubleSided,
-	             facesAnimTex, facesNoTexture, facesModeTri, facesMode3, weldCount);
+	             facesAnimTex, facesNoTexture, facesModeTri, facesMode3, facesWater,
+	             (s_trackMesh.waterEnvLayout != NULL) ? (unsigned)CTR_ReadU16LE(&s_trackMesh.waterEnvLayout->tpage) : 0u, weldCount);
 
 	/*
 	 * The animated-texture ledger. `chains` is how many texture chains any
