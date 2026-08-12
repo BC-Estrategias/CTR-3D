@@ -1332,6 +1332,41 @@ static u32 NativeTrackAnim_PatchVertices(s32 camX, s32 camZ)
 
 		if ((vert->faceFlags & 0x20) != 0)
 		{
+			/* Water UV flow: retail's water emit stores each vertex's ANIMATED
+			 * color_lo word over the packet's UV bytes (flagN aliases uvN in
+			 * DrawLevelOvr1PUvScratch -- namespace_DrawLevel.h's asserts), so
+			 * color_lo is a per-vertex UV pair sliding across the env sheet,
+			 * not a colour. Re-read it every frame and push it through the
+			 * water rect. Clamped to the rect's true bbox -- a wave value
+			 * outside the baked box would sample a neighbouring atlas cell --
+			 * and counted through the same outOfRect tripwire the AnimTex
+			 * patcher uses, so a rect sized too small for the wander surfaces
+			 * in [TRKANIM] rather than as quiet edge-sticking. */
+			const unsigned texRefMax = (unsigned)(sizeof(s_trackMesh.texRectIndex) / sizeof(s_trackMesh.texRectIndex[0]));
+			s16 rectIdx = ((unsigned)vert->texRef < texRefMax) ? s_trackMesh.texRectIndex[vert->texRef] : (s16)-1;
+
+			if ((rectIdx >= 0) && (rectIdx < s_trackMesh.atlas.rectCount))
+			{
+				const struct NativeTrackAtlasRect *rect = &s_trackMesh.atlas.rects[rectIdx];
+
+				if (rect->atlasUnit != TRACK_ATLAS_UNIT_INVALID)
+				{
+					u8 pageU = src->color_lo[0];
+					u8 pageV = src->color_lo[1];
+
+					if ((pageU < rect->minU) || (pageU > rect->maxU) || (pageV < rect->minV) || (pageV > rect->maxV))
+					{
+						s_animPatchOutOfRect++;
+						pageU = (pageU < rect->minU) ? rect->minU : ((pageU > rect->maxU) ? rect->maxU : pageU);
+						pageV = (pageV < rect->minV) ? rect->minV : ((pageV > rect->maxV) ? rect->maxV : pageV);
+					}
+
+					vert->u = pageU;
+					vert->v = pageV;
+					NativeTrackAnim_QueueVertexUV(vi, rect, pageU, pageV);
+				}
+			}
+
 			NativeTrackAnim_WaterFade(vert, camX, camZ);
 		}
 
@@ -1340,6 +1375,7 @@ static u32 NativeTrackAnim_PatchVertices(s32 camX, s32 camZ)
 	}
 
 	NativeTrackAnim_FlushQueuedVerts();
+	NativeTrackAnim_FlushQueuedUV();
 	return patched;
 }
 
@@ -3009,16 +3045,6 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					facesMode3++;
 				}
 
-				if (faceIsWater)
-				{
-					/* Retail water ignores the face's rotation/flip and
-					 * triangle-relearn bits entirely -- every water face gets
-					 * the layout's corners in fixed order. */
-					uvIdxOf[0] = 0;
-					uvIdxOf[1] = 1;
-					uvIdxOf[2] = 2;
-					uvIdxOf[3] = 3;
-				}
 
 				for (int c = 0; c < 4; c++)
 				{
@@ -3095,6 +3121,17 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 					dst->a = 0xff;
 					dst->u = uvBytes[sTrackUvByteOfs[uvIdxOf[c]]];
 					dst->v = uvBytes[sTrackUvByteOfs[uvIdxOf[c]] + 1];
+					if (faceIsWater)
+					{
+						/* Water UVs are the vertex's own animated color_lo
+						 * pair, not layout corners: retail's water emit stores
+						 * color_lo over the packet's UV bytes (flagN aliases
+						 * uvN in DrawLevelOvr1PUvScratch). This bakes the
+						 * load-time value; the animated-vertex patcher re-reads
+						 * it every frame. */
+						dst->u = src->color_lo[0];
+						dst->v = src->color_lo[1];
+					}
 					dst->texRef = texRef;
 
 #if defined(CTR_NATIVE_BAKE_PARITY) && CTR_NATIVE_BAKE_PARITY
