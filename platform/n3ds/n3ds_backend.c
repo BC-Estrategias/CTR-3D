@@ -776,6 +776,22 @@ static void N3DS_StereoEyeVec(float k, float *out4)
 	}
 }
 
+/* Widest horizontal shift stereo can apply to far-pinned content, in PSX
+ * screen px, rounded up: p = k*(1 - conv/depth) tends to k at infinite depth,
+ * and k = sep/2 at full slider. Flat sky content that must reach the screen
+ * edges (backdrop fill, horizon glow) overscans X by this so neither eye's
+ * shift can pull an edge on-screen; mono clips the overshoot at the window
+ * edge. Deliberately constant while stereo is enabled -- NOT slider-tracking,
+ * so the geometry never breathes with the slider. */
+int N3DS_StereoSkyPadX(void)
+{
+	if (!g_dbg_stereo)
+	{
+		return 0;
+	}
+	return (int)(s_stereoSep * 0.5f) + 1;
+}
+
 /* Once per frame, from N3DS_C3DBeginFrame: read the physical slider, decide
  * whether this frame is stereo, reset the journal, compute both eyes'
  * vectors. Logs only on the active/inactive TRANSITION -- the slider is an

@@ -4826,7 +4826,11 @@ void NativeRenderer_Clear(int x, int y, int w, int h, u8 r, u8 g, u8 b)
 
 		if (g_dbg_widescreen == 2)
 		{
-			const int extra = (displayW * (400 - N3DS_TOP_CONTENT_W)) / (2 * N3DS_TOP_CONTENT_W);
+			/* + stereo overscan: each eye shifts the far-pinned fill
+			 * horizontally by up to the far-plane parallax, which would pull
+			 * an exactly-fitted edge on-screen. Mono clips the overshoot --
+			 * the wide window edge is the physical screen edge. */
+			const int extra = (displayW * (400 - N3DS_TOP_CONTENT_W)) / (2 * N3DS_TOP_CONTENT_W) + N3DS_StereoSkyPadX();
 
 			if (relX == 0)
 			{

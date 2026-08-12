@@ -191,6 +191,11 @@ void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count);
 void N3DS_StereoRecordPacket(int blendMode, int doubling, int depthWrite, int atlas, int baseVertex, int vertCount);
 void N3DS_StereoRecordVram(int slot, int baseVertex);
 void N3DS_StereoRenderRightEye(void);
+/* Max far-plane parallax in PSX px, rounded up (0 when stereo is
+ * master-disabled): flat sky-class content that must reach the screen edges
+ * overscans X by this so a per-eye shift cannot expose the window edge.
+ * Constant per stereosep, not slider-tracking. */
+int N3DS_StereoSkyPadX(void);
 
 /*
  * One real vertex buffer per FRAME, not per draw. C3D_DrawArrays only

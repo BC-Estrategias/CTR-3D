@@ -5332,7 +5332,19 @@ int NativeWide_UiShiftX(int x)
  */
 int NativeWide_GlowStretchX(int x)
 {
-	const int m = NativeWide_CullMarginX(512); /* 64 while REAL wide, else 0 */
+	int m = NativeWide_CullMarginX(512); /* 64 while REAL wide, else 0 */
 
+#ifdef __3DS__
+	if (m != 0)
+	{
+		/* Stereo shifts far-pinned content horizontally by up to the far-plane
+		 * parallax per eye; stretch that much past the window edge so neither
+		 * eye can pull the gradient's edge on-screen. Mono clips the overshoot
+		 * -- the wide window edge IS the physical screen edge. */
+		extern int N3DS_StereoSkyPadX(void);
+
+		m += N3DS_StereoSkyPadX();
+	}
+#endif
 	return x + (((x - 256) * m) / 256);
 }
