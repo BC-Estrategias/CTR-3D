@@ -1,5 +1,18 @@
 #include <common.h>
 
+#ifndef CTR_NATIVE_GTE_CAPTURE
+#define CTR_NATIVE_GTE_CAPTURE 0
+#endif
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+// Declared locally rather than by including platform/native_gte_capture.h:
+// this file sits earlier in game_unity.h's include chain than the first file
+// that pulls that header in (MAIN/MainFrame.c), and the chain's order is
+// load-bearing. Same idiom as DrawSky.c's hooks; the prototype is checked
+// against the real one at the point MainFrame.c does include the header.
+extern void GTECapture_AddPaintOnTopRange(const void *start, const void *end, int flatParallax);
+#endif
+
 enum
 {
 	DOT_LIGHT_COUNT = 4,
@@ -44,6 +57,13 @@ void DotLights_Video(struct GameTracker *gGT, s32 red1, s32 red2, s32 red3, s32 
 		return;
 	}
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	// Flat 2D overlay linked into the WORLD OT (retail's choice, so the
+	// character icons layer over it) -- registered paint-on-top so the depth
+	// test reproduces that layering instead of burying it in the track.
+	const void *paintTopStart = gGT->backBuffer->primMem.cursor;
+#endif
+
 	s32 iconState[DOT_LIGHT_COUNT];
 	iconState[0] = red1;
 	iconState[1] = red2;
@@ -76,6 +96,10 @@ void DotLights_Video(struct GameTracker *gGT, s32 red1, s32 red2, s32 red3, s32 
 			DecalHUD_DrawPolyFT4(gGT->trafficLightIcon[iconIndex], newPosX + (sizeX * lightIndex), newPosY, &gGT->backBuffer->primMem, pb->ptrOT, 0, scale);
 		}
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	GTECapture_AddPaintOnTopRange(paintTopStart, gGT->backBuffer->primMem.cursor, 1);
+#endif
 }
 
 

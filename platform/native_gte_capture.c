@@ -57,6 +57,8 @@ typedef struct
 // matrix states would make "dominant share" mushy, not wrong.
 #define GTE_CAPTURE_MTX_IDS 64
 
+#define GTE_CAPTURE_PAINTNEAR_MAX 4
+
 typedef struct
 {
 	GTECaptureEntry entries[GTE_CAPTURE_TABLE_SIZE];
@@ -78,6 +80,20 @@ typedef struct
 	// and how many ids this frame actually used.
 	u32 mtxStores[GTE_CAPTURE_MTX_IDS];
 	u32 mtxUsed;
+	// PAINT-ON-TOP prim ranges (header comment on g_dbg_paintOnTop). Same
+	// frame-behind travel rule as the exempt range; registered by the instance
+	// depth bracket for allowlisted models, cleared by Clear. Appended at the
+	// END of the struct so the positional initializer above the buffer pair
+	// stays valid.
+	const void *paintNearStart[GTE_CAPTURE_PAINTNEAR_MAX];
+	const void *paintNearEnd[GTE_CAPTURE_PAINTNEAR_MAX];
+	/* Per range: 0 = parallax from the member's own captures (3D models --
+	 * the talking masks), 1 = parallax flattened to the UI band (flat overlay
+	 * art in the world OT -- stoplight, "FINAL LAP"), 2 = flat AND X-stretched
+	 * to the wide window (the finish/weapon lens flare -- retail sizes it for
+	 * the 4:3 screen). */
+	u8 paintNearFlat[GTE_CAPTURE_PAINTNEAR_MAX];
+	u32 paintNearN;
 } GTECaptureBuffer;
 
 // Cost ablation. This switch removes both per-vertex calls without a
@@ -131,6 +147,37 @@ internal void GTECapture_InstanceAxisFlush(void);
 extern int g_dbg_modelDepthCheck;
 global_variable u32 s_instAxisFrames;
 
+/* PAINT-ON-TOP class (design comment in the header). Membership is by MODEL
+ * name, not instance name -- the mask hint instance is literally named "head",
+ * which is far too generic to key on. The two big talking-head models are the
+ * only members; the in-race shield masks (akuaku/ukauka) orbit the kart at
+ * honest positions and must keep the real depth test. */
+int g_dbg_paintOnTop = 1;
+global_variable const char *const s_paintOnTopModels[] = {"ukabig", "akubig"};
+/* Bracket latch: set when BeginInstanceDepth matches the allowlist, consumed
+ * by EndInstanceDepth into the write buffer's range array. Game-thread only,
+ * same ownership as the bracket itself. */
+global_variable int s_paintNearArmed;
+global_variable const void *s_paintNearStartCursor;
+
+int GTECapture_ModelPaintsOnTop(const char *modelName)
+{
+	u32 i;
+
+	if (modelName == NULL)
+	{
+		return 0;
+	}
+	for (i = 0; i < (sizeof(s_paintOnTopModels) / sizeof(s_paintOnTopModels[0])); i++)
+	{
+		if (strncmp(modelName, s_paintOnTopModels[i], 15) == 0)
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
 void GTECapture_Clear(void)
 {
 	GTECaptureBuffer *buf;
@@ -152,12 +199,16 @@ void GTECapture_Clear(void)
 	buf->mtxUsed = 0;
 	buf->exemptStart = NULL;
 	buf->exemptEnd = NULL;
+	buf->paintNearN = 0;
 	s_gteMtxShadowValid = 0;
 	s_gteMtxCurId = 0;
 
 	/* [PKTAXIS] window boundary (instance-axis bracket, below). Also closes a
 	 * bracket a mid-frame early-out could otherwise leave open -- the same
-	 * leak the model capture closes in its EndFrame. */
+	 * leak the model capture closes in its EndFrame. Disarm the paint-near
+	 * latch first: the buffer just flipped, so a leaked bracket's cursor pair
+	 * would register a stale range into the NEW frame's buffer. */
+	s_paintNearArmed = 0;
 	s_watchFrameCtr++;
 	GTECapture_EndInstanceDepth();
 	if (g_dbg_modelDepthCheck && (++s_instAxisFrames >= 256))
@@ -474,6 +525,18 @@ void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct Pus
 	{
 		s_instAxisShift = GTE_INSTAXIS_UNRESOLVED; /* classify on first store */
 	}
+
+	/* Paint-on-top latch. The bracket wraps exactly one instance's draw-func
+	 * execution, and the retail draw funcs advance primMem.cursor per prim, so
+	 * the cursor here and at EndInstanceDepth bracket this instance's packets
+	 * and nothing else. The pool is the one RenderBucket_Execute draws into
+	 * (MainFrame_RenderFrame passes &gGT->backBuffer->primMem), which is the
+	 * same pool the OT walk later visits. */
+	if (g_dbg_paintOnTop && (inst->model != NULL) && GTECapture_ModelPaintsOnTop(inst->model->name))
+	{
+		s_paintNearArmed = 1;
+		s_paintNearStartCursor = sdata->gGT->backBuffer->primMem.cursor;
+	}
 }
 
 /*
@@ -520,6 +583,15 @@ void GTECapture_EndInstanceDepth(void)
 			                       (long)s_watchCamPos[1], (long)s_watchCamPos[2]);
 		}
 		s_watchActive = 0;
+	}
+
+	/* Paint-on-top registration -- second half of the latch in
+	 * BeginInstanceDepth. An empty range (draw func rejected every prim, or
+	 * the model path intercepted the writes) registers nothing. */
+	if (s_paintNearArmed)
+	{
+		GTECapture_AddPaintOnTopRange(s_paintNearStartCursor, sdata->gGT->backBuffer->primMem.cursor, 0);
+		s_paintNearArmed = 0;
 	}
 
 	if (s_instAxisFixed)
@@ -940,6 +1012,7 @@ u32 GTECapture_ReadMatrixCensus(u8 *outDomId, u32 *outIdsUsed)
 // registered prim range (see the exempt fields on the buffer).
 global_variable int s_gteCaptureSuppress;
 global_variable int s_gteCaptureExemptNode;
+global_variable int s_gteCapturePaintNearNode;
 
 void GTECapture_SetUIBand(const void *start, const void *end)
 {
@@ -957,10 +1030,33 @@ void GTECapture_SetUIBandExemptRange(const void *start, const void *end)
 	buf->exemptEnd = end;
 }
 
+/*
+ * Register one paint-on-top prim range for this frame (header comment on
+ * g_dbg_paintOnTop). Game-thread only, same ownership as Store; the range
+ * must be a [start, end) pair of gGT->backBuffer->primMem cursors bracketing
+ * exactly the member's own packets -- the pool the OT walk visits.
+ * flatParallax: 0 = 3D member, stereo depth from its own captures; 1 = flat
+ * overlay art, stereo flattened to the UI band's screen-plane treatment.
+ */
+void GTECapture_AddPaintOnTopRange(const void *start, const void *end, int flatParallax)
+{
+	GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureWriteIdx];
+
+	if ((g_dbg_paintOnTop == 0) || (buf->paintNearN >= GTE_CAPTURE_PAINTNEAR_MAX) || (end <= start))
+	{
+		return;
+	}
+	buf->paintNearStart[buf->paintNearN] = start;
+	buf->paintNearEnd[buf->paintNearN] = end;
+	buf->paintNearFlat[buf->paintNearN] = (u8)(((flatParallax >= 0) && (flatParallax <= 2)) ? flatParallax : 1);
+	buf->paintNearN++;
+}
+
 void GTECapture_BeginOTWalk(void)
 {
 	s_gteCaptureSuppress = 0;
 	s_gteCaptureExemptNode = 0;
+	s_gteCapturePaintNearNode = 0;
 }
 
 void GTECapture_MarkOTNode(const void *node)
@@ -980,6 +1076,24 @@ void GTECapture_MarkOTNode(const void *node)
 	// band was never entered. Two pointer compares per node against a range
 	// that is NULL/NULL on any frame RaceFlag_DrawSelf did not register.
 	s_gteCaptureExemptNode = ((node >= buf->exemptStart) && (node < buf->exemptEnd));
+
+	// Paint-on-top ranges, same per-node discipline. paintNearN is 0 on any
+	// frame no member drew, so the loop body never runs then. The stored
+	// value is the flavor (1 = 3D member, 2 = flat overlay, 3 = flat +
+	// wide-stretch), not just a hit.
+	{
+		u32 i;
+
+		s_gteCapturePaintNearNode = 0;
+		for (i = 0; i < buf->paintNearN; i++)
+		{
+			if ((node >= buf->paintNearStart[i]) && (node < buf->paintNearEnd[i]))
+			{
+				s_gteCapturePaintNearNode = 1 + (int)buf->paintNearFlat[i];
+				break;
+			}
+		}
+	}
 }
 
 int GTECapture_LookupSuppressed(void)
@@ -1011,6 +1125,19 @@ int GTECapture_LookupSuppressed(void)
 int GTECapture_NodeExempt(void)
 {
 	return s_gteCaptureExemptNode;
+}
+
+/*
+ * Is the walk inside a registered paint-on-top range? Consumed by
+ * PacketDepth_ResolveXY: OCCLUSION pins to the nearest world stamp (the
+ * member is retail-parked inside geometry, and retail's painter drew it
+ * after the ground -- the pin is that draw-order statement translated to the
+ * depth axis, kept under the UI band so the HUD still covers it), PARALLAX
+ * reads the member's own captures so stereo keeps its real shape.
+ */
+int GTECapture_NodePaintNear(void)
+{
+	return s_gteCapturePaintNearNode;
 }
 
 #endif /* defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE */

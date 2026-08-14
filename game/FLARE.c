@@ -6,6 +6,7 @@
  * include platform/ headers. */
 extern void GTECapture_BeginFixedDepthShift(int shift);
 extern void GTECapture_EndInstanceDepth(void);
+extern void GTECapture_AddPaintOnTopRange(const void *start, const void *end, int flatParallax);
 #endif
 
 static inline u32 FLARE_PackXY(s16 x, s16 y)
@@ -201,6 +202,13 @@ void FLARE_ThTick(struct Thread *th)
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 	GTECapture_EndInstanceDepth();
+	/* Retail draws this burst over everything farther than its (nudged -2)
+	 * OT bucket in one sheet; per-vertex depth would honestly bury the parts
+	 * that cross nearer ground. Flat overlay flavor: a lens flash belongs at
+	 * screen depth in stereo, and a flat sheet cannot tear across parallax
+	 * planes on a capture miss. Flavor 2 = flat + X-stretch to the wide
+	 * window: retail sizes the burst for the 4:3 screen. */
+	GTECapture_AddPaintOnTopRange(prim, prim + 4, 2);
 #endif
 }
 

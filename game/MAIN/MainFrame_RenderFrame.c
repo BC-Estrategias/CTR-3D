@@ -441,6 +441,14 @@ void DrawFinalLap(struct GameTracker *gGT)
 
 	SVec2 resultPos;
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	// Flat 2D overlay linked into the WORLD OT (the retail comment at the
+	// draw call below explains the layering intent) -- registered
+	// paint-on-top so the depth test reproduces that layering instead of
+	// letting the track occlude the text.
+	const void *paintTopStart = gGT->backBuffer->primMem.cursor;
+#endif
+
 	// number of players
 	for (i = 0; i < 4; i++)
 	{
@@ -499,6 +507,10 @@ void DrawFinalLap(struct GameTracker *gGT)
 
 		sdata->finalLapTextTimer[i]--;
 	}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	GTECapture_AddPaintOnTopRange(paintTopStart, gGT->backBuffer->primMem.cursor, 1);
+#endif
 }
 
 void RainLogic(struct GameTracker *gGT)

@@ -206,4 +206,29 @@ void GTECapture_SetUIBandExemptRange(const void *start, const void *end);
 // contract. Meaningful only while a walk is in progress.
 int GTECapture_NodeExempt(void);
 
+// PAINT-ON-TOP models (the talking-mask hint heads). Retail parks these
+// instances inside hub geometry and its painter's algorithm carries them --
+// drawn after the ground, so they never clip. There is no retail-authored
+// signal to key on (depthBiasNormal stays at the birth default), so the class
+// is a native allowlist matched by model name. Members' packet ranges are
+// registered by the instance depth bracket (no game-code registration, unlike
+// the flag's), and the resolver pins their OCCLUSION to the nearest world
+// stamp -- under the UI band, so the HUD still covers them -- while PARALLAX
+// stays honest, same channel split as the flag. Runtime A/B: dumpreq 'ontop'
+// (default ON; OFF is the buried-in-ground behaviour).
+extern int g_dbg_paintOnTop;
+int GTECapture_ModelPaintsOnTop(const char *modelName);
+// Walk-side query: 0 = not a member, 1 = 3D member (parallax from its own
+// captures), 2 = flat overlay (parallax flattened to the UI band), 3 = flat
+// overlay whose X is also stretched to the wide window (retail sized it for
+// the 4:3 screen -- the lens flare).
+int GTECapture_NodePaintNear(void);
+// Second membership route, for flat 2D overlay art drawn into the WORLD OT
+// (stoplight, "FINAL LAP" -- retail links them there so the character icons
+// layer over them, which our UI-band suppression therefore never covers):
+// the producer registers its own packet range, RaceFlag-style, since there
+// is no instance bracket to latch it from. flatParallax = 0/1/2, mapping to
+// NodePaintNear's 1/2/3.
+void GTECapture_AddPaintOnTopRange(const void *start, const void *end, int flatParallax);
+
 #endif

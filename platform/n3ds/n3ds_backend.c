@@ -4145,6 +4145,19 @@ unsigned int N3DS_ReadButtons(void)
 						N3DS_DebugLog("[CTR-3DS] watch: off");
 					}
 				}
+				else if (strncmp(word, "ontop", 5) == 0)
+				{
+					extern int g_dbg_paintOnTop;
+
+					/* Paint-on-top model class (talking-mask hint heads):
+					 * occlusion pinned to the nearest world stamp, parallax
+					 * honest -- retail parks them inside hub geometry and its
+					 * draw order carries them; our depth test needs the
+					 * explicit statement. Allowlist: native_gte_capture.c. */
+					g_dbg_paintOnTop ^= 1;
+					N3DS_DebugLog(g_dbg_paintOnTop ? "[CTR-3DS] paint-on-top models: ON (masks win the depth test)"
+					                               : "[CTR-3DS] paint-on-top models: off (buried-in-ground A/B leg)");
+				}
 #endif
 				else
 				{

@@ -1889,6 +1889,66 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		return 1;
 	}
 
+	{
+		int paintNear = GTECapture_NodePaintNear();
+
+		if (paintNear)
+		{
+			/*
+			 * PAINT-ON-TOP (allowlist and design comment on g_dbg_paintOnTop,
+			 * native_gte_capture.h). Occlusion pins to the nearest world
+			 * stamp: retail parks these members inside/behind world geometry
+			 * and its painter draws them after it, so "wins against all world
+			 * content, loses to the UI band" IS retail's layering, translated
+			 * to the depth axis. PKTDEPTH_WORLD_MAX sits one below the UI
+			 * base, so the HUD still covers the member -- and the widescreen
+			 * X ramp (keyed on the OCCLUSION stamp, native_renderer_3ds.c)
+			 * stays off, which flat overlay members need: they position
+			 * themselves from the world viewport and are already wide-aware.
+			 * A member's own faces tie at one stamp and resolve by submission
+			 * order under LEQUAL, which is retail command order -- the
+			 * flag-sheet argument.
+			 *
+			 * Parallax splits by flavor: a 3D member (talking mask) keeps its
+			 * captured real depth (prefilled with the pin so a miss degrades
+			 * flat, the safe direction) so the head stays round in stereo; a
+			 * flat overlay (stoplight, "FINAL LAP") takes a UI-band value, so
+			 * the shader's band mask gives it the HUD's screen-plane stereo
+			 * treatment -- band on the PARALLAX channel only, so the X-ramp
+			 * exclusion above still holds.
+			 */
+			*out = PKTDEPTH_WORLD_MAX;
+			if (perVert)
+			{
+				for (i = 0; i < n; i++)
+				{
+					perVert[i] = PKTDEPTH_WORLD_MAX;
+				}
+			}
+			if (perVertPar)
+			{
+				if (paintNear >= 2)
+				{
+					for (i = 0; i < n; i++)
+					{
+						perVertPar[i] = PKTDEPTH_UI_BASE;
+					}
+				}
+				else
+				{
+					for (i = 0; i < n; i++)
+					{
+						perVertPar[i] = PKTDEPTH_WORLD_MAX;
+					}
+					PacketDepth_FillParallaxFromCapture(xs, ys, n, perVertPar);
+				}
+			}
+			s_pendingDepthIsModel = 0;
+			s_pendingDepthSpread = 0;
+			return 1;
+		}
+	}
+
 	if (exempt)
 	{
 		/*
@@ -2989,6 +3049,23 @@ void MakeVertexQuad(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, 
 		}
 
 		PacketDepth_ResolvePrim(srcs, 4);
+
+		/* Flavor-3 paint-on-top (the lens flare): X stretched to the wide
+		 * window, same linear remap as the skybox glow and identity when wide
+		 * is off. AFTER the resolve, which must key on the raw coordinates
+		 * the stores used. Quad-only on purpose -- the one member emits GT4s;
+		 * a triangle-emitting member would need the same lines in
+		 * MakeVertexTriangle. */
+		if (GTECapture_NodePaintNear() == 3)
+		{
+			extern int NativeWide_GlowStretchX(int x);
+			int vi;
+
+			for (vi = 0; vi < 4; vi++)
+			{
+				vertex[vi].x = (float)NativeWide_GlowStretchX((int)vertex[vi].x);
+			}
+		}
 	}
 #endif
 }
