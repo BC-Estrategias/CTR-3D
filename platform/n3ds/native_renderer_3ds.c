@@ -326,39 +326,38 @@ int g_dbg_backdropDump = 0;
  * lifecycle as s_mergeBinVerts.
  */
 /*
- * DEFAULT OFF (2026-08-09), pending one unresolved regression -- see "KNOWN
- * REGRESSION" below. Everything this fixes is real and owner-verified on Azahar
- * (menu and character-select text layering), but turning it on also loses the
- * character-select diorama's gradient backdrop, so it ships opt-in until that is
- * closed. Flip with dumpreq 'uiorder'.
+ * DEFAULT ON: this fixes a broad class of UI layering defects (menu and
+ * character-select text layering, the selected portrait being covered by its own
+ * highlight) and costs one known regression, which is the trade the owner chose.
+ * Flip with dumpreq 'uiorder'.
  *
- * KNOWN REGRESSION, and the state of the hunt (s44). With this ON, the gradient
- * behind the rotating character on character select does not draw. Established
- * by measurement, not argument:
- *   - The content DOES reach this list. The one-shot 'uidump' shows three large
- *     slabs at the box (~460x92, seg00-02): two blended layers and one OPAQUE,
- *     all at the same screen rect. Other segments in the same list draw fine
- *     (both text strips, the blue selection highlight), so the pass works.
+ * KNOWN REGRESSION: with this ON, the gradient backdrop behind the rotating
+ * character on character select does not draw. Established by measurement:
+ *   - The gradient is NOT in this list. Proved on the 4P character-select
+ *     screen, where four gradients at four known quadrants make an
+ *     unmistakable fingerprint: 'uidump' reports 33 segments / 420 verts and
+ *     NOT ONE quad matching any preview box. (The three ~460x92 slabs an
+ *     earlier hunt identified as "the gradient" from the 1P dump are panel and
+ *     border geometry that shares the rectangle. Identifying content by
+ *     bounding box alone is how that went wrong.) This pass therefore cannot be
+ *     reordering the gradient; it changes something around it.
  *   - dropped=0, so it is not a capacity loss.
  *   - REFUTED by runtime A/B, each individually: the s43 sky-first accumulator
  *     ('skyfirst'), backface culling ('bfcull', still 1 when the gradient
- *     appeared), the depth-stamp pin ('uipin' -- gradient stays missing without
- *     it, so the pin is innocent), WHERE the pass runs ('uilast' -- moving it
- *     back to the post-merge slot changes nothing, so it is not an occlusion
- *     problem), and the direct-emit fast path ('directemit').
+ *     appeared), the depth-stamp pin ('uipin'), WHERE the pass runs ('uilast'),
+ *     and the direct-emit fast path ('directemit').
+ *   - Degrades with draw order rather than failing outright: in 4P the gradient
+ *     is whole behind P1, PARTIAL behind P2, absent behind P3 and P4. Whatever
+ *     kills it dies mid-way, not at a clean boundary.
  *
- * LEADING HYPOTHESIS, untested: those three slabs are one gradient built in
- * layers. The old bin scheme always drew opaque content before blended content
- * regardless of submission order, so the opaque slab landed as a BASE and the two
- * blended layers painted over it. This pass replays true submission order, which
- * puts the opaque slab LAST -- on top of the layers that make the gradient
- * visible. If that holds it is the exact mirror of the menu-text bug this change
- * fixed (where class ordering was wrong and submission order was right), meaning
- * neither rule alone is correct and the resolution is a design question, not a
- * patch. Next step: emit the list opaque-first and see whether the gradient
- * returns.
+ * LEADING SUSPECT, untested: the full-screen opaque untextured backdrop fill
+ * (4P 'uidump' seg00, box -64,0..576,216) IS classified UI, so this pass pulls
+ * it out of the state bins and redraws it at frame end, after all world
+ * content. A full-screen opaque fill relocating to the end of the frame is the
+ * right shape to erase background content that is not itself UI. Next step:
+ * exclude that fill from UI routing and see whether the gradient returns.
  */
-int g_dbg_uiOrder = 0;
+int g_dbg_uiOrder = 1;
 /*
  * BISECT TOGGLE (temporary, dumpreq 'uipin'). The change above is two halves
  * -- the depth-stamp PIN (PacketDepth_UiStamp, native_gpu.c) and the ordered
