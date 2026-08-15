@@ -223,6 +223,13 @@
 ; Outputs
 .out outpos position
 .out outtc0 texcoord0
+; outtc1 mirrors outtc0 exactly. Texture unit 1 (GPU_NEAREST, sampled for ALPHA
+; only) and unit 0 (GPU_LINEAR, sampled for RGB) must hit the identical atlas
+; texel, so the crisp cutout mask stays registered with the smoothed colour --
+; the two-unit split in N3DS_TrackDraw_SetTextured (SetTextured mode 2). PICA
+; texture unit N defaults to sampling texcoordN, so unit 1 needs its own
+; texcoord1 output; without it unit 1 samples garbage and the alpha is trashed.
+.out outtc1 texcoord1
 .out outclr color
 
 ; Inputs (regId order must match N3DS_C3DInit's s_trackAttrInfo setup,
@@ -441,8 +448,11 @@
 	; attribute), so src1/src2 order is unconstrained here -- unlike the
 	; mul below, whose constant must lead.
 	add r8.xy, uvOffset.xy, intc.xy
-	mul outtc0.xy, atlasScale, r8.xy
+	mul r8.xy, atlasScale, r8.xy
+	mov outtc0.xy, r8.xy
 	mov outtc0.zw, zeros
+	mov outtc1.xy, r8.xy
+	mov outtc1.zw, zeros
 
 	; outclr: colorScale rescales the raw GPU_UNSIGNED_BYTE fetch back to
 	; 0..1 (same convention as ctr.v.pica). Alpha is a constant 1.0 -- inclr.w

@@ -866,6 +866,41 @@ static void DrawLevelOvr1P_PrepareDeepestMosaicUv(const struct DrawLevelOvr1PScr
 	u32 uv0 = DrawLevelOvr1P_ReadPackedWord(source + 0);
 	u32 uv1 = DrawLevelOvr1P_ReadPackedWord(source + 4);
 
+#ifdef CTR_NATIVE
+	/* [MOSMAP] wiretap -- retail's own entry->piece assignment, live. Caps:
+	 * first 24 calls per base, 8 bases, then silent. Temporary instrument. */
+	{
+		static uintptr_t s_mosmapBases[8];
+		static int s_mosmapCount[8];
+		static int s_mosmapBaseCount;
+		int mmslot = -1;
+
+		for (int mm = 0; mm < s_mosmapBaseCount; mm++)
+		{
+			if (s_mosmapBases[mm] == (uintptr_t)mosaicBase)
+			{
+				mmslot = mm;
+				break;
+			}
+		}
+		if ((mmslot < 0) && (s_mosmapBaseCount < 8))
+		{
+			mmslot = s_mosmapBaseCount++;
+			s_mosmapBases[mmslot] = (uintptr_t)mosaicBase;
+		}
+		if ((mmslot >= 0) && (s_mosmapCount[mmslot] < 24))
+		{
+			s_mosmapCount[mmslot]++;
+			Platform_Log("[MOSMAP] base=%x off=%u entry=%u idxRaw=%u rowsel=%d bias=%u span=%u fam=%x sx=%d sy=%d uv0=%08x uv1=%08x\n",
+			             (unsigned)mosaicBase, (unsigned)sourceOffset, (unsigned)(sourceOffset / 12u),
+			             (unsigned)*CTR_SCRATCHPAD_PTR(u32, DRAW_LEVEL_OVR1P_MOSAIC_SOURCE_INDEX_OFFSET),
+			             ((s32)(DrawLevelOvr1P_Scratch()->selected4x1TableWord << 8) < 0) ? 1 : 0,
+			             (unsigned)*CTR_SCRATCHPAD_PTR(u32, DRAW_LEVEL_OVR1P_MOSAIC_SOURCE_BIAS_OFFSET), (unsigned)reloadSpan,
+			             (unsigned)directHandlerAddress, (int)projected[indices[0]].posScreen[0], (int)projected[indices[0]].posScreen[1], uv0, uv1);
+		}
+	}
+#endif
+
 	// NOTE(aalhendi): Retail deepest fallthrough rewrites selected scratch-record
 	// UV halfwords before jumping through the direct table.
 	struct DrawLevelOvr1PScratchVertex *mutableProjected = (struct DrawLevelOvr1PScratchVertex *)projected;

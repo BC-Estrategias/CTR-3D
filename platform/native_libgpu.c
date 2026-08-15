@@ -20,6 +20,42 @@
 
 #include <string.h>
 
+#ifdef CTR_INTERNAL
+#if !defined(__3DS__)
+#include <SDL3/SDL.h> /* SDL_GetPerformanceCounter/Frequency */
+#else
+#include "n3ds/sdl3_compat_3ds.h" /* the same clock, shimmed */
+#endif
+
+/* Worker-own-clock split of the DrawOTag job -- see NativeOtagSplitStats. The
+ * job runs on core 2 outside the main perf frame, so these are timed directly
+ * rather than through NativePerf's gated scopes. */
+global_variable u64 s_otagPatchTicks;
+global_variable u64 s_otagParseTicks;
+global_variable u64 s_otagSplitsTicks;
+global_variable unsigned int s_otagSplitCalls;
+
+void NativePerf_TakeOtagSplit(struct NativeOtagSplitStats *out)
+{
+	const u64 freq = SDL_GetPerformanceFrequency();
+
+	if (out == NULL)
+	{
+		return;
+	}
+
+	out->patchUs = freq ? (unsigned long)((s_otagPatchTicks * 1000000ull) / freq) : 0UL;
+	out->parseUs = freq ? (unsigned long)((s_otagParseTicks * 1000000ull) / freq) : 0UL;
+	out->splitsUs = freq ? (unsigned long)((s_otagSplitsTicks * 1000000ull) / freq) : 0UL;
+	out->calls = s_otagSplitCalls;
+
+	s_otagPatchTicks = 0;
+	s_otagParseTicks = 0;
+	s_otagSplitsTicks = 0;
+	s_otagSplitCalls = 0;
+}
+#endif
+
 // NOTE(aalhendi): Native libgpu preserves the retail-shaped PsyQ GPU facade
 // while keeping the game-facing GPU symbols under ctr-native ownership. The
 // primitive parser and GL backend live behind this native platform boundary.
@@ -481,7 +517,20 @@ void CtrGpu_ExecDrawOTag(void *p)
 	// Outside the retry loop below: it is idempotent (the per-chain frame latch
 	// makes a repeat a no-op), so running it once per walk rather than once per
 	// paused-emulator repaint costs nothing and claims less.
+#ifdef CTR_INTERNAL
+	{
+		const u64 patchStart = SDL_GetPerformanceCounter();
+
+		NativeTrackAnim_PatchFrame();
+		s_otagPatchTicks += SDL_GetPerformanceCounter() - patchStart;
+	}
+#else
 	NativeTrackAnim_PatchFrame();
+#endif
+#endif
+
+#ifdef CTR_INTERNAL
+	s_otagSplitCalls++;
 #endif
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_OTAG);
@@ -499,8 +548,21 @@ void CtrGpu_ExecDrawOTag(void *p)
 			ClearSplits();
 		}
 
+#ifdef CTR_INTERNAL
+		{
+			const u64 parseStart = SDL_GetPerformanceCounter();
+			u64 splitsStart;
+
+			ParsePrimitivesLinkedList((uint32_t *)p, 0);
+			splitsStart = SDL_GetPerformanceCounter();
+			s_otagParseTicks += splitsStart - parseStart;
+			DrawAllSplits();
+			s_otagSplitsTicks += SDL_GetPerformanceCounter() - splitsStart;
+		}
+#else
 		ParsePrimitivesLinkedList((uint32_t *)p, 0);
 		DrawAllSplits();
+#endif
 	} while (g_dbg_emulatorPaused);
 	NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_OTAG);
 }

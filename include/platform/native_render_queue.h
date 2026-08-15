@@ -100,6 +100,48 @@ static inline void NativeRenderQueue_Shutdown(void)
 
 #endif
 
+#ifdef CTR_INTERNAL
+/*
+ * Main-thread queue-stall probe. Answers where a frame's "waiting for the
+ * render worker" time actually goes: blocked in Wait for a posted job to
+ * complete, or blocked in Post because the ring was full (worker behind).
+ * Crash Cove shows ~35ms of main-thread wait that no worker bucket accounts
+ * for; this splits it. All times are main-thread wall-clock. TakeStats copies
+ * the window's accumulators and zeroes them. Zeroed/no-op off the worker path.
+ */
+struct NativeRenderQueueDebugStats
+{
+	unsigned int postCalls;        /* Post() invocations */
+	unsigned int postBlockedCalls; /* Post() calls that hit a full ring */
+	unsigned int waitCalls;        /* Wait() invocations */
+	unsigned int peakDepth;        /* peak (posted - completed) seen at Post entry */
+	unsigned long postBlockUs;     /* main-thread us blocked on a full ring */
+	unsigned long waitBlockUs;     /* main-thread us blocked waiting for completion */
+	unsigned int ringSize;         /* ring capacity, for reading peakDepth against */
+};
+
+void NativeRenderQueue_DebugTakeStats(struct NativeRenderQueueDebugStats *out);
+
+/*
+ * Worker-thread profile, timed with the worker's OWN wall clock -- NOT the
+ * NativePerf worker_exec bucket, which only counts while the main thread's perf
+ * frame is open and so misses async work done on core 2. This is the instrument
+ * for the "main waits 36ms but worker_exec says 5.8ms" gap: if the summed exec
+ * here approaches the main-thread wait, the worker really is doing that work and
+ * the old bucket was undercounting. Job kinds are lumped into the groups that
+ * matter: the OT walk, DrawAllSplits, present/end-frame, image ops (LoadImage/
+ * Move/Store/Clear -- the water texture traffic), and everything else. idle is
+ * time asleep in RenderWorkWait. TakeStats copies and zeroes.
+ */
+struct NativeRenderWorkerDebugStats
+{
+	unsigned long otagUs, syncUs, endFrameUs, imageUs, otherUs, idleUs;
+	unsigned int otagCalls, syncCalls, endFrameCalls, imageCalls, otherCalls, idleWaits;
+};
+
+void NativeRenderQueue_DebugTakeWorkerStats(struct NativeRenderWorkerDebugStats *out);
+#endif
+
 /* Append a job; returns its ticket. Blocks only when the ring is full. */
 unsigned int NativeRenderQueue_Post(const struct NativeRenderJob *job);
 

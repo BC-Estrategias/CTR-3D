@@ -35,6 +35,125 @@ static unsigned int s_completedCount; /* queue-lock guarded */
 static int s_workerUp;
 static int s_routeWasActive;
 
+#ifdef CTR_INTERNAL
+#include "n3ds/sdl3_compat_3ds.h" /* SDL_GetPerformanceCounter/Frequency shim */
+
+/* qstall probe accumulators -- see NativeRenderQueueDebugStats. Written only on
+ * the game thread inside Post/Wait; the worker never calls these. */
+static unsigned int s_qsPostCalls;
+static unsigned int s_qsPostBlockedCalls;
+static unsigned int s_qsWaitCalls;
+static unsigned int s_qsPeakDepth;
+static u64 s_qsPostBlockTicks;
+static u64 s_qsWaitBlockTicks;
+
+static unsigned long NativeRenderQueue_TicksToUs(u64 ticks)
+{
+	const u64 freq = SDL_GetPerformanceFrequency();
+
+	return freq ? (unsigned long)((ticks * 1000000ull) / freq) : 0UL;
+}
+
+void NativeRenderQueue_DebugTakeStats(struct NativeRenderQueueDebugStats *out)
+{
+	if (out == NULL)
+	{
+		return;
+	}
+
+	out->postCalls = s_qsPostCalls;
+	out->postBlockedCalls = s_qsPostBlockedCalls;
+	out->waitCalls = s_qsWaitCalls;
+	out->peakDepth = s_qsPeakDepth;
+	out->postBlockUs = NativeRenderQueue_TicksToUs(s_qsPostBlockTicks);
+	out->waitBlockUs = NativeRenderQueue_TicksToUs(s_qsWaitBlockTicks);
+	out->ringSize = NATIVE_RENDER_QUEUE_RING;
+
+	s_qsPostCalls = 0;
+	s_qsPostBlockedCalls = 0;
+	s_qsWaitCalls = 0;
+	s_qsPeakDepth = 0;
+	s_qsPostBlockTicks = 0;
+	s_qsWaitBlockTicks = 0;
+}
+
+/* Worker-owned profile accumulators. Written only on the worker thread (inside
+ * WorkerMain); TakeWorkerStats reads+zeroes them from the stats block. Lock-free
+ * on the same benign-race terms as worker_exec -- a diagnostic, not a fence. */
+enum
+{
+	WPROF_OTAG = 0,
+	WPROF_SYNC,
+	WPROF_ENDFRAME,
+	WPROF_IMAGE,
+	WPROF_OTHER,
+	WPROF_COUNT
+};
+
+static u64 s_wpTicks[WPROF_COUNT];
+static u32 s_wpCalls[WPROF_COUNT];
+static u64 s_wpIdleTicks;
+static u32 s_wpIdleWaits;
+
+static int NativeRenderQueue_WorkerBucket(int kind)
+{
+	switch (kind)
+	{
+		case NATIVE_RENDER_JOB_DRAW_OTAG:
+		{
+			return WPROF_OTAG;
+		}
+		case NATIVE_RENDER_JOB_DRAW_SYNC:
+		{
+			return WPROF_SYNC;
+		}
+		case NATIVE_RENDER_JOB_END_FRAME:
+		case NATIVE_RENDER_JOB_PRESENT_VRAM_DISPLAY:
+		{
+			return WPROF_ENDFRAME;
+		}
+		case NATIVE_RENDER_JOB_LOAD_IMAGE:
+		case NATIVE_RENDER_JOB_LOAD_IMAGE2:
+		case NATIVE_RENDER_JOB_MOVE_IMAGE:
+		case NATIVE_RENDER_JOB_STORE_IMAGE:
+		case NATIVE_RENDER_JOB_CLEAR_IMAGE:
+		{
+			return WPROF_IMAGE;
+		}
+		default:
+		{
+			return WPROF_OTHER;
+		}
+	}
+}
+
+void NativeRenderQueue_DebugTakeWorkerStats(struct NativeRenderWorkerDebugStats *out)
+{
+	if (out == NULL)
+	{
+		return;
+	}
+
+	out->otagUs = NativeRenderQueue_TicksToUs(s_wpTicks[WPROF_OTAG]);
+	out->syncUs = NativeRenderQueue_TicksToUs(s_wpTicks[WPROF_SYNC]);
+	out->endFrameUs = NativeRenderQueue_TicksToUs(s_wpTicks[WPROF_ENDFRAME]);
+	out->imageUs = NativeRenderQueue_TicksToUs(s_wpTicks[WPROF_IMAGE]);
+	out->otherUs = NativeRenderQueue_TicksToUs(s_wpTicks[WPROF_OTHER]);
+	out->idleUs = NativeRenderQueue_TicksToUs(s_wpIdleTicks);
+	out->otagCalls = s_wpCalls[WPROF_OTAG];
+	out->syncCalls = s_wpCalls[WPROF_SYNC];
+	out->endFrameCalls = s_wpCalls[WPROF_ENDFRAME];
+	out->imageCalls = s_wpCalls[WPROF_IMAGE];
+	out->otherCalls = s_wpCalls[WPROF_OTHER];
+	out->idleWaits = s_wpIdleWaits;
+
+	memset(s_wpTicks, 0, sizeof(s_wpTicks));
+	memset(s_wpCalls, 0, sizeof(s_wpCalls));
+	s_wpIdleTicks = 0;
+	s_wpIdleWaits = 0;
+}
+#endif
+
 static void NativeRenderQueue_ExecuteJob(struct NativeRenderJob *job)
 {
 	switch (job->kind)
@@ -120,7 +239,14 @@ static void NativeRenderQueue_WorkerMain(void)
 {
 	for (;;)
 	{
+#ifdef CTR_INTERNAL
+		const u64 idleStart = SDL_GetPerformanceCounter();
+#endif
 		N3DS_RenderWorkWait();
+#ifdef CTR_INTERNAL
+		s_wpIdleTicks += SDL_GetPerformanceCounter() - idleStart;
+		s_wpIdleWaits++;
+#endif
 
 		for (;;)
 		{
@@ -139,6 +265,10 @@ static void NativeRenderQueue_WorkerMain(void)
 			stop = (job.kind == NATIVE_RENDER_JOB_STOP);
 			if (!stop)
 			{
+#ifdef CTR_INTERNAL
+				const int wbucket = NativeRenderQueue_WorkerBucket(job.kind);
+				const u64 execStart = SDL_GetPerformanceCounter();
+#endif
 				/* The worker's side of the fence -- see NATIVE_PERF_BUCKET_WORKER_EXEC's
 				 * comment. Everything outside this scope in the loop is queue
 				 * handshake: the lock pairs above and below, the done-signal,
@@ -146,6 +276,10 @@ static void NativeRenderQueue_WorkerMain(void)
 				NativePerf_BeginScope(NATIVE_PERF_BUCKET_WORKER_EXEC);
 				NativeRenderQueue_ExecuteJob(&job);
 				NativePerf_EndScope(NATIVE_PERF_BUCKET_WORKER_EXEC);
+#ifdef CTR_INTERNAL
+				s_wpTicks[wbucket] += SDL_GetPerformanceCounter() - execStart;
+				s_wpCalls[wbucket]++;
+#endif
 			}
 
 			N3DS_RenderQueueLock();
@@ -164,17 +298,47 @@ static void NativeRenderQueue_WorkerMain(void)
 unsigned int NativeRenderQueue_Post(const struct NativeRenderJob *job)
 {
 	unsigned int ticket;
+#ifdef CTR_INTERNAL
+	int blocked = 0;
+	u64 blockStart = 0;
+
+	s_qsPostCalls++;
+#endif
 
 	for (;;)
 	{
 		N3DS_RenderQueueLock();
-		if ((s_postedCount - s_completedCount) < NATIVE_RENDER_QUEUE_RING)
 		{
-			break;
+			const unsigned int depth = s_postedCount - s_completedCount;
+#ifdef CTR_INTERNAL
+			if (depth > s_qsPeakDepth)
+			{
+				s_qsPeakDepth = depth;
+			}
+#endif
+			if (depth < NATIVE_RENDER_QUEUE_RING)
+			{
+				break;
+			}
 		}
 		N3DS_RenderQueueUnlock();
+#ifdef CTR_INTERNAL
+		if (!blocked)
+		{
+			blocked = 1;
+			s_qsPostBlockedCalls++;
+			blockStart = SDL_GetPerformanceCounter();
+		}
+#endif
 		N3DS_RenderDoneWait();
 	}
+
+#ifdef CTR_INTERNAL
+	if (blocked)
+	{
+		s_qsPostBlockTicks += SDL_GetPerformanceCounter() - blockStart;
+	}
+#endif
 
 	s_jobs[s_postedCount % NATIVE_RENDER_QUEUE_RING] = *job;
 	s_postedCount++;
@@ -187,6 +351,12 @@ unsigned int NativeRenderQueue_Post(const struct NativeRenderJob *job)
 
 void NativeRenderQueue_Wait(unsigned int ticket)
 {
+#ifdef CTR_INTERNAL
+	const u64 waitStart = SDL_GetPerformanceCounter();
+
+	s_qsWaitCalls++;
+#endif
+
 	for (;;)
 	{
 		unsigned int completed;
@@ -198,6 +368,9 @@ void NativeRenderQueue_Wait(unsigned int ticket)
 		/* Signed distance so ticket/counter wrap is harmless. */
 		if ((int)(completed - ticket) >= 0)
 		{
+#ifdef CTR_INTERNAL
+			s_qsWaitBlockTicks += SDL_GetPerformanceCounter() - waitStart;
+#endif
 			return;
 		}
 		N3DS_RenderDoneWait();

@@ -12,6 +12,7 @@
 #include <SDL3/SDL.h>
 #else
 #include "n3ds/n3ds_audio_thread.h"
+#include "n3ds/n3ds_render_thread.h" /* N3DS_RenderWorkerIsSelf */
 #endif
 
 #include <errno.h>
@@ -203,6 +204,25 @@ global_variable u32 s_windowFrames;
 global_variable f64 s_windowTotalMs;
 global_variable f64 s_windowWorkMs;
 global_variable f64 s_windowBucketMs[NATIVE_PERF_BUCKET_COUNT];
+
+#if defined(__3DS__) && CTR_NATIVE_RENDER_THREAD
+/*
+ * Worker-thread scope accumulators. The render worker runs jobs async on core 2,
+ * so its scopes can't use the main thread's path: that one gates on s_frameOpen
+ * (usually closed when the worker runs) and folds through a per-frame array the
+ * main thread resets underneath it -- which is why worker_exec, draw_otag,
+ * track_anim, native_track_draw, merge_flush all read ~6x low. The worker
+ * instead accumulates straight into its own window total here, ungated except by
+ * s_enabled and using its own depth/start arrays (never touched by main, so no
+ * BeginFrame-memset race). Folded into s_windowBucketMs in Report3DSWindow
+ * behind that function's existing NativeRenderQueue_Fence() -- the one moment
+ * the worker is provably idle -- so the read+zero cannot tear.
+ */
+global_variable f64 s_workerWindowMs[NATIVE_PERF_BUCKET_COUNT];
+global_variable s32 s_workerScopeDepth[NATIVE_PERF_BUCKET_COUNT];
+global_variable u64 s_workerScopeStart[NATIVE_PERF_BUCKET_COUNT];
+#endif
+
 global_variable u32 s_torchWindowListed;
 global_variable u32 s_torchWindowEmitted;
 /* Worst single frame's emit count: the window average smears a one-frame
@@ -224,9 +244,13 @@ global_variable const char *s_windowCfg;
  */
 internal int NativeAudio_DebugConsumeFrameKeyOns(void);
 internal void NativeAudio_DebugFormatVoiceProfWindow(char *buf, int bufSize, int maxFrameUs, int maxFrameKeyOns);
-global_variable f64 s_windowMaxTotalMs;
 global_variable int s_windowMaxFrameKeyOns;
 #endif
+
+/* Worst single frame in the window, in ms. Outside the profile gate above
+ * because the bottom-screen console reads it in every config -- only the
+ * key-on correlation beside it needs the audio profiler compiled in. */
+global_variable f64 s_windowMaxTotalMs;
 
 /*
  * Last reported window, mirrored for the bottom-screen console in
@@ -468,6 +492,17 @@ internal void NativePerf_Report3DSWindow(void)
 	// numbers. Costs at most one walk, once per 64-frame window; no-op when
 	// the queue is inactive.
 	NativeRenderQueue_Fence();
+
+#if defined(__3DS__) && CTR_NATIVE_RENDER_THREAD
+	/* Worker is now idle (fenced): fold its window totals into the shared array
+	 * the report reads, then zero them for the next window. Safe here and only
+	 * here -- the worker cannot be mid-write. */
+	for (s32 bucket = 0; bucket < NATIVE_PERF_BUCKET_COUNT; bucket++)
+	{
+		s_windowBucketMs[bucket] += s_workerWindowMs[bucket];
+	}
+	memset(s_workerWindowMs, 0, sizeof(s_workerWindowMs));
+#endif
 
 	toAvgUs = 1000.0 / (f64)s_windowFrames;
 
@@ -960,20 +995,25 @@ void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 		s_torchWindowMaxFrameEmitted = s_torchFrameEmitted;
 	}
 
-#if CTR_NATIVE_AUDIO_DECODE_PROFILE
 	{
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
 		/* Consumed (and so reset) EVERY frame, not just on a new max --
 		 * otherwise key-ons accumulate across frames and the correlation
 		 * reads spuriously high. */
 		int frameKeyOns = NativeAudio_DebugConsumeFrameKeyOns();
+#endif
 
+		/* The max itself is tracked in every config -- the bottom screen
+		 * reports it whether or not the audio profiler is compiled in, and a
+		 * worst-frame readout pinned at zero would read as "no hitches". */
 		if (totalMs > s_windowMaxTotalMs)
 		{
 			s_windowMaxTotalMs = totalMs;
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
 			s_windowMaxFrameKeyOns = frameKeyOns;
+#endif
 		}
 	}
-#endif
 
 	if (s_windowFrames >= NATIVE_PERF_3DS_REPORT_FRAMES)
 	{
@@ -1027,7 +1067,25 @@ void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 
 void NativePerf_BeginScope(enum NativePerfBucket bucket)
 {
-	if (!s_enabled || !s_frameOpen || (bucket < 0) || (bucket >= NATIVE_PERF_BUCKET_COUNT))
+	if (!s_enabled || (bucket < 0) || (bucket >= NATIVE_PERF_BUCKET_COUNT))
+	{
+		return;
+	}
+
+#if defined(__3DS__) && CTR_NATIVE_RENDER_THREAD
+	/* Worker thread: its own accumulators, not gated on the main thread's
+	 * per-frame window. See s_workerWindowMs. */
+	if (N3DS_RenderWorkerIsSelf())
+	{
+		if (s_workerScopeDepth[bucket]++ == 0)
+		{
+			s_workerScopeStart[bucket] = SDL_GetPerformanceCounter();
+		}
+		return;
+	}
+#endif
+
+	if (!s_frameOpen)
 	{
 		return;
 	}
@@ -1040,7 +1098,27 @@ void NativePerf_BeginScope(enum NativePerfBucket bucket)
 
 void NativePerf_EndScope(enum NativePerfBucket bucket)
 {
-	if (!s_enabled || !s_frameOpen || (bucket < 0) || (bucket >= NATIVE_PERF_BUCKET_COUNT))
+	if (!s_enabled || (bucket < 0) || (bucket >= NATIVE_PERF_BUCKET_COUNT))
+	{
+		return;
+	}
+
+#if defined(__3DS__) && CTR_NATIVE_RENDER_THREAD
+	if (N3DS_RenderWorkerIsSelf())
+	{
+		if (s_workerScopeDepth[bucket] <= 0)
+		{
+			return;
+		}
+		if (--s_workerScopeDepth[bucket] == 0)
+		{
+			s_workerWindowMs[bucket] += NativePerf_CounterToMs(SDL_GetPerformanceCounter() - s_workerScopeStart[bucket]);
+		}
+		return;
+	}
+#endif
+
+	if (!s_frameOpen)
 	{
 		return;
 	}

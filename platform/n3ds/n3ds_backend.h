@@ -98,10 +98,9 @@ typedef struct
 /*
  * z carries the depth substrate (z-break play): GrVertex.emitOrdinal biased
  * into s16 range (ordinal - 32768), so later-submitted primitives are
- * "nearer". With CTR_NATIVE_OT_DEPTH off the depth test never turns on and z
- * is inert. Overlay quads drawn outside the OT walk (VRAM present, atlas
- * inspector) use N3DS_DEPTH_TOPMOST so they beat any world depth when the
- * test is on; they also draw last, so either polarity keeps them on top.
+ * "nearer". Overlay quads drawn outside the OT walk (VRAM present, atlas
+ * inspector) use N3DS_DEPTH_TOPMOST so they beat any world depth; they also
+ * draw last, so either polarity keeps them on top.
  *
  * w is the PARALLAX channel (GrVertex.parallaxOrdinal, biased identically) --
  * the depth the STEREO shader uses, which is not always the depth the test
@@ -472,6 +471,13 @@ void N3DS_TrackGeom_PatchUV(const unsigned short *vertIndices, const short *uvPa
  * populations and cadences are nothing alike; see the .c definition. */
 void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short *xyz, const unsigned char *rgb, int count);
 
+/* Flush the GPU's copy of the vertices patched this frame in ONE cache-flush
+ * over the union of the ranges PatchUV/PatchPosColor touched. Call once after
+ * all patching for the frame; those functions only widen the range now, they
+ * no longer flush per chunk (which re-flushed most of the buffer many times a
+ * frame -- the animated verts scatter across it). */
+void N3DS_TrackGeom_FlushPatched(void);
+
 /* Begin/Leaf/End bracket one frame's resident-track draw batch, called from
  * NativeRenderer_EndScene immediately before the packet
  * path's own merge-bin barrier flush. Begin binds the track program/
@@ -586,6 +592,12 @@ void N3DS_EarlyInit(void);
  * mirrors into that stream so hardware hang diagnostics arrive live over Wi-Fi
  * instead of needing an SD pull. */
 int N3DS_NetloadStreamActive(void);
+
+/* Nonzero while the SD-card log sink is enabled (g_dbg_sdLog; SELECT+TOUCH or
+ * dumpreq `sdlog`, default off). Platform_Log's file sink honours the same
+ * switch as N3DS_DebugLog's, so one control governs every SD write this build
+ * makes -- see the policy note at Platform_LogWrite. */
+int N3DS_SdLogEnabled(void);
 
 /* Registers the emulated PSX VRAM buffer so the SELECT+R debug capture in
  * N3DS_ReadButtons can write it to sdmc:/vramdump_<frame>.bin. Called once

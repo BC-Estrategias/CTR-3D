@@ -134,6 +134,20 @@ extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *life
 #define N3DS_NDSP_CHANNEL     23
 #define N3DS_HW_VOICE_COUNT   23
 
+/*
+ * Output-stage gain, applied only where mix levels meet ndsp (the music
+ * channel's SetMix and the hardware voices' SetMix) -- never inside the
+ * mixer, whose PC byte-identity the SPU golden test enforces. Retail sets
+ * master volume 0x3fff, PS1's max but only half of full digital scale (see
+ * NATIVE_AUDIO_DIRECT_VOL_MAX, native_audio.c), so faithful amplitude is
+ * quiet on the 3DS; 2.0 restores full scale. PS1 content peaks well below
+ * full scale at that master, so 2.0 has headroom, and the DSP saturates
+ * rather than wraps if a peak ever exceeds it. Runtime: dumpreq `vol N`
+ * (percent of SPU-faithful, 200 = this default).
+ */
+#define N3DS_NDSP_OUTPUT_GAIN_DEFAULT 2.0f
+static float s_ndspOutputGain = N3DS_NDSP_OUTPUT_GAIN_DEFAULT;
+
 /* Protects s_audio (native_audio.c) during MixFrame -- backs
  * N3DS_AudioLock/N3DS_AudioUnlock, which back SDL_Lock/UnlockAudioStream. */
 static LightLock s_audioRenderLock;
@@ -234,8 +248,10 @@ static void N3DS_NdspSinkInit(void)
 	ndspChnSetRate(N3DS_NDSP_CHANNEL, (float)N3DS_NDSP_MIXER_RATE_HZ);
 	ndspChnSetFormat(N3DS_NDSP_CHANNEL, NDSP_FORMAT_STEREO_PCM16);
 	memset(mix, 0, sizeof(mix));
-	mix[0] = 1.0f; /* front left */
-	mix[1] = 1.0f; /* front right */
+	/* Memo (s_ndspGainLeft/Right) stays in RAW producer units; the output
+	 * gain multiplies in only at the poke, here and in ApplyChannelState. */
+	mix[0] = s_ndspOutputGain; /* front left */
+	mix[1] = s_ndspOutputGain; /* front right */
 	ndspChnSetMix(N3DS_NDSP_CHANNEL, mix);
 	s_ndspRate = N3DS_NDSP_MIXER_RATE_HZ;
 	s_ndspGainLeft = 1.0f;
@@ -291,8 +307,8 @@ static void N3DS_NdspApplyChannelState(int sampleRate, float gainLeft, float gai
 		float mix[12];
 
 		memset(mix, 0, sizeof(mix));
-		mix[0] = gainLeft;
-		mix[1] = gainRight;
+		mix[0] = gainLeft * s_ndspOutputGain;
+		mix[1] = gainRight * s_ndspOutputGain;
 		ndspChnSetMix(N3DS_NDSP_CHANNEL, mix);
 		s_ndspGainLeft = gainLeft;
 		s_ndspGainRight = gainRight;
@@ -496,6 +512,35 @@ int N3DS_NdspGetDroppedBlocks(void)
 	return (int)s_ndspDroppedBlocks;
 }
 
+int N3DS_AudioSetOutputGainPercent(int percent)
+{
+	if (percent >= 0)
+	{
+		if (percent > 400)
+		{
+			percent = 400;
+		}
+		s_ndspOutputGain = (float)percent / 100.0f;
+	}
+	else
+	{
+		s_ndspOutputGain = N3DS_NDSP_OUTPUT_GAIN_DEFAULT;
+	}
+
+	/*
+	 * Force the music channel's on-change memo stale so the next submit
+	 * re-pokes SetMix with the new gain. Hardware voices pick it up as the
+	 * per-vblank mirror next changes each voice's volume -- in-game volumes
+	 * shift constantly, so that lands within moments. Cross-thread against
+	 * the submit thread's own memo writes, but both sides only ever converge
+	 * on a re-poke; worst case is one redundant SetMix.
+	 */
+	s_ndspGainLeft = -1.0f;
+	s_ndspGainRight = -1.0f;
+
+	return (int)(s_ndspOutputGain * 100.0f + 0.5f);
+}
+
 void N3DS_NdspGetFlushCounts(int *fullFlushes, int *earlyFlushes)
 {
 	if (fullFlushes != NULL)
@@ -659,8 +704,8 @@ void N3DS_HwVoiceSetMix(int voice, float left, float right)
 		return;
 	}
 	memset(mix, 0, sizeof(mix));
-	mix[0] = left;
-	mix[1] = right;
+	mix[0] = left * s_ndspOutputGain;
+	mix[1] = right * s_ndspOutputGain;
 	ndspChnSetMix(voice, mix);
 }
 

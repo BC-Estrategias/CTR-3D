@@ -57,6 +57,13 @@ int N3DS_NetloadStreamActive(void)
 	return s_netloadStreamActive;
 }
 
+int N3DS_SdLogEnabled(void)
+{
+	extern int g_dbg_sdLog;
+
+	return g_dbg_sdLog;
+}
+
 static void N3DS_NetloadStreamExit(void)
 {
 	if (s_socBuffer != NULL)
@@ -519,7 +526,7 @@ static int s_uLocStereoUi = -1;
  * Runtime-tunable (dumpreq 'uipop N') because this is a comfort value judged
  * by eye, on hardware.
  */
-int g_dbg_uiPopPct = 25;
+int g_dbg_uiPopPct = 35;
 static float s_stereoVecUi[2][4];
 static C3D_RenderTarget *s_renderTarget = NULL;
 
@@ -540,6 +547,16 @@ static C3D_Tex s_vramDisplayTex[N3DS_VRAM_DISPLAY_TEX_COUNT];
  * N3DS_TrackAtlas_Alloc). */
 static C3D_Tex s_trackAtlasTextures[N3DS_TRACK_ATLAS_MAX_UNITS];
 static int s_trackAtlasUnitsAllocated = 0;
+
+/* Nearest-filtered VIEWS of the same texels, for the bilinear cutout split
+ * (smooth colour + crisp alpha, docs approach #2). Each is a struct copy of
+ * the matching s_trackAtlasTextures[i] -- SAME .data pointer, so it shares the
+ * uploaded texels and costs no extra memory -- with the filter forced to
+ * GPU_NEAREST. Bound to texture unit 1 alongside the (bilinear) unit 0 so the
+ * combiner can take RGB from the smooth sample and ALPHA from the sharp one,
+ * giving a clean cutout with no bilinear rim. Re-copied whenever the pool is
+ * (re)allocated, since a level reload changes the underlying .data. */
+static C3D_Tex s_trackAtlasTexturesNearest[N3DS_TRACK_ATLAS_MAX_UNITS];
 
 #ifdef CTR_NATIVE_MODEL_RENDERER
 /*
@@ -625,6 +642,51 @@ static int s_trackGeomReady = 0;
  * to restore it from short of a full rebuild. */
 static int s_trackGeomVertCount = 0;
 static int s_trackGeomVertStride = 0;
+
+/* Deferred flush range for the per-frame animated-vertex patch. The patch
+ * touches thousands of scattered vertices; flushing each chunk's own
+ * min..max span re-flushed nearly the whole vertex block a dozen-plus times a
+ * frame (the animated verts scatter across the buffer, so every chunk's span
+ * covers most of it). The patch functions now only WIDEN this byte range;
+ * N3DS_TrackGeom_FlushPatched issues one GSPGPU_FlushDataCache over the union
+ * at the end of the frame's patch. Bytes, into s_trackGeomMem. */
+static size_t s_trackPatchLoByte = 0;
+static size_t s_trackPatchHiByte = 0;
+static int s_trackPatchTouched = 0;
+
+static void N3DS_TrackGeom_MarkPatched(int lo, int hi)
+{
+	const size_t first = (size_t)lo * (size_t)s_trackGeomVertStride;
+	const size_t last = ((size_t)hi + 1u) * (size_t)s_trackGeomVertStride;
+
+	if (!s_trackPatchTouched)
+	{
+		s_trackPatchLoByte = first;
+		s_trackPatchHiByte = last;
+		s_trackPatchTouched = 1;
+		return;
+	}
+
+	if (first < s_trackPatchLoByte)
+	{
+		s_trackPatchLoByte = first;
+	}
+	if (last > s_trackPatchHiByte)
+	{
+		s_trackPatchHiByte = last;
+	}
+}
+
+void N3DS_TrackGeom_FlushPatched(void)
+{
+	if (!s_trackGeomReady || (s_trackGeomMem == NULL) || !s_trackPatchTouched)
+	{
+		return;
+	}
+
+	GSPGPU_FlushDataCache((u8 *)s_trackGeomMem + s_trackPatchLoByte, (u32)(s_trackPatchHiByte - s_trackPatchLoByte));
+	s_trackPatchTouched = 0;
+}
 /* Set by Begin only when geometry is actually ready; End always clears it
  * and always restores packet state regardless (cheap, and foolproof against
  * any Begin/Leaf/End call-order mistake upstream). */
@@ -938,6 +1000,17 @@ void N3DS_StereoRecordVram(int slot, int baseVertex)
  * them behind a chord nobody presses. */
 int g_dbg_widescreen = 2;
 
+/* Punch-through alpha-test reference (0-255), applied by the single
+ * C3D_AlphaTest below. Default 1 = "any non-zero", the established behaviour.
+ * Raising it discards the partially-covered edge pixels bilinear invents at a
+ * cutout boundary -- the dark rim over bright backgrounds (Labs grate over its
+ * green floor, fences over the orange track). ONLY affects bilinear content:
+ * nearest textures carry alpha exactly 0 or 255, which any reference in [1,255]
+ * classifies identically, so models/UI/packets are untouched. Tunable live via
+ * dumpreq `alpharef N` because the sweet spot (rim gone, thin grid lines not
+ * yet eroded) is a look call, not a derivable constant. */
+int g_dbg_trackAlphaRef = 1;
+
 void N3DS_C3DSetProjection(float left, float right, float bottom)
 {
 	if (g_dbg_widescreen == 2)
@@ -968,9 +1041,9 @@ void N3DS_C3DSetProjection(float left, float right, float bottom)
 	/*
 	 * Depth range covers the biased emit-ordinal in vertex z (s16, so
 	 * [-32768, 32767] -- see N3DS_Vertex in n3ds_backend.h). Must span the
-	 * full range even with CTR_NATIVE_OT_DEPTH off: real z values outside
-	 * near/far would be CLIPPED, so a narrow range plus stamped z would
-	 * erase geometry, not just mis-layer it.
+	 * full range: real z values outside near/far would be CLIPPED, so a
+	 * narrow range plus stamped z would erase geometry, not just mis-layer
+	 * it.
 	 */
 	Mtx_OrthoTilt(&s_projection, left, right, bottom, 0.0f, -32769.0f, 32769.0f, true);
 }
@@ -1132,8 +1205,10 @@ int N3DS_C3DInit(void)
 	 * GEQUAL-1 test therefore serves every pass unchanged -- the pass
 	 * distinction lives in the sampled cell, not in GPU state. Set once
 	 * here rather than per-draw since no draw ever needs a different test.
+	 * Reference is g_dbg_trackAlphaRef (default 1) -- see its comment; raising
+	 * it trims bilinear's cutout fringe and is a no-op for nearest content.
 	 */
-	C3D_AlphaTest(true, GPU_GEQUAL, 1);
+	C3D_AlphaTest(true, GPU_GEQUAL, (int)g_dbg_trackAlphaRef);
 
 	/*
 	 * Fixed blend color shared by BM_AVERAGE (reads the alpha, 0.5) and
@@ -1447,8 +1522,7 @@ void N3DS_C3DBeginFrame(void)
 	C3D_FrameBegin(g_dbg_frameSync ? C3D_FRAME_SYNCDRAW : 0);
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: returned");
 	/* Depth clears to FAR. Mtx_OrthoTilt maps LARGER vertex z to SMALLER
-	 * stored depth (verified empirically, see below), so far = max. Harmless
-	 * when CTR_NATIVE_OT_DEPTH is off (depth buffer unused). */
+	 * stored depth (verified empirically, see below), so far = max. */
 	C3D_RenderTargetClear(s_renderTarget, C3D_CLEAR_ALL, 0x000000FF, 0x00FFFFFF);
 	if (s_stereoFrameActive)
 	{
@@ -1459,7 +1533,6 @@ void N3DS_C3DBeginFrame(void)
 	}
 	C3D_FrameDrawOn(s_renderTarget);
 
-#ifdef CTR_NATIVE_OT_DEPTH
 	/*
 	 * Depth substrate: every prim carries its OT-emission ordinal as z, so
 	 * later-submitted always wins the depth test -- painter's order in the
@@ -1484,7 +1557,6 @@ void N3DS_C3DBeginFrame(void)
 	{
 		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
 	}
-#endif
 
 	/*
 	 * Pillarbox the top screen to the bottom screen's 4:3-equivalent width.
@@ -1805,6 +1877,13 @@ void N3DS_TrackAtlas_Free(void)
 	s_trackAtlasUnitsAllocated = 0;
 }
 
+/* Track-atlas sampler A/B (SELECT+D-RIGHT / dumpreq `bilinear`). Default 0 =
+ * GPU_NEAREST, the established point-sampled look. 1 = GPU_LINEAR (bilinear).
+ * Applied at alloc and live-reapplied by N3DS_TrackAtlas_ApplyFilter -- the
+ * filter lives in the C3D_Tex object and is read at bind, so the flip is a
+ * field write with no re-upload, safe mid-race. */
+int g_dbg_trackBilinear = 1;
+
 int N3DS_TrackAtlas_Alloc(int unitCount)
 {
 	char msg[128];
@@ -1839,12 +1918,40 @@ int N3DS_TrackAtlas_Alloc(int unitCount)
 			s_trackAtlasUnitsAllocated = i;
 			return i;
 		}
-		C3D_TexSetFilter(&s_trackAtlasTextures[i], GPU_NEAREST, GPU_NEAREST);
+		/* Filter per g_dbg_trackBilinear (above). Bilinear softens near-variant
+		 * magnification up close; safe against hard seam bleed because every
+		 * packed rect carries >=2 texels of right/bottom pad
+		 * (NativeTrackAtlas_Pack), so a 1-texel kernel never reaches a
+		 * neighbour's CONTENT; left/top edges fringe one texel toward neighbour
+		 * pad, accepted. UVs already address texel centres. */
+		{
+			GPU_TEXTURE_FILTER_PARAM f = g_dbg_trackBilinear ? GPU_LINEAR : GPU_NEAREST;
+			C3D_TexSetFilter(&s_trackAtlasTextures[i], f, f);
+		}
 		C3D_TexSetWrap(&s_trackAtlasTextures[i], GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+
+		/* Nearest VIEW of the same texels for the cutout split (see the array
+		 * comment). Struct copy shares .data; force its filter to nearest. */
+		s_trackAtlasTexturesNearest[i] = s_trackAtlasTextures[i];
+		C3D_TexSetFilter(&s_trackAtlasTexturesNearest[i], GPU_NEAREST, GPU_NEAREST);
 	}
 
 	s_trackAtlasUnitsAllocated = unitCount;
 	return unitCount;
+}
+
+/* Re-apply g_dbg_trackBilinear to every live unit. No re-upload -- just the
+ * filter field on each C3D_Tex, read at bind -- so this is a valid mid-race
+ * A/B flip. No-op when no pool is allocated. */
+void N3DS_TrackAtlas_ApplyFilter(void)
+{
+	GPU_TEXTURE_FILTER_PARAM f = g_dbg_trackBilinear ? GPU_LINEAR : GPU_NEAREST;
+	int i;
+
+	for (i = 0; i < s_trackAtlasUnitsAllocated; i++)
+	{
+		C3D_TexSetFilter(&s_trackAtlasTextures[i], f, f);
+	}
 }
 
 void N3DS_TrackAtlas_UploadRect(int unit, int dstX, int dstY, int wTexels, int hTexels, const void *tiledRGBA5551)
@@ -1884,6 +1991,18 @@ void N3DS_TrackAtlas_Bind(int unit)
 	}
 
 	C3D_TexBind(0, &s_trackAtlasTextures[unit]);
+}
+
+/* Bind the same unit's NEAREST view to texture unit 1, for the cutout split.
+ * Caller has already validated the unit via N3DS_TrackAtlas_Bind. */
+static void N3DS_TrackAtlas_BindNearestView(int unit)
+{
+	if ((unit < 0) || (unit >= s_trackAtlasUnitsAllocated))
+	{
+		return;
+	}
+
+	C3D_TexBind(1, &s_trackAtlasTexturesNearest[unit]);
 }
 
 /* ------------------------------------------------ native track draw --- */
@@ -2031,10 +2150,9 @@ void N3DS_TrackGeom_PatchUV(const unsigned short *vertIndices, const short *uvPa
 
 	if (touched)
 	{
-		size_t first = (size_t)lo * (size_t)s_trackGeomVertStride;
-		size_t last = ((size_t)hi + 1u) * (size_t)s_trackGeomVertStride;
-
-		GSPGPU_FlushDataCache(base + first, (u32)(last - first));
+		/* No flush here: widen the frame's patched range and let
+		 * N3DS_TrackGeom_FlushPatched issue one flush over the union. */
+		N3DS_TrackGeom_MarkPatched(lo, hi);
 	}
 }
 
@@ -2108,10 +2226,9 @@ void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short
 
 	if (touched)
 	{
-		size_t first = (size_t)lo * (size_t)s_trackGeomVertStride;
-		size_t last = ((size_t)hi + 1u) * (size_t)s_trackGeomVertStride;
-
-		GSPGPU_FlushDataCache(base + first, (u32)(last - first));
+		/* No flush here: widen the frame's patched range and let
+		 * N3DS_TrackGeom_FlushPatched issue one flush over the union. */
+		N3DS_TrackGeom_MarkPatched(lo, hi);
 	}
 }
 
@@ -2180,7 +2297,6 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 		C3D_CullFace(GPU_CULL_FRONT_CCW);
 	}
 
-#ifdef CTR_NATIVE_OT_DEPTH
 	/* State 2 (TRACKRO, see g_dbg_depthTest): the track still TESTS against
 	 * depth -- so it can still be hidden by nearer packet content, which is
 	 * what makes this a fair test rather than a "draw the track first" hack --
@@ -2191,7 +2307,6 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 	{
 		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_COLOR);
 	}
-#endif
 
 	/*
 	 * Assert opaque blending explicitly rather than
@@ -2345,29 +2460,48 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
  * doubling off for its untextured draws. Textured track content needs it back
  * or every texture reads half-brightness against retail.
  */
-static void N3DS_TrackDraw_SetTextured(int textured)
+/*
+ * mode: 0 = untextured (flat Gouraud), 1 = textured single-sample (one unit
+ * feeds both channels), 2 = textured CUTOUT SPLIT (colour from the smooth
+ * bilinear unit 0, alpha from the sharp nearest unit 1 -- crisp cutout, no
+ * bilinear rim, smooth texels; docs approach #2). Mode 2 is used only for
+ * opaque draws while bilinear is on; the blend pass stays mode 1 so its soft
+ * alpha edges (the Labs glow, waterfalls) are untouched.
+ */
+static void N3DS_TrackDraw_SetTextured(int mode)
 {
 	C3D_TexEnv *env;
 
-	if (s_trackTexturedState == textured)
+	if (s_trackTexturedState == mode)
 	{
 		return;
 	}
 
 	env = C3D_GetTexEnv(0);
-	if (textured)
-	{
-		C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
-		C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
-	}
-	else
+	if (mode == 0)
 	{
 		C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, 0);
 		C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
 	}
+	else if (mode == 2)
+	{
+		/* RGB keeps the PS1 2x texel*colour modulate (unit 0, bilinear). Alpha
+		 * takes the crisp mask from unit 1 (nearest), still modulated by the
+		 * vertex alpha exactly as the single path did. C3D_RGB and C3D_Alpha are
+		 * independent env slots, so these four calls fully define the stage. */
+		C3D_TexEnvSrc(env, C3D_RGB, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+		C3D_TexEnvFunc(env, C3D_RGB, GPU_MODULATE);
+		C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE1, GPU_PRIMARY_COLOR, 0);
+		C3D_TexEnvFunc(env, C3D_Alpha, GPU_MODULATE);
+	}
+	else
+	{
+		C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+		C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+	}
 	C3D_DirtyTexEnv(env);
-	N3DS_C3DSetColorDoubling(textured ? 1 : 0);
-	s_trackTexturedState = textured;
+	N3DS_C3DSetColorDoubling((mode != 0) ? 1 : 0);
+	s_trackTexturedState = mode;
 }
 
 void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float ordinalLo, float ordinalSpan, float invIndexSpan, int atlasBin, int blend, int uvDx, int uvDy)
@@ -2422,8 +2556,18 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	 */
 	if ((atlasBin >= 0) && (atlasBin < s_trackAtlasUnitsAllocated))
 	{
+		/* Cutout split (smooth colour, crisp alpha) only for OPAQUE draws while
+		 * bilinear is on. blend != 3 is the blend pass -- its soft alpha edges
+		 * are the look we want to keep, so it stays single-sample (mode 1). With
+		 * bilinear off, mode 1 is the nearest single-sample path unchanged. */
+		int split = g_dbg_trackBilinear && (blend == 3);
+
 		N3DS_TrackAtlas_Bind(atlasBin);
-		N3DS_TrackDraw_SetTextured(1);
+		if (split)
+		{
+			N3DS_TrackAtlas_BindNearestView(atlasBin);
+		}
+		N3DS_TrackDraw_SetTextured(split ? 2 : 1);
 	}
 	else
 	{
@@ -2486,7 +2630,6 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 		if (s_trackDepthWriteState != wantDepthWrite)
 		{
 			s_trackDepthWriteState = wantDepthWrite;
-#ifdef CTR_NATIVE_OT_DEPTH
 			/* Leave state 2 (TRACKRO) alone -- it already means "test but never
 			 * write" for the whole track, which is a superset of what the blend
 			 * pass needs, and stomping it here would silently disable the
@@ -2495,7 +2638,6 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 			{
 				C3D_DepthTest(true, GPU_LEQUAL, wantDepthWrite ? GPU_WRITE_ALL : GPU_WRITE_COLOR);
 			}
-#endif
 		}
 
 		/* ABR -> BlendMode is +1, and that is not a guess: native_gpu.c:49 spells
@@ -2539,7 +2681,6 @@ void N3DS_TrackDraw_End(void)
 		C3D_CullFace(GPU_CULL_NONE);
 	}
 
-#ifdef CTR_NATIVE_OT_DEPTH
 	/* Undo state 2's read-only depth mask. Unconditional on the state rather
 	 * than mirrored off a flag set in Begin: Begin can return early (geometry
 	 * not ready) having changed nothing, and re-asserting the frame-wide pair
@@ -2559,7 +2700,6 @@ void N3DS_TrackDraw_End(void)
 		 * issues no redundant state change at all. */
 		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
 	}
-#endif
 
 	s_trackDepthWriteState = -1;
 	s_trackDrawActive = 0;
@@ -2780,9 +2920,7 @@ void N3DS_ModelDraw_Run(int startVertex, int triangleCount, int atlasIndex, int 
 		if (s_modelDepthWriteState != wantDepthWrite)
 		{
 			s_modelDepthWriteState = wantDepthWrite;
-#ifdef CTR_NATIVE_OT_DEPTH
 			C3D_DepthTest(true, GPU_LEQUAL, wantDepthWrite ? GPU_WRITE_ALL : GPU_WRITE_COLOR);
-#endif
 		}
 
 		N3DS_C3DSetBlendMode(blend);
@@ -2821,7 +2959,6 @@ void N3DS_ModelDraw_End(void)
 	 * desync if Begin returned early. */
 	N3DS_BindPacketDrawState();
 
-#ifdef CTR_NATIVE_OT_DEPTH
 	/* The blend pass turned depth writes off. Restore the frame-wide pair before
 	 * anything else draws, or every packet issued after the models this frame
 	 * would silently stop writing depth -- and only on frames that happened to
@@ -2831,7 +2968,6 @@ void N3DS_ModelDraw_End(void)
 	{
 		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
 	}
-#endif
 
 	s_modelDrawActive = 0;
 	s_modelTexturedState = -1;
@@ -2927,7 +3063,6 @@ void N3DS_StereoRenderRightEye(void)
 	/* Same pillarbox crop (or widescreen lift) as N3DS_C3DBeginFrame --
 	 * viewport state does not automatically follow the framebuffer binding. */
 	C3D_SetViewport(0, g_dbg_widescreen ? 0 : N3DS_TOP_CONTENT_X, 240, g_dbg_widescreen ? 400 : N3DS_TOP_CONTENT_W);
-#ifdef CTR_NATIVE_OT_DEPTH
 	/* Frame-wide depth pair, mirroring BeginFrame's policy exactly --
 	 * whatever state the left eye's last draw left behind is not it. */
 	if (g_dbg_depthTest == 1)
@@ -2938,7 +3073,6 @@ void N3DS_StereoRenderRightEye(void)
 	{
 		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
 	}
-#endif
 	/* Packet program + layout + buffer + combiner + projection + the RIGHT
 	 * eye's packet parallax (s_stereoEye is 1 now, so the upload inside
 	 * picks the right vector). */
@@ -3048,12 +3182,10 @@ void N3DS_StereoRenderRightEye(void)
 	if (s_stereoOverflow)
 	{
 		N3DS_BindPacketDrawState();
-#ifdef CTR_NATIVE_OT_DEPTH
 		if (g_dbg_depthTest != 1)
 		{
 			C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
 		}
-#endif
 	}
 
 	/* s_stereoEye stays 1 until the next frame's latch resets it -- nothing
@@ -3066,11 +3198,7 @@ void N3DS_StereoRenderRightEye(void)
  * OT_DEPTH there is no depth buffer to mask and this is a no-op. */
 void N3DS_C3DSetDepthWrite(int enable)
 {
-#ifdef CTR_NATIVE_OT_DEPTH
 	C3D_DepthTest(true, GPU_LEQUAL, enable ? GPU_WRITE_ALL : GPU_WRITE_COLOR);
-#else
-	(void)enable;
-#endif
 }
 
 void N3DS_C3DSetBlendMode(int blendMode)
@@ -3181,7 +3309,8 @@ unsigned int N3DS_ReadButtons(void)
 	 *   single      -- toggle g_dbg_forceSingleTexture
 	 *   textureless -- toggle g_dbg_texturelessMode
 	 *   triscopes   -- toggle g_dbg_perfTriScopes (per-triangle perf split; taxed)
-	 *   drawmerge   -- toggle g_dbg_drawMerge (CTR_NATIVE_DRAW_MERGE builds only)
+	 *   drawmerge   -- toggle g_dbg_drawMerge: 0 falls back to immediate
+	 *                  per-run submission instead of the state-sorted bins
 	 *   flagstyle [N] -- menu/loading flag: 0 = retail grey checkers (default),
 	 *                  1 = pride stripes, 2 = purple/white (Spyro). Bare token
 	 *                  cycles. Also reachable in-game by cheat: WONDER, SOAR.
@@ -3199,6 +3328,13 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  'trackrender N' sets a specific state. Also reachable on
 	 *                  hardware via SELECT+ZR (a dumpreq file can't be placed
 	 *                  mid-race there -- see the button handler below).
+	 *   weld        -- toggle g_dbg_trackWeld, the track mesh's T-junction weld
+	 *                  (DEFAULT OFF; it bends plank and trestle geometry rather
+	 *                  than repairing cracks). Read during the mesh build, so
+	 *                  set it before loading the level to compare against, and
+	 *                  load a DIFFERENT track first -- the mesh is cached per
+	 *                  level and reloading the same one rebuilds nothing.
+	 *                  [TRKWELD] reports count and displacement histogram.
 	 *   packetdepth -- toggle g_dbg_packetDepth (depth model): packets stamp
 	 *                  GTE sz3 and the track shader switches to the same
 	 *                  true-depth axis, both at once. Hardware button: SELECT+L.
@@ -3229,11 +3365,20 @@ unsigned int N3DS_ReadButtons(void)
 	 *   wide [N]    -- g_dbg_widescreen: bare toggles off<->REAL (mode 2,
 	 *                  wide FOV window at 4:3 pixel scale); `wide 1` is the
 	 *                  rejected anamorphic stretch. Button: SELECT+D-DOWN.
+	 *   bilinear    -- toggle g_dbg_trackBilinear (default ON): track-atlas
+	 *                  sampler bilinear <-> nearest. Live, no rebuild.
+	 *                  Button: SELECT+D-RIGHT.
+	 *   alpharef N  -- punch-through cutoff 0-255 (g_dbg_trackAlphaRef, default
+	 *                  1). Raising it trims bilinear's dark cutout rim; too high
+	 *                  erodes thin cutout detail. No-op under nearest. Bare = 1.
 	 *   padmux [N]  -- virtual multitap (default OFF -- renderer can't do
 	 *                  split-screen, and off keeps VS/battle behind retail's
 	 *                  own controller gate): `padmux N` drives pad N with the
 	 *                  3DS buttons, 0 = off (retail single-pad bus), bare =
 	 *                  cycle the driven pad. Button: SELECT+ZR.
+	 *   vol [N]     -- output-stage gain, percent of SPU-faithful amplitude
+	 *                  (retail's 0x3fff master is half digital scale, so 200
+	 *                  = full scale and the default). Bare resets to default.
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -3255,9 +3400,19 @@ unsigned int N3DS_ReadButtons(void)
 
 				word[got] = '\0';
 				fclose(req);
-				remove("sdmc:/dumpreq.txt");
 
-				if (strncmp(word, "widemask", 8) == 0)
+				/* Consumed = successfully deleted. On a host filesystem
+				 * (Azahar) a freshly written file can be transiently held
+				 * open by the OS (AV scan); remove() then fails, and acting
+				 * anyway re-fires the same request every poll -- a TOGGLE
+				 * request flapped a dozen in-place rebuilds that way. Skip
+				 * this poll instead: the file survives and the next poll
+				 * retries the whole read+delete. */
+				if (remove("sdmc:/dumpreq.txt") != 0)
+				{
+					/* not consumed -- retried next poll */
+				}
+				else if (strncmp(word, "widemask", 8) == 0)
 				{
 					/* Strips-hunt kill switches: bit 1 = instance bbox
 					 * margin, 2 = per-tri margin, 4 = sky face margin,
@@ -3344,7 +3499,6 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_perfTriScopes ? "[CTR-3DS] per-tri perf scopes: ON (syscall tax ~10k/frame)"
 					                                  : "[CTR-3DS] per-tri perf scopes: off");
 				}
-#ifdef CTR_NATIVE_DRAW_MERGE
 				else if (strncmp(word, "drawmerge", 9) == 0)
 				{
 					extern int g_dbg_drawMerge;
@@ -3355,7 +3509,6 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_drawMerge ? "[CTR-3DS] draw merge: ON (deferred bins + segment replay)"
 					                              : "[CTR-3DS] draw merge: off (immediate runs)");
 				}
-#endif
 #if defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS
 				else if (strncmp(word, "lodgeo", 6) == 0 || strncmp(word, "lodtex", 6) == 0)
 				{
@@ -3391,6 +3544,47 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_renderThread ? "[CTR-3DS] render worker routing: ON"
 					                                 : "[CTR-3DS] render worker routing: OFF (sync on main thread)");
 				}
+#if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+				else if (strncmp(word, "bilinear", 8) == 0)
+				{
+					/* Same live filter flip as the SELECT+D-RIGHT chord. */
+					g_dbg_trackBilinear ^= 1;
+					N3DS_TrackAtlas_ApplyFilter();
+					N3DS_DebugLog(g_dbg_trackBilinear ? "[CTR-3DS] track filter: BILINEAR" : "[CTR-3DS] track filter: nearest");
+				}
+				else if (strncmp(word, "alpharef", 8) == 0)
+				{
+					/* Punch-through cutoff (0-255), the bilinear-rim dial. Set
+					 * once at init, so re-assert C3D_AlphaTest here to make the
+					 * new reference land live. Bare token resets to 1. */
+					const char *arg = word + 8;
+					int ref = 1;
+
+					while ((*arg == ' ') || (*arg == '\t'))
+					{
+						arg++;
+					}
+					if ((*arg >= '0') && (*arg <= '9'))
+					{
+						ref = atoi(arg);
+						if (ref < 0)
+						{
+							ref = 0;
+						}
+						if (ref > 255)
+						{
+							ref = 255;
+						}
+					}
+					g_dbg_trackAlphaRef = ref;
+					C3D_AlphaTest(true, GPU_GEQUAL, g_dbg_trackAlphaRef);
+					{
+						char msg[64];
+						snprintf(msg, sizeof(msg), "[CTR-3DS] alpha cutoff: %d/255 (1 = retail; higher trims bilinear rim)", g_dbg_trackAlphaRef);
+						N3DS_DebugLog(msg);
+					}
+				}
+#endif
 #ifdef CTR_NATIVE_DIRECT_EMIT
 				else if (strncmp(word, "directemit", 10) == 0)
 				{
@@ -3438,6 +3632,17 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_stPass2 ^= 1;
 					N3DS_DebugLog(g_dbg_stPass2 ? "[CTR-3DS] semi-trans pass 2: ON" : "[CTR-3DS] semi-trans pass 2: SKIPPED");
 				}
+#ifdef CTR_NATIVE_TRACK_RENDERER
+				else if (strncmp(word, "weld", 4) == 0)
+				{
+					extern int g_dbg_trackWeld;
+
+					/* Track-mesh T-junction weld. Read only during a level mesh
+					 * build, so this has to be set before the level loads. */
+					g_dbg_trackWeld ^= 1;
+					N3DS_DebugLog(g_dbg_trackWeld ? "[CTR-3DS] track weld: ON (next level load)" : "[CTR-3DS] track weld: OFF (next level load)");
+				}
+#endif
 				else if (strncmp(word, "skyfar", 6) == 0)
 				{
 					extern int g_dbg_skyFar;
@@ -3508,6 +3713,29 @@ unsigned int N3DS_ReadButtons(void)
 						snprintf(msg, sizeof(msg), "[CTR-3DS] padmux: 4 pads connected, driving pad %d", state);
 						N3DS_DebugLog(msg);
 					}
+				}
+				else if (strncmp(word, "vol", 3) == 0)
+				{
+					/* Output-stage gain (n3ds_audio_thread.c): applied at the
+					 * ndsp mix pokes only, so the mixer -- and PC byte-identity
+					 * -- is untouched. 'vol N' sets percent of SPU-faithful
+					 * amplitude; bare resets to the 200 default. */
+					extern int N3DS_AudioSetOutputGainPercent(int percent);
+					const char *arg = word + 3;
+					int pct = -1;
+					char msg[64];
+
+					while ((*arg == ' ') || (*arg == '\t'))
+					{
+						arg++;
+					}
+					if ((*arg >= '0') && (*arg <= '9'))
+					{
+						pct = atoi(arg);
+					}
+					pct = N3DS_AudioSetOutputGainPercent(pct);
+					snprintf(msg, sizeof(msg), "[CTR-3DS] output gain: %d%% (100 = SPU-faithful)", pct);
+					N3DS_DebugLog(msg);
 				}
 				else if (strncmp(word, "uiorder", 7) == 0)
 				{
@@ -3587,6 +3815,7 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_uiDump = 1;
 					N3DS_DebugLog("[CTR-3DS] ui-dump: armed (next frame)");
 				}
+#ifdef CTR_NATIVE_TRACK_RENDERER
 				else if (strncmp(word, "bfcull", 6) == 0)
 				{
 					extern int g_dbg_bfCull;
@@ -3610,6 +3839,7 @@ unsigned int N3DS_ReadButtons(void)
 					              : g_dbg_bfCull == 1 ? "[CTR-3DS] backface cull (track): BACK faces culled"
 					                                  : "[CTR-3DS] backface cull (track): FRONT faces culled");
 				}
+#endif
 				else if (strncmp(word, "fbtest", 6) == 0)
 				{
 					extern int g_dbg_skipFbTriTest;
@@ -3674,6 +3904,7 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] packet depth bias: %d (units nearer)", g_dbg_pktDepthBias);
 					N3DS_DebugLog(msg);
 				}
+#ifdef CTR_NATIVE_TRACK_RENDERER
 				else if (strncmp(word, "trkchk", 6) == 0)
 				{
 					/* s32: runs BOTH depth formulas -- the integer one this
@@ -3688,6 +3919,7 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_trackDepthCheck ? "[CTR-3DS] track depth check: ON (integer + shader arms)"
 					                                    : "[CTR-3DS] track depth check: off");
 				}
+#endif
 				else if (strncmp(word, "nofx", 4) == 0)
 				{
 					extern int g_dbg_noFx;
@@ -3704,6 +3936,7 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_fxNoDepthWrite ? "[CTR-3DS] blended packets: depth TEST only (default, matches model/track)"
 					                                   : "[CTR-3DS] blended packets: also WRITE depth (old behaviour)");
 				}
+#ifdef CTR_NATIVE_TRACK_RENDERER
 				else if (strncmp(word, "trknear", 7) == 0)
 				{
 					/* s32: [TRKNEAR] walks OUR OWN resident mesh and reports its
@@ -3718,6 +3951,7 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_trackNearCensus ^= 1;
 					N3DS_DebugLog(g_dbg_trackNearCensus ? "[CTR-3DS] track near census: ON" : "[CTR-3DS] track near census: off");
 				}
+#endif
 				else if (strncmp(word, "trackafter", 10) == 0)
 				{
 					extern int g_dbg_trackAfterMerge;
@@ -3826,6 +4060,7 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] track render: %s", names[g_dbg_trackRender]);
 					N3DS_DebugLog(msg);
 				}
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
 				else if (strncmp(word, "decalaxis", 9) == 0)
 				{
 					extern int g_dbg_decalAxisFix;
@@ -3838,6 +4073,7 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_decalAxisFix ? "[CTR-3DS] decal depth axis: FIXED (4x unscaled)"
 					                                : "[CTR-3DS] decal depth axis: off (pre-s41 behaviour)");
 				}
+#endif
 				else if (strncmp(word, "dorder", 6) == 0)
 				{
 					char msg[80];
@@ -4222,6 +4458,7 @@ unsigned int N3DS_ReadButtons(void)
 	 * state this chord returns to OFF first. SELECT+Y was freed from the
 	 * packet-depth-bias ladder (still dumpreq `pktbias`); reused for this perf
 	 * experiment because it needs to be flippable mid-race. */
+#ifdef CTR_NATIVE_TRACK_RENDERER
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_Y))
 	{
 		extern int g_dbg_bfCull;
@@ -4230,6 +4467,7 @@ unsigned int N3DS_ReadButtons(void)
 		N3DS_DebugLog(g_dbg_bfCull ? "[CTR-3DS] backface cull (track): BACK faces culled (watch `work` ms)"
 		                           : "[CTR-3DS] backface cull (track): OFF (draw all faces)");
 	}
+#endif
 
 	/* SELECT held + ZL: depth-test state cycle 0->1->2->0 (see g_dbg_depthTest
 	 * above N3DS_C3DBeginFrame for what each state proves). ZL has been free
@@ -4275,9 +4513,19 @@ unsigned int N3DS_ReadButtons(void)
 	 * hardware A/B would be cross-run. The OFF transition is safe mid-race
 	 * by construction: Route() fences the worker before the first direct
 	 * call (native_render_queue.c). */
-	/* SELECT+DDOWN freed (widescreen -- now part of the SELECT+START master). Still reachable as dumpreq `wide`. */
 
-	/* SELECT+DRIGHT freed (textureless debug view). Still reachable as dumpreq `textureless`. */
+	/* SELECT+DRIGHT: track-atlas sampler A/B, nearest <-> bilinear. Pure
+	 * mid-race flip -- rewrites each unit's filter field, no re-upload, no
+	 * rebuild -- so it lands the same frame. dumpreq `bilinear` is the same
+	 * path for Azahar. (Was the textureless debug view, now dumpreq-only.) */
+#if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DRIGHT))
+	{
+		g_dbg_trackBilinear ^= 1;
+		N3DS_TrackAtlas_ApplyFilter();
+		N3DS_DebugLog(g_dbg_trackBilinear ? "[CTR-3DS] track filter: BILINEAR" : "[CTR-3DS] track filter: nearest");
+	}
+#endif
 
 #ifdef CTR_NATIVE_DIRECT_EMIT
 	/* SELECT+DLEFT freed (direct emit -- baseline, A/B settled). Still reachable as dumpreq `directemit`. */
@@ -4347,41 +4595,6 @@ unsigned int N3DS_ReadButtons(void)
 	 * a deliberate debugging act that can afford a relaunch. Widescreen joins
 	 * the master because "ours" includes it: REAL (2) on, 4:3 crop (0) off; the
 	 * rejected stretch (1) stays dumpreq-only. */
-	/*
-	 * UI pop-out dial: SELECT + D-LEFT / D-RIGHT, in 5% steps of the eye's
-	 * at-infinity shift. Earns a chord (owner-approved) on the one criterion
-	 * that justifies one: it is a COMFORT value, judged by eye, in stereo, on
-	 * hardware -- and it cannot be dialled any other way there, because dumpreq
-	 * needs the SD card the game is holding. Deliberately not the touch screen:
-	 * touch is a bad A/B edge -- it disturbs the thing being judged.
-	 *
-	 * Clamped 0..100 here: 0 restores the old flat-at-screen-plane UI, and 100
-	 * is already well past the owner's "not as much as the character" bound, so
-	 * the dial cannot walk into eye strain by held-button accident. dumpreq
-	 * 'uipop N' still reaches 200 for deliberate experiments.
-	 *
-	 * Current value is on the bottom-screen stats block, not the log: the log is
-	 * unreadable while the game runs, and this number is only meaningful at the
-	 * moment it is being looked at.
-	 */
-	if ((held & KEY_SELECT) && (hidKeysDown() & (KEY_DLEFT | KEY_DRIGHT)))
-	{
-		const int step = (hidKeysDown() & KEY_DRIGHT) ? 5 : -5;
-		char msg[80];
-
-		g_dbg_uiPopPct += step;
-		if (g_dbg_uiPopPct < 0)
-		{
-			g_dbg_uiPopPct = 0;
-		}
-		if (g_dbg_uiPopPct > 100)
-		{
-			g_dbg_uiPopPct = 100;
-		}
-		snprintf(msg, sizeof(msg), "[CTR-3DS] ui pop-out: %d%% of k", g_dbg_uiPopPct);
-		N3DS_DebugLog(msg);
-	}
-
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_START))
 	{
 		extern int g_dbg_trackRender;

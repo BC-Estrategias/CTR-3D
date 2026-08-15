@@ -177,36 +177,14 @@ if(CTR_NATIVE_OTWALK_PROFILE)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_OTWALK_PROFILE=1)
 endif()
 
-# 3DS z-break substrate: enable the PICA depth test against the per-prim
-# emit-ordinal carried in vertex z. Order-preserving by construction (equal
-# ordinal + equal-passes test = painter), so ON must be pixel-identical to
-# OFF -- that A/B is the acceptance. The ordinal stamping and vertex z
-# plumbing are unconditional; this gate only turns the depth TEST on. It
-# exists to make submission reorder (cross-bucket state-sorted batching)
-# legal, which is where the fps payoff lives.
-option(CTR_NATIVE_OT_DEPTH
-    "3DS: depth-test against per-prim emit ordinals (z-break substrate)"
-    ON)
-if(CTR_NATIVE_OT_DEPTH)
-    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_OT_DEPTH=1)
-endif()
-
-# First consumer of the depth substrate: defer the frame's draws, bin opaque
-# (BM_NONE) content by GPU state across OT buckets, replay blends in order.
-# Collapses the ~350 state transitions of a race frame's walk into ~a-draw-
-# per-state. Requires CTR_NATIVE_OT_DEPTH (the depth test is what makes
-# opaque reorder legal); runtime A/B via dumpreq 'drawmerge'. This is the
-# gate that deliberately gives up the substrate's ON==OFF pixel identity --
-# opaque submission ORDER changes, pixels should not, and draws/frame must.
-option(CTR_NATIVE_DRAW_MERGE
-    "3DS: cross-bucket state-sorted draw merge (needs CTR_NATIVE_OT_DEPTH)"
-    ON)
-if(CTR_NATIVE_DRAW_MERGE)
-    if(NOT CTR_NATIVE_OT_DEPTH)
-        message(FATAL_ERROR "CTR_NATIVE_DRAW_MERGE requires CTR_NATIVE_OT_DEPTH=ON")
-    endif()
-    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_DRAW_MERGE=1)
-endif()
+# The 3DS z-break substrate (PICA depth test against the per-prim emit ordinal
+# in vertex z) and the draw merge built on it (opaque binned by GPU state
+# across OT buckets, blends replayed in order) are both unconditional. They
+# were compile-time options while their ON/OFF A/B was the open question;
+# hardware accepted both and the OFF legs are gone. The merge still has a
+# runtime A/B -- dumpreq 'drawmerge' (g_dbg_drawMerge) -- which is the lever
+# to reach for, and it keeps the immediate-submission path alive as the else
+# branch of every merge decision.
 
 # Runtime percentage on CTR's own track/texture LOD switch distances, seeded
 # once per frame in RenderAllLevelGeometry, plus the [LODPROBE] counters that
@@ -295,24 +273,6 @@ endif()
 
 if(CTR_NATIVE_TRACK_RENDERER)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_TRACK_RENDERER=1)
-
-    # On 3DS the whole depth compose (design 4.3) is the OT_DEPTH substrate --
-    # track fragments and packets meet in one depth buffer only because that
-    # gate legalizes comparing a real depth test against emit-ordinal z -- and
-    # rung 3a issues its draws at the DRAW_MERGE barrier (N3DS_FlushRun's
-    # caller). Neither dependency is optional the way CTR_NATIVE_DIRECT_EMIT's
-    # is; catch a mismatched config at configure time rather than a silent
-    # black track or a merge-barrier that never runs on hardware. PC is
-    # count-only at this ladder step (no drawing at all), so it carries no
-    # such requirement.
-    if(NINTENDO_3DS)
-        if(NOT CTR_NATIVE_OT_DEPTH)
-            message(FATAL_ERROR "CTR_NATIVE_TRACK_RENDERER requires CTR_NATIVE_OT_DEPTH=ON on 3DS (the depth compose is the OT_DEPTH substrate)")
-        endif()
-        if(NOT CTR_NATIVE_DRAW_MERGE)
-            message(FATAL_ERROR "CTR_NATIVE_TRACK_RENDERER requires CTR_NATIVE_DRAW_MERGE=ON on 3DS (draws are issued at the merge-bin barrier)")
-        endif()
-    endif()
 endif()
 
 # PICA-native model renderer (s30-s32, docs/NATIVE_MODEL_RENDERER_DESIGN.md).
@@ -410,9 +370,6 @@ option(CTR_NATIVE_DIRECT_EMIT
     "Direct packet->bin emit for all-opaque-poly OT nodes (3DS fast path; PC counts only)"
     ON)
 if(CTR_NATIVE_DIRECT_EMIT)
-    if(NINTENDO_3DS AND NOT CTR_NATIVE_DRAW_MERGE)
-        message(FATAL_ERROR "CTR_NATIVE_DIRECT_EMIT requires CTR_NATIVE_DRAW_MERGE on 3DS (it emits into the merge bins)")
-    endif()
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_DIRECT_EMIT=1)
 endif()
 

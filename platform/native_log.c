@@ -37,6 +37,26 @@ internal void Platform_LogWrite(FILE *consoleStream, const char *text)
 
 	if (s_logStream != NULL)
 	{
+#ifdef __3DS__
+		/* Gated on g_dbg_sdLog, the same switch as ctr3ds.log, so one control
+		 * governs every SD write. The WRITE is gated, not just the flush: a
+		 * buffered write is only free until stdio's buffer fills, and it then
+		 * flushes wherever it happens to be -- mid-corner, unthrottled, which
+		 * is the stall the switch exists to remove. This card charges per call,
+		 * not per byte. Callers on the frame path must still rate-limit
+		 * themselves; the switch defaults off and is not a licence to log every
+		 * frame. Off still leaves the bottom-screen console and the netload
+		 * stream above, both free.
+		 *
+		 * Kept per-line rather than throttled like N3DS_DebugLog's: this sink
+		 * carries the LOAD/hang checkpoints out of game/, whose whole value is
+		 * being on disk when the console stops responding. Switching it on is
+		 * an explicit "I want the log, charge me for it". */
+		if (!N3DS_SdLogEnabled())
+		{
+			return;
+		}
+#endif
 		fputs(text, s_logStream);
 		fflush(s_logStream);
 	}

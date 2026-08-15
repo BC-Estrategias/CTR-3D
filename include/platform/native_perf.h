@@ -193,6 +193,25 @@ void NativePerf_EndScope(enum NativePerfBucket bucket);
  * rather than mere list presence (GTE projection only).
  */
 void NativePerf_CountTorch(int listed, int emitted);
+
+#ifdef CTR_INTERNAL
+/*
+ * The DrawOTag job (the ~35ms "walk" the main thread waits behind) split into
+ * its three phases with the worker's OWN clock -- the NativePerf buckets for
+ * these undercount, since the job runs async on core 2 outside the main thread's
+ * perf frame. patch = NativeTrackAnim_PatchFrame (moving water/lava rewrite),
+ * parse = ParsePrimitivesLinkedList (the packet OT walk itself), splits =
+ * DrawAllSplits (flush bins to the GPU). Defined in native_libgpu.c where the
+ * job body lives. TakeOtagSplit copies and zeroes.
+ */
+struct NativeOtagSplitStats
+{
+	unsigned long patchUs, parseUs, splitsUs;
+	unsigned int calls;
+};
+
+void NativePerf_TakeOtagSplit(struct NativeOtagSplitStats *out);
+#endif
 #else
 static inline int NativePerf_ConfigureFromArgs(int argc, char **argv)
 {

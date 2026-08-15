@@ -1044,6 +1044,95 @@ internal u16 NativeGpu_NextDepthStamp(void)
 	return ordinal;
 }
 
+/* ---- Packet-depth debug toggles -------------------------------------------
+ *
+ * A toggle's DEFINITION is unconditional; only the code it gates is guarded.
+ * Most of what these switch lives in the CTR_NATIVE_GTE_CAPTURE block below,
+ * but the consumers are not all inside it: DrawSplit further down this file is
+ * compiled in every config, and the 3DS backend and renderer TUs extern these
+ * without a capture guard. A definition parked inside the guard therefore
+ * vanishes in a capture-OFF build while its uses remain, which does not fail
+ * until compile or link. Same idiom as g_dbg_trackRender / g_dbg_modelRender.
+ *
+ * Each keeps its normal default here, so a capture-OFF build behaves exactly
+ * as if the toggle had never been flipped.
+ */
+
+/* Boot default; see CTR_NATIVE_RENDERER_DEFAULT_ON in CMakeLists.txt. This one
+ * toggle drives BOTH sides of the shared depth axis (packets stamp sz3, and the
+ * track shader's selector reads it in n3ds_backend.c) -- flipping only one puts
+ * the geometry sources on different axes, which is worse than either alone. */
+#ifndef CTR_NATIVE_RENDERER_DEFAULT_ON
+#define CTR_NATIVE_RENDERER_DEFAULT_ON 0
+#endif
+
+int g_dbg_packetDepth = CTR_NATIVE_RENDERER_DEFAULT_ON;
+
+/*
+ * Owner-requested depth bias, in view.z units (stamp units are the same
+ * scale: stamp = 0xFFFF - sz3, so +1 stamp == 1 unit NEARER the camera).
+ *
+ * Applies to WORLD packet content only -- this is the single funnel every
+ * world stamp passes through, and the 2D/UI band is resolved before it, so UI
+ * is untouched. Because it shifts every world packet by the same amount,
+ * packet-vs-packet ordering is bit-for-bit unchanged; the only relationship it
+ * moves is packet-vs-TRACK, which is exactly the complaint ("racers sinking
+ * into the ground").
+ *
+ * A HACK, deliberately, and it trades one artefact against another: too small
+ * and racers still sink, too large and they show through walls, and on a track
+ * with thin geometry there may be no value that is clean everywhere. The real
+ * fix is the track side -- the near-plane clamp (ctr_track.v.pica's
+ * depthMinWorld) and behind-camera leaves, both still open. Default 0 so this
+ * costs nothing and changes nothing until it is asked for.
+ */
+int g_dbg_pktDepthBias = 0;
+
+/* Deferred driver-local exhaust-smoke pass. External linkage (the dumpreq
+ * handler lives in the separate n3ds_backend.c TU). A/B master, default ON:
+ * 1 = driver-local smoke is held out of the normal merge and redrawn AFTER the
+ * native model pass so it paints over its own kart body (retail's painter's
+ * order) while a nearer wall/kart still occludes it; 0 = old behaviour (smoke
+ * in the merge, body over it). Runtime A/B: dumpreq 'smokedefer'.
+ *
+ * NO near-bias: the smoke's own captured view.z depth
+ * (GTECapture_StoreParticleCorner), drawn after the body, is sufficient on its
+ * own -- owner tested bias 0 and it was perfect, so the dial was removed.
+ * The depth CAPTURE is still essential: without it the smoke falls back to the
+ * parse-order ordinal axis, reads as infinitely far, and is occluded by all. */
+int g_dbg_smokeDefer = 1;
+
+/* Skybox far-pin A/B (dumpreq 'skyfar'). Default ON. The range table and the
+ * resolver branch it gates live in the guarded block below. */
+int g_dbg_skyFar = 1;
+
+/* Minimap-box probe (dumpreq 'stpass1' / 'stpass2'): skip pass 1 or pass 2
+ * of every textured-semi-trans two-pass split (DrawSplit below). Whichever skip
+ * removes the minimap's black box names the guilty pass -- PASS1 is the
+ * opaque-body view drawn blending-off (a box there means 0x0000/STP texels are
+ * leaking into the PASS1 view on this platform), PASS2 is the blended STP view
+ * (a box there means the blend state is wrong at replay time). Diagnostic
+ * only; both default ON = unchanged output, and PC has no toggle for them. */
+int g_dbg_stPass1 = 1;
+int g_dbg_stPass2 = 1;
+
+/* Set per node by the OT walk (beside GTECapture_MarkOTNode): whether the node
+ * the walk is about to hand to direct-emit or the parse path is sky-class (the
+ * backdrop union or the star slice). Read by PacketDepth_ResolveXY, which sees
+ * only screen coordinates, not the packet address. Self-resetting -- assigned
+ * every node -- so it needs no separate per-walk clear.
+ *
+ * Unconditional for the same reason as the toggles above: native_direct_emit.c
+ * reads both under CTR_NATIVE_DIRECT_EMIT, which does not imply capture. The
+ * producer stays in the guarded block, so a capture-OFF build leaves them 0 and
+ * the direct-emit sky/glow paths simply never trigger. */
+global_variable int s_skyNodeActive;
+/* s46: same per-packet tagging for the glow slice (subset of the sky span).
+ * Read by the direct-emit vertex loop to decide the wide-window X stretch. */
+global_variable int s_glowNodeActive;
+
+/* ------------------------------------------------------------------------- */
+
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 /* Packet depth from GTE sz3 -- docs/PACKET_DEPTH_DESIGN.md.
  *
@@ -1072,15 +1161,6 @@ internal u16 NativeGpu_NextDepthStamp(void)
  *
  * Declared here, above NativeGpu_StampEmitOrdinal, because that is the consumer.
  */
-/* Boot default; see CTR_NATIVE_RENDERER_DEFAULT_ON in CMakeLists.txt. This one
- * toggle drives BOTH sides of the shared depth axis (packets stamp sz3, and the
- * track shader's selector reads it in n3ds_backend.c) -- flipping only one puts
- * the geometry sources on different axes, which is worse than either alone. */
-#ifndef CTR_NATIVE_RENDERER_DEFAULT_ON
-#define CTR_NATIVE_RENDERER_DEFAULT_ON 0
-#endif
-
-int g_dbg_packetDepth = CTR_NATIVE_RENDERER_DEFAULT_ON;
 
 /* ONE AXIS, FOUR CASES. Every stamp below is "nearer = larger", and every one
  * of them must land on the SAME numeric scale, because the depth test cannot
@@ -1118,9 +1198,9 @@ enum
 	/*
 	 * 4 UI prims per stamp -> the band orders 64*4 = 256 primitives.
 	 *
-	 * Do not widen this packing to buy capacity: with CTR_NATIVE_DRAW_MERGE,
-	 * opaque content is binned by state and replayed per bin, so submission
-	 * order only holds within a bin. Prims sharing a stamp tie and resolve by
+	 * Do not widen this packing to buy capacity: the draw merge bins opaque
+	 * content by state and replays it per bin, so submission order only
+	 * holds within a bin. Prims sharing a stamp tie and resolve by
 	 * draw order; coarser packing turns that into cross-bin ordering
 	 * corruption for UI (glyph/panel swaps), not just lost precision. The
 	 * real fix for capacity is to stop UI depending on the depth test for
@@ -1291,56 +1371,6 @@ global_variable s16 s_pktMissSampOccX[PKTMISS_SAMPLE_N];
 global_variable s16 s_pktMissSampOccY[PKTMISS_SAMPLE_N];
 global_variable u16 s_pktMissSampOccZ[PKTMISS_SAMPLE_N];
 global_variable u8 s_pktMissSampOccGen[PKTMISS_SAMPLE_N];
-
-/*
- * Owner-requested depth bias, in view.z units (stamp units are the same
- * scale: stamp = 0xFFFF - sz3, so +1 stamp == 1 unit NEARER the camera).
- *
- * Applies to WORLD packet content only -- this is the single funnel every
- * world stamp passes through, and the 2D/UI band is resolved before it, so UI
- * is untouched. Because it shifts every world packet by the same amount,
- * packet-vs-packet ordering is bit-for-bit unchanged; the only relationship it
- * moves is packet-vs-TRACK, which is exactly the complaint ("racers sinking
- * into the ground").
- *
- * A HACK, deliberately, and it trades one artefact against another: too small
- * and racers still sink, too large and they show through walls, and on a track
- * with thin geometry there may be no value that is clean everywhere. The real
- * fix is the track side -- the near-plane clamp (ctr_track.v.pica's
- * depthMinWorld) and behind-camera leaves, both still open. Default 0 so this
- * costs nothing and changes nothing until it is asked for.
- */
-int g_dbg_pktDepthBias = 0;
-
-/* Deferred driver-local exhaust-smoke pass. External linkage (the dumpreq
- * handler lives in the separate n3ds_backend.c TU). A/B master, default ON:
- * 1 = driver-local smoke is held out of the normal merge and redrawn AFTER the
- * native model pass so it paints over its own kart body (retail's painter's
- * order) while a nearer wall/kart still occludes it; 0 = old behaviour (smoke
- * in the merge, body over it). Runtime A/B: dumpreq 'smokedefer'.
- *
- * NO near-bias: the smoke's own captured view.z depth
- * (GTECapture_StoreParticleCorner), drawn after the body, is sufficient on its
- * own -- owner tested bias 0 and it was perfect, so the dial was removed.
- * The depth CAPTURE is still essential: without it the smoke falls back to the
- * parse-order ordinal axis, reads as infinitely far, and is occluded by all. */
-int g_dbg_smokeDefer = 1;
-
-/* Skybox far-pin A/B (dumpreq 'skyfar'). Default ON. Defined out here beside
- * g_dbg_smokeDefer, not inside the CTR_NATIVE_GTE_CAPTURE block below, so the
- * dumpreq extern resolves in any 3DS config -- same placement as smokeDefer. The
- * range table and resolver branch it gates live in that guarded block. */
-int g_dbg_skyFar = 1;
-
-/* Minimap-box probe (dumpreq 'stpass1' / 'stpass2'): skip pass 1 or pass 2
- * of every textured-semi-trans two-pass split (DrawSplit below). Whichever skip
- * removes the minimap's black box names the guilty pass -- PASS1 is the
- * opaque-body view drawn blending-off (a box there means 0x0000/STP texels are
- * leaking into the PASS1 view on this platform), PASS2 is the blended STP view
- * (a box there means the blend state is wrong at replay time). Diagnostic
- * only; both default ON = unchanged output, and PC has no toggle for them. */
-int g_dbg_stPass1 = 1;
-int g_dbg_stPass2 = 1;
 
 /* s42d tag: which POLY_FT4 packets are driver-local exhaust smoke, identified
  * by PACKET ADDRESS (unique per frame) -- NOT a code-byte bit. Every bit of a
@@ -1550,15 +1580,6 @@ internal int NativeGpu_IsStarPacket(uintptr_t addr)
 	return (addr >= s_starRangeStart[s_skyRangeReadIdx]) && (addr < s_starRangeEnd[s_skyRangeReadIdx]);
 }
 
-/* Set per node by the OT walk (beside GTECapture_MarkOTNode): whether the node
- * the walk is about to hand to direct-emit or the parse path is sky-class (the
- * backdrop union or the star slice). Read by PacketDepth_ResolveXY, which sees
- * only screen coordinates, not the packet address. Self-resetting -- assigned
- * every node -- so it needs no separate per-walk clear. */
-global_variable int s_skyNodeActive;
-/* s46: same per-packet tagging for the glow slice (subset of the sky span).
- * Read by the direct-emit vertex loop to decide the wide-window X stretch. */
-global_variable int s_glowNodeActive;
 #endif
 
 internal u16 PacketDepth_ClampWorld(u32 stamp)

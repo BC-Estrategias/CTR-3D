@@ -148,6 +148,16 @@ int N3DS_NdspIsUp(void);
 int N3DS_NdspGetQueuedBlocks(void);
 int N3DS_NdspGetDroppedBlocks(void);
 
+/*
+ * 3DS-only output-stage gain, in percent of SPU-faithful amplitude: applied
+ * where mix levels meet ndsp (music channel + hardware voices), never inside
+ * the mixer, so PC byte-identity is untouched. Retail's 0x3fff master is
+ * half of full digital scale, so the default is 200. `percent` 0..400 sets;
+ * negative resets to the default. Returns the percent now in effect.
+ * Runtime: dumpreq `vol N`.
+ */
+int N3DS_AudioSetOutputGainPercent(int percent);
+
 /* Sink aggregation mode receipts: cumulative counts of full
  * 8-parcel aggregate submissions vs early anti-underrun small flushes. On
  * hardware, full >> early means the seam-rate fix actually engaged; early

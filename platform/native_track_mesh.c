@@ -524,6 +524,95 @@ static int NativeTrackMesh_WeldSlot(struct NativeTrackWeldTable *table, u64 key)
 	return (int)slot;
 }
 
+/*
+ * Weld displacement census. The snap only ever moves an edge-mid vertex, so a
+ * surface it deforms shows the same shape every time: a kink at the middle of
+ * one edge with straight runs to both corners, which lands in the upper
+ * buckets here. A repair doing only what it claims stays in the lowest one.
+ * Magnitude is the largest single-axis delta -- no float, and it separates
+ * rounding slop from a visible move as well as a true length does.
+ */
+#define TRACK_WELD_MAG_BUCKETS 6
+#define TRACK_WELD_TOP 8
+
+struct NativeTrackWeldDiag
+{
+	int mag[TRACK_WELD_MAG_BUCKETS]; /* |d| under 1, 4, 16, 64, 256, then the rest */
+	int topMag[TRACK_WELD_TOP];
+	s16 topPos[TRACK_WELD_TOP][3];
+	int topCount;
+};
+
+static struct NativeTrackWeldDiag s_trkWeldDiag;
+
+/*
+ * T-junction weld. DEFAULT OFF, and a candidate for deletion rather than a
+ * feature waiting to be re-enabled.
+ *
+ * Adjacent quadblocks index the SAME LevVertex entry for a shared edge mid, so
+ * wherever two blocks genuinely meet the two mids are one number and the snap
+ * below cannot fire. Every firing is therefore a pair that does NOT share the
+ * entry -- surfaces whose edge endpoints merely coincide, such as a plank face
+ * abutting the wall behind it -- and snapping one onto the other bends the
+ * geometry instead of repairing it. Measured displacements are 64-255 units
+ * against a ~578-unit median face edge, and no level has ever produced a
+ * sub-unit correction, which is what a real crack repair would look like.
+ *
+ * dumpreq 'weld' flips it. The flag is read only while a level mesh is being
+ * built, so a flip takes effect on the next level load and never on the current
+ * one; the mesh is cached per level, so reloading the SAME track after a flip
+ * rebuilds nothing and shows the previous geometry. [TRKWELD] reports the count
+ * and the displacement histogram either way.
+ */
+int g_dbg_trackWeld = 0;
+
+static void NativeTrackMesh_WeldNote(const struct LevVertex *src, s16 nx, s16 ny, s16 nz)
+{
+	int dx = (int)nx - (int)src->pos.x;
+	int dy = (int)ny - (int)src->pos.y;
+	int dz = (int)nz - (int)src->pos.z;
+	int mag = (dx < 0) ? -dx : dx;
+	int ay = (dy < 0) ? -dy : dy;
+	int az = (dz < 0) ? -dz : dz;
+	int bucket;
+	int i;
+
+	if (ay > mag)
+	{
+		mag = ay;
+	}
+
+	if (az > mag)
+	{
+		mag = az;
+	}
+
+	bucket = (mag < 1) ? 0 : (mag < 4) ? 1 : (mag < 16) ? 2 : (mag < 64) ? 3 : (mag < 256) ? 4 : 5;
+	s_trkWeldDiag.mag[bucket]++;
+
+	/* Largest movers kept insertion-sorted: their positions are what a bend
+	 * report gets checked against, so the list has to carry where, not just
+	 * how far. */
+	if ((s_trkWeldDiag.topCount < TRACK_WELD_TOP) || (mag > s_trkWeldDiag.topMag[TRACK_WELD_TOP - 1]))
+	{
+		i = (s_trkWeldDiag.topCount < TRACK_WELD_TOP) ? s_trkWeldDiag.topCount++ : (TRACK_WELD_TOP - 1);
+
+		while ((i > 0) && (s_trkWeldDiag.topMag[i - 1] < mag))
+		{
+			s_trkWeldDiag.topMag[i] = s_trkWeldDiag.topMag[i - 1];
+			s_trkWeldDiag.topPos[i][0] = s_trkWeldDiag.topPos[i - 1][0];
+			s_trkWeldDiag.topPos[i][1] = s_trkWeldDiag.topPos[i - 1][1];
+			s_trkWeldDiag.topPos[i][2] = s_trkWeldDiag.topPos[i - 1][2];
+			i--;
+		}
+
+		s_trkWeldDiag.topMag[i] = mag;
+		s_trkWeldDiag.topPos[i][0] = nx;
+		s_trkWeldDiag.topPos[i][1] = ny;
+		s_trkWeldDiag.topPos[i][2] = nz;
+	}
+}
+
 static void NativeTrackMesh_Free(void)
 {
 #if defined(__3DS__)
@@ -645,169 +734,6 @@ static void NativeTrackAtlas_AddLayout(const struct TextureLayout *layout, s16 *
 	atlas->rectCount++;
 }
 
-/* True corner-bbox area of one layout, in the same page-space texel units
- * NativeTrackAtlas_AddLayout gathers and packedTexels accumulates. */
-static u32 NativeTrackMesh_MosaicLayoutArea(const struct TextureLayout *layout)
-{
-	u8 minU = layout->u0, maxU = layout->u0, minV = layout->v0, maxV = layout->v0;
-	static const u8 cornerOfs[3] = {4, 8, 10};
-
-	for (int c = 0; c < 3; c++)
-	{
-		u8 u = (&layout->u0)[cornerOfs[c]];
-		u8 v = (&layout->u0)[cornerOfs[c] + 1];
-
-		minU = TRKMESH_MIN(minU, u);
-		maxU = TRKMESH_MAX(maxU, u);
-		minV = TRKMESH_MIN(minV, v);
-		maxV = TRKMESH_MAX(maxV, v);
-	}
-
-	return (u32)(maxU - minU + 1) * (u32)(maxV - minV + 1);
-}
-
-/*
- * Mosaic census -- pre-work for the montage close-up experiment
- * (docs/PORT_FEASIBILITY_3DS.md, "Mosaic"). Load-time, platform-neutral and
- * output-neutral, same contract as the [TRKSTP] census: it only classifies
- * each interned IconGroup4's mosaic slot and totals what compositing the hi
- * tiles into per-texture montages would ask of the atlas.
- *
- * Slot semantics are retail's own (226_00_DrawLevelOvr1P.c):
- * GetProjectedMidTexture steps far->middle->near by depth threshold and only
- * steps onto the mosaic layout itself when the slot's first word is NOT a
- * pointer; when it IS one (PS1 0x80xxxxxx, host-rebased by the native
- * loader, so here it lands inside the mempack arena), the deepest
- * subdivision frames instead index a per-sub-quad TextureLayout array at
- * that address (PrepareDeepestMosaicUv). So: 0 = no close-up variant,
- * plausible inline layout = single un-subdivided close-up variant, arena
- * pointer = hi-tile array, i.e. the montage source.
- *
- * montKB is the montage space bound: per UNIQUE hi array, the near bbox x4
- * (a 2x2 montage of near-sized tiles). tileKB sums the four probed tile
- * bboxes for the same arrays -- if the two agree, the tiles really are
- * near-sized and "montage = 2x resolution" holds; if tiles!=probed*4 some
- * arrays carry implausible layouts and the mapping read needs another look.
- */
-static void NativeTrackMesh_MosaicCensus(void)
-{
-	const struct PlatformMempackArena *arena = Platform_GetMempackArena();
-	uintptr_t arenaBase = (uintptr_t)arena->base;
-	uintptr_t arenaEnd = (uintptr_t)arena->endOfMemory;
-	u32 igCount = 0, none = 0, inlineVar = 0, hi = 0, uniqHi = 0, odd = 0;
-	u32 tilesOk = 0, tilesProbed = 0, montTexels = 0, tileTexels = 0;
-	int seenOverflow = 0;
-	u32 seenCount = 0;
-	uintptr_t *seen = (uintptr_t *)malloc(1024 * sizeof(uintptr_t));
-
-	for (u32 t = 0; t < s_trackMesh.texCount; t++)
-	{
-		uintptr_t texPtr = s_trackMesh.texTable[t];
-		const struct IconGroup4 *groups[256];
-		u32 groupCount = 0;
-
-		/* The water env-map ref is a bare layout, not an IconGroup4 --
-		 * reading it as one walks past its data. */
-		if (texPtr == (uintptr_t)s_trackMesh.waterEnvLayout)
-		{
-			continue;
-		}
-
-		if ((texPtr & 1) != 0)
-		{
-			const struct AnimTex *anim = (const struct AnimTex *)(texPtr - 1);
-
-			if ((anim->numFrames > 0) && (anim->numFrames <= 256))
-			{
-				struct IconGroup4 **frames = ANIMTEX_GETARRAY((struct AnimTex *)anim);
-
-				for (int f = 0; f < anim->numFrames; f++)
-				{
-					if (frames[f] != NULL)
-					{
-						groups[groupCount++] = frames[f];
-					}
-				}
-			}
-		}
-		else
-		{
-			groups[groupCount++] = (const struct IconGroup4 *)texPtr;
-		}
-
-		for (u32 g = 0; g < groupCount; g++)
-		{
-			const struct TextureLayout *mos = (const struct TextureLayout *)groups[g] + 3; /* mosaic */
-			u32 word = CTR_ReadU32LE(&mos->u0);
-
-			igCount++;
-
-			if (word == 0)
-			{
-				none++;
-			}
-			else if (((uintptr_t)word >= arenaBase) && ((uintptr_t)word + 4 * sizeof(struct TextureLayout) <= arenaEnd))
-			{
-				hi++;
-
-				int dup = 0;
-
-				for (u32 s = 0; s < seenCount; s++)
-				{
-					if (seen[s] == (uintptr_t)word)
-					{
-						dup = 1;
-						break;
-					}
-				}
-
-				if (!dup && (seen != NULL))
-				{
-					if (seenCount >= 1024)
-					{
-						seenOverflow++;
-					}
-					else
-					{
-						const struct TextureLayout *tiles = (const struct TextureLayout *)(uintptr_t)word;
-
-						seen[seenCount++] = (uintptr_t)word;
-						uniqHi++;
-						montTexels += NativeTrackMesh_MosaicLayoutArea((const struct TextureLayout *)groups[g] + 2 /* near */) * 4u;
-
-						for (int i = 0; i < 4; i++)
-						{
-							tilesProbed++;
-
-							if ((CTR_ReadU16LE(&tiles[i].tpage) & 0xfe00) == 0)
-							{
-								tilesOk++;
-								tileTexels += NativeTrackMesh_MosaicLayoutArea(&tiles[i]);
-							}
-						}
-					}
-				}
-			}
-			else if ((CTR_ReadU16LE(&mos->tpage) & 0xfe00) == 0)
-			{
-				inlineVar++;
-			}
-			else
-			{
-				odd++;
-			}
-		}
-	}
-
-	free(seen);
-
-	Platform_Log("[MOSCEN] lvl=%d ig=%u none=%u inline=%u hi=%u uniqHi=%u odd=%u tiles=%u/%u montKB=%u tileKB=%u atlasKB=%u freeKB=%u%s\n",
-	             NativePerf_CurrentLevelID(), igCount, none, inlineVar, hi, uniqHi, odd, tilesOk, tilesProbed, (montTexels * 2u) / 1024u,
-	             (tileTexels * 2u) / 1024u, (s_trackMesh.atlas.packedTexels * 2u) / 1024u,
-	             (((u32)TRACK_ATLAS_MAX_UNITS * TRACK_ATLAS_DIM * TRACK_ATLAS_DIM - s_trackMesh.atlas.packedTexels) * 2u) / 1024u,
-	             seenOverflow ? " SEEN-OVERFLOW" : "");
-}
-
 /*
  * Shelf-pack the gathered rects into 512x512 units. Census-sized: ~120
  * pairs, ~0.5-1.2MB of near-variant texels -- a plain shelf is plenty.
@@ -844,40 +770,46 @@ static void NativeTrackMesh_MosaicCensus(void)
  */
 /* Shelf cursor, extracted so a rect can claim more than one slot without the
  * placement rules being written twice (semi-transparent rects take two -- see
- * the p2Unit comment on NativeTrackAtlasRect). Returns 0 when the pool is
- * exhausted, having advanced nothing; the caller stops packing. */
+ * the p2Unit comment on NativeTrackAtlasRect). Returns 0 when the placement
+ * would need a unit at or past maxUnits, and then TRULY advances nothing --
+ * a later rect must still see an uncorrupted cursor after an earlier one's
+ * placement was refused. */
 struct NativeTrackAtlasCursor
 {
 	int unit, cursorX, cursorY, shelfH;
 };
 
-static int NativeTrackAtlas_PlaceOne(struct NativeTrackAtlasCursor *cur, int w, int h, u8 *outUnit, u16 *outX, u16 *outY)
+static int NativeTrackAtlas_PlaceOne(struct NativeTrackAtlasCursor *cur, int w, int h, int maxUnits, u8 *outUnit, u16 *outX, u16 *outY)
 {
-	if (cur->cursorX + w > TRACK_ATLAS_DIM)
+	int unit = cur->unit, cursorX = cur->cursorX, cursorY = cur->cursorY, shelfH = cur->shelfH;
+
+	if (cursorX + w > TRACK_ATLAS_DIM)
 	{
-		cur->cursorX = 0;
-		cur->cursorY += cur->shelfH;
-		cur->shelfH = 0;
+		cursorX = 0;
+		cursorY += shelfH;
+		shelfH = 0;
 	}
 
-	if (cur->cursorY + h > TRACK_ATLAS_DIM)
+	if (cursorY + h > TRACK_ATLAS_DIM)
 	{
-		cur->unit++;
-		cur->cursorX = 0;
-		cur->cursorY = 0;
-		cur->shelfH = 0;
-
-		if (cur->unit >= TRACK_ATLAS_MAX_UNITS)
-		{
-			return 0;
-		}
+		unit++;
+		cursorX = 0;
+		cursorY = 0;
+		shelfH = 0;
 	}
 
-	*outUnit = (u8)cur->unit;
-	*outX = (u16)TRKMESH_ROUND8(cur->cursorX);
-	*outY = (u16)TRKMESH_ROUND8(cur->cursorY);
-	cur->cursorX += w;
-	cur->shelfH = TRKMESH_MAX(cur->shelfH, h);
+	if (unit >= maxUnits)
+	{
+		return 0;
+	}
+
+	*outUnit = (u8)unit;
+	*outX = (u16)TRKMESH_ROUND8(cursorX);
+	*outY = (u16)TRKMESH_ROUND8(cursorY);
+	cur->unit = unit;
+	cur->cursorX = cursorX + w;
+	cur->cursorY = cursorY;
+	cur->shelfH = TRKMESH_MAX(shelfH, h);
 	return 1;
 }
 
@@ -915,9 +847,9 @@ static void NativeTrackAtlas_Pack(void)
 			continue;
 		}
 
-		if (!NativeTrackAtlas_PlaceOne(&cur, w, h, &rect->atlasUnit, &rect->atlasX, &rect->atlasY))
+		if (!NativeTrackAtlas_PlaceOne(&cur, w, h, TRACK_ATLAS_MAX_UNITS, &rect->atlasUnit, &rect->atlasX, &rect->atlasY))
 		{
-			atlas->rectsDropped += atlas->rectCount - i;
+			atlas->rectsDropped += (atlas->rectCount - i);
 			break;
 		}
 
@@ -954,7 +886,7 @@ static void NativeTrackAtlas_Pack(void)
 		 */
 		if (TRACK_RECT_IS_SEMITRANS(rect))
 		{
-			if (NativeTrackAtlas_PlaceOne(&cur, w, h, &rect->p2Unit, &rect->p2X, &rect->p2Y))
+			if (NativeTrackAtlas_PlaceOne(&cur, w, h, TRACK_ATLAS_MAX_UNITS, &rect->p2Unit, &rect->p2X, &rect->p2Y))
 			{
 				atlas->packedTexels += (u32)(w * h);
 			}
@@ -1001,8 +933,10 @@ static void NativeTrackAtlas_Pack(void)
  */
 static void NativeTrackAtlas_EncodeUV(const struct NativeTrackAtlasRect *rect, u8 pageU, u8 pageV, s16 *outU, s16 *outV, int *outAtlasU, int *outAtlasV)
 {
-	const int atlasU = (int)rect->atlasX + ((int)pageU - (int)rect->srcU);
-	const int atlasV = (int)rect->atlasY + ((int)pageV - (int)rect->srcV);
+	int atlasU, atlasV;
+
+	atlasU = (int)rect->atlasX + ((int)pageU - (int)rect->srcU);
+	atlasV = (int)rect->atlasY + ((int)pageV - (int)rect->srcV);
 
 	*outU = (s16)((atlasU << 1) + 1);
 	*outV = (s16)(((2 * TRACK_ATLAS_DIM) - 1) - (atlasV << 1));
@@ -1376,6 +1310,11 @@ static u32 NativeTrackAnim_PatchVertices(s32 camX, s32 camZ)
 
 	NativeTrackAnim_FlushQueuedVerts();
 	NativeTrackAnim_FlushQueuedUV();
+#if defined(__3DS__)
+	/* One cache flush over the union of everything patched above, instead of
+	 * one per chunk inside each Patch* call. */
+	N3DS_TrackGeom_FlushPatched();
+#endif
 	return patched;
 }
 
@@ -1968,6 +1907,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 			 * window past the end of vram[] for a bottom-half page). */
 			N3DS_DecodeAndTilePage((s16)rect->tpage, (s16)rect->clut, format, primaryView, rect->srcU, rect->srcV, rect->allocW, rect->allocH,
 			                       rect->allocW / 8, s_trackAtlasStaging);
+			N3DS_DilateTransparentRGB(s_trackAtlasStaging, rect->allocW, rect->allocH, rect->allocW / 8);
 			N3DS_TrackAtlas_UploadRect(rect->atlasUnit, rect->atlasX, rect->atlasY, rect->allocW, rect->allocH, s_trackAtlasStaging);
 
 			texelsDecoded += (u32)rect->allocW * (u32)rect->allocH;
@@ -1977,6 +1917,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 			{
 				N3DS_DecodeAndTilePage((s16)rect->tpage, (s16)rect->clut, format, N3DS_TEXVIEW_PASS2, rect->srcU, rect->srcV, rect->allocW,
 				                       rect->allocH, rect->allocW / 8, s_trackAtlasStaging);
+				N3DS_DilateTransparentRGB(s_trackAtlasStaging, rect->allocW, rect->allocH, rect->allocW / 8);
 				N3DS_TrackAtlas_UploadRect(rect->p2Unit, rect->p2X, rect->p2Y, rect->allocW, rect->allocH, s_trackAtlasStaging);
 
 				texelsDecoded += (u32)rect->allocW * (u32)rect->allocH;
@@ -1999,8 +1940,8 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 	 * lower than [TRKSTP]'s rect count, and without them the failure looks
 	 * identical to the feature not working at all. */
 	Platform_Log("[TRKATLAS3DS] units=%d/%d rects=%d/%d stp=%d p2drop=%d skipOversize=%d skipNoUnit=%d texels=%u KB=%u us=%d freeKiB=%u\n", allocated,
-	             atlas->unitsUsed, rectsUploaded, atlas->rectCount, stpRectsUploaded, atlas->p2Dropped, skipOversize, skipNoUnit, texelsDecoded,
-	             (texelsDecoded * 2u) / 1024u, (int)elapsedUs, freeKiB);
+	             atlas->unitsUsed, rectsUploaded, atlas->rectCount, stpRectsUploaded, atlas->p2Dropped, skipOversize, skipNoUnit,
+	             texelsDecoded, (texelsDecoded * 2u) / 1024u, (int)elapsedUs, freeKiB);
 
 	if (allocated < atlas->unitsUsed)
 	{
@@ -2778,6 +2719,8 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	static const s8 sEdgeOfSlot[9] = {-1, -1, -1, -1, 0, 1, -1, 2, 3};
 	int weldCount = 0;
 
+	memset(&s_trkWeldDiag, 0, sizeof(s_trkWeldDiag));
+
 	int leavesTotal = 0, leavesExcluded = 0, facesDoubleSided = 0, facesNoTexture = 0, facesAnimTex = 0, facesModeTri = 0, facesMode3 = 0;
 	int facesWater = 0;
 	/* keptWater and keptAnim are both populations that USED to be dropped whole
@@ -3064,7 +3007,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 					/* Weld snap: an edge-mid whose matched edge carries a
 					 * different canonical mid takes the canonical position. */
-					if ((weldTable != NULL) && (sEdgeOfSlot[gridSlot] >= 0))
+					if ((weldTable != NULL) && g_dbg_trackWeld && (sEdgeOfSlot[gridSlot] >= 0))
 					{
 						const u8 *edge = sTrackOuterEdges[(int)sEdgeOfSlot[gridSlot]];
 						u16 ea = block->index[edge[0]];
@@ -3086,6 +3029,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 									dst->y = (s16)(u16)((canon - 1) >> 16);
 									dst->z = (s16)(u16)(canon - 1);
 									weldCount++;
+									NativeTrackMesh_WeldNote(src, dst->x, dst->y, dst->z);
 
 									/* This vertex's position is no longer its
 									 * source's -- it is the canonical mid of a
@@ -3411,7 +3355,6 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 
 	NativeTrackAtlas_Pack();
 
-
 #if defined(__3DS__)
 	int trackAtlasOk = NativeTrackAtlas_UploadToBackend(mesh, numQuadBlock, numVertex);
 	/* Geometry upload shares the atlas's own withhold-latch-
@@ -3534,6 +3477,15 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	             (u32)(s_trackMesh.vertCount * sizeof(struct NativeTrackVert) / 1024), (u32)(s_trackMesh.indexCount * sizeof(u16) / 1024), facesDoubleSided,
 	             facesAnimTex, facesNoTexture, facesModeTri, facesMode3, facesWater,
 	             (s_trackMesh.waterEnvLayout != NULL) ? (unsigned)CTR_ReadU16LE(&s_trackMesh.waterEnvLayout->tpage) : 0u, weldCount);
+
+	Platform_Log("[TRKWELD] lvl=%d on=%d welds=%d mag[<1=%d <4=%d <16=%d <64=%d <256=%d 256+=%d]\n", NativePerf_CurrentLevelID(), g_dbg_trackWeld, weldCount,
+	             s_trkWeldDiag.mag[0], s_trkWeldDiag.mag[1], s_trkWeldDiag.mag[2], s_trkWeldDiag.mag[3], s_trkWeldDiag.mag[4], s_trkWeldDiag.mag[5]);
+
+	for (int i = 0; i < s_trkWeldDiag.topCount; i++)
+	{
+		Platform_Log("[TRKWELD] top%d mag=%d at (%d,%d,%d)\n", i, s_trkWeldDiag.topMag[i], (int)s_trkWeldDiag.topPos[i][0], (int)s_trkWeldDiag.topPos[i][1],
+		             (int)s_trkWeldDiag.topPos[i][2]);
+	}
 
 	/*
 	 * The animated-texture ledger. `chains` is how many texture chains any
@@ -3669,8 +3621,6 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	             s_trackMesh.atlas.rectCount, s_trackMesh.atlas.unitsUsed,
 	             TRACK_ATLAS_MAX_UNITS, s_trackMesh.atlas.unitsUsed ? (int)((s_trackMesh.atlas.packedTexels * 100u) / ((u32)s_trackMesh.atlas.unitsUsed * TRACK_ATLAS_DIM * TRACK_ATLAS_DIM)) : 0,
 	             (s_trackMesh.atlas.packedTexels * 2u) / 1024u, atlasAnimFrames, s_trackMesh.atlas.rectsDropped, s_trackMesh.atlas.p2Dropped);
-
-	NativeTrackMesh_MosaicCensus();
 }
 
 /*
