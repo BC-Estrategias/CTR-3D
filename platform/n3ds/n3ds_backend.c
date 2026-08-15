@@ -2450,7 +2450,11 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	 * the rect's PASS2 placement; the shader wants them in its own encoded units,
 	 * which are 2x fixed point, so the doubling happens here -- next to the
 	 * comment that says why -- rather than in the mesh builder, which thinks in
-	 * texels throughout.
+	 * texels throughout. V is negated because the baked UV encodes V flipped for
+	 * PICA's bottom-up T axis (NativeTrackAtlas_EncodeUV: outV = (2*DIM-1) -
+	 * (atlasV<<1)), so a downward atlas shift must SUBTRACT in encoded space --
+	 * the shader adds uvOffset to the flipped UV, so the sign has to invert here.
+	 * Silent whenever PASS2 packs on the primary's shelf row (uvDy == 0).
 	 *
 	 * Written on EVERY draw including opaque ones. An unset uniform component
 	 * holds whatever the last program to use that physical register left there,
@@ -2461,7 +2465,7 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	/* .z/.w unused (was the behind-eye depth-kick lever, removed); written
 	 * every draw to avoid the stale-register issue the paragraph above
 	 * describes. */
-	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocUvOffset, (float)(uvDx * 2), (float)(uvDy * 2), 0.0f, 0.0f);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocUvOffset, (float)(uvDx * 2), (float)(-uvDy * 2), 0.0f, 0.0f);
 
 	/*
 	 * Blended ranges draw with their own PS1 blend mode and, critically, with
