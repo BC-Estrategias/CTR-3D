@@ -166,6 +166,20 @@ int N3DS_AudioSetOutputGainPercent(int percent);
  * so only a hardware log can score this). */
 void N3DS_NdspGetFlushCounts(int *fullFlushes, int *earlyFlushes);
 
+/* Cumulative count of submits where the DSP-side queue was already empty -- a
+ * real playback gap, the XA-pop signal (distinct from aggEarly, which counts
+ * the recovery flushes). Trends toward 0 when the handoff keeps the DSP fed. */
+int N3DS_NdspGetDspEmptyEvents(void);
+
+/*
+ * Runtime aggregate handoff target, dumpreq `aggsize N` (1..8). The A/B lever
+ * for the XA-pop hunt: 1 hands every parcel to the DSP immediately (no gaps,
+ * max resampler seams); 8 (default) yields the fewest seams but lets the DSP
+ * run dry between handoffs under a worker stall. <1 resets to the default.
+ * Returns the target now in effect.
+ */
+int N3DS_AudioSetAggTarget(int parcels);
+
 /*
  * Hardware voices (plan B): SPU voices 0..22 play on ndsp's
  * own channels; the parcel sink above becomes the music channel (23). SPU

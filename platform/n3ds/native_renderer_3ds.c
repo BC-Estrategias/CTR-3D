@@ -4625,7 +4625,7 @@ void NativeRenderer_SwapWindow(void)
 					char profLine[224];
 
 					N3DS_NdspGetFlushCounts(&fullFlushes, &earlyFlushes);
-					snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] sink aggFull=%d aggEarly=%d", fullFlushes, earlyFlushes);
+					snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] sink aggFull=%d aggEarly=%d dspEmpty=%d", fullFlushes, earlyFlushes, N3DS_NdspGetDspEmptyEvents());
 					N3DS_DebugLog(cacheLine);
 
 					N3DS_AudioThreadGetProfile(&prof);

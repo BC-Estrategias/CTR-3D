@@ -123,6 +123,16 @@ extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *life
 #define N3DS_NDSP_AGG_FRAMES   (N3DS_NDSP_PARCEL_FRAMES_MAX * N3DS_NDSP_AGG_PARCELS)
 #define N3DS_NDSP_BLOCK_COUNT  6
 /*
+ * Runtime aggregate handoff target's SHIPPING default (the `aggsize` A/B lever
+ * settles here). N3DS_NDSP_AGG_PARCELS above is the slot CAPACITY / A/B ceiling;
+ * this is where the target starts. 3 hands off ~2.7x more often than the old 8,
+ * so the DSP-side queue stays ~9-12 of the 12-parcel cushion instead of draining
+ * toward 0 between handoffs -- which is what made XA voices/cutscenes pop
+ * (hardware-tuned: 8 popped, 1 emptied the cushion and stalled the intro, 3
+ * de-pops while keeping the full cushion).
+ */
+#define N3DS_NDSP_AGG_DEFAULT  3
+/*
  * Channel plan (ndsp has exactly 24): SPU voices 0..22 map 1:1 onto ndsp
  * channels 0..22 as MONO_PCM16 hardware voices; channel 23 carries the
  * music/parcel stream (XA + anything else MixFrame still renders). SPU
@@ -194,6 +204,23 @@ static float s_ndspGainRight = -1.0f;
  * batching; these counters are how a hardware log proves it engaged. */
 static u32 s_ndspFullFlushes;
 static u32 s_ndspEarlyFlushes;
+/* Submits where the DSP-side queue was ALREADY empty when we went to append --
+ * i.e. the channel had run dry and was outputting silence/stale until this
+ * flush. This is the real playback-gap count, the XA-pop signal; aggEarly
+ * counts the recovery flushes, this counts the gaps that forced them. */
+static u32 s_ndspDspEmptyEvents;
+/*
+ * Runtime aggregate handoff target (dumpreq `aggsize N`, 1..N3DS_NDSP_AGG_PARCELS).
+ * The whole XA-pop tradeoff lives on this one knob:
+ *   1            -> hand every parcel to the DSP immediately. The DSP-side
+ *                   cushion never drains (worker keeps it topped to 12), so no
+ *                   gaps -- at the cost of a resampler seam every parcel.
+ *   AGG_PARCELS  -> fewest seams (~7.5/sec), but the DSP can run dry between
+ *                   handoffs whenever the worker stalls -- the measured gaps.
+ * Sweeping this on hardware is how we learn which artifact is actually audible
+ * without committing to the bigger single-looping-ring rewrite blind.
+ */
+static int s_ndspAggTarget = N3DS_NDSP_AGG_DEFAULT;
 
 /* Hardware-voice linear store (see the plan-B section below for the full
  * story); declared here because N3DS_NdspSinkShutdown frees it. */
@@ -459,13 +486,16 @@ int N3DS_NdspSubmitMusicParcel(const short *frames, int frameCount, int sampleRa
 	 * flush produces one small buffer; the queue behind it refills with
 	 * full-size ones, so the seam rate settles back to ~7.5/sec.
 	 */
-	if (s_ndspAggParcels >= N3DS_NDSP_AGG_PARCELS)
+	if (s_ndspAggParcels >= s_ndspAggTarget)
 	{
 		s_ndspFullFlushes++;
 		N3DS_NdspFlushAggregate();
 	}
 	else if (N3DS_NdspQueuedParcelsDspSide() == 0)
 	{
+		/* The DSP already ran dry -- a real playback gap. Count it (the pop
+		 * signal) and flush the partial to recover as fast as possible. */
+		s_ndspDspEmptyEvents++;
 		s_ndspEarlyFlushes++;
 		N3DS_NdspFlushAggregate();
 	}
@@ -551,6 +581,28 @@ void N3DS_NdspGetFlushCounts(int *fullFlushes, int *earlyFlushes)
 	{
 		*earlyFlushes = (int)s_ndspEarlyFlushes;
 	}
+}
+
+int N3DS_NdspGetDspEmptyEvents(void)
+{
+	return (int)s_ndspDspEmptyEvents;
+}
+
+int N3DS_AudioSetAggTarget(int parcels)
+{
+	/* Bare/invalid resets to the aggregating default; the slots are sized for
+	 * N3DS_NDSP_AGG_PARCELS, so a larger target cannot be honored without a
+	 * realloc and is clamped down rather than overrun. */
+	if (parcels < 1)
+	{
+		parcels = N3DS_NDSP_AGG_DEFAULT;
+	}
+	if (parcels > N3DS_NDSP_AGG_PARCELS)
+	{
+		parcels = N3DS_NDSP_AGG_PARCELS;
+	}
+	s_ndspAggTarget = parcels;
+	return s_ndspAggTarget;
 }
 
 /*
@@ -799,6 +851,26 @@ void N3DS_AudioThreadGetProfile(struct N3DS_AudioWorkerProfile *out)
 	s_profParcels = 0;
 }
 
+/*
+ * Worker cushion target in parcels, clamped to what the pool can hold WITHOUT
+ * dropping at the current aggregate size: (BLOCK_COUNT-1) full buffers, leaving
+ * one slot free for the accumulating flush. Without the clamp a small aggsize
+ * makes pool capacity fall below the 12-parcel (~200ms) target, so the worker's
+ * top-up loop can never reach it, spins to its guard cap, and every spin
+ * advances the game-visible XA clock (NativeAudio_RenderXAParcelForAudioThread)
+ * for a parcel the full sink then silently drops -- racing the music several
+ * times past real speed while the game clock is unaffected. At the aggregating
+ * default (aggsize 8) this evaluates to 12, unchanged. The deeper bug -- the XA
+ * clock advancing even when a submit is dropped -- still lurks for any
+ * pool-full stall; this only keeps the pool from filling in normal operation.
+ */
+static int N3DS_NdspCushionTarget(void)
+{
+	int cushion = (N3DS_NDSP_BLOCK_COUNT - 1) * s_ndspAggTarget;
+
+	return (cushion < 12) ? cushion : 12;
+}
+
 static void N3DS_AudioThreadMain(void *arg)
 {
 	const u64 xaPeriodTicks = SYSCLOCK_ARM11 / 60;
@@ -874,7 +946,7 @@ static void N3DS_AudioThreadMain(void *arg)
 			int xaIdle = 0;
 
 			mark = svcGetSystemTick();
-			while ((N3DS_NdspGetQueuedBlocks() < 12) && (guard < 8))
+			while ((N3DS_NdspGetQueuedBlocks() < N3DS_NdspCushionTarget()) && (guard < 8))
 			{
 				if (!NativeAudio_RenderXAParcelForAudioThread()) /* takes the render lock itself */
 				{
