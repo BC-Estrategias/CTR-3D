@@ -178,6 +178,40 @@ int GTECapture_ModelPaintsOnTop(const char *modelName)
 	return 0;
 }
 
+/* PAINT-UNDER class: members are geometry retail parks INSIDE or coincident
+ * with other geometry and hides purely by painter's order (same OT bucket,
+ * drawn first). Under a real depth test they win by their honest depth -- the
+ * intro's plain "BOX_02A" cube is a shell ~2 units OUTSIDE the wooden crate,
+ * so it paints the whole crate flat orange. Members draw through the packet
+ * path with their captured depth pushed farther by an eighth plus
+ * GTE_PAINT_UNDER_BIAS (stored-axis units) -- retail's layering translated to
+ * the depth axis; the model path applies the matching push in
+ * NativeModelDraw_ComposeRows. dumpreq `under` (g_dbg_paintUnder) A/Bs it. */
+#define GTE_PAINT_UNDER_BIAS 8
+int g_dbg_paintUnder = 1;
+global_variable const char *const s_paintUnderNames[] = {"BOX_02A"};
+global_variable int s_paintUnderActive;
+
+int GTECapture_InstPaintsUnder(const struct Instance *inst)
+{
+	u32 i;
+	const char *modelName;
+
+	if ((g_dbg_paintUnder == 0) || (inst == NULL))
+	{
+		return 0;
+	}
+	modelName = (inst->model != NULL) ? inst->model->name : "";
+	for (i = 0; i < (sizeof(s_paintUnderNames) / sizeof(s_paintUnderNames[0])); i++)
+	{
+		if ((strncmp(inst->name, s_paintUnderNames[i], 15) == 0) || (strncmp(modelName, s_paintUnderNames[i], 15) == 0))
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
 void GTECapture_Clear(void)
 {
 	GTECaptureBuffer *buf;
@@ -369,7 +403,15 @@ int g_dbg_bboxDepthStores = 1;
  * downstream (walk/stamp side); if not, the wrong step is named by which
  * number disagrees. */
 char g_dbg_watchName[16];
+/* dumpreq `hide NAME`: the watched instance's draw func is skipped entirely,
+ * so a layered prop can be peeled piece by piece. */
+int g_dbg_watchHide;
 global_variable int s_watchActive;
+
+int GTECapture_WatchIsHiddenInstance(void)
+{
+	return (g_dbg_watchHide != 0) && (s_watchActive != 0);
+}
 global_variable char s_watchInstName[16];
 global_variable s64 s_watchTrueZ;
 global_variable s32 s_watchMvpZ;
@@ -487,6 +529,7 @@ void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct Pus
 	s_instAxisTrueZ = trueZ;
 	s_instAxisFunc = ((funcKind >= 0) && (funcKind < 5)) ? funcKind : 0;
 	s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
+	s_paintUnderActive = GTECapture_InstPaintsUnder(inst);
 
 	/* Watch tap -- see g_dbg_watchName. Matched per bracket so multiple
 	 * same-named instances (the prize ring is three "prize1"s) each report. */
@@ -494,8 +537,23 @@ void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct Pus
 	if (g_dbg_watchName[0] != '\0')
 	{
 		const char *modelName = (inst->model != NULL) ? inst->model->name : "";
+		size_t wlen = strlen(g_dbg_watchName);
+		int exact = (wlen > 0) && (g_dbg_watchName[wlen - 1] == '$');
+		int hit;
 
-		if ((strncmp(inst->name, g_dbg_watchName, 15) == 0) || (strncmp(modelName, g_dbg_watchName, 15) == 0))
+		/* Prefix match, so `watch BOX` taps every BOX_* piece of a multi-instance
+		 * prop; a trailing '$' (`watch BOX_02$`) demands the whole name. */
+		if (exact)
+		{
+			wlen--;
+			hit = ((strncmp(inst->name, g_dbg_watchName, wlen) == 0) && (inst->name[wlen] == '\0')) ||
+			      ((strncmp(modelName, g_dbg_watchName, wlen) == 0) && (modelName[wlen] == '\0'));
+		}
+		else
+		{
+			hit = (strncmp(inst->name, g_dbg_watchName, wlen) == 0) || (strncmp(modelName, g_dbg_watchName, wlen) == 0);
+		}
+		if (hit)
 		{
 			int wi;
 
@@ -585,10 +643,10 @@ void GTECapture_EndInstanceDepth(void)
 	 * printed too: "the draw func rejected every triangle" is a finding. */
 	if (s_watchActive)
 	{
-		if ((s_watchFrameCtr & 31u) == 0u)
+		if ((s_watchFrameCtr & 7u) == 0u)
 		{
-			Platform_LogInstrument("[WATCH] name=%s func=%d trueZ=%ld mvpZ=%ld shift=%d stores=%lu raw=%u..%u corr=%u..%u t=(%ld,%ld,%ld) cam=(%ld,%ld,%ld)\n",
-			                       s_watchInstName, s_watchFunc,
+			Platform_LogInstrument("[WATCH] f=%lu name=%s func=%d trueZ=%ld mvpZ=%ld shift=%d stores=%lu raw=%u..%u corr=%u..%u t=(%ld,%ld,%ld) cam=(%ld,%ld,%ld)\n",
+			                       (unsigned long)s_watchFrameCtr, s_watchInstName, s_watchFunc,
 			                       (long)s_watchTrueZ, (long)s_watchMvpZ, (s_instAxisShift == GTE_INSTAXIS_UNRESOLVED) ? 99 : s_instAxisShift,
 			                       (unsigned long)s_watchStores, (unsigned)s_watchRawMin, (unsigned)s_watchRawMax, (unsigned)s_watchCorrMin,
 			                       (unsigned)s_watchCorrMax, (long)s_watchInstT[0], (long)s_watchInstT[1], (long)s_watchInstT[2], (long)s_watchCamPos[0],
@@ -616,6 +674,7 @@ void GTECapture_EndInstanceDepth(void)
 		s_instAxisFixed = 0;
 		s_instAxisShift = GTE_INSTAXIS_UNRESOLVED;
 		s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
+		s_paintUnderActive = 0;
 		return;
 	}
 
@@ -645,6 +704,7 @@ void GTECapture_EndInstanceDepth(void)
 	s_instAxisActive = 0;
 	s_instAxisShift = GTE_INSTAXIS_UNRESOLVED;
 	s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
+	s_paintUnderActive = 0;
 }
 
 /* Per-frame window flush, driven by GTECapture_Clear below. 256 content-ish
@@ -797,6 +857,14 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 			int b = (int)sz3 - g_dbg_decalNearBias;
 
 			sz3 = (u16)((b >= 1) ? b : 1);
+		}
+
+		/* Paint-under farther bias, same units and placement as the decal bias. */
+		if (s_paintUnderActive)
+		{
+			u32 b = (u32)sz3 + ((u32)sz3 >> 3) + GTE_PAINT_UNDER_BIAS;
+
+			sz3 = (b > 0xFFFFu) ? (u16)0xFFFFu : (u16)b;
 		}
 #endif
 

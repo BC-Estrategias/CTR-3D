@@ -35,6 +35,9 @@ int g_dbg_hudModelsAsUi = 1;
 #define MODELEMIT_MAX_TRIS      4096
 #define MODELEMIT_MAX_VERTS     (MODELEMIT_MAX_TRIS * 3)
 #define MODELEMIT_MAX_INSTANCES 128
+/* Paint-under depth push (see NativeModelEmitInstance.paintUnder). 1.10 puts a
+ * shell 2 units outside a crate ~8 units behind its skin at the intro close-up. */
+#define NATIVE_MODEL_PAINT_UNDER_SCALE 1.10f
 
 /* Matches [DEMIT]/[MODELFRAME] cadence -- one line per 64 content frames. */
 #define MODELEMIT_WINDOW_FRAMES 64
@@ -116,6 +119,10 @@ struct NativeModelEmitInstance
 	 * screen position.
 	 */
 	s8 depthShift;
+	/* Paint-under member (GTECapture_InstPaintsUnder): the draw side scales
+	 * hParam.x UP so this instance's depth reads farther than its cover's,
+	 * the depth-axis translation of retail drawing it first. */
+	u8 paintUnder;
 
 	/*
 	 * Instance fade inputs. RenderBucket_LoadPrimColors loads IR0 from idpp->alphaScale (not the
@@ -518,6 +525,11 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 	inst->triCount = 0;
 	inst->forceSemiTrans = (u8)(forceSemiTrans ? 1 : 0);
 	inst->depthShift = s_modelEmitPendingDepthShift;
+#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
+	inst->paintUnder = (u8)GTECapture_InstPaintsUnder(worldInst);
+#else
+	inst->paintUnder = 0;
+#endif
 
 	/* Fade inputs (see the field comment). BeginInstance runs after the
 	 * instance setup callback in RenderBucket_DispatchDrawFunc's order, so
@@ -1162,6 +1174,13 @@ internal void NativeModelDraw_ComposeRows(const struct NativeModelEmitInstance *
 		{
 			*outH = h * (float)(1 << -inst->depthShift);
 		}
+	}
+	/* Paint-under: depth reads NATIVE_MODEL_PAINT_UNDER_SCALE farther than
+	 * honest (multiplicative -- the member is a shell around its cover, so a
+	 * proportional push keeps it inside at every distance). */
+	if (inst->paintUnder)
+	{
+		*outH *= NATIVE_MODEL_PAINT_UNDER_SCALE;
 	}
 }
 

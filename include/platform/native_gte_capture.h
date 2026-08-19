@@ -218,6 +218,16 @@ int GTECapture_NodeExempt(void);
 // (default ON; OFF is the buried-in-ground behaviour).
 extern int g_dbg_paintOnTop;
 int GTECapture_ModelPaintsOnTop(const char *modelName);
+// PAINT-UNDER members: the mirror class -- geometry retail hides purely by
+// painter's order (coincident with, or a hair OUTSIDE, the surface that covers
+// it; the intro crate's plain BOX_02A shell). Members draw through the packet
+// path with their captured depth biased farther. Runtime A/B: dumpreq 'under'
+// (default ON; OFF paints the intro crate flat orange).
+extern int g_dbg_paintUnder;
+int GTECapture_InstPaintsUnder(const struct Instance *inst);
+// dumpreq 'hide NAME': the watched instance skips its draw func (diagnostic).
+extern int g_dbg_watchHide;
+int GTECapture_WatchIsHiddenInstance(void);
 // Walk-side query: 0 = not a member, 1 = 3D member (parallax from its own
 // captures), 2 = flat overlay (parallax flattened to the UI band), 3 = flat
 // overlay whose X is also stretched to the wide window (retail sized it for

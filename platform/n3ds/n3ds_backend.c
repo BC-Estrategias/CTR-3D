@@ -4422,22 +4422,27 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_modelDepthCheck ? "[CTR-3DS] depth axis check: ON ([AXISCHK]/[PKTAXIS] every 256f)"
 					                                    : "[CTR-3DS] depth axis check: off");
 				}
-				else if (strncmp(word, "watch", 5) == 0)
+				else if ((strncmp(word, "watch", 5) == 0) || (strncmp(word, "hide", 4) == 0))
 				{
 					extern char g_dbg_watchName[16];
+					extern int g_dbg_watchHide;
 					char msg[64];
+					int hide = (word[0] == 'h');
+					const char *arg = word + (hide ? 4 : 5);
 
 					/* 'watch <name>' taps one named object (instance name
-					 * OR model name -- e.g. 'watch prize1'); [WATCH] lines
-					 * report its store-side depth story while it draws. Bare
-					 * 'watch' turns it off. */
-					if (word[5] == ' ')
+					 * OR model name, prefix match -- e.g. 'watch prize1',
+					 * 'watch BOX'); [WATCH] lines report its store-side depth
+					 * story while it draws. 'hide <name>' also skips its draw.
+					 * Bare 'watch'/'hide' turns both off. */
+					g_dbg_watchHide = hide;
+					if (arg[0] == ' ')
 					{
 						int wi;
 
-						for (wi = 0; (wi < 15) && (word[6 + wi] != '\0') && (word[6 + wi] != '\n') && (word[6 + wi] != '\r') && (word[6 + wi] != ' '); wi++)
+						for (wi = 0; (wi < 15) && (arg[1 + wi] != '\0') && (arg[1 + wi] != '\n') && (arg[1 + wi] != '\r') && (arg[1 + wi] != ' '); wi++)
 						{
-							g_dbg_watchName[wi] = word[6 + wi];
+							g_dbg_watchName[wi] = arg[1 + wi];
 						}
 						g_dbg_watchName[wi] = '\0';
 						snprintf(msg, sizeof(msg), "[CTR-3DS] watch: '%s' ([WATCH] while it draws)", g_dbg_watchName);
@@ -4461,6 +4466,17 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_paintOnTop ^= 1;
 					N3DS_DebugLog(g_dbg_paintOnTop ? "[CTR-3DS] paint-on-top models: ON (masks win the depth test)"
 					                               : "[CTR-3DS] paint-on-top models: off (buried-in-ground A/B leg)");
+				}
+				else if (strncmp(word, "under", 5) == 0)
+				{
+					extern int g_dbg_paintUnder;
+
+					/* Paint-under class (intro crate's BOX_02A shell): packet
+					 * path, captured depth biased farther. Allowlist:
+					 * native_gte_capture.c. */
+					g_dbg_paintUnder ^= 1;
+					N3DS_DebugLog(g_dbg_paintUnder ? "[CTR-3DS] paint-under members: ON (hidden inside their cover)"
+					                               : "[CTR-3DS] paint-under members: off (flat-orange crate A/B leg)");
 				}
 #endif
 				else

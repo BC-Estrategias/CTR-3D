@@ -62,6 +62,7 @@ extern int NativeWide_MarginClassOn(int bit);
 struct PushBuffer;
 extern void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct PushBuffer *pb, s32 mvpZIfNormal, int funcKind);
 extern void GTECapture_EndInstanceDepth(void);
+extern int GTECapture_WatchIsHiddenInstance(void);
 /* s45 bbox-store A/B -- see RenderBucket_ProjectFrameBounds and the flag's
  * definition in native_gte_capture.c. */
 extern void GTECapture_SetStoreSuppressed(int suppressed);
@@ -5512,6 +5513,12 @@ static void RenderBucket_DispatchDrawFunc(struct RenderBucketDrawContext *ctx)
 		}
 		}
 		GTECapture_BeginInstanceDepth(ctx->inst, ctx->pb, ctx->idpp->mvp.t[2], axisFunc);
+		if (GTECapture_WatchIsHiddenInstance())
+		{
+			/* Diagnostic: dumpreq `hide NAME` suppresses the watched instance's draw. */
+			GTECapture_EndInstanceDepth();
+			return;
+		}
 	}
 #endif
 

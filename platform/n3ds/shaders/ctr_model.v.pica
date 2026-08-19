@@ -92,9 +92,12 @@
 .fvec stereo        ; f8
 
 ; Constants
-.constf constants(0.0, 1.0, -1.0, 0.0)
+; w = B/64 = 32735 -- S.z of a vertex pinned at the world near-band floor,
+;     per unit w (see the substrate block in main).
+.constf constants(0.0, 1.0, -1.0, 32735.0)
 .alias  zeros constants.xxxx
 .alias  ones  constants.yyyy
+.alias  pdNearPerW constants.wwww
 
 ; x = 1/2048 -- texcoord scale. Model UVs are written by the CPU in the PACKET
 ;     path's atlas convention (2*texel + 1, V pre-flipped as 2047 - 2a) against
@@ -183,12 +186,23 @@
 	; straddles the eye lands ~64 view units in front of it instead of on the
 	; far plane. All three shaders use the same constants so track, model and
 	; packet content stay on one shared axis. hParam.x = H, guarded >= 1.
+	;
+	; NEAR-BAND FLOOR: depth is clamped at 64 like the packet path clamps its
+	; stamps (PacketDepth_ClampWorld), so S.z = w*(B/max(depth,64) + pdFar) =
+	; min(B/H, w*B/64) + w*pdFar. Without the min, a vertex nearer than ~64
+	; view units stores z > 32769 -- past the ortho's near end -- and the GPU
+	; clips the triangle: the intro crate's punched-out front panel (depth 53)
+	; vanished and the shell behind it showed through. Retail draws such
+	; geometry (SZ3 clamps, no near plane), so the model path must too. For
+	; w <= 0 the min picks w*B/64, which the w-clip rejects.
 	mov r3.y, hParam.xxxx               ; H (a mov may read the uniform bank)
 	max r3.y, ones, r3.y                ; H >= 1 (const src1, temp src2)
 	rcp r3.y, r3.y                      ; 1/H
 	mul r3.y, pdScale, r3.y             ; B/H
+	mul r3.z, pdNearPerW, r1.z          ; w*B/64 (const src1, temp src2)
+	min r3.y, r3.y, r3.z                ; B/max(depth,64) per unit w
 	mul r3.x, pdFar, r1.z               ; w*pdFar
-	add r3.x, r3.x, r3.y                ; S.z = B/H + w*pdFar
+	add r3.x, r3.x, r3.y                ; S.z = min(B/H, w*B/64) + w*pdFar
 
 	; S = (a, b, S.z, w). Assembled component-by-component: a single mov
 	; reads ONE source register, so gathering four components from three temps
