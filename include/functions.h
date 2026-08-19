@@ -352,6 +352,9 @@ void *LOAD_ReadDirectory(char *filename);
 void *LOAD_XnfFile(char *filename, void *ptrDestination, int *size);
 int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *bigfile);
 void LOAD_LevelFile(int levelID);
+#ifdef CTR_NATIVE
+void LOAD_NativePrefetchCrateIntro(struct BigHeader *bigfile);
+#endif
 
 void LOAD_HowlCallback(u8 result, u8 *unk);
 int LOAD_HowlSectorChainStart(CdlFILE *cdlFileHWL, void *ptrDestination, int firstSector,

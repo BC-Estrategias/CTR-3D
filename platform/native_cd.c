@@ -6,6 +6,7 @@
 #include <psx/libcd.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // NOTE(aalhendi): Native exports the retail Cd* API. Extracted host files stay
@@ -229,6 +230,98 @@ internal s32 NativeCD_SetLoc(const CdlLOC *pos)
 	return fseek(s_nativeCdFiles[s_nativeCdCurrentFile].hostFile, sector * NATIVE_CD_SECTOR_SIZE, SEEK_SET) == 0;
 }
 
+#if defined(__3DS__)
+// Boot-time prefetch of a handful of disc subfiles into RAM. The music
+// sequencer ticks from the per-vblank callback on the main thread, so a long
+// synchronous SD read during a level load starves it and tears an audible gap.
+// Reading those subfiles up front (before any music starts) lets the in-load
+// reads hit RAM instead. Bounded and fail-safe: overflow, non-disc sources, and
+// allocation failures skip caching and leave the disc path untouched.
+#define NATIVE_CD_PREFETCH_MAX 4
+
+struct NativeCDPrefetchExtent
+{
+	s32 fileIndex;
+	u32 startSector;
+	u32 sectorCount;
+	u8 *data;
+};
+
+global_variable struct NativeCDPrefetchExtent s_cdPrefetch[NATIVE_CD_PREFETCH_MAX];
+global_variable s32 s_cdPrefetchCount;
+
+internal u8 *NativeCD_PrefetchLookup(s32 fileIndex, u32 sector, s32 sectors)
+{
+	s32 i;
+
+	for (i = 0; i < s_cdPrefetchCount; i++)
+	{
+		struct NativeCDPrefetchExtent *slot = &s_cdPrefetch[i];
+		u32 rel;
+
+		if ((slot->fileIndex != fileIndex) || (sector < slot->startSector))
+		{
+			continue;
+		}
+
+		rel = sector - slot->startSector;
+		if ((rel < slot->sectorCount) && ((u32)sectors <= slot->sectorCount - rel))
+		{
+			return slot->data + (size_t)rel * NATIVE_CD_SECTOR_SIZE;
+		}
+	}
+
+	return NULL;
+}
+#endif
+
+void NativeCD_PrefetchExtent(int encodedLoc, int byteSize)
+{
+#if defined(__3DS__)
+	s32 fileIndex;
+	u32 startSector;
+	u32 sectorCount;
+	u8 *buffer;
+	struct NativeCDPrefetchExtent *slot;
+
+	if ((byteSize <= 0) || (s_cdPrefetchCount >= NATIVE_CD_PREFETCH_MAX))
+	{
+		return;
+	}
+
+	fileIndex = (encodedLoc >> 24) & 0xff;
+	startSector = (u32)(encodedLoc & 0xffffff);
+
+	if ((fileIndex < 0) || (fileIndex >= s_nativeCdFileCount) || (s_nativeCdFiles[fileIndex].source != NATIVE_CD_FILE_DISC))
+	{
+		return;
+	}
+
+	sectorCount = ((u32)byteSize + (NATIVE_CD_SECTOR_SIZE - 1)) / NATIVE_CD_SECTOR_SIZE;
+
+	buffer = (u8 *)malloc((size_t)sectorCount * NATIVE_CD_SECTOR_SIZE);
+	if (buffer == NULL)
+	{
+		return;
+	}
+
+	if (!NativeDiscImage_ReadDataSectors(&s_nativeCdFiles[fileIndex].discFile, startSector, sectorCount, buffer))
+	{
+		free(buffer);
+		return;
+	}
+
+	slot = &s_cdPrefetch[s_cdPrefetchCount++];
+	slot->fileIndex = fileIndex;
+	slot->startSector = startSector;
+	slot->sectorCount = sectorCount;
+	slot->data = buffer;
+#else
+	(void)encodedLoc;
+	(void)byteSize;
+#endif
+}
+
 internal s32 NativeCD_ReadSectors(s32 sectors, void *dst)
 {
 	size_t byteCount;
@@ -242,6 +335,17 @@ internal s32 NativeCD_ReadSectors(s32 sectors, void *dst)
 
 	if (s_nativeCdFiles[s_nativeCdCurrentFile].source == NATIVE_CD_FILE_DISC)
 	{
+#if defined(__3DS__)
+		{
+			u8 *cached = NativeCD_PrefetchLookup(s_nativeCdCurrentFile, (u32)s_nativeCdCurrentSector, sectors);
+			if (cached != NULL)
+			{
+				memcpy(dst, cached, byteCount);
+				s_nativeCdCurrentSector += sectors;
+				return 1;
+			}
+		}
+#endif
 #if CTR_NATIVE_DISC_IO_PROFILE
 		s_nativeDiscIoSiteCd++;
 		s_nativeDiscIoSiteCdSectors += (u32)sectors;

@@ -16,6 +16,37 @@ void LOAD_StringToUpper(char *path)
 
 #ifdef CTR_NATIVE
 #include <platform/native_cd.h>
+
+// Prefetch the boot crate-intro level files (VRAM + LEV) into the native CD read
+// cache before any intro music starts. The music sequencer ticks per-vblank on
+// this thread, so the mid-load disc/SD reads would otherwise stall it and tear
+// an audible gap; served from RAM they cost nothing. The crate group has no PTR
+// entry (BI_NDBOX + LVI_PTR aliases the next group), so only VRAM and LEV.
+void LOAD_NativePrefetchCrateIntro(struct BigHeader *bigfile)
+{
+	struct BigEntry *entry;
+	int group[2];
+	int i;
+
+	if (bigfile == NULL)
+	{
+		return;
+	}
+
+	entry = BIG_GETENTRY(bigfile);
+	group[0] = LOAD_GetBigfileIndex(NAUGHTY_DOG_CRATE, LOAD_LEVEL_LOD_1P, LVI_VRAM);
+	group[1] = LOAD_GetBigfileIndex(NAUGHTY_DOG_CRATE, LOAD_LEVEL_LOD_1P, LVI_LEV);
+
+	for (i = 0; i < 2; i++)
+	{
+		if ((group[i] < 0) || (group[i] >= bigfile->numEntry))
+		{
+			continue;
+		}
+
+		NativeCD_PrefetchExtent(bigfile->cdpos + entry[group[i]].offset, entry[group[i]].size);
+	}
+}
 #endif
 
 // NOTE(aalhendi): ASM-verified NTSC-U 926 0x8007c118-0x8007c208.

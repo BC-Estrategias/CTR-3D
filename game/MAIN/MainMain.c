@@ -13,7 +13,7 @@
 #define CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART 0
 #endif
 
-#if defined(CTR_NATIVE) && CTR_NATIVE_AUDIO_ARENA_RESET_ON_RESTART
+#if defined(CTR_NATIVE)
 #include <platform/native_audio.h>
 #endif
 
@@ -675,6 +675,21 @@ void StateZero()
 	howl_InitGlobals(data.kartHwlPath);
 
 	VSyncCallback(MainDrawCb_Vsync);
+
+#ifdef CTR_NATIVE
+	// Build the XA voice-line cache before any intro CSEQ music or XA begins.
+	// The build is a large synchronous disc/SD read on this thread, and the
+	// music sequencer ticks from the per-vblank callback on this same thread,
+	// so building it once audio is playing stalls the sequencer and tears an
+	// audible gap in the intro. The SCEA splash stays on screen meanwhile.
+	// Self-gates to a no-op after the first build (and on PC).
+	NativeAudio_VoiceCacheEnsure();
+
+	// Same reasoning for the crate-intro level files: prefetch them into the CD
+	// read cache now, in the silent SCEA window, so the in-load reads hit RAM
+	// and never stall the sequencer mid-song. No-op on PC.
+	LOAD_NativePrefetchCrateIntro(sdata->ptrBigfile1);
+#endif
 
 	Music_SetIntro();
 	CseqMusic_StopAll();
