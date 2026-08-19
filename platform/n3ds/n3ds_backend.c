@@ -157,7 +157,7 @@ static u64 s_logLastFlushTick = 0;
  * Off still leaves svcOutputDebugString per line (free with no debugger
  * attached, and Azahar still captures it) and the whole bottom-screen
  * readout, which is CPU-only. Turn back on when a log is actually wanted --
- * SELECT + TOUCH on hardware, dumpreq `sdlog`.
+ * SELECT+R on hardware, dumpreq `sdlog`.
  */
 int g_dbg_sdLog = 0;
 
@@ -3740,6 +3740,30 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] output gain: %d%% (100 = SPU-faithful)", pct);
 					N3DS_DebugLog(msg);
 				}
+				else if (strncmp(word, "aggsize", 7) == 0)
+				{
+					/* XA sink aggregate handoff target (n3ds_audio_thread.c): the
+					 * A/B lever for the XA-pop hunt. 'aggsize 1' hands every parcel
+					 * to the DSP immediately (no gaps, max resampler seams);
+					 * 'aggsize 8' is the aggregating default (fewest seams, but the
+					 * DSP can run dry between handoffs). Bare resets to default. */
+					extern int N3DS_AudioSetAggTarget(int parcels);
+					const char *arg = word + 7;
+					int n = -1;
+					char msg[80];
+
+					while ((*arg == ' ') || (*arg == '\t'))
+					{
+						arg++;
+					}
+					if ((*arg >= '0') && (*arg <= '9'))
+					{
+						n = atoi(arg);
+					}
+					n = N3DS_AudioSetAggTarget(n);
+					snprintf(msg, sizeof(msg), "[CTR-3DS] xa sink aggsize: %d parcel(s) per handoff", n);
+					N3DS_DebugLog(msg);
+				}
 				else if (strncmp(word, "uiorder", 7) == 0)
 				{
 					extern int g_dbg_uiOrder;
@@ -4544,16 +4568,6 @@ unsigned int N3DS_ReadButtons(void)
 		N3DS_DebugLog(msg);
 	}
 
-	/* SELECT held + D-pad DOWN: toggle render-worker routing mid-run (mid-run
-	 * flips bracket [PERF] windows by state, killing the cross-run content
-	 * confound the same way textureless's combo does below). dumpreq
-	 * 'renderthread' covers Azahar (host-writable SD folder), but on
-	 * hardware nothing can place that file while the game runs -- FTP and
-	 * the game are one-app-at-a-time -- so without a combo the feature's own
-	 * hardware A/B would be cross-run. The OFF transition is safe mid-race
-	 * by construction: Route() fences the worker before the first direct
-	 * call (native_render_queue.c). */
-
 	/* SELECT+DRIGHT: track-atlas sampler A/B, nearest <-> bilinear. Pure
 	 * mid-race flip -- rewrites each unit's filter field, no re-upload, no
 	 * rebuild -- so it lands the same frame. dumpreq `bilinear` is the same
@@ -4571,10 +4585,7 @@ unsigned int N3DS_ReadButtons(void)
 	/* SELECT+DLEFT freed (direct emit -- baseline, A/B settled). Still reachable as dumpreq `directemit`. */
 #endif
 
-	/* SELECT+DLEFT freed again (the particle-lift sweep did its job and
-	 * was removed -- the lift nudged every particle, not just a kart's own
-	 * smoke). Still reachable as nothing; the real driver-local fix carries no
-	 * runtime knob. */
+	/* SELECT+DLEFT free. The XA sink aggregate size is reachable via dumpreq `aggsize N`. */
 
 #if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
 	/* SELECT held + D-pad UP: GTE capture cost A/B. The depth model the

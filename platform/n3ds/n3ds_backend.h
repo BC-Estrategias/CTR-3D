@@ -593,7 +593,7 @@ void N3DS_EarlyInit(void);
  * instead of needing an SD pull. */
 int N3DS_NetloadStreamActive(void);
 
-/* Nonzero while the SD-card log sink is enabled (g_dbg_sdLog; SELECT+TOUCH or
+/* Nonzero while the SD-card log sink is enabled (g_dbg_sdLog; SELECT+R or
  * dumpreq `sdlog`, default off). Platform_Log's file sink honours the same
  * switch as N3DS_DebugLog's, so one control governs every SD write this build
  * makes -- see the policy note at Platform_LogWrite. */
