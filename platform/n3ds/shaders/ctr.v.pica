@@ -72,9 +72,15 @@
 ; the band's own values (d <= 63); the slt against it is the "world content
 ; only" mask. Half-integer on purpose: both neighbours are exactly
 ; representable in float24 and neither can land ON the threshold.
-.constf stereoConst(32767.0, 63.5, 0.0, 0.0)
+; z/w = the perspective-correct depth substrate (see the block in main): stored
+; z = B/d + pdFar with B = 2095040, so d = 64 -> 32703 (just below the UI
+; band's 32704) and d = 65535 -> 0. pdFar = -B/65535 = -31.968. Identical
+; constants in ctr_track.v.pica and ctr_model.v.pica.
+.constf stereoConst(32767.0, 63.5, 2095040.0, -31.968)
 .alias  stereoBias stereoConst.xxxx
 .alias  uiBandEdge stereoConst.yyyy
+.alias  pdScale    stereoConst.zzzz
+.alias  pdFar      stereoConst.wwww
 
 ; texcoordScale is 1/2048, NOT 1/N3DS_ATLAS_DIM: vertex UVs arrive as
 ; texel-CENTER numerators (2*texel + 1, see DrawTriangles) so the sampled
@@ -84,9 +90,14 @@
 ; is commented out; sampling at texel - 0.5 put 1:1-mapped fragments -- font
 ; glyphs, sprites -- exactly ON texel boundaries, and at sub-page tile edges
 ; the tie-break crossed into the neighbouring 64x64 cache cell.)
-.constf vertexScale(0.00048828125, 0.0039215686, 0.0, 0.0) ; 1/2048, 1/255
+; z = 65534.5: the far-pin edge for the depth substrate -- a stamp of 0x0000
+; (d = 65535, the sky / backdrop far pin at raw z = -32768) keeps its raw z so
+; it stays strictly behind every mapped world value (which bottom out at 0).
+; Half-integer so neither neighbour lands on the threshold in float24.
+.constf vertexScale(0.00048828125, 0.0039215686, 65534.5, 0.0) ; 1/2048, 1/255
 .alias  texcoordScale vertexScale.xxxx
 .alias  colorScale    vertexScale.yyyy
+.alias  farPinEdge    vertexScale.zzzz
 
 ; Outputs
 .out outpos position
@@ -141,6 +152,38 @@
 	mul r1.y, stereoUi.xxxx, r1.y       ; UI pop-out, 0 for world
 	add r1.w, r1.w, r1.y                ; p = world p, or the UI pop-out
 	add r0.x, r0.x, r1.w                ; shifted screen X (both temps)
+
+	; ---- PERSPECTIVE-CORRECT DEPTH SUBSTRATE ------------------------------
+	; The rasterizer interpolates z/w linearly in screen space, which is only
+	; exact for a value affine in 1/depth. The track and model shaders now
+	; store z = B/d + pdFar (d = 32767 - stamp) for that reason, so packets
+	; must land on the same axis: WORLD stamps (63.5 < d < 65534.5) take the
+	; identical mapping; UI-band stamps (d <= 63) keep their raw z so the
+	; band's own 32704..32767 ordering is untouched (the mapped world tops
+	; out at 32703), and the far pin (d = 65535: sky / backdrop at raw
+	; -32768) keeps its raw z so it stays strictly behind every mapped world
+	; value (which bottom out at 0). Packets are flat-depth per prim, so this
+	; is exact for them either way; it is the shared axis with the track that
+	; matters. Uses the OCCLUSION channel r0.z, not the parallax channel the
+	; stereo block read. d >= 1 keeps the rcp finite (a 0xFFFF stamp gives
+	; d = 0). The two raw masks are disjoint (d <= 63 vs d >= 65535), so
+	; their sum is a clean 0/1. r2 is free.
+	mul r2.x, negOnes, r0.z             ; -z
+	add r2.x, stereoBias, r2.x          ; d = 32767 - z
+	slt r2.y, uiBandEdge, r2.x          ; worldMask = (d > 63.5) ? 1 : 0
+	slt r2.w, farPinEdge, r2.x          ; farMask   = (d > 65534.5) ? 1 : 0
+	max r2.x, ones, r2.x                ; d >= 1
+	rcp r2.z, r2.x                      ; 1/d
+	mul r2.z, pdScale, r2.z             ; B/d
+	add r2.z, pdFar, r2.z               ; zNew = B/d - B/65535
+	mul r2.y, negOnes, r2.y             ; -worldMask
+	add r2.y, ones, r2.y                ; uiMask = 1 - worldMask
+	add r2.y, r2.y, r2.w                ; rawMask = uiMask + farMask (0/1)
+	mul r2.w, r2.y, r0.z                ; rawMask * raw z (both temps)
+	mul r2.y, negOnes, r2.y             ; -rawMask
+	add r2.y, ones, r2.y                ; mappedMask = 1 - rawMask
+	mul r2.z, r2.y, r2.z                ; mappedMask * zNew
+	add r0.z, r2.z, r2.w                ; z = raw (UI / far pin) or zNew
 
 	dp4 outpos.x, projection[0], r0
 	dp4 outpos.y, projection[1], r0

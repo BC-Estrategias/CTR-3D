@@ -115,9 +115,15 @@
 
 ; x = 64 -- the world near-band floor described above.
 ; y = 32767 -- zOrd = 32767 - depth.
-.constf depthConst(64.0, 32767.0, 0.0, 0.0)
+; z/w = the PERSPECTIVE-CORRECT depth substrate (shared by all three shaders,
+; see the block before the S assembly in main): stored z = B/depth - B/65535
+; with B = 2095040, so depth 64 -> 32703 (just below the UI band's 32704) and
+; depth 65535 -> 0. z = -B/65535 = -31.968.
+.constf depthConst(64.0, 32767.0, 2095040.0, -31.968)
 .alias  depthMinWorld depthConst.xxxx
 .alias  zOrdFromDepth depthConst.yyyy
+.alias  pdScale       depthConst.zzzz
+.alias  pdFar         depthConst.wwww
 
 ; Outputs
 .out outpos position
@@ -167,10 +173,26 @@
 	mul r5.z, r1.z, r5.y                ; w*p (both temps, order-free)
 	add r1.x, r1.x, r5.z                ; a += w*p
 
-	; S = (a, b, w*zOrd, w). Assembled component-by-component: a single mov
+	; ---- PERSPECTIVE-CORRECT DEPTH SUBSTRATE ------------------------------
+	; The rasterizer interpolates z/w LINEARLY IN SCREEN SPACE, which is only
+	; correct for a value affine in 1/viewZ. The shared substrate is now
+	; z_ndc = B/depth + pdFar (see ctr_track.v.pica's block for the full
+	; derivation), and it is computed here as S.z = B/H + w*pdFar: identical
+	; to w*(B/depth + pdFar) for every vertex in front of the eye (depth =
+	; w*H) but LINEAR IN w, so the GPU's homogeneous clip of a triangle that
+	; straddles the eye lands ~64 view units in front of it instead of on the
+	; far plane. All three shaders use the same constants so track, model and
+	; packet content stay on one shared axis. hParam.x = H, guarded >= 1.
+	mov r3.y, hParam.xxxx               ; H (a mov may read the uniform bank)
+	max r3.y, ones, r3.y                ; H >= 1 (const src1, temp src2)
+	rcp r3.y, r3.y                      ; 1/H
+	mul r3.y, pdScale, r3.y             ; B/H
+	mul r3.x, pdFar, r1.z               ; w*pdFar
+	add r3.x, r3.x, r3.y                ; S.z = B/H + w*pdFar
+
+	; S = (a, b, S.z, w). Assembled component-by-component: a single mov
 	; reads ONE source register, so gathering four components from three temps
 	; takes four movs.
-	mul r3.x, r1.z, r2.w                ; w*zOrd (both temps, order-free)
 	mov r4.x, r1.x                      ; a
 	mov r4.y, r1.y                      ; b
 	mov r4.z, r3.x                      ; w*zOrd

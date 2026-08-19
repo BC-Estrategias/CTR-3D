@@ -388,6 +388,18 @@ global_variable s32 s_watchCamPos[3];
 /* The ground-decal (shadows/skids/tires) fixed-shift unscale. Its own switch
  * rather than a share of g_dbg_pktAxisFix, so an A/B moves one thing. */
 int g_dbg_decalAxisFix = 1;
+/* Ground-decal nearer bias, in view.z units, applied to every store inside a
+ * FIXED-shift bracket (shadows/skids/tires and the ordinary particle list) --
+ * the 3DS analogue of retail's painter's order for content that sits ON the
+ * road. A decal quad is planar between its corners; the road under it is not
+ * (a quadblock's centre vertex is displaced), so at exact per-vertex depth the
+ * road's bumps rise above the decal's plane between its corners and win the
+ * depth test in patches. Pulling only this content nearer by more than the
+ * road's local relief keeps it on top, the way retail drew it, without moving
+ * karts, pickups or the world. 32 clears Oxide Station's relief; 16 did not
+ * (owner-judged in Azahar). dumpreq `decalbias N`. 3DS only: the PC renderer
+ * does not depth-test packets, and its golden output must not move. */
+int g_dbg_decalNearBias = 32;
 
 #define GTE_INSTAXIS_UNRESOLVED 99
 #define GTE_INSTAXIS_MTX_NONE 0xFFFFFFFFu
@@ -775,6 +787,18 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 				sz3 = (t > 0xFFFFu) ? (u16)0xFFFFu : (u16)t;
 			}
 		}
+
+#if defined(__3DS__)
+		/* Ground-decal nearer bias (g_dbg_decalNearBias) -- fixed brackets only,
+		 * after the axis unscale so it is in the track's view.z units. Floor of
+		 * 1 keeps a hit distinguishable from empty, same as the unscale. */
+		if (s_instAxisFixed && (g_dbg_decalNearBias > 0))
+		{
+			int b = (int)sz3 - g_dbg_decalNearBias;
+
+			sz3 = (u16)((b >= 1) ? b : 1);
+		}
+#endif
 
 		/* Watch tap: raw = as the draw projected it, corr = as stored. */
 		if (s_watchActive && !s_instAxisFixed)

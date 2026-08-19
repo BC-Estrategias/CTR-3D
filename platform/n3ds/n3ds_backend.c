@@ -3904,6 +3904,26 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(msg, sizeof(msg), "[CTR-3DS] packet depth bias: %d (units nearer)", g_dbg_pktDepthBias);
 					N3DS_DebugLog(msg);
 				}
+				else if (strncmp(word, "decalbias", 9) == 0)
+				{
+					extern int g_dbg_decalNearBias;
+					char msg[80];
+
+					/* 'decalbias N': ground-decal (shadow/skid/tire/particle)
+					 * nearer bias in view.z units, applied at the capture store
+					 * inside the fixed-shift bracket (native_gte_capture.c). Bare
+					 * 'decalbias' toggles 0 <-> 32 for a one-token A/B. */
+					if (word[9] == ' ')
+					{
+						g_dbg_decalNearBias = atoi(&word[10]);
+					}
+					else
+					{
+						g_dbg_decalNearBias = g_dbg_decalNearBias ? 0 : 32;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] ground-decal nearer bias: %d view.z units", g_dbg_decalNearBias);
+					N3DS_DebugLog(msg);
+				}
 #ifdef CTR_NATIVE_TRACK_RENDERER
 				else if (strncmp(word, "trkchk", 6) == 0)
 				{

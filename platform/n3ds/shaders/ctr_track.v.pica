@@ -141,9 +141,12 @@
 .fvec stereo
 
 ; Constants
-.constf constants(0.0, 1.0, -1.0, 0.0)
+; w = -B/65535 = -31.968: the far end of the perspective-correct depth
+; substrate (see pdScale below and the block before the S assembly in main).
+.constf constants(0.0, 1.0, -1.0, -31.968)
 .alias  zeros constants.xxxx
 .alias  ones  constants.yyyy
+.alias  pdFar constants.wwww
 
 ; x = -128 (drawOrder debias, additive -- see the header comment on the
 ; missing SUB opcode), y = 1/64 (viewZ->otIndex quantizer, matches retail's
@@ -205,8 +208,12 @@
 ; the two sides only share an axis while these agree.
 ; z = 0.0 disables the near-plane reject below (owner ruling, see the REVERTED
 ; block in main). 1000.0 re-enables it.
-.constf depthConst2(64.0, 0.0009765625, 0.0, 0.0)
+; w = B = 2095040, the perspective-correct depth substrate scale: stored
+; z = B/depth + pdFar, so depth 64 -> 32703 (just below the UI band's 32704)
+; and depth 65535 -> 0. Identical constant in ctr.v.pica and ctr_model.v.pica.
+.constf depthConst2(64.0, 0.0009765625, 0.0, 2095040.0)
 .alias  depthMinWorld depthConst2.xxxx
+.alias  pdScale       depthConst2.wwww
 ; Near-plane reject kick (s29). Any positive multiple large enough that a
 ; violation of ONE view.z unit already pushes zOrd past the clip volume's
 ; 32767 end: 1 * 1000 does, and the deepest possible violation (viewZ = 0,
@@ -397,13 +404,17 @@
 
 	; ---- STEREO parallax --------------------------------------------------
 	; p = k - kC/depth on the composed a = w*screenX: a += w*p shifts the
-	; post-divide screen X by exactly p pixels. Depth source is r4.z -- the
-	; TRUE-DEPTH path's clamped [256, 65535] value, which is computed above
-	; regardless of which depth axis the hParam selector blends, so the rcp
-	; is always finite and behind-eye vertices (clamped to 256) take the
-	; bounded near-limit shift instead of an unbounded one. r9: r5-r8 are
-	; taken below/above, and the S vector must not be disturbed.
-	rcp r9.x, r4.z                      ; 1/depth
+	; post-divide screen X by exactly p pixels. Depth source is the TRUE
+	; view.z (r2.x), clamped to [depthMinWorld, depthMax] -- NOT r4.z. r4.z
+	; carries the drawOrder tie-break (hParam.w, dumpreq `dorder`), which is
+	; an ordering fudge, not a distance; dividing the parallax by it made
+	; `dorder` bend the 3D. A surface's stereo depth is its real distance
+	; from the eye, never its sort key. The clamp keeps rcp finite and gives
+	; behind-eye vertices (clamped to depthMinWorld) the bounded near-limit
+	; shift. r7 is dead after the near-reject block; S vector (r5) untouched.
+	max r7.x, depthMinWorld, r2.x       ; trueDepth = max(depthMinWorld, viewZ)
+	min r7.x, depthMax, r7.x            ; clamp to [depthMinWorld, depthMax]
+	rcp r9.x, r7.x                      ; 1/trueDepth (decoupled from dorder)
 	mul r9.y, stereo.yyyy, r9.x         ; kC/depth
 	mul r9.y, negOne, r9.y              ; -kC/depth (no SUB opcode)
 	add r9.y, stereo.xxxx, r9.y         ; p = k - kC/depth
@@ -412,10 +423,67 @@
 	mul r9.z, r1.z, r9.y                ; w*p (both temps, order-free)
 	add r1.x, r1.x, r9.z                ; a += w*p
 
-	; S = (a, b, w*zOrd, w) -- assembled component-by-component: a single mov
+	; ---- PERSPECTIVE-CORRECT DEPTH SUBSTRATE ------------------------------
+	; The rasterizer interpolates z/w LINEARLY IN SCREEN SPACE, which is only
+	; correct for a value affine in 1/viewZ. zOrd = 32767 - depth is affine in
+	; viewZ, so a track polygon spanning a depth range had its interior depth
+	; interpolated wrongly -- hundreds of view units on a near floor triangle
+	; (harmonic vs arithmetic mean of the vertex depths), which is why the
+	; ground punched up through Crash Cove's ramps/bridges/water near the
+	; camera and only on horizontal surfaces (walls span little depth). The
+	; substrate is now z_ndc = B/depth + pdFar: monotonic in depth with the
+	; same polarity (near = larger z), affine in 1/depth so the GPU
+	; interpolates it exactly. ctr.v.pica / ctr_model.v.pica use the same
+	; constants, so all three sources stay on one shared axis.
+	;
+	; TRUE-DEPTH leg: computed as S.z = B/H + w*(pdFar - tie), NOT as
+	; w*(B/depth + pdFar) through a clamped rcp. Same value for every vertex
+	; in front of the eye (depth = w*H, so w*B/depth = B/H), but LINEAR IN w,
+	; which is what makes the GPU's homogeneous clipping geometrically right:
+	; a behind-eye vertex extrapolates along the same line, so the near-plane
+	; crossing lands ~64 view units IN FRONT of the eye (where B/d + pdFar
+	; hits the ortho's near end) and the far plane never catches an in-front
+	; edge. The clamped-rcp form put behind-eye vertices at "nearest", which
+	; made the near-plane crossing land behind the eye and the FAR plane cut
+	; the edge in front of it -- the near sliver of every eye-straddling
+	; ground triangle then interpolated from far-plane depth and lost to the
+	; sky (a black band following the camera). This is also the proper
+	; near-plane clip the REVERTED near-reject block above wished for: a
+	; straddling triangle is split at the plane, not discarded.
+	;
+	; The drawOrder tie-break rides in z_ndc units here (nearer = larger z,
+	; so it is subtracted): a constant z offset is a depth offset that scales
+	; with depth^2/B -- i.e. constant in DEPTH-BUFFER resolution at every
+	; distance, which is exactly what a coplanar tie-break wants. tie is r4.y
+	; = hParam.w * (drawOrder-128), negative for ground faces (pulled nearer).
+	; hParam.x = H is guarded >= 1 so the rcp stays finite. r3 is dead here.
+	mov r3.x, hParam.xxxx               ; H (a mov may read the uniform bank)
+	max r3.x, ones, r3.x                ; H >= 1 (const src1, temp src2)
+	rcp r3.x, r3.x                      ; 1/H
+	mul r3.x, pdScale, r3.x             ; B/H
+	mul r3.y, negOne, r4.y              ; -tie
+	add r3.y, pdFar, r3.y               ; pdFar - tie
+	mul r3.y, r1.z, r3.y                ; w*(pdFar - tie)
+	add r3.x, r3.x, r3.y                ; S.z_true = B/H + w*(pdFar - tie)
+
+	; ORDINAL leg (legacy A/B, packetdepth off): zOrd is an emit ordinal, not a
+	; depth, so it takes the same B/d + pdFar map through a clamped rcp (no
+	; behind-eye vertices exist on that axis) and is multiplied by w like the
+	; old S.z was. Blend the two S.z legs by the same selector as before.
+	mul r3.z, negOne, r6.x              ; -zOrd_ordinal
+	add r3.z, zOrdFromDepth, r3.z       ; d = 32767 - zOrd_ordinal
+	max r3.z, ones, r3.z                ; d >= 1
+	rcp r3.z, r3.z                      ; 1/d
+	mul r3.z, pdScale, r3.z             ; B/d
+	add r3.z, pdFar, r3.z               ; mapped ordinal z
+	mul r3.z, r1.z, r3.z                ; S.z_ord = w * mapped
+	mul r3.x, hParam.yyyy, r3.x         ; selTrueDepth * S.z_true
+	mul r3.z, hParam.zzzz, r3.z         ; selOrdinal  * S.z_ord
+	add r4.y, r3.x, r3.z                ; S.z (both temps, order-free)
+
+	; S = (a, b, S.z, w) -- assembled component-by-component: a single mov
 	; can only read ONE source register (with swizzle), so gathering four
 	; components from three different temp registers takes four movs, not one.
-	mul r4.y, r1.z, r4.x                ; w*zOrd (both temp regs, order-free)
 	mov r5.x, r1.x                      ; a
 	mov r5.y, r1.y                      ; b
 	mov r5.z, r4.y                      ; w*zOrd
