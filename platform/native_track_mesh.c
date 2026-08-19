@@ -2882,6 +2882,21 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 						continue;
 					}
 				}
+				/* Retail draws every visible face of a water-flagged BSP leaf through
+				 * its water list (Ovr226_800a1e30_DrawWaterBspList), textured with the
+				 * level's single waterEnvMap and ignoring the face's own
+				 * ptr_texture_mid. Water is the leaf flag, not a null texture: a water
+				 * quad carrying a stray non-null texture pointer must still draw as
+				 * blended water, not an opaque slab. AnimTex faces keep their own path
+				 * above. */
+				else if (leafIsWater && (level->ptr_tex_waterEnvMap != NULL))
+				{
+					texPtr = (uintptr_t)level->ptr_tex_waterEnvMap;
+					layout = level->ptr_tex_waterEnvMap;
+					s_trackMesh.waterEnvLayout = level->ptr_tex_waterEnvMap;
+					faceIsWater = 1;
+					facesWater++;
+				}
 				else
 				{
 					layout = (const struct TextureLayout *)texPtr + 2; /* near */
@@ -2970,6 +2985,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				 * assets carrying it would show up instead of guessing. */
 				u8 uvIdxOf[4] = {uvPerm[0], uvPerm[1], uvPerm[2], uvPerm[3]};
 				int modeTri = (faceMode == 1) || (faceMode == 2);
+
 
 				if (modeTri)
 				{
