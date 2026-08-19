@@ -113,6 +113,17 @@ static void MainFrame_PrimMemWatermarkSample(struct DB *db)
 #define CTR_NATIVE_GTE_CAPTURE 0
 #endif
 
+// The clock item's full-screen feedback blur (DISPLAY_Blur_Main with a
+// positive strength; the cutscene camera path drives the same call at full
+// strength through gGT->clockEffectEnabled). It textures a 50% quad from the
+// previous presented frame every frame, so a renderer without a cheap
+// framebuffer-as-texture path can't draw it faithfully; the 3DS build defines
+// this 0 (CMakeLists.txt) and skips the blur while keeping the flat white
+// flash and the item's gameplay effect. 1 = retail.
+#ifndef CTR_NATIVE_FEEDBACK_BLUR
+#define CTR_NATIVE_FEEDBACK_BLUR 1
+#endif
+
 // NOTE(aalhendi): ASM-verified NTSC-U 926 0x80034bbc-0x80034d54 for the retail path.
 void MainFrame_ResetDB(struct GameTracker *gGT)
 {
@@ -290,7 +301,7 @@ void MainFrame_GameLogic(struct GameTracker *gGT, struct GamepadSystem *gGamepad
 					uVar3 = (u32)psVar9->clockReceive;
 				}
 
-#if defined(CTR_NATIVE)
+#if defined(CTR_NATIVE) && CTR_NATIVE_FEEDBACK_BLUR
 				DISPLAY_Blur_Main(pushBuffer, uVar3);
 #endif
 			}

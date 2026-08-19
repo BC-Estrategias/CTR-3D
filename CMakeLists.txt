@@ -209,6 +209,26 @@ if(CTR_NATIVE_LOD_BIAS)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_LOD_BIAS=1)
 endif()
 
+# The clock item's full-screen feedback blur (game/Display.c DISPLAY_Blur_Main;
+# the intro flyby cutscenes drive the same call at full strength). It textures
+# a 50% quad from the previous presented frame every frame -- on the PC GL
+# renderer that reads back as retail; on the 3DS it is a framebuffer-sourced
+# quad per camera per frame with no cheap path (the semi-transparent view falls
+# to the mirror+decode route, and the fb-capture HOLD would freeze it), so the
+# 3DS build ships without it. The flat white clock flash and the item's
+# gameplay effect are unaffected. Source default lives in game/MAIN/MainFrame.c.
+if(NINTENDO_3DS)
+    set(CTR_NATIVE_FEEDBACK_BLUR_DEFAULT OFF)
+else()
+    set(CTR_NATIVE_FEEDBACK_BLUR_DEFAULT ON)
+endif()
+option(CTR_NATIVE_FEEDBACK_BLUR
+    "Retail full-screen feedback blur for the clock item / cutscene flybys"
+    ${CTR_NATIVE_FEEDBACK_BLUR_DEFAULT})
+if(NOT CTR_NATIVE_FEEDBACK_BLUR)
+    target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_FEEDBACK_BLUR=0)
+endif()
+
 # Track censuses for the native track renderer (s27) -- one [TRKCENSUS] log
 # block per level load: vertex-pool edge sharing (the no-crack premise),
 # water/animated-vertex exclusion share, AnimTex inventory, and texture
