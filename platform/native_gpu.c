@@ -271,6 +271,13 @@ enum
 
 int g_dbg_flagStyle = FLAG_STYLE_RETAIL;
 
+/* Give Penta Penguin his PAL/Japan max-stats ("5/5/5") class instead of the
+ * NTSC-U Turn class. ON by default -- owner's call, a deliberate divergence from
+ * NTSC-U retail so Penta is always the PAL "God Penta". The `pentapal` dumpreq and
+ * the future Options menu can turn it off. A plain runtime int, not a compile-time
+ * gate. See include/native_penta.h. */
+int g_pentaPal = 1;
+
 /* See include/platform/native_gpu.h. Lives here, not in the 3DS renderer that
  * writes it, so the windowed instruments that READ it (native_perf.c, the
  * [OTPROF] block below) do not depend on a 3DS-only file being in the build. */

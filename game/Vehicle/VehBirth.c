@@ -1,4 +1,5 @@
 #include <common.h>
+#include <native_penta.h>
 
 enum
 {
@@ -597,6 +598,13 @@ void VehBirth_SetConsts(struct Driver *driver)
 			dst[3] = (u8)(rawValue >> 24);
 		}
 	}
+
+#ifdef CTR_NATIVE
+	if (g_pentaPal && (data.characterIDs[driver->driverID] == PENTA_PENGUIN))
+	{
+		NativePenta_ApplyPalClass(driver);
+	}
+#endif
 
 	return;
 }

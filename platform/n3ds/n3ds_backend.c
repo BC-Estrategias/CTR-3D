@@ -3314,6 +3314,9 @@ unsigned int N3DS_ReadButtons(void)
 	 *   flagstyle [N] -- menu/loading flag: 0 = retail grey checkers (default),
 	 *                  1 = pride stripes, 2 = purple/white (Spyro). Bare token
 	 *                  cycles. Also reachable in-game by cheat: WONDER, SOAR.
+	 *   pentapal [N] -- opt-in: give Penta his PAL/Japan max-stats (5/5/5) class
+	 *                  instead of the NTSC-U Turn class. Bare token toggles, N sets
+	 *                  0/1. Off = retail NTSC-U. Applied at kart birth.
 	 *   renderthread -- toggle g_dbg_renderThread (core-2 render worker routing;
 	 *                  OFF falls back to synchronous main-thread rendering)
 	 *   lodgeo [N]  -- track LOD distance, percent of retail (CTR_NATIVE_LOD_BIAS)
@@ -4187,6 +4190,23 @@ unsigned int N3DS_ReadButtons(void)
 					}
 					snprintf(styleMsg, sizeof(styleMsg), "[CTR-3DS] race flag: %s", flagStyleNames[g_dbg_flagStyle]);
 					N3DS_DebugLog(styleMsg);
+				}
+				else if (strncmp(word, "pentapal", 8) == 0)
+				{
+					extern int g_pentaPal;
+
+					/* Opt-in: Penta Penguin's PAL/Japan max-stats (5/5/5) class instead
+					 * of the NTSC-U Turn class. Bare token toggles; 'pentapal N' sets
+					 * 0/1. Read at kart birth, so toggle before a race starts. */
+					if (word[8] == ' ')
+					{
+						g_pentaPal = (atoi(&word[9]) != 0) ? 1 : 0;
+					}
+					else
+					{
+						g_pentaPal = !g_pentaPal;
+					}
+					N3DS_DebugLog(g_pentaPal ? "[CTR-3DS] Penta: PAL 5/5/5 max class ON" : "[CTR-3DS] Penta: OFF (retail NTSC-U Turn class)");
 				}
 				else if (strncmp(word, "axisfix", 7) == 0)
 				{
