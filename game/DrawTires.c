@@ -1,5 +1,12 @@
 #include <common.h>
 
+#ifdef CTR_NATIVE
+/* Defined in platform/native_gpu.c (same unity TU, later in main.c's include
+ * order). Gates the fix for retail's mirrored-tire lateral-offset bug -- see
+ * DrawTiresReflection_BuildWheelLocalPairs. */
+extern int g_tireReflectFix;
+#endif
+
 static const u32 sDrawTiresSolidJumpTable[8] = {
     0x8006ed7c, 0x8006ed98, 0x8006edb4, 0x8006edcc, 0x8006ede4, 0x8006ee00, 0x8006ee1c, 0x8006ee3c,
 };
@@ -328,6 +335,18 @@ static void DrawTiresSolid_LoadCorner(struct DrawTiresScratch *scratch, int vect
 
 static int DrawTiresSolid_SelectSpriteIndex(int angleValue)
 {
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+	/* Invisible-tire hunt: dumpreq `tirepin` pins every wheel to sprite 0 (the
+	 * suspect frame) so the one-frame blink becomes a steady state. Remove
+	 * with the hunt. */
+	extern int g_tirehuntPin0;
+
+	if (g_tirehuntPin0)
+	{
+		return 0;
+	}
+#endif
+
 	int tableIndex = angleValue >> 5;
 
 	if (angleValue < 0)
@@ -708,7 +727,18 @@ static void DrawTiresReflection_BuildWheelLocalPairs(struct DrawTiresScratch *sc
 	// 0x8006f0e8 overwrites v1 with instFlags & 0x100 before the multiply at
 	// 0x8006f10c. Native makes that register lineage explicit until the exact
 	// delay-slot/register ABI is restored for PSX backfeed.
+	//
+	// That clobber is a shipped retail BUG: the lateral offset collapses to 9
+	// units (flag set) or 0, so the reflection's wheel pairs merge on the
+	// centerline -- visible on real PS1 as one tire at front-center and one at
+	// rear-center. g_tireReflectFix restores the value the load intended,
+	// Instance.scale.x, matching DrawTiresSolid_BuildWheelLocalPairs; OFF is
+	// the exact retail expression.
+#ifdef CTR_NATIVE
+	int wheelX = g_tireReflectFix ? ((inst->scale.x * 0x90) >> 12) : (((scratch->instFlags & PUSHBUFFER_EXISTS) * 0x90) >> 12);
+#else
 	int wheelX = ((scratch->instFlags & PUSHBUFFER_EXISTS) * 0x90) >> 12;
+#endif
 	int negWheelX = -wheelX;
 
 	scratch->wheelLocal[0].center.x = wheelX;
