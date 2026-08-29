@@ -1,6 +1,11 @@
 #include <common.h>
 #include <native_penta.h>
 
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+#include <platform/native_amnesia.h>
+#include <platform/native_log.h>
+#endif
+
 enum
 {
 	VEH_BIRTH_ADV_RETURN_LEVEL_COUNT = 0x14,
@@ -186,6 +191,10 @@ void VehBirth_TeleportSelf(struct Driver *d, u8 spawnFlag, int spawnPosY)
 	s16 *warppadRot = NULL;
 	int spawnAtBoss;
 	int spawnOutsideBoss = 0;
+
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+	NativeAmnesia_NoteEvent(AMN_EV_RESPAWN, d->driverID, (s32)spawnFlag);
+#endif
 
 	if ((level1 == NULL) || (level1->ptr_mesh_info == NULL))
 	{
@@ -642,6 +651,29 @@ void VehBirth_TireSprites(struct Thread *t)
 
 	struct Icon **tire = ICONGROUP_GETICONS(tireAnim);
 	d->wheelSprites = tire;
+
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+	/* Invisible-tire hunt: sprite index 0 (the dead-side-on frame) is the
+	 * suspect; dump every rotation frame's packed UV/clut/tpage words once
+	 * per birth so the odd one out is visible in the instrument log. */
+	if (driverID == 0)
+	{
+		for (int i = 0; i < 17; i++)
+		{
+			struct Icon *ic = tire[i];
+
+			if (ic == NULL)
+			{
+				Platform_LogInstrument("[TIRESPR] %d NULL", i);
+			}
+			else
+			{
+				Platform_LogInstrument("[TIRESPR] %d w0=%08x w1=%08x w2=%08x", i, (unsigned)CTR_ReadU32LE(&ic->texLayout.u0),
+				                       (unsigned)CTR_ReadU32LE(&ic->texLayout.u1), (unsigned)CTR_ReadU32LE(&ic->texLayout.u2));
+			}
+		}
+	}
+#endif
 
 	d->wheelSize = VEH_BIRTH_WHEEL_SIZE;
 

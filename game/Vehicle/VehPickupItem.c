@@ -1,5 +1,9 @@
 #include <common.h>
 
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+#include <platform/native_amnesia.h>
+#endif
+
 static inline void VehPickupItem_CopyMatrix(MATRIX *dst, const MATRIX *src)
 {
 	dst->m[0][0] = src->m[0][0];
@@ -256,6 +260,10 @@ struct MaskHeadWeapon *VehPickupItem_MaskUseWeapon(struct Driver *driver, b32 bo
 	int soundID;
 
 	gGT = sdata->gGT;
+
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+	NativeAmnesia_NoteEvent(AMN_EV_MASK, driver->driverID, (s32)boolPlaySound);
+#endif
 
 	if (!LOAD_IsOpen_RacingOrBattle() || ((gGT->gameMode1 & ADVENTURE_ARENA) != 0))
 	{
@@ -535,6 +543,10 @@ void VehPickupItem_ShootNow(struct Driver *d, s32 weaponID, s32 flags)
 	int modelID;
 	int mineHitModel = 0;
 	int mineShouldInitFollower = 0;
+
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+	NativeAmnesia_NoteEvent(AMN_EV_WEAPON_FIRE, weaponID, d->driverID);
+#endif
 
 	switch (weaponID)
 	{

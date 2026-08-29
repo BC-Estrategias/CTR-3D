@@ -1,5 +1,8 @@
 #include <common.h>
 
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+#include <platform/native_amnesia.h>
+#endif
 
 enum
 {
@@ -790,6 +793,9 @@ void CAM_FollowDriver_AngleAxis(struct CameraDC *cDC, struct Driver *d, struct C
 
 	if ((cDC->flags & CAMERA_FLAG_DIRECTION_CHANGED) != 0)
 	{
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+		NativeAmnesia_NoteEvent(AMN_EV_CAMCUT, cDC->cameraID, 0);
+#endif
 		cDC->lookAtPos.x = lookAt.x;
 		cDC->lookAtPos.y = lookAt.y;
 		cDC->lookAtPos.z = lookAt.z;

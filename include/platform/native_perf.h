@@ -153,6 +153,16 @@ enum NativePerfBucket
 	 * Appended, never inserted: s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_TORCH_MAIN,
+	/*
+	 * Main-thread disc read (native_disc_image.c ReadRawRun, owner=MAIN only --
+	 * the audio-thread XA reads use owner=AUDIO and are deliberately excluded,
+	 * both to avoid racing this main-thread scope and because they don't stall
+	 * the main frame). Exists to attribute the ~50ms UNTIMED main-thread spikes
+	 * the spike catcher found on Tiger Temple: a synchronous mid-race disc read
+	 * is the prime suspect. Appended, never inserted: s_bucketInfo is indexed by
+	 * this enum.
+	 */
+	NATIVE_PERF_BUCKET_DISC_READ_MAIN,
 	NATIVE_PERF_BUCKET_COUNT
 };
 
@@ -194,6 +204,13 @@ void NativePerf_EndScope(enum NativePerfBucket bucket);
  */
 void NativePerf_CountTorch(int listed, int emitted);
 
+/*
+ * Flush the spike-catcher ring to sdmc:/ctr_spikes.log now (3DS only; no-op on
+ * PC and when perf is compiled out). Normally the ring auto-flushes on a level
+ * change; this is the on-demand path for dumpreq 'spikes'.
+ */
+void NativePerf_DumpSpikesNow(void);
+
 #ifdef CTR_INTERNAL
 /*
  * The DrawOTag job (the ~35ms "walk" the main thread waits behind) split into
@@ -221,6 +238,10 @@ static inline int NativePerf_ConfigureFromArgs(int argc, char **argv)
 }
 
 static inline void NativePerf_Shutdown(void)
+{
+}
+
+static inline void NativePerf_DumpSpikesNow(void)
 {
 }
 

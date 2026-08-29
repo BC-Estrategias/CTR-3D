@@ -1,6 +1,7 @@
 #include "platform/native_disc_image.h"
 
 #include <platform/native_path.h>
+#include <platform/native_perf.h>
 
 #include <limits.h>
 #if !defined(_WIN32)
@@ -401,11 +402,24 @@ internal int NativeDiscImage_ReadRawRun(u32 lba, u32 count, u8 *raw, int owner)
 			return 0;
 		}
 
+		int readOk;
 #if defined(__3DS__)
-		if (!NativeDiscImage_FdReadFull(fd, raw, bytes))
+		/* Time the MAIN-thread read only (owner=MAIN). The audio-thread XA
+		 * streaming reads use owner=AUDIO on their own fd and must never touch
+		 * this main-thread scope -- see the DISC_READ_MAIN enum comment. */
+		if (owner == NATIVE_DISC_IMAGE_OWNER_MAIN)
+		{
+			NativePerf_BeginScope(NATIVE_PERF_BUCKET_DISC_READ_MAIN);
+		}
+		readOk = NativeDiscImage_FdReadFull(fd, raw, bytes);
+		if (owner == NATIVE_DISC_IMAGE_OWNER_MAIN)
+		{
+			NativePerf_EndScope(NATIVE_PERF_BUCKET_DISC_READ_MAIN);
+		}
 #else
-		if (fread(raw, 1, bytes, s_nativeDiscImageFile) != bytes)
+		readOk = (fread(raw, 1, bytes, s_nativeDiscImageFile) == bytes);
 #endif
+		if (!readOk)
 		{
 #if CTR_NATIVE_DISC_IO_PROFILE
 			prof->ioFails++;

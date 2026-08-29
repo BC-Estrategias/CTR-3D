@@ -1,11 +1,19 @@
 #include <common.h>
 
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+#include <platform/native_amnesia.h>
+#endif
+
 // NOTE(aalhendi): ASM-verified against NTSC-U 926 overlay 231 0x800ac1b0-0x800ac220.
 
 int RB_Hazard_HurtDriver(struct Driver *driverVictim, int damageType, struct Driver *driverAttacker, int reason)
 {
 	struct GameTracker *gGT = sdata->gGT;
 	int result = 0;
+
+#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+	NativeAmnesia_NoteEvent(AMN_EV_WEAPON_HIT, damageType, driverVictim->driverID);
+#endif
 
 	if ((driverVictim->actionsFlagSet & ACTION_BOT) == 0)
 	{

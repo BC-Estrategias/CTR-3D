@@ -158,6 +158,9 @@ global_variable const struct NativePerfBucketInfo s_bucketInfo[NATIVE_PERF_BUCKE
     /* dominantCandidate 0: nests inside mainframe_effects_ms, which is
      * already a candidate. */
     {"torch_main_ms", 0},
+    /* Main-thread disc read; a dominant candidate -- it IS the thing we want to
+     * see win "dominant" on a stalled frame. Appended to match the enum. */
+    {"disc_read_main_ms", 1},
 };
 
 global_variable FILE *s_csvFile;
@@ -204,6 +207,59 @@ global_variable u32 s_windowFrames;
 global_variable f64 s_windowTotalMs;
 global_variable f64 s_windowWorkMs;
 global_variable f64 s_windowBucketMs[NATIVE_PERF_BUCKET_COUNT];
+
+/*
+ * Spike catcher: the windowed [PERF] average hides the frames that actually
+ * hurt -- a 30fps-median track still feels like the mid-20s when a handful of
+ * frames stall past budget. This records only the DROPPED frames (total > 40ms)
+ * with the perf bucket that dominated each, into a small RAM ring, then flushes
+ * the ring in ONE batched write to sdmc:/ctr_spikes.log on a level change (a
+ * load screen, where a stall is invisible). It deliberately does NOT ride the
+ * per-frame SD log path, so it runs with g_dbg_sdLog OFF -- which matters
+ * because that log's own writes are themselves a top spike source, and would
+ * otherwise be the loudest thing in the data. dumpreq 'spikes' dumps/toggles.
+ */
+#define NATIVE_PERF_SPIKE_RING 96
+struct NativePerfSpike
+{
+	u32 frameCounter;
+	f32 totalMs;
+	f32 workMs;
+	f32 dominantMs;
+	/* Top two buckets by RAW time, aggregates included (render_frame,
+	 * game_logic). The dominant bucket above is the biggest LEAF candidate and
+	 * reads ~3ms on these spikes; the raw top tells which HALF of the frame the
+	 * unaccounted ~50ms lives in even when it sits between leaf scopes. */
+	f32 rawTop1Ms;
+	f32 rawTop2Ms;
+	/* Render-worker walk breakdown for THIS frame (core-2 DrawOTag job, peeked
+	 * and deltaed on the main thread): patch = track-anim rewrite, parse = the
+	 * OT walk, splits = DrawAllSplits (queueing draws to the GPU). If these sum
+	 * near the 47ms wait, the walk is the cost; if they stay small, the wait is
+	 * the GPU-sync/present remainder past the walk. */
+	f32 walkPatchMs;
+	f32 walkParseMs;
+	f32 walkSplitsMs;
+	s32 levelID;
+	u32 gameMode1;
+	enum NativePerfBucket dominantBucket;
+	enum NativePerfBucket rawTop1;
+	enum NativePerfBucket rawTop2;
+};
+global_variable struct NativePerfSpike s_spikeRing[NATIVE_PERF_SPIKE_RING];
+global_variable u32 s_spikeCount;
+global_variable u32 s_spikeSeenTotal;
+global_variable s32 s_spikeLastLevel;
+global_variable s32 s_spikeLevelValid;
+global_variable s32 s_spikePostFlushSkip;
+int g_dbg_spikeCatch = 1; /* dumpreq 'spikes' (default on for the spike hunt) */
+/* Last peek of the worker walk's cumulative ticks, for per-frame deltas. */
+global_variable u64 s_spikeLastPatchTicks;
+global_variable u64 s_spikeLastParseTicks;
+global_variable u64 s_spikeLastSplitsTicks;
+global_variable f32 s_spikeWalkPatchMs;
+global_variable f32 s_spikeWalkParseMs;
+global_variable f32 s_spikeWalkSplitsMs;
 
 #if defined(__3DS__) && CTR_NATIVE_RENDER_THREAD
 /*
@@ -891,6 +947,137 @@ void NativePerf_BeginFrame(const struct NativePerfFrameInfo *info)
 	s_frameOpen = 1;
 }
 
+#if defined(__3DS__)
+internal void NativePerf_SpikeFlush(void)
+{
+	FILE *f;
+
+	if (s_spikeCount == 0)
+	{
+		return;
+	}
+	/* Own file, own single open/write/close -- NOT the per-frame sdlog path. */
+	f = fopen("sdmc:/ctr_spikes.log", "a");
+	if (f != NULL)
+	{
+		u32 i;
+
+		for (i = 0; i < s_spikeCount; i++)
+		{
+			const struct NativePerfSpike *s = &s_spikeRing[i];
+
+			fprintf(f, "[SPIKE] f=%lu total=%.1f work=%.1f dom=%s domMs=%.1f raw1=%s/%.1f raw2=%s/%.1f walk(p/pa/sp)=%.1f/%.1f/%.1f lvl=%ld mode=%08lx\n",
+			        (unsigned long)s->frameCounter, (double)s->totalMs, (double)s->workMs, NativePerf_BucketName(s->dominantBucket), (double)s->dominantMs,
+			        NativePerf_BucketName(s->rawTop1), (double)s->rawTop1Ms, NativePerf_BucketName(s->rawTop2), (double)s->rawTop2Ms, (double)s->walkPatchMs,
+			        (double)s->walkParseMs, (double)s->walkSplitsMs, (long)s->levelID, (unsigned long)s->gameMode1);
+		}
+		fclose(f);
+	}
+	s_spikeCount = 0;
+	/* The fclose SD write stalls the frame right after this; do not let that
+	 * self-record as a spike. */
+	s_spikePostFlushSkip = 3;
+}
+
+internal void NativePerf_SpikeRecord(f64 totalMs, f64 workMs, enum NativePerfBucket dom, f64 domMs, const struct NativePerfFrameInfo *ri)
+{
+	struct NativePerfSpike *s;
+
+	/* Delta the worker walk's cumulative ticks to this frame -- every frame, so
+	 * a recorded spike carries the split for the walk it actually waited on. */
+	{
+		extern void NativeOtag_PeekWalkTicks(u64 * patch, u64 * parse, u64 * splits);
+		u64 pc = 0;
+		u64 pa = 0;
+		u64 sp = 0;
+
+		NativeOtag_PeekWalkTicks(&pc, &pa, &sp);
+		s_spikeWalkPatchMs = (f32)NativePerf_CounterToMs(pc - s_spikeLastPatchTicks);
+		s_spikeWalkParseMs = (f32)NativePerf_CounterToMs(pa - s_spikeLastParseTicks);
+		s_spikeWalkSplitsMs = (f32)NativePerf_CounterToMs(sp - s_spikeLastSplitsTicks);
+		s_spikeLastPatchTicks = pc;
+		s_spikeLastParseTicks = pa;
+		s_spikeLastSplitsTicks = sp;
+	}
+
+	if (!g_dbg_spikeCatch)
+	{
+		return;
+	}
+	/* Level change (race<->menu/load) is a gameplay-free flush point. */
+	if (!s_spikeLevelValid || (ri->levelID != s_spikeLastLevel))
+	{
+		NativePerf_SpikeFlush();
+		s_spikeLastLevel = ri->levelID;
+		s_spikeLevelValid = 1;
+	}
+	if (s_spikePostFlushSkip > 0)
+	{
+		s_spikePostFlushSkip--;
+		return;
+	}
+	if (totalMs <= NATIVE_PERF_FRAME_WARN_40_MS)
+	{
+		return;
+	}
+	if (s_spikeCount >= NATIVE_PERF_SPIKE_RING)
+	{
+		NativePerf_SpikeFlush(); /* backstop: a race this spiky is its own answer */
+		return;
+	}
+	s = &s_spikeRing[s_spikeCount++];
+	s->frameCounter = (u32)ri->frameCounter;
+	s->totalMs = (f32)totalMs;
+	s->workMs = (f32)workMs;
+	s->dominantBucket = dom;
+	s->dominantMs = (f32)domMs;
+	s->levelID = ri->levelID;
+	s->gameMode1 = (u32)ri->gameMode1;
+
+	/* Two biggest buckets by raw time, aggregates included -- see the struct. */
+	{
+		enum NativePerfBucket t1 = NATIVE_PERF_BUCKET_GAME_LOGIC;
+		enum NativePerfBucket t2 = NATIVE_PERF_BUCKET_GAME_LOGIC;
+		f64 t1ms = -1.0;
+		f64 t2ms = -1.0;
+		s32 b;
+
+		for (b = 0; b < NATIVE_PERF_BUCKET_COUNT; b++)
+		{
+			const f64 v = s_frameBucketMs[b];
+
+			if (v > t1ms)
+			{
+				t2ms = t1ms;
+				t2 = t1;
+				t1ms = v;
+				t1 = (enum NativePerfBucket)b;
+			}
+			else if (v > t2ms)
+			{
+				t2ms = v;
+				t2 = (enum NativePerfBucket)b;
+			}
+		}
+		s->rawTop1 = t1;
+		s->rawTop1Ms = (f32)t1ms;
+		s->rawTop2 = t2;
+		s->rawTop2Ms = (f32)t2ms;
+	}
+	s->walkPatchMs = s_spikeWalkPatchMs;
+	s->walkParseMs = s_spikeWalkParseMs;
+	s->walkSplitsMs = s_spikeWalkSplitsMs;
+	s_spikeSeenTotal++;
+}
+#endif
+
+void NativePerf_DumpSpikesNow(void)
+{
+#if defined(__3DS__)
+	NativePerf_SpikeFlush();
+#endif
+}
+
 void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 {
 	f64 totalMs;
@@ -924,6 +1111,12 @@ void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
 	NativeAudio_GetOutputStats(&endUnderrunFrames, &endOverflowFrames, &endQueuedFrames);
 
 	rowInfo = (info != NULL) ? info : &s_frameBeginInfo;
+
+#if defined(__3DS__)
+	/* Catch dropped frames with their dominant bucket, out-of-band from the
+	 * per-frame sdlog path (see the spike-catcher block above). */
+	NativePerf_SpikeRecord(totalMs, workMs, dominantBucket, dominantMs, rowInfo);
+#endif
 
 	// s_csvFile is NULL on 3DS, which reports through the log instead; the
 	// bucket accounting below still has to run either way.

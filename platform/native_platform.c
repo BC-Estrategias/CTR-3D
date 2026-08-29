@@ -24,6 +24,38 @@
 SDL_Window *g_window = NULL;
 int g_dbg_polygonSelected = 0;
 
+/* Rain-density dial (3DS confirmation instrument). 100 = full retail rain. A
+ * per-region-intensity particle count from the game passes through here; the
+ * dial scales it so a hardware A/B can prove the rain is the Tiger-Temple perf
+ * cost (rainscale 0 = rain off). Identity on PC and at 100, so the shipping
+ * build is byte-unchanged until the dial is turned. Set via dumpreq 'rainscale
+ * N'. This is a measurement knob, not the fix -- thinning the rain is not the
+ * intended remedy; a batched native rain path that keeps full density is. */
+int g_rainScalePercent = 100;
+
+s32 NativeWeather_ScaleRainParticles(s32 count)
+{
+#ifdef __3DS__
+	if ((g_rainScalePercent < 100) && (count > 0))
+	{
+		return (count * g_rainScalePercent) / 100;
+	}
+#endif
+	return count;
+}
+
+#ifdef __3DS__
+int N3DS_WeatherSetRainScale(int pct)
+{
+	if ((pct < 0) || (pct > 100))
+	{
+		pct = 100; /* bare 'rainscale' or out-of-range resets to full density */
+	}
+	g_rainScalePercent = pct;
+	return pct;
+}
+#endif
+
 extern int g_cfg_bilinearFiltering;
 extern int g_dbg_emulatorPaused;
 extern int g_dbg_texturelessMode;
@@ -221,8 +253,8 @@ internal void NativePlatform_LodBiasConfigureFromArgs(int argc, char *argv[])
 #endif
 
 #if defined(CTR_INTERNAL) && defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
-// PC surface for g_dbg_trackRender (3DS: dumpreq 'trackrender'/SELECT+ZR
-// toggle). Without a PC setter this can never leave 0 here, and PC is where
+// PC surface for g_dbg_trackRender (3DS: dumpreq 'trackrender', or the
+// SELECT+START master). Without a PC setter this can never leave 0 here, and PC is where
 // the recorder is actually verified.
 internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[])
 {
@@ -374,7 +406,7 @@ internal void NativePlatform_ModelRenderConfigureFromArgs(int argc, char *argv[]
 
 #if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
 // --gte-capture 0|1|2: PC surface for the capture cost ablation (3DS has
-// SELECT+D-UP / dumpreq 'gtecapture'). The measurement it exists for happens on
+// dumpreq 'gtecapture'). The measurement it exists for happens on
 // hardware, but the switch is exercised here first: in a capture-ON,
 // desnap-OFF build all three states must produce the identical golden
 // checksum, which is what proves the ablation only removes writes nobody is
