@@ -1,6 +1,7 @@
 #include <common.h>
 
 #if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
+#include <platform/native_amnesia.h>
 #include <platform/native_perf.h>
 #include <platform/native_replay_scheduler.h>
 #include <platform/native_savestate.h>
@@ -15,6 +16,9 @@
 
 #if defined(CTR_NATIVE)
 #include <platform/native_audio.h>
+// platform/native_options.c -- repoints unused LNG slots for the native
+// options menu once the language table exists (local-extern idiom).
+extern void NativeOptions_InstallStrings(void);
 #endif
 
 #if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
@@ -437,6 +441,9 @@ u32 main(void)
 				MainFrame_GameLogic(gGT, gGS);
 #if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
 				NativePerf_EndScope(NATIVE_PERF_BUCKET_GAME_LOGIC);
+				NativeAmnesia_FrameState(gGT->levelID, (u32)gGT->gameMode1, (u32)gGT->gameMode2, (s32)gGT->clockEffectEnabled,
+				                         (s32)gGT->pushBuffer_UI.fadeFromBlack_currentValue, gGT->cameraDC[0].cameraPos.x,
+				                         gGT->cameraDC[0].cameraPos.y, gGT->cameraDC[0].cameraPos.z);
 #endif
 			}
 
@@ -639,6 +646,9 @@ void StateZero()
 	// English=1
 	// PAL SCES02105 calls it multiple times
 	LOAD_LangFile((int)sdata->ptrBigfile1, 1);
+#ifdef CTR_NATIVE
+	NativeOptions_InstallStrings();
+#endif
 	GAMEPROG_NewGame_OnBoot();
 	gGT->overlayIndex_null_notUsed = 0;
 
@@ -689,6 +699,16 @@ void StateZero()
 	// read cache now, in the silent SCEA window, so the in-load reads hit RAM
 	// and never stall the sequencer mid-song. No-op on PC.
 	LOAD_NativePrefetchCrateIntro(sdata->ptrBigfile1);
+
+	// 3DS boots to speedometer mode (bit 8): the minimap lives on the bottom
+	// screen there (UI_RenderFrame_Racing routes it), so the speedometer is
+	// the better default for the top screen's HUD slot. Returns 0 on PC,
+	// which keeps retail's boot-to-map default. Triangle still toggles.
+	{
+		extern int NativeUiMap_BootHudFlags(void);
+
+		sdata->HudAndDebugFlags |= NativeUiMap_BootHudFlags();
+	}
 #endif
 
 	Music_SetIntro();

@@ -1,5 +1,12 @@
 #include <common.h>
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+// Register the track-select map sheet's packet span for the 3DS far-edge UV
+// inset (seam between the sheet's half-icons). Same local-extern idiom as
+// UI_RenderFrame.c's NativeGpu_MarkUiMapRange.
+extern void NativeGpu_MarkUiPicRange(uintptr_t start, uintptr_t end);
+#endif
+
 enum TrackSelectVideoState
 {
 	MM_TRACK_VIDEO_ICON = 1,
@@ -903,6 +910,13 @@ void MM_TrackSelect_MenuProc(struct RectMenu *menu)
 				s32 mapWidth = (s32)iconMap0->texLayout.u1 - (s32)iconMap0->texLayout.u0;
 				s32 mapHeight = ((s32)mapTopV2 - (s32)mapTopV0) + (s32)mapBottomV2 - (s32)mapBottomV0;
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+				// All six layers allocate sequentially from primMem with
+				// nothing interleaved, so one bracket spans exactly the
+				// sheet stack (white + outline shifts + shadow).
+				uintptr_t mapPicPrimStart = (uintptr_t)gGT->backBuffer->primMem.cursor;
+#endif
+
 				// draw six track minimaps on menu
 				// map 1 is the regular color, which is white
 				// map 2 is blue and shifted 2px to the left
@@ -940,6 +954,10 @@ void MM_TrackSelect_MenuProc(struct RectMenu *menu)
 					    // 3 = draw map black - used for the shadow of the minimap in the track select screen
 					    D230.drawMapOffset[mapLayer].type);
 				}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+				NativeGpu_MarkUiPicRange(mapPicPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor);
+#endif
 			}
 
 			MM_TrackSelect_Video_Draw(&previewRect, selectMenu, (int)(s16)D230.trackSelect.currentTrack,

@@ -1,4 +1,20 @@
 #include <common.h>
+#include <native_reserves.h>
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+// Register the in-race minimap block's packet span for the 3DS bottom-screen
+// map routing. Same local-extern idiom and same header-checked-later guarantee
+// as DrawSky.c's NativeGpu_MarkSkyRange.
+extern void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end);
+#endif
+#ifdef CTR_NATIVE
+// Bottom-screen map hook (platform/native_gpu.c). RouteActive lets the map
+// block run in speedometer mode too -- its primitives are routed off the top
+// screen, so retail's map-or-speedo exclusivity holds up there while the
+// bottom panel keeps its map. Returns 0 on PC. (The FPS overlay's hook is
+// used from MainFrame_RenderFrame.c now, where it draws every frame.)
+extern int NativeUiMap_RouteActive(void);
+#endif
 
 // To do: add a header
 
@@ -36,6 +52,9 @@ void UI_RenderFrame_Racing()
 	int offset;
 	u32 mapPosX;
 	u32 mapPosY;
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	uintptr_t uiMapPrimStart;
+#endif
 
 	offset = 0;
 
@@ -194,6 +213,13 @@ void UI_RenderFrame_Racing()
 				{
 					// Draw powerslide meter
 					UI_DrawSlideMeter(hudStructPtr[UI_HUD_SLOT_SLIDE_METER].x + offset, hudStructPtr[UI_HUD_SLOT_SLIDE_METER].y, playerStruct);
+
+#if defined(CTR_NATIVE)
+					if (g_reservesMeter)
+					{
+						UI_DrawReservesMeter(hudStructPtr[UI_HUD_SLOT_SLIDE_METER].x + offset, hudStructPtr[UI_HUD_SLOT_SLIDE_METER].y, playerStruct);
+					}
+#endif
 				}
 
 				// If you are not in Time Trial or Relic Race
@@ -745,12 +771,29 @@ void UI_RenderFrame_Racing()
 		}
 	}
 
+	// Nonzero while the 3DS routes the map to the bottom screen: the map block
+	// then runs in speedometer mode too, speedo owning the top screen while
+	// the map still feeds the bottom panel. Routed primitives never draw on
+	// the top screen, so retail's one-or-the-other rule holds there. Stays 0
+	// on PC (hook leg) and on non-native builds (never assigned).
+	int uiMapRouted = 0;
+
+#ifdef CTR_NATIVE
+	uiMapRouted = NativeUiMap_RouteActive();
+#endif
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	// The whole minimap block below (icons + sheet) allocates sequentially from
+	// backBuffer->primMem with nothing interleaved, so [cursor-before,
+	// cursor-after) is exactly the map and nothing else. Marked even when the
+	// block is skipped: the empty span keeps the tag cleared for this frame.
+	uiMapPrimStart = (uintptr_t)gGT->backBuffer->primMem.cursor;
+#endif
 	if (levPtrMap != 0)
 	{
 		if (((numPlyr == 1)
 
-		     // if want to draw map, not speedometer
-		     && (sdata->HudAndDebugFlags & 8) == 0) ||
+		     // if want to draw map, not speedometer (or the map is routed away)
+		     && (((sdata->HudAndDebugFlags & 8) == 0) || uiMapRouted)) ||
 
 		    (numPlyr == 3))
 		{
@@ -788,8 +831,15 @@ void UI_RenderFrame_Racing()
 
 			    // color, in this case white
 			    1);
+
+			// (The FPS overlay used to be emitted here, inside the map block;
+			// it moved to MainFrame_RenderFrame's UI phase so it draws on
+			// EVERY screen, not only beside the map.)
 		}
 	}
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	NativeGpu_MarkUiMapRange(uiMapPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor);
+#endif
 
 	bVar3 = false;
 

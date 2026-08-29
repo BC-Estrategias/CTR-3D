@@ -21,7 +21,21 @@ internal void Platform_LogWrite(FILE *consoleStream, const char *text)
 	OutputDebugStringA(text);
 #endif
 
+#ifdef __3DS__
+	/* stdout is the bottom-screen debug console, and glyphs land in its
+	 * shared framebuffer at print time -- an ungated fputs scribbles over the
+	 * bottom-screen minimap and keeps the panel chattering in a release build
+	 * ([TRKFRAME]'s periodic census was the line caught doing both). The
+	 * console-visibility policy lives in one place, N3DS_ConsolePaintAllowed
+	 * (map ownership / dumpreq 'stats' / boot grace); the netload stderr
+	 * mirror below and the SD sink still carry every line regardless. */
+	if ((stream != stdout) || N3DS_ConsolePaintAllowed())
+	{
+		fputs(text, stream);
+	}
+#else
 	fputs(text, stream);
+#endif
 
 #ifdef __3DS__
 	// When netloaded, stderr is the live stream back to the sending PC

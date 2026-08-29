@@ -320,6 +320,31 @@ void MainFrame_RenderFrame(struct GameTracker *gGT, struct GamepadSystem *gGamep
 		RaceFlag_DrawSelf();
 	}
 
+#ifdef CTR_NATIVE
+	// 3DS bottom-screen FPS overlay, emitted EVERY frame -- menus, loads,
+	// pauses, races -- so the readout never blinks out with the minimap
+	// (owner call). The hook returns 0 on PC and whenever routing is off, so
+	// nothing ever draws here on the top screen or on PC. The x/y feed only
+	// the text's own bbox; the bottom pass re-anchors it top-right.
+	{
+		extern int NativeUiMap_FpsOverlayText(char *buf, int bufSize);
+		char fpsStr[16];
+
+		if (NativeUiMap_FpsOverlayText(&fpsStr[0], (int)sizeof(fpsStr)))
+		{
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+			extern void NativeGpu_MarkUiFpsRange(uintptr_t start, uintptr_t end);
+
+			uintptr_t fpsPrimStart = (uintptr_t)gGT->backBuffer->primMem.cursor;
+#endif
+			DecalFont_DrawLine(&fpsStr[0], 438, 197, FONT_SMALL, WHITE);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+			NativeGpu_MarkUiFpsRange(fpsPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor);
+#endif
+		}
+	}
+#endif
+
 	RenderDispEnv_UI(gGT);
 	MAINFRAME_PERF_END(NATIVE_PERF_BUCKET_MAINFRAME_UI);
 
@@ -536,7 +561,12 @@ void RainLogic(struct GameTracker *gGT)
 		// assume numPlayers is never zero,
 		// assume weather_intensity is always valid
 
-		gGT->rainBuffer[i].numParticles_max = (camQB->weather_intensity << 2) / numPlyrCurrGame;
+		{
+			// Rain-density dial: identity on PC and at full density, so this is
+			// byte-unchanged until the 3DS 'rainscale' knob is turned down.
+			extern s32 NativeWeather_ScaleRainParticles(s32 count);
+			gGT->rainBuffer[i].numParticles_max = NativeWeather_ScaleRainParticles((camQB->weather_intensity << 2) / numPlyrCurrGame);
+		}
 
 		gGT->rainBuffer[i].vanishRate = (camQB->weather_vanishRate << 2) / numPlyrCurrGame;
 	}
@@ -1004,22 +1034,46 @@ void RenderAllTires(struct GameTracker *gGT)
 	GTECapture_BeginFixedDepthShift(2);
 #endif
 
+	/* The reflection legs run in "under" depth mode: retail tucks the mirrored
+	 * tires beneath the opaque road by painter's order, so on the 3DS depth
+	 * substrate they must LOSE the ground tie the solid-leg decal bias exists
+	 * to win. Toggled per call rather than hoisting the reflections out of the
+	 * bucket order -- OT links are head-inserted, so reordering emission would
+	 * reorder same-bucket draws on the PC/retail path too. */
 	if (gGT->threadBuckets[PLAYER].thread != 0)
 	{
 		DrawTires_Solid(gGT->threadBuckets[PLAYER].thread, gGT_primMem, numPlyrCurrGame);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		GTECapture_SetFixedShiftUnder(1);
+#endif
 		DrawTires_Reflection(gGT->threadBuckets[PLAYER].thread, gGT_primMem, numPlyrCurrGame);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		GTECapture_SetFixedShiftUnder(0);
+#endif
 	}
 
 	if (gGT->numBotsNextGame != 0)
 	{
 		DrawTires_Solid(gGT->threadBuckets[ROBOT].thread, gGT_primMem, numPlyrCurrGame);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		GTECapture_SetFixedShiftUnder(1);
+#endif
 		DrawTires_Reflection(gGT->threadBuckets[ROBOT].thread, gGT_primMem, numPlyrCurrGame);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		GTECapture_SetFixedShiftUnder(0);
+#endif
 	}
 
 	if (gGT->threadBuckets[GHOST].thread != 0)
 	{
 		DrawTires_Solid(gGT->threadBuckets[GHOST].thread, gGT_primMem, numPlyrCurrGame);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		GTECapture_SetFixedShiftUnder(1);
+#endif
 		DrawTires_Reflection(gGT->threadBuckets[GHOST].thread, gGT_primMem, numPlyrCurrGame);
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		GTECapture_SetFixedShiftUnder(0);
+#endif
 	}
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE

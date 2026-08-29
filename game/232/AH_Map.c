@@ -1,5 +1,14 @@
 #include <common.h>
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+// Register the hub map block's packet span (sheet + player/warppad/item
+// icons) for the 3DS bottom-screen map routing -- same class and same
+// local-extern idiom as UI_RenderFrame_Racing's bracket. Routed when the
+// bottom map is on; drawn in place with the seam-closing far-edge UV inset
+// when it is off.
+extern void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end);
+#endif
+
 enum AHMapIconID
 {
 	AH_MAP_ICON_WARPPAD = 0x31,
@@ -691,6 +700,14 @@ void AH_Map_Main(void)
 
 		D232.mapPriorityArrowDrawn = 0;
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		// Everything from the dots through the sheet allocates sequentially
+		// from primMem with nothing interleaved; the slide meter stays
+		// OUTSIDE the bracket -- it is gameplay HUD, not map content, and
+		// must keep drawing on the top screen when the map routes away.
+		uintptr_t hubMapPrimStart = (uintptr_t)gGT->backBuffer->primMem.cursor;
+#endif
+
 		UI_Map_DrawDrivers(map, gGT->threadBuckets[PLAYER].thread, &driverIconCounter);
 
 		AH_Map_Warppads(map, gGT->threadBuckets[WARPPAD].thread, &arrowCounter);
@@ -702,6 +719,10 @@ void AH_Map_Main(void)
 		               AH_MAP_SCREEN_POS_X, AH_MAP_SCREEN_POS_Y,
 
 		               &gGT->backBuffer->primMem, gGT->pushBuffer_UI.ptrOT, 1);
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		NativeGpu_MarkUiMapRange(hubMapPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor);
+#endif
 
 		UI_DrawSlideMeter(hud[AH_MAP_HUD_SLOT_SLIDE_METER].x, hud[AH_MAP_HUD_SLOT_SLIDE_METER].y, advDriver);
 	}
