@@ -555,6 +555,44 @@ void N3DS_SetTopContentFullWidth(int fullWidth);
  * docs/PAUSE_FREEZE_FRAME_DESIGN.md. */
 int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH);
 
+/* ------------------------------------------------ bottom-screen minimap --- */
+/* Second-screen pass for the in-race minimap (renderer's
+ * N3DS_DrawBottomMapPass, dumpreq 'btmmap'). Begin lazily creates the bottom
+ * render target (non-fatal: returns 0 when unavailable and the caller must
+ * skip -- same boots-without-it contract as the stereo right eye), switches
+ * drawing onto it for the rest of the frame, sets a full-panel viewport,
+ * re-asserts the frame's depth policy, binds the packet draw state, and
+ * uploads an ortho window of [left..right] x [top..bottom] PSX units (Y-down,
+ * top < bottom) -- the magnification IS the window, no vertex is touched. It
+ * also suppresses the debug console's bottom-screen painting for a few
+ * presents (the console resumes by itself once the pass goes quiet). End
+ * restores the stored top-screen projection: N3DS_C3DBeginFrame re-uploads
+ * the STORED matrix every frame and N3DS_C3DSetProjection only rebuilds it on
+ * a display-mode change, so leaving the window matrix in place would project
+ * every following top frame through the map window. Call strictly between
+ * N3DS_StereoRenderRightEye and N3DS_C3DEndFrame. The parallax uniform is
+ * left as the last eye set it, deliberately: every routed primitive carries a
+ * UI-band stamp, which the shader's own band mask flattens to zero shift. */
+int N3DS_BottomMapDraw_Begin(float left, float right, float top, float bottom);
+/* Re-aim the window between Begin and End (the FPS overlay's smaller window
+ * after the map's). Uniform sequencing is safe mid-frame: citro3d records the
+ * dirty uniform into the command list at the next draw, the same pattern the
+ * per-instance model uploads rely on. */
+void N3DS_BottomMapDraw_SetWindow(float left, float right, float top, float bottom);
+void N3DS_BottomMapDraw_End(void);
+/* Nonzero while the map pass holds the bottom panel. The stats drip painter
+ * must check this and hold off: console glyphs land in the shared framebuffer
+ * at PRINT time, so the present-side flush/swap suppression alone cannot stop
+ * text from scribbling over the map. Stats composition and the log mirror
+ * continue; only the console painting pauses, and the drip's own row rotation
+ * scrubs the map's pixels back off within one sweep after release. */
+int N3DS_BottomMapOwnsScreen(void);
+/* The single console-visibility answer for every glyph painter (the stats
+ * drip and Platform_Log's stdout echo): false while the map owns the panel,
+ * false once the game is presenting unless the stats console is toggled on
+ * (dumpreq 'stats'), true during boot so pre-game errors stay readable. */
+int N3DS_ConsolePaintAllowed(void);
+
 /* ---------------------------------------------------------------- input --- */
 
 #define N3DS_BTN_A      (1u << 0)
@@ -599,7 +637,7 @@ int N3DS_NetloadStreamActive(void);
  * makes -- see the policy note at Platform_LogWrite. */
 int N3DS_SdLogEnabled(void);
 
-/* Registers the emulated PSX VRAM buffer so the SELECT+R debug capture in
+/* Registers the emulated PSX VRAM buffer so the debug capture (dumpreq `capture`) in
  * N3DS_ReadButtons can write it to sdmc:/vramdump_<frame>.bin. Called once
  * from the renderer TU (which owns vram[]) since the backend TU can't see
  * that global. bytes is sizeof(vram). frameCounter points at the renderer's

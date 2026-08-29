@@ -451,20 +451,40 @@
 	; near-plane clip the REVERTED near-reject block above wished for: a
 	; straddling triangle is split at the plane, not discarded.
 	;
-	; The drawOrder tie-break rides in z_ndc units here (nearer = larger z,
-	; so it is subtracted): a constant z offset is a depth offset that scales
-	; with depth^2/B -- i.e. constant in DEPTH-BUFFER resolution at every
-	; distance, which is exactly what a coplanar tie-break wants. tie is r4.y
-	; = hParam.w * (drawOrder-128), negative for ground faces (pulled nearer).
+	; The drawOrder tie-break carries TWO terms because it has two jobs and no
+	; single unit does both. tie is r4.y = hParam.w * (drawOrder-128), negative
+	; for ground faces; both terms are subtracted, so a negative tie moves the
+	; face toward the camera.
+	;
+	;   z_ndc units, w*(pdFar - tie): a constant depth-BUFFER offset. Resolves
+	;   an exactly-coplanar pair at any distance, including past ~10k units
+	;   where buffer precision alone is several view units wide. Its world
+	;   equivalent is tie*depth^2/B, which vanishes near the eye.
+	;
+	;   view.z units, -(B/H)*tie/trueDepth: a constant WORLD offset -- what
+	;   retail's painter's order means, and what packet ground decals get from
+	;   g_dbg_decalNearBias. Overlay track faces (turbo pads, road markings) lie
+	;   flat on quadblocks whose centre vertex is displaced, so the road's own
+	;   relief rises through them by real world units; only a world offset
+	;   outranks that, and near the eye the z_ndc term is far too small to.
+	;
+	; The two are equal at depth = sqrt(B) ~ 1447 and each dominates on its own
+	; side of that. The view.z term is a per-vertex constant times 1/trueDepth
+	; (r9.x, clamped for the stereo rcp above) and never a function of w, so
+	; S.z stays affine in w and an eye-straddling edge keeps the single
+	; near-plane crossing the leg above depends on.
 	; hParam.x = H is guarded >= 1 so the rcp stays finite. r3 is dead here.
 	mov r3.x, hParam.xxxx               ; H (a mov may read the uniform bank)
 	max r3.x, ones, r3.x                ; H >= 1 (const src1, temp src2)
 	rcp r3.x, r3.x                      ; 1/H
 	mul r3.x, pdScale, r3.x             ; B/H
 	mul r3.y, negOne, r4.y              ; -tie
+	mul r3.z, r3.y, r9.x                ; -tie/trueDepth (both temps, order-free)
+	mul r3.z, r3.z, r3.x                ; -(B/H)*tie/trueDepth -- view.z-unit term
 	add r3.y, pdFar, r3.y               ; pdFar - tie
 	mul r3.y, r1.z, r3.y                ; w*(pdFar - tie)
-	add r3.x, r3.x, r3.y                ; S.z_true = B/H + w*(pdFar - tie)
+	add r3.x, r3.x, r3.y                ; B/H + w*(pdFar - tie)
+	add r3.x, r3.x, r3.z                ; S.z_true, both tie terms applied
 
 	; ORDINAL leg (legacy A/B, packetdepth off): zOrd is an emit ordinal, not a
 	; depth, so it takes the same B/d + pdFar map through a clamped rcp (no

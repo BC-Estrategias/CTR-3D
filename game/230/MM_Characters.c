@@ -1,5 +1,13 @@
 #include <common.h>
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+// Register the diorama backdrop strips' packet span so the 3DS walk pins them
+// to the far depth plane (they are screen-space quads with no captured depth,
+// layered by retail purely by OT slot). Same local-extern idiom as
+// MM_TrackSelect.c's NativeGpu_MarkUiPicRange.
+extern void NativeGpu_MarkMenuBackdropRange(uintptr_t start, uintptr_t end);
+#endif
+
 enum
 {
 	MM_CHARACTER_SELECT_SCREEN_W = 0x200,
@@ -1201,7 +1209,15 @@ dontDrawSelectCharacter:
 		drawRect.x = 0;
 		drawRect.y = 0;
 
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		uintptr_t backdropPrimStart = (uintptr_t)gGT->backBuffer->primMem.cursor;
+#endif
+
 		RECTMENU_DrawRwdBlueRect(&drawRect, &D230.characterSelect_BlueRectColors[0], &gGT->pushBuffer[playerIndex].ptrOT[0x3ff], &gGT->backBuffer->primMem);
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+		NativeGpu_MarkMenuBackdropRange(backdropPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor);
+#endif
 	}
 	return;
 }

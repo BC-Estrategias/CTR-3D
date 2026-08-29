@@ -35,6 +35,30 @@ global_variable u64 s_otagParseTicks;
 global_variable u64 s_otagSplitsTicks;
 global_variable unsigned int s_otagSplitCalls;
 
+/* Never-reset cumulative twins of the above, for the spike catcher: it peeks
+ * these each frame and deltas them, so it needs values TakeOtagSplit does not
+ * zero out from under it. Lets a worker-spike line say whether the ~47ms was
+ * the walk (parse/splits) or the GPU-sync remainder. */
+global_variable u64 s_otagPatchCum;
+global_variable u64 s_otagParseCum;
+global_variable u64 s_otagSplitsCum;
+
+void NativeOtag_PeekWalkTicks(u64 *patch, u64 *parse, u64 *splits)
+{
+	if (patch != NULL)
+	{
+		*patch = s_otagPatchCum;
+	}
+	if (parse != NULL)
+	{
+		*parse = s_otagParseCum;
+	}
+	if (splits != NULL)
+	{
+		*splits = s_otagSplitsCum;
+	}
+}
+
 void NativePerf_TakeOtagSplit(struct NativeOtagSplitStats *out)
 {
 	const u64 freq = SDL_GetPerformanceFrequency();
@@ -520,9 +544,12 @@ void CtrGpu_ExecDrawOTag(void *p)
 #ifdef CTR_INTERNAL
 	{
 		const u64 patchStart = SDL_GetPerformanceCounter();
+		u64 patchDelta;
 
 		NativeTrackAnim_PatchFrame();
-		s_otagPatchTicks += SDL_GetPerformanceCounter() - patchStart;
+		patchDelta = SDL_GetPerformanceCounter() - patchStart;
+		s_otagPatchTicks += patchDelta;
+		s_otagPatchCum += patchDelta;
 	}
 #else
 	NativeTrackAnim_PatchFrame();
@@ -553,11 +580,16 @@ void CtrGpu_ExecDrawOTag(void *p)
 			const u64 parseStart = SDL_GetPerformanceCounter();
 			u64 splitsStart;
 
+			u64 splitsEnd;
+
 			ParsePrimitivesLinkedList((uint32_t *)p, 0);
 			splitsStart = SDL_GetPerformanceCounter();
 			s_otagParseTicks += splitsStart - parseStart;
+			s_otagParseCum += splitsStart - parseStart;
 			DrawAllSplits();
-			s_otagSplitsTicks += SDL_GetPerformanceCounter() - splitsStart;
+			splitsEnd = SDL_GetPerformanceCounter();
+			s_otagSplitsTicks += splitsEnd - splitsStart;
+			s_otagSplitsCum += splitsEnd - splitsStart;
 		}
 #else
 		ParsePrimitivesLinkedList((uint32_t *)p, 0);

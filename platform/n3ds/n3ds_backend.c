@@ -252,12 +252,10 @@ void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count)
 }
 
 /*
- * SELECT+R VRAM capture (CTR_INTERNAL, texture-corruption diagnostic). The
- * renderer TU owns vram[] but can't do the SELECT+R button
- * check (libctru's hid* live only in this TU); this TU can't see vram[]. So
- * the renderer registers the buffer pointer once and the button check +
- * fwrite happen here, in N3DS_ReadButtons, where hidScanInput() has already
- * run this frame.
+ * VRAM debug capture (CTR_INTERNAL, texture-corruption diagnostic; part of
+ * the dumpreq `capture` set). The renderer TU owns vram[] but the trigger
+ * plumbing lives in this TU, which can't see vram[]. So the renderer
+ * registers the buffer pointer once and the trigger + fwrite happen here.
  */
 static const void *s_dumpVramPtr = NULL;
 static unsigned int s_dumpVramBytes = 0;
@@ -385,8 +383,68 @@ void N3DS_GfxExit(void)
  */
 int g_dbg_fastPresent = 1;
 
+/* Bottom-screen minimap present-side TTL -- declared up here because
+ * N3DS_GfxPresent consumes it; set by N3DS_BottomMapDraw_Begin (much further
+ * down, with the rest of that pass's state). */
+static int s_bottomMapOwnFrames = 0;
+/* Armed at the first present: from then on the console only paints when the
+ * stats toggle asks for it (release posture -- the bottom panel stays black
+ * outside the map). Anything printed BEFORE the first present (boot banners,
+ * an asset error that aborts before the game runs) stays on screen. */
+static int s_consoleQuietArmed = 0;
+
+/*
+ * Single console-visibility answer for every glyph painter: the stats drip
+ * (native_renderer_3ds.c) and Platform_Log's stdout echo (native_log.c).
+ * Glyphs land in the shared bottom framebuffer at PRINT time, so visibility
+ * must be enforced where text is painted, not at present/flush time.
+ */
+int N3DS_ConsolePaintAllowed(void)
+{
+	extern int g_dbg_statsConsole; /* renderer TU, dumpreq 'stats' */
+
+	if (s_bottomMapOwnFrames > 0)
+	{
+		return 0; /* the map owns the panel */
+	}
+	if (g_dbg_statsConsole)
+	{
+		return 1; /* dev sitting */
+	}
+	return !s_consoleQuietArmed; /* boot text until the game presents */
+}
+
 void N3DS_GfxPresent(void)
 {
+	/*
+	 * Bottom-screen minimap owns the panel: C3D_FrameEnd's display transfer is
+	 * presenting the bottom screen on those frames, and the console's text
+	 * shares the same single-buffered framebuffer -- flushing/swapping for the
+	 * console here would scribble stale text over the map. The TTL (set by
+	 * N3DS_BottomMapDraw_Begin) expires within a few presents of the map pass
+	 * going quiet, and the console resumes untouched.
+	 */
+	if (!s_consoleQuietArmed)
+	{
+		/* First present: the game is running, so wipe the boot text and go
+		 * quiet (see the flag's comment). One-shot. */
+		s_consoleQuietArmed = 1;
+		consoleClear();
+	}
+	if (s_bottomMapOwnFrames > 0)
+	{
+		s_bottomMapOwnFrames--;
+		if (s_bottomMapOwnFrames == 0)
+		{
+			/* The map just released the panel and (with the stats console off)
+			 * nothing else will ever repaint it -- wipe the dead map frame so
+			 * the bottom screen returns to black rather than freezing. With
+			 * stats ON the drip repaints its rows over the cleared screen. */
+			consoleClear();
+		}
+		return;
+	}
+
 	/*
 	 * Only the bottom screen's console framebuffer goes through this path.
 	 * The generic gfxSwapBuffers() swaps every screen's buffers, which would
@@ -604,15 +662,23 @@ static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange 
 
 /*
  * The track's drawOrder tie-break weight, in view.z units per drawOrder step,
- * uploaded as hParam.w (docs/GROUND_DECAL_PASS_DESIGN.md 3/4). Default 1.0:
- * an ablation to 0 (removing the term) was tested and the ground decals
- * stayed buried, so the drawOrder term is not the burial mechanism. The knob
- * remains as the cheapest way to size any future decal-side offset.
+ * uploaded as hParam.w (docs/GROUND_DECAL_PASS_DESIGN.md 3/4).
+ *
+ * What an overlay face has to outrank is not the flat plane of the face below
+ * it but that face's RELIEF -- a quadblock's centre vertex is displaced, so
+ * the road rises through a flat turbo pad or road marking by real world units.
+ * The weight must therefore exceed the relief, measured at 6: a Caves turbo
+ * pad shows ground through itself at 4 and is clean at 6.
+ *
+ * The shove is per-face and global -- weight * that face's signed drawOrder
+ * byte -- so the ceiling below, not this number, is what keeps an extreme
+ * drawOrder from pulling a road face in front of the karts standing on it.
  * File-scope rather than a shared g_dbg_* because both readers (this uniform
  * write and the dumpreq token) live in this TU, which is its own TU so the
  * unity-build tentative-definition collision hazard does not apply here.
  */
-static float s_trackDrawOrderWeight = 1.0f;
+#define N3DS_TRACK_DRAWORDER_WEIGHT_DEFAULT 6.0f
+static float s_trackDrawOrderWeight = N3DS_TRACK_DRAWORDER_WEIGHT_DEFAULT;
 static int s_trackULocUvOffset = -1, s_trackULocStereo = -1;
 /* Memo for the blend pass's depth-write state, so a frame with no semi-
  * transparent content pays nothing and a frame with some flips the pair exactly
@@ -697,8 +763,8 @@ static int s_trackDrawActive = 0;
 /*
  * See n3ds_backend.h's stereo block for the design. State here, in the order
  * it is used: master toggle and tuning (dumpreq `stereo`/`stereosep`/
- * `stereoconv`), the per-frame latch, the per-eye parallax vectors, and the
- * draw journal the right eye replays.
+ * `stereoconv`/`stereopop`), the per-frame latch, the per-eye parallax
+ * vectors, and the draw journal the right eye replays.
  *
  * The parallax model is p = k * (1 - convergence/depth) in PSX screen pixels,
  * on the shared view.z axis all three geometry sources sit on. Content AT the
@@ -733,6 +799,13 @@ int g_dbg_stereoWindow = 0;
 static C3D_RenderTarget *s_renderTargetRight = NULL;
 static float s_stereoSep = 12.0f;    /* k*2 at full slider: total left/right disparity at infinite depth, PSX px */
 static float s_stereoConv = 1200.0f; /* view.z units at screen depth (just beyond the player kart's ~256..2278 band) */
+/* Pop-out clamp, as a multiple of the at-infinity shift k. 65536 means
+ * uncapped: |p|/k = conv/d - 1 can never exceed it (conv's dumpreq clamp
+ * tops out at 60000 and the shader floors d at 1), and 65536 * kMax still
+ * fits PICA float24. dumpreq `stereopop N`; SELECT+D-LEFT toggles this
+ * value capped <-> uncapped mid-race. */
+#define N3DS_STEREO_POP_UNCAPPED 65536.0f
+static float s_stereoPopMul = 2.0f;
 static int s_stereoFrameActive = 0;  /* latched once per frame in N3DS_C3DBeginFrame */
 static int s_stereoRecording = 0;    /* journal writes enabled: active frame, and cleared for
                                       * the replay so re-entered functions cannot re-record */
@@ -832,16 +905,19 @@ static int N3DS_StereoPacketDepthActive(void)
 
 /* Fills one eye's (k, k*conv, clampLo, clampHi). The clamp band is
  * asymmetric on purpose: pop-out (disparity crossed in front of the screen)
- * is allowed up to 2x the at-infinity shift, then stops -- unbounded pop-out
- * from very-near content (behind-eye track clamped to depth 256, exhaust in
- * the camera) is the classic eye-stabbing failure of layered stereo. */
+ * is allowed up to s_stereoPopMul times the at-infinity shift (default 2x),
+ * then stops -- unbounded pop-out from very-near content (behind-eye track
+ * clamped to depth 256, exhaust in the camera) is the classic eye-stabbing
+ * failure of layered stereo. The into-screen bound stays at absK because
+ * p = k*(1 - C/d) approaches k from below: that side is the curve's own
+ * asymptote and never engages. */
 static void N3DS_StereoEyeVec(float k, float *out4)
 {
 	const float absK = (k < 0.0f) ? -k : k;
 	/* Window mode zeroes the crossed-disparity (pop-out) side of the clamp
 	 * band; content nearer than the convergence depth pins to the screen
 	 * plane instead of popping out and folding (see g_dbg_stereoWindow). */
-	const float popOut = g_dbg_stereoWindow ? 0.0f : (2.0f * absK);
+	const float popOut = g_dbg_stereoWindow ? 0.0f : (s_stereoPopMul * absK);
 
 	out4[0] = k;
 	out4[1] = k * s_stereoConv;
@@ -992,8 +1068,9 @@ void N3DS_StereoRecordVram(int slot, int baseVertex)
  * read it across the plain-scalar TU boundary.
  *
  * Default 2 (REAL widescreen): the port boots widescreen by default.
- * SELECT+D-DOWN cycles off<->REAL, and dumpreq `wide`/`wide 1` reach all
- * three states including the anamorphic stretch. The known-open margin
+ * The SELECT+START master flips it with the rest of the renderer config;
+ * dumpreq `wide`/`wide 1` reaches all three states including the anamorphic
+ * stretch. The known-open margin
  * classes (game-side 4:3 PVS/frustum culling holes, kart pop-in at the
  * margin edges, full-screen fades not covering the margins) are unchanged by
  * this -- promoting the default does not close them, it just stops hiding
@@ -1440,8 +1517,7 @@ static void N3DS_FrameTrace(const char *msg)
  *
  * State 1 vs 2 is the whole point -- 1 asks "is it depth at all", 2 asks "is it
  * OUR depth". Runtime, because the answer is worth more than a rebuild cycle:
- * dumpreq `depthtest [N]` in Azahar, SELECT+ZL on hardware (a dumpreq file
- * cannot be placed mid-race).
+ * dumpreq `depthtest [N]`.
  */
 int g_dbg_depthTest = 0;
 
@@ -1453,8 +1529,8 @@ int g_dbg_depthTest = 0;
  * Lives in THIS translation unit like g_dbg_depthTest, because both of its
  * readers (the hParam uniform write and the dumpreq handler) are here.
  *
- * dumpreq `nearfar` only -- deliberately NOT a button. Every existing chord is
- * taken, and unlike a perf A/B this one does not need a mid-race flip: the
+ * dumpreq `nearfar` only -- deliberately NOT a button. Unlike a perf A/B,
+ * this one does not need a mid-race flip: the
  * sink is visible in a still frame, so booting once each way settles it, and a
  * dumpreq IS placeable before launch even on hardware.
  *
@@ -1500,8 +1576,7 @@ static int N3DS_NextPktBias(int cur)
  * the 30fps cap is enforced by the game itself (ReadyToFlip counts the
  * emulated 60Hz clock, not phase-locked to the panel) and presentation is
  * vblank-latched by GSP regardless, so nothing tears without it. 1 = align,
- * 0 = begin the moment the GPU is free. Runtime A/B: SELECT+B on hardware,
- * dumpreq `framesync` in Azahar.
+ * 0 = begin the moment the GPU is free. Runtime A/B: dumpreq `framesync`.
  *
  * Default 0: hardware-measured, Tubes mono 41->34.7ms, stereo 49->36.2ms --
  * most of stereo's extra frame cost was this wait rounding frames up to the
@@ -1785,8 +1860,8 @@ void N3DS_C3DUploadDecodedSubCell(int atlasIndex, int physCellX, int physCellY, 
 #ifdef CTR_INTERNAL
 /* Dumps every atlas texture's raw (8x8-Morton-tiled RGBA5551) linear storage to
  * sdmc:/atlas_<i>.bin for the texture-corruption investigation.
- * Un-swizzled + rendered on the host. Triggered by SELECT+R alongside the VRAM
- * dump so both capture the same frame. s_atlasTextures[].data is CPU-written by
+ * Un-swizzled + rendered on the host. Runs inside the dumpreq `capture` set
+ * alongside the VRAM dump so both capture the same frame. s_atlasTextures[].data is CPU-written by
  * the decode (N3DS_C3DUploadTileBlock), so it is CPU-readable here. */
 static void N3DS_DebugWriteAtlasDump(void)
 {
@@ -1882,7 +1957,7 @@ void N3DS_TrackAtlas_Free(void)
  * Applied at alloc and live-reapplied by N3DS_TrackAtlas_ApplyFilter -- the
  * filter lives in the C3D_Tex object and is read at bind, so the flip is a
  * field write with no re-upload, safe mid-race. */
-int g_dbg_trackBilinear = 1;
+int g_dbg_trackBilinear = 0;
 
 int N3DS_TrackAtlas_Alloc(int unitCount)
 {
@@ -2232,7 +2307,7 @@ void N3DS_TrackGeom_PatchPosColor(const unsigned short *vertIndices, const short
 	}
 }
 
-/* Backface culling for the track (dumpreq 'bfcull', chord SELECT+Y): 0 = off
+/* Backface culling for the track (dumpreq 'bfcull'): 0 = off
  * (draw every face), 1 = cull GPU back-faces, 2 = cull front-faces. Applied
  * per-frame in N3DS_TrackDraw_Begin, undone in _End. Default 1: culling
  * matches retail, is near-free, and removes erroneous back-facing geometry
@@ -3025,6 +3100,167 @@ void N3DS_ModelDraw_End(void)
  * glBlendFuncSeparate): the framebuffer alpha carries nothing this renderer
  * reads, and blending it with the RGB factors could only corrupt it.
  */
+/* ------------------------------------------------ bottom-screen minimap --- */
+/*
+ * Second-screen pass for the in-race minimap -- see the header's contract
+ * comment. Same non-fatal target-allocation policy as the stereo right eye:
+ * a console that cannot allocate it keeps the map on the top screen and says
+ * so once.
+ *
+ * The transfer's OUT format must match the framebuffer format the LCD is
+ * actually scanning, queried at runtime -- NOT assumed. consoleInit owns the
+ * bottom screen's format and libctru is free to pick a 16-bit one; a
+ * bytes-per-pixel mismatch between what the transfer writes and what the LCD
+ * reads shows as the map interlaced with itself in vertical stripes, 2-3
+ * ghost copies down the panel (observed live on the first Azahar sitting,
+ * with an RGB8-out transfer assumed from a stale comment).
+ *
+ * While this pass owns the screen the debug console must not paint: console
+ * text lands in the SAME single-buffered framebuffer the display transfer
+ * fills, so a row repainted between transfers would scribble over the map.
+ * s_bottomMapOwnFrames is a short present-side TTL rather than an exact
+ * handshake because present and the render frame run on different threads;
+ * it self-heals back to the console within a few presents of the map going
+ * quiet (menus, race end, 'btmmap' off).
+ */
+static C3D_RenderTarget *s_renderTargetBottom = NULL;
+static int s_bottomTargetFailed = 0;
+static C3D_Mtx s_bottomSavedProjection;
+/* s_bottomMapOwnFrames (the present-side TTL) is declared beside
+ * N3DS_GfxPresent, its consumer. */
+
+static u32 N3DS_BottomTransferFlags(void)
+{
+	const GSPGPU_FramebufferFormat fmt = gfxGetScreenFormat(GFX_BOTTOM);
+	u32 out;
+
+	switch (fmt)
+	{
+	case GSP_RGBA8_OES:
+	{
+		out = GX_TRANSFER_FMT_RGBA8;
+		break;
+	}
+	case GSP_BGR8_OES:
+	{
+		out = GX_TRANSFER_FMT_RGB8;
+		break;
+	}
+	case GSP_RGB565_OES:
+	{
+		out = GX_TRANSFER_FMT_RGB565;
+		break;
+	}
+	case GSP_RGB5_A1_OES:
+	{
+		out = GX_TRANSFER_FMT_RGB5A1;
+		break;
+	}
+	case GSP_RGBA4_OES:
+	default:
+	{
+		out = GX_TRANSFER_FMT_RGBA4;
+		break;
+	}
+	}
+	{
+		char msg[96];
+
+		snprintf(msg, sizeof(msg), "[CTR-3DS] btmmap: bottom fb format=%d -> transfer out fmt=%d", (int)fmt, (int)out);
+		N3DS_DebugLog(msg);
+	}
+	return GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) | GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
+	       GX_TRANSFER_OUT_FORMAT(out) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO);
+}
+
+/* Nonzero while the map pass holds the bottom panel -- the stats drip
+ * (N3DS_StatsDripRow, renderer TU) must not paint console rows over it;
+ * suppressing the flush/swap in N3DS_GfxPresent alone is not enough, because
+ * console glyphs are written into the shared framebuffer at print time. */
+int N3DS_BottomMapOwnsScreen(void)
+{
+	return s_bottomMapOwnFrames > 0;
+}
+
+int N3DS_BottomMapDraw_Begin(float left, float right, float top, float bottom)
+{
+	if (s_renderTargetBottom == NULL)
+	{
+		if (s_bottomTargetFailed)
+		{
+			return 0;
+		}
+		s_renderTargetBottom = C3D_RenderTargetCreate(240, 320, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+		if (s_renderTargetBottom == NULL)
+		{
+			s_bottomTargetFailed = 1;
+			N3DS_DebugLog("[CTR-3DS] btmmap: bottom render target FAILED to allocate, minimap stays on top");
+			return 0;
+		}
+		C3D_RenderTargetSetOutput(s_renderTargetBottom, GFX_BOTTOM, GFX_LEFT, N3DS_BottomTransferFlags());
+	}
+
+	/* Queued clear before any bottom draw; every draw this frame executes at
+	 * FrameEnd's command list, after this fill -- the same ordering
+	 * N3DS_C3DBeginFrame's own clears rely on. Depth clears to far
+	 * (LEQUAL + clear-to-max polarity, see BeginFrame). */
+	C3D_RenderTargetClear(s_renderTargetBottom, C3D_CLEAR_ALL, 0x000000FF, 0x00FFFFFF);
+	C3D_FrameDrawOn(s_renderTargetBottom);
+	/* Viewport does not follow the framebuffer binding (same note as the right
+	 * eye); full 320x240 panel, stored sideways like every 3DS target. */
+	C3D_SetViewport(0, 0, 240, 320);
+	/* Frame-wide depth pair, mirroring BeginFrame's policy -- whatever the
+	 * right-eye replay's last draw left behind is not it. */
+	if (g_dbg_depthTest == 1)
+	{
+		C3D_DepthTest(true, GPU_ALWAYS, GPU_WRITE_ALL);
+	}
+	else
+	{
+		C3D_DepthTest(true, GPU_LEQUAL, GPU_WRITE_ALL);
+	}
+	/* Packet program/layout/buffer/combiner + projection + parallax re-upload.
+	 * The parallax vector is whichever eye ran last -- irrelevant here: every
+	 * routed primitive carries a UI-band stamp, which the shader's band mask
+	 * flattens to zero shift. */
+	N3DS_BindPacketDrawState();
+	/* The display window: same ortho construction as N3DS_C3DSetProjection but
+	 * with a non-zero top and NO widescreen extension -- the window is fitted
+	 * to the map's own rect, aspect-corrected by the caller. Saved/restored
+	 * around the pass because BeginFrame re-uploads the STORED matrix every
+	 * frame while SetProjection only rebuilds it on a display-mode change. */
+	Mtx_Copy(&s_bottomSavedProjection, &s_projection);
+	Mtx_OrthoTilt(&s_projection, left, right, bottom, top, -32769.0f, 32769.0f, true);
+	if (s_uLocProjection >= 0)
+	{
+		C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
+	}
+
+	s_bottomMapOwnFrames = 3;
+	return 1;
+}
+
+/* Re-aim the ortho window mid-pass (the FPS overlay draws through a smaller,
+ * non-magnifying window after the map's). Only valid between Begin and End;
+ * Begin already saved the real projection and End restores it. */
+void N3DS_BottomMapDraw_SetWindow(float left, float right, float top, float bottom)
+{
+	Mtx_OrthoTilt(&s_projection, left, right, bottom, top, -32769.0f, 32769.0f, true);
+	if (s_uLocProjection >= 0)
+	{
+		C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
+	}
+}
+
+void N3DS_BottomMapDraw_End(void)
+{
+	Mtx_Copy(&s_projection, &s_bottomSavedProjection);
+	if (s_uLocProjection >= 0)
+	{
+		C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uLocProjection, &s_projection);
+	}
+}
+
 /*
  * The right eye: replay the frame's journal against the right target with the
  * right eye's parallax vectors. Called by NativeRenderer_EndScene after every
@@ -3271,7 +3507,7 @@ void NativeRenderer3DS_DebugDumpCacheMeta(void);
 
 void NativeRenderer3DS_DebugArmTriangleDump(void);
 
-/* Runs the full SELECT+R capture set: emulated VRAM, every atlas's raw
+/* Runs the full debug capture set (dumpreq `capture`): emulated VRAM, every atlas's raw
  * storage, and both decode-cache tiers' metadata, all describing the same
  * instant, plus arms a per-triangle dump of the NEXT frame (page/clut/UV/
  * position/atlas-resolution per triangle -- the addressing-side complement
@@ -3317,6 +3553,12 @@ unsigned int N3DS_ReadButtons(void)
 	 *   pentapal [N] -- opt-in: give Penta his PAL/Japan max-stats (5/5/5) class
 	 *                  instead of the NTSC-U Turn class. Bare token toggles, N sets
 	 *                  0/1. Off = retail NTSC-U. Applied at kart birth.
+	 *   reserves [N] -- boost-reserves HUD meter by the retail slide bar
+	 *                  (DEFAULT ON). Bare token toggles, N sets 0/1.
+	 *   tirefix [N] -- fix retail's mirrored-tire delay-slot bug so ice
+	 *                  reflections show wheels at the corners (DEFAULT ON).
+	 *                  OFF = the shipped PS1 centerline tires. Bare token
+	 *                  toggles, N sets 0/1.
 	 *   renderthread -- toggle g_dbg_renderThread (core-2 render worker routing;
 	 *                  OFF falls back to synchronous main-thread rendering)
 	 *   lodgeo [N]  -- track LOD distance, percent of retail (CTR_NATIVE_LOD_BIAS)
@@ -3328,9 +3570,8 @@ unsigned int N3DS_ReadButtons(void)
 	 *   trackrender [N] -- native track renderer state (CTR_NATIVE_TRACK_RENDERER
 	 *                  builds only): 0=off(retail) 1=on(resident replaces retail)
 	 *                  2=both(diagnostic overlay). Bare token cycles 0->1->2->0;
-	 *                  'trackrender N' sets a specific state. Also reachable on
-	 *                  hardware via SELECT+ZR (a dumpreq file can't be placed
-	 *                  mid-race there -- see the button handler below).
+	 *                  'trackrender N' sets a specific state. The SELECT+START
+	 *                  master flips it with the rest of the renderer config.
 	 *   weld        -- toggle g_dbg_trackWeld, the track mesh's T-junction weld
 	 *                  (DEFAULT OFF; it bends plank and trestle geometry rather
 	 *                  than repairing cracks). Read during the mesh build, so
@@ -3340,11 +3581,12 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  [TRKWELD] reports count and displacement histogram.
 	 *   packetdepth -- toggle g_dbg_packetDepth (depth model): packets stamp
 	 *                  GTE sz3 and the track shader switches to the same
-	 *                  true-depth axis, both at once. Hardware button: SELECT+L.
+	 *                  true-depth axis, both at once. Button: folded into the
+	 *                  SELECT+START master.
 	 *   gtecapture [N] -- g_dbg_gteCapture (CTR_NATIVE_GTE_CAPTURE builds):
 	 *                  1=full 2=store-only(no matrix note) 0=ablated, to price
 	 *                  the capture subsystem and its matrix probe separately.
-	 *                  Bare token cycles 1->2->0. Hardware button: SELECT+D-UP.
+	 *                  Bare token cycles 1->2->0.
 	 *   strictmtx   -- toggle g_dbg_pktDepthStrictMtx: a primitive whose
 	 *                  vertices resolve to two different matrix states is
 	 *                  treated as a miss instead of trusting a foreign depth.
@@ -3361,14 +3603,18 @@ unsigned int N3DS_ReadButtons(void)
  *                  (default 12; negative swaps the eyes; bare resets)
  *   stereoconv [N] -- screen-plane depth, view.z units (default 1200;
  *                  bare resets)
+ *   stereopop [N] -- pop-out clamp as a multiple of the at-infinity shift
+ *                  (default 2; 0 pins near content to the screen, 65536 =
+ *                  uncapped; bare resets). Button: SELECT+D-LEFT toggles
+ *                  capped <-> uncapped.
  *   depthtest [N] -- g_dbg_depthTest, the occlusion split: 0=normal
 	 *                  1=no depth test (painter's order) 2=track tests but
 	 *                  does not write depth. Bare token cycles 0->1->2->0.
-	 *                  Hardware button: SELECT+ZL.
 	 *   wide [N]    -- g_dbg_widescreen: bare toggles off<->REAL (mode 2,
 	 *                  wide FOV window at 4:3 pixel scale); `wide 1` is the
-	 *                  rejected anamorphic stretch. Button: SELECT+D-DOWN.
-	 *   bilinear    -- toggle g_dbg_trackBilinear (default ON): track-atlas
+	 *                  rejected anamorphic stretch. Button: folded into the
+	 *                  SELECT+START master.
+	 *   bilinear    -- toggle g_dbg_trackBilinear (default OFF): track-atlas
 	 *                  sampler bilinear <-> nearest. Live, no rebuild.
 	 *                  Button: SELECT+D-RIGHT.
 	 *   alpharef N  -- punch-through cutoff 0-255 (g_dbg_trackAlphaRef, default
@@ -3378,7 +3624,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  split-screen, and off keeps VS/battle behind retail's
 	 *                  own controller gate): `padmux N` drives pad N with the
 	 *                  3DS buttons, 0 = off (retail single-pad bus), bare =
-	 *                  cycle the driven pad. Button: SELECT+ZR.
+	 *                  cycle the driven pad.
 	 *   vol [N]     -- output-stage gain, percent of SPU-faithful amplitude
 	 *                  (retail's 0x3fff master is half digital scale, so 200
 	 *                  = full scale and the default). Bare resets to default.
@@ -3458,6 +3704,14 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_sdLog ^= 1;
 					N3DS_DebugLog(g_dbg_sdLog ? "[CTR-3DS] sdlog: ON (writing ctr3ds.log -- costs a ~2s hitch)"
 					                          : "[CTR-3DS] sdlog: off (no SD writes; bottom screen still live)");
+				}
+				else if (strncmp(word, "syncdecode", 10) == 0)
+				{
+					extern int g_dbg_hwSyncDecode;
+
+					g_dbg_hwSyncDecode ^= 1;
+					N3DS_DebugLog(g_dbg_hwSyncDecode ? "[CTR-3DS] syncdecode: ON (full decode at key-on, pre-chunking behavior)"
+					                                 : "[CTR-3DS] syncdecode: off (head chunk at key-on, audio thread pumps the rest)");
 				}
 				else if (strncmp(word, "fastpresent", 11) == 0)
 				{
@@ -3691,7 +3945,7 @@ unsigned int N3DS_ReadButtons(void)
 					 * connected so VS/battle player counts open up; the 3DS
 					 * buttons drive one selectable pad. `padmux 0` = off
 					 * (retail single-pad bus), `padmux N` = drive pad N, bare
-					 * = cycle the driven pad. Chord: SELECT+ZR. */
+					 * = cycle the driven pad. */
 					extern int Platform_InputDebugPadMux(int op);
 					const char *arg = word + 6;
 					int op = -1;
@@ -3804,6 +4058,46 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_uiLast ? "[CTR-3DS] ui-last: ON (UI pass draws last of all)"
 					                           : "[CTR-3DS] ui-last: off (UI pass draws right after the merge barrier)");
 				}
+				else if (strncmp(word, "stats", 5) == 0)
+				{
+					extern int g_dbg_statsConsole;
+
+					/* Bottom-console visibility (release default OFF): the
+					 * stats drip and Platform_Log's stdout echo both paint
+					 * again while ON. Log/SD/netload sinks are unaffected
+					 * either way. */
+					g_dbg_statsConsole ^= 1;
+					N3DS_DebugLog(g_dbg_statsConsole ? "[CTR-3DS] stats console: ON (bottom panel shows stats + log echo)"
+					                                 : "[CTR-3DS] stats console: off (bottom panel quiet outside the map)");
+				}
+				else if (strncmp(word, "btmmap", 6) == 0)
+				{
+					extern int g_dbg_btmMap;
+
+					/* Bottom-screen minimap. ON restamps the in-race map block
+					 * one below the UI pin and replays it on the bottom render
+					 * target, magnified; the debug console yields the panel
+					 * while the map is live. OFF leaves every stamp at the pin
+					 * and the map draws on the top screen exactly as before --
+					 * and the console (stats block) gets the panel back. */
+					g_dbg_btmMap ^= 1;
+					N3DS_DebugLog(g_dbg_btmMap ? "[CTR-3DS] btmmap: ON (minimap on the bottom screen)"
+					                           : "[CTR-3DS] btmmap: off (minimap on the top screen, console restored)");
+				}
+				else if (strncmp(word, "amnesia", 7) == 0)
+				{
+#ifdef CTR_NATIVE_OTWALK_PROFILE
+					extern int g_dbg_amnesia;
+
+					/* Cache-collapse probe: arms the [AMNESIA] episode logger
+					 * in the OT-walk fold (profile builds only). */
+					g_dbg_amnesia ^= 1;
+					N3DS_DebugLog(g_dbg_amnesia ? "[CTR-3DS] amnesia probe: ON ([AMNESIA] episodes to the instrument log)"
+					                            : "[CTR-3DS] amnesia probe: off");
+#else
+					N3DS_DebugLog("[CTR-3DS] amnesia probe: not in this build (needs CTR_NATIVE_OTWALK_PROFILE)");
+#endif
+				}
 				else if (strncmp(word, "uipop", 5) == 0)
 				{
 					/* How far UI pops out of the screen, as a percent of this
@@ -3841,6 +4135,44 @@ unsigned int N3DS_ReadButtons(void)
 					 * contents on the next frame. Needs the SD log on. */
 					g_dbg_uiDump = 1;
 					N3DS_DebugLog("[CTR-3DS] ui-dump: armed (next frame)");
+				}
+				else if (strncmp(word, "rainscale", 9) == 0)
+				{
+					/* Rain-density dial (RenderWeather): 'rainscale N' scales the
+					 * per-frame rain particle count to N percent of full retail
+					 * density; bare or out-of-range resets to 100. A confirmation
+					 * instrument for the Tiger-Temple rain cost -- 'rainscale 0'
+					 * is rain OFF, so a pre-launch A/B proves whether the rain is
+					 * the shortfall. Thinning the rain is NOT the intended fix; a
+					 * batched native rain path that keeps full density is. */
+					extern int N3DS_WeatherSetRainScale(int pct);
+					const char *arg = word + 9;
+					int pct = -1;
+					char msg[80];
+
+					while ((*arg == ' ') || (*arg == '\t'))
+					{
+						arg++;
+					}
+					if ((*arg >= '0') && (*arg <= '9'))
+					{
+						pct = atoi(arg);
+					}
+					pct = N3DS_WeatherSetRainScale(pct);
+					snprintf(msg, sizeof(msg), "[CTR-3DS] rain density: %d%% (0 = rain off, 100 = full)", pct);
+					N3DS_DebugLog(msg);
+				}
+				else if (strncmp(word, "spikes", 6) == 0)
+				{
+					/* Spike catcher (native_perf.c): flush the buffered
+					 * dropped-frame records to sdmc:/ctr_spikes.log now. The ring
+					 * also auto-flushes on every level change, so a race's spikes
+					 * land when you return to the menu -- this is just the manual
+					 * grab (e.g. from a pause) with the SD log OFF. */
+					extern void NativePerf_DumpSpikesNow(void);
+
+					NativePerf_DumpSpikesNow();
+					N3DS_DebugLog("[CTR-3DS] spike catcher: buffer flushed to sdmc:/ctr_spikes.log");
 				}
 #ifdef CTR_NATIVE_TRACK_RENDERER
 				else if (strncmp(word, "bfcull", 6) == 0)
@@ -4016,6 +4348,28 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_stereoWindow ? "[CTR-3DS] stereo window mode: ON (no pop-out, world starts at the screen)"
 					                                 : "[CTR-3DS] stereo window mode: off (pop-out allowed, clamped)");
 				}
+				else if (strncmp(word, "stereopop", 9) == 0)
+				{
+					char msg[64];
+
+					/* 'stereopop N' sets the pop-out clamp as a multiple of
+					 * the at-infinity shift (0 pins near content to the
+					 * screen, 65536 = uncapped). Bare token resets the
+					 * default. SELECT+D-LEFT toggles this same value between
+					 * capped and uncapped mid-race. */
+					if (word[9] == ' ')
+					{
+						int n = atoi(&word[10]);
+
+						s_stereoPopMul = (float)((n < 0) ? 0 : (n > 65536) ? 65536 : n);
+					}
+					else
+					{
+						s_stereoPopMul = 2.0f;
+					}
+					snprintf(msg, sizeof(msg), "[CTR-3DS] stereo pop-out cap: %dx at-infinity shift", (int)s_stereoPopMul);
+					N3DS_DebugLog(msg);
+				}
 				else if (strncmp(word, "stereosep", 9) == 0)
 				{
 					char msg[64];
@@ -4141,7 +4495,7 @@ unsigned int N3DS_ReadButtons(void)
 					}
 					else
 					{
-						s_trackDrawOrderWeight = (s_trackDrawOrderWeight != 0.0f) ? 0.0f : 1.0f;
+						s_trackDrawOrderWeight = (s_trackDrawOrderWeight != 0.0f) ? 0.0f : N3DS_TRACK_DRAWORDER_WEIGHT_DEFAULT;
 					}
 					snprintf(msg, sizeof(msg), "[CTR-3DS] track drawOrder weight: %d view.z units/step%s", (int)s_trackDrawOrderWeight,
 					         (s_trackDrawOrderWeight == 0.0f) ? " (term REMOVED -- phase 0 diagnostic)" : "");
@@ -4231,6 +4585,123 @@ unsigned int N3DS_ReadButtons(void)
 						g_pentaPal = !g_pentaPal;
 					}
 					N3DS_DebugLog(g_pentaPal ? "[CTR-3DS] Penta: PAL 5/5/5 max class ON" : "[CTR-3DS] Penta: OFF (retail NTSC-U Turn class)");
+				}
+				else if (strncmp(word, "reserves", 8) == 0)
+				{
+					extern int g_reservesMeter;
+
+					/* Boost-reserves HUD meter by the retail slide bar (DEFAULT ON).
+					 * Bare token toggles; 'reserves N' sets 0/1. */
+					if (word[8] == ' ')
+					{
+						g_reservesMeter = (atoi(&word[9]) != 0) ? 1 : 0;
+					}
+					else
+					{
+						g_reservesMeter = !g_reservesMeter;
+					}
+					N3DS_DebugLog(g_reservesMeter ? "[CTR-3DS] reserves meter ON" : "[CTR-3DS] reserves meter OFF");
+				}
+				else if (strncmp(word, "tirepin", 7) == 0)
+				{
+					extern int g_tirehuntPin0;
+
+					/* Invisible-tire hunt: pin all wheels to sprite 0. */
+					g_tirehuntPin0 ^= 1;
+					N3DS_DebugLog(g_tirehuntPin0 ? "[CTR-3DS] tirepin: ON (all wheels sprite 0)" : "[CTR-3DS] tirepin: off");
+				}
+				else if (strncmp(word, "tirelog", 7) == 0)
+				{
+					extern int g_dbg_tireVtxLog;
+
+					/* Invisible-tire hunt: continuous merge-stage trace of
+					 * tire-clut triangles ([TV]/[TS]/[TB]/[TF]/[TT]/[TVBO],
+					 * native_renderer_3ds.c). Needs sdlog ON to reach SD. */
+					g_dbg_tireVtxLog ^= 1;
+					N3DS_DebugLog(g_dbg_tireVtxLog ? "[CTR-3DS] tirelog: ON (merge-stage tire trace)" : "[CTR-3DS] tirelog: off");
+				}
+				else if (strncmp(word, "pdfill", 6) == 0)
+				{
+					extern int g_dbg_pktDepthPartialFill;
+					char pdMsg[96];
+
+					/* Packet-depth partial-hit fill (invisible-tire fix,
+					 * native_gpu.c PacketDepth_ResolveXY). Modes: 0 = off
+					 * (the blink), 1 = any-hit (the gradient flicker),
+					 * 2 = strict honest-partial (ship). Bare token toggles
+					 * 2 <-> 0; 'pdfill N' sets a mode. */
+					if (word[6] == ' ')
+					{
+						g_dbg_pktDepthPartialFill = atoi(&word[7]);
+					}
+					else
+					{
+						g_dbg_pktDepthPartialFill = (g_dbg_pktDepthPartialFill != 0) ? 0 : 2;
+					}
+					snprintf(pdMsg, sizeof(pdMsg), "[CTR-3DS] pdfill: mode %d (0=off 1=any-hit 2=strict)", g_dbg_pktDepthPartialFill);
+					N3DS_DebugLog(pdMsg);
+				}
+				else if (strncmp(word, "menubdpar", 9) == 0)
+				{
+					extern int g_dbg_menuBdParZ;
+					char mpMsg[112];
+
+					/* STEREO plane for the character-select backdrop, in view.z
+					 * units (screen plane = 1200). 0 = follow the occlusion
+					 * stamp, which sits at effectively infinite parallax.
+					 * Occlusion is untouched either way. */
+					if (word[9] == ' ')
+					{
+						int z = atoi(&word[10]);
+
+						if (z < 0)
+						{
+							z = 0;
+						}
+						if (z > 60000)
+						{
+							z = 60000;
+						}
+						g_dbg_menuBdParZ = z;
+					}
+					snprintf(mpMsg, sizeof(mpMsg), "[CTR-3DS] menubdpar: stereo plane view.z %d%s", g_dbg_menuBdParZ,
+					         (g_dbg_menuBdParZ == 0) ? " (follow occlusion = infinity)" : "");
+					N3DS_DebugLog(mpMsg);
+				}
+				else if (strncmp(word, "menubd", 6) == 0)
+				{
+					extern int g_dbg_menuBackdrop;
+
+					/* Character-select diorama backdrop stamp (DEFAULT ON,
+					 * native_gpu.c PacketDepth_ResolveXY). OFF restores the
+					 * raw emit ordinal, which the menu flag buries. */
+					if (word[6] == ' ')
+					{
+						g_dbg_menuBackdrop = (atoi(&word[7]) != 0) ? 1 : 0;
+					}
+					else
+					{
+						g_dbg_menuBackdrop = !g_dbg_menuBackdrop;
+					}
+					N3DS_DebugLog(g_dbg_menuBackdrop ? "[CTR-3DS] menubd: ON (diorama backdrop behind preview model)"
+					                                 : "[CTR-3DS] menubd: off (strips buried behind the flag)");
+				}
+				else if (strncmp(word, "tirefix", 7) == 0)
+				{
+					extern int g_tireReflectFix;
+
+					/* Fix of retail's mirrored-tire delay-slot bug (DEFAULT ON) --
+					 * OFF restores the shipped PS1 centerline tires for A/B.
+					 * Bare token toggles; 'tirefix N' sets 0/1. */
+					if (word[7] == ' ')
+					{
+						g_tireReflectFix = (atoi(&word[8]) != 0) ? 1 : 0;
+					}
+					else
+					{
+						g_tireReflectFix = !g_tireReflectFix;
+					}
+					N3DS_DebugLog(g_tireReflectFix ? "[CTR-3DS] tire reflection fix ON (wheels at corners)" : "[CTR-3DS] tire reflection fix OFF (retail centerline bug)");
 				}
 				else if (strncmp(word, "axisfix", 7) == 0)
 				{
@@ -4487,29 +4958,10 @@ unsigned int N3DS_ReadButtons(void)
 		}
 	}
 
-	/* Repurposed: was the automated config sweep, settled since
-	 * (dumpreq `sweep` still covers Azahar). Now the frame-pacing A/B --
-	 * g_dbg_frameSync, defined above N3DS_C3DBeginFrame. Mid-race by design:
-	 * a mid-run flip brackets [PERF] windows by state on identical content,
-	 * and dumpreq is unplaceable while the game holds the SD card. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_B))
-	{
-		g_dbg_frameSync ^= 1;
-		N3DS_DebugLog(g_dbg_frameSync ? "[CTR-3DS] framesync: ON (FrameBegin waits for hw vblank)"
-		                              : "[CTR-3DS] framesync: OFF (begin immediately)");
-	}
-
 	/* SELECT held + R: SD logging on/off (g_dbg_sdLog, defined by the log
-	 * statics near the top of this file). R came free when the VRAM-capture
-	 * diagnostic was retired; the owner reassigned it here because this is the
-	 * toggle he reaches for most -- ON costs a ~100-170ms hitch every 2s, so
-	 * it is the one switch whose state can invalidate a whole sitting.
-	 *
-	 * Briefly lived on SELECT+TOUCH (now free again), which itself replaced an
-	 * attempt on SELECT+A -- that is the model-render toggle ~200 lines below,
-	 * so one press flipped BOTH and silently confounded the measurement (owner
-	 * caught it: "select A turns models off"). Grep the whole platform tree for
-	 * a key token before binding it; most chords belong to other sessions. */
+	 * statics near the top of this file). The toggle the owner reaches for
+	 * most -- ON costs a ~100-170ms hitch every 2s, so it is the one switch
+	 * whose state can invalidate a whole sitting. */
 	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_R))
 	{
 		g_dbg_sdLog ^= 1;
@@ -4519,70 +4971,16 @@ unsigned int N3DS_ReadButtons(void)
 		                          : "[CTR-3DS] sdlog: off (no SD writes; bottom screen still live)");
 	}
 
-	/* SELECT held + X: bottom-screen verbosity. Default off -- the stats
-	 * block had grown into a wall the owner couldn't read the live toggles in. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_X))
-	{
-		extern int g_dbg_statsVerbose;
-
-		g_dbg_statsVerbose ^= 1;
-		N3DS_DebugLog(g_dbg_statsVerbose ? "[CTR-3DS] stats: VERBOSE" : "[CTR-3DS] stats: quiet");
-	}
-
-	/* SELECT+Y = backface-cull A/B (track-scoped), toggles OFF <-> cull
-	 * BACK. Mid-race by design -- sit at one spot and flip it while watching the
-	 * `work` ms and the holes/waterfall change live; a dumpreq can't be placed
-	 * while the game holds the SD card. BACK is the established-correct winding
-	 * (quads cull clean; only stray triangle faces hole). FRONT (state 2) stays
-	 * reachable as dumpreq `bfcull 2` for winding checks -- from any culling
-	 * state this chord returns to OFF first. SELECT+Y was freed from the
-	 * packet-depth-bias ladder (still dumpreq `pktbias`); reused for this perf
-	 * experiment because it needs to be flippable mid-race. */
-#ifdef CTR_NATIVE_TRACK_RENDERER
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_Y))
-	{
-		extern int g_dbg_bfCull;
-
-		g_dbg_bfCull = g_dbg_bfCull ? 0 : 1;
-		N3DS_DebugLog(g_dbg_bfCull ? "[CTR-3DS] backface cull (track): BACK faces culled (watch `work` ms)"
-		                           : "[CTR-3DS] backface cull (track): OFF (draw all faces)");
-	}
-#endif
-
-	/* SELECT held + ZL: depth-test state cycle 0->1->2->0 (see g_dbg_depthTest
-	 * above N3DS_C3DBeginFrame for what each state proves). ZL has been free
-	 * since resolve-memo moved off it. Mid-race by design -- the question
-	 * is "where did the karts go", and the karts only exist mid-race, so a
-	 * cross-run A/B would confound content the way the LOD null did. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZL))
-	{
-		static const char *const names[3] = {"NORMAL (LEQUAL + writes)", "NOTEST (painter's order)",
-		                                     "TRACKRO (track tests but does not write depth)"};
-		char msg[80];
-
-		g_dbg_depthTest = (g_dbg_depthTest + 1) % 3;
-		snprintf(msg, sizeof(msg), "[CTR-3DS] depth test: %s", names[g_dbg_depthTest]);
-		N3DS_DebugLog(msg);
-	}
-
-	/* SELECT held + ZR: virtual multitap (native_input.c) -- first press
-	 * connects all four pads (opening VS/battle player counts), further
-	 * presses cycle which pad the 3DS buttons drive; the others sit idle.
-	 * Default OFF: the renderer has no split-screen support, so these modes
-	 * stay behind retail's own controller gate until deliberately opened for
-	 * renderer work. Mid-race by necessity: hopping karts is the point, and
-	 * dumpreq is unplaceable while the game holds the SD card. ZR has been
-	 * free since trackrender folded into the SELECT+START master. dumpreq
-	 * `padmux [N]` sets a specific pad or turns the mux off again. */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_ZR))
-	{
-		extern int Platform_InputDebugPadMux(int op);
-		const int state = Platform_InputDebugPadMux(-1);
-		char msg[64];
-
-		snprintf(msg, sizeof(msg), "[CTR-3DS] padmux: driving pad %d of 4", state);
-		N3DS_DebugLog(msg);
-	}
+	/* The chord map is deliberately this small -- owner's ruling, the chords
+	 * below are the ones he actually reaches for. Everything else is a dumpreq
+	 * token only: `framesync`, `verbose` (bottom-screen stats), `bfcull [N]`,
+	 * `depthtest [N]`, `padmux [N]`, `gtecapture [N]`, `directemit`,
+	 * `aggsize N`, `packetdepth`, `trackrender`, `modelrender`, `wide`.
+	 * B / X / Y / ZL / ZR / D-UP / D-DOWN / A / L are all free. A control
+	 * earns a chord only when it must flip mid-race (the game holds the SD
+	 * card then, so dumpreq is unplaceable) AND the owner will use it;
+	 * otherwise bind nothing and grep this file first -- a colliding chord
+	 * once confounded two A/Bs at once. */
 
 	/* SELECT+DRIGHT: track-atlas sampler A/B, nearest <-> bilinear. Pure
 	 * mid-race flip -- rewrites each unit's filter field, no re-upload, no
@@ -4597,52 +4995,62 @@ unsigned int N3DS_ReadButtons(void)
 	}
 #endif
 
-#ifdef CTR_NATIVE_DIRECT_EMIT
-	/* SELECT+DLEFT freed (direct emit -- baseline, A/B settled). Still reachable as dumpreq `directemit`. */
-#endif
-
-	/* SELECT+DLEFT free. The XA sink aggregate size is reachable via dumpreq `aggsize N`. */
-
-#if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
-	/* SELECT held + D-pad UP: GTE capture cost A/B. The depth model the
-	 * track renderer needs reads per-vertex sz3 out of the capture table, which
-	 * means capture stops being an optional instrument and becomes permanently
-	 * compiled in on the platform with the least frame time to spare -- so its
-	 * price gets measured BEFORE the design commits to it. Completes the
-	 * held-SELECT d-pad family (DOWN=render worker, RIGHT=textureless,
-	 * LEFT=direct emit); same reason as all of them, a hardware A/B needs a
-	 * button because dumpreq is unplaceable while the game holds the SD card.
-	 * Safe to flip mid-race: OFF only stops writing a side table whose readers
-	 * all treat a miss as "use the exact snapped value". */
-	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DUP))
+	/* SELECT held + D-pad LEFT: stereo pop-out cap <-> uncapped. A button
+	 * because the question is whether uncapped pop-out survives normal racing,
+	 * which needs eyes on the 3D screen mid-race with the slider in hand --
+	 * dumpreq is unplaceable while the game holds the SD card. Uncapping
+	 * remembers the capped value it left, so a dumpreq-tuned cap (`stereopop
+	 * N`) round-trips through the toggle. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DLEFT))
 	{
-		extern int g_dbg_gteCapture;
-		static const char *const names[3] = {"OFF (ablated; lookups all miss)", "FULL (store + matrix note)", "STORE ONLY (no matrix note)"};
-		char msg[80];
+		static float s_popMulCapped = 2.0f;
 
-		/* Cycles 1 -> 2 -> 0 -> 1 so a sitting walks full -> what the depth
-		 * model would actually pay -> nothing, and each [PERF] window between
-		 * two of these log lines belongs to exactly one state. */
-		g_dbg_gteCapture = (g_dbg_gteCapture + 1) % 3;
-		snprintf(msg, sizeof(msg), "[CTR-3DS] gte capture: %s", names[g_dbg_gteCapture]);
-		N3DS_DebugLog(msg);
+		if (s_stereoPopMul < N3DS_STEREO_POP_UNCAPPED)
+		{
+			s_popMulCapped = s_stereoPopMul;
+			s_stereoPopMul = N3DS_STEREO_POP_UNCAPPED;
+			N3DS_DebugLog("[CTR-3DS] stereo pop-out: UNCAPPED");
+		}
+		else
+		{
+			char msg[64];
+
+			s_stereoPopMul = s_popMulCapped;
+			snprintf(msg, sizeof(msg), "[CTR-3DS] stereo pop-out cap: %dx at-infinity shift", (int)s_stereoPopMul);
+			N3DS_DebugLog(msg);
+		}
 	}
 
-	/* SELECT held + D-pad DOWN is the render worker; SELECT + L is packet depth
-	 * -- the depth model's mid-race A/B. Flips BOTH sides at once (packets
-	 * stamp sz3, track shader switches to the true-depth axis), because either
-	 * alone puts the two geometry sources on different axes. This is the
-	 * toggle the "karts through walls" objection gets tested against, so it
-	 * has to be a button: a dumpreq file cannot be placed mid-race. */
-	/* SELECT+L freed -- packet depth folded into the SELECT+START master.
-	 * Still reachable as dumpreq `packetdepth`. */
-#endif
+	/* SELECT held + D-pad UP: cycle the character-select backdrop's STEREO
+	 * plane -- infinity (follow the occlusion stamp) -> the flag's plane just
+	 * behind the screen -> just past the far end of the kart band. Same reason
+	 * as the pop-out chord above: the only way to judge this is eyes on the 3D
+	 * screen with the slider in hand while character select is up, and dumpreq
+	 * cannot be placed while the game holds the SD card. Occlusion is untouched
+	 * by every step, so the strips stay in front of the flag and behind the
+	 * preview model whichever plane is selected. */
+	if ((held & KEY_SELECT) && (hidKeysDown() & KEY_DUP))
+	{
+		extern int g_dbg_menuBdParZ;
+		char msg[96];
 
-#ifdef CTR_NATIVE_TRACK_RENDERER
-	/* SELECT+ZR freed (native track renderer (incl. state 2, BOTH)). Still
-	 * reachable as dumpreq `trackrender`. ZR reassigned to the padmux
-	 * active-pad cycle (handler above, beside SELECT+ZL). */
-#endif
+		if (g_dbg_menuBdParZ == 0)
+		{
+			g_dbg_menuBdParZ = 1232;
+		}
+		else if (g_dbg_menuBdParZ == 1232)
+		{
+			g_dbg_menuBdParZ = 2500;
+		}
+		else
+		{
+			g_dbg_menuBdParZ = 0;
+		}
+		snprintf(msg, sizeof(msg), "[CTR-3DS] menu backdrop stereo plane: %s", (g_dbg_menuBdParZ == 0)     ? "infinity"
+		                                                                      : (g_dbg_menuBdParZ == 1232) ? "1232 (just behind screen)"
+		                                                                                                   : "2500 (past kart band)");
+		N3DS_DebugLog(msg);
+	}
 
 #if defined(CTR_NATIVE_TRACK_RENDERER) && defined(CTR_NATIVE_MODEL_RENDERER) && defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
 	/* SELECT held + START: the owner's "our config" combo --
@@ -4680,30 +5088,6 @@ unsigned int N3DS_ReadButtons(void)
 	}
 #endif
 
-#ifdef CTR_NATIVE_MODEL_RENDERER
-	/* SELECT held + A: PICA-native models on/off (rung 2). A BUTTON for the
-	 * same reason trackrender is one -- this is the A/B the sunk-kart question
-	 * gets settled against, and it has to be flippable mid-race with a kart
-	 * visibly sitting on the road.
-	 *
-	 * WAS D-RIGHT, which was a COLLISION, not a free chord: D-RIGHT has been
-	 * textureless mode since the owner moved it there (see that
-	 * handler above), so one press flipped both, and every A/B either control
-	 * was supposed to settle would have been confounded by the other. The
-	 * comment that used to sit here asserted D-RIGHT was free after checking
-	 * only the OTHER three d-pad directions.
-	 *
-	 * A is safe despite being accelerate: this tests hidKeysDown(), the
-	 * press EDGE, so an already-held A (the whole race) never fires it -- only
-	 * pressing A after SELECT is already down does. Every other chord is
-	 * taken (B/X/Y/L/R/ZL/ZR and all four d-pad directions).
-	 *
-	 * Two states, not three, matching the trackrender button's reasoning: BOTH
-	 * stays reachable as 'modelrender 2' via dumpreq. */
-	/* SELECT+A freed -- model render folded into the SELECT+START master.
-	 * Still reachable as dumpreq `modelrender` (including state 2, BOTH).
-	 * Frees the accelerate button from carrying a chord at all. */
-#endif
 #endif
 
 	if (held & KEY_A)

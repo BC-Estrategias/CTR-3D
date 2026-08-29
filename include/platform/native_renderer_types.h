@@ -68,6 +68,35 @@ typedef struct
 } GrVertex;
 #pragma pack(pop)
 
+/* UI-band stamp for the in-race minimap block: still inside the >= 0xFFC0 UI
+ * classifier band, one below the ordered-UI pin (0xFFFF), so the stereo
+ * flatten and the widescreen X ramp keep treating it as UI. Stamped whenever
+ * the ordered-UI pin owns the band, NOT only while the bottom-screen map is
+ * routed: it is both the peel key for the bottom panel (that consumer carries
+ * the dumpreq 'btmmap' gate itself) and the sprite-class key for the far-edge
+ * UV inset that closes the seam between the map sheet's two half-icons on
+ * either screen. Producer: PacketDepth_ResolveXY (native_gpu.c); consumers:
+ * NativeRenderer_DrawTriangles' UI branch and N3DS_ConvertTriangleVerts
+ * (native_renderer_3ds.c). Only ever stamped while the pin owns the band, so
+ * every other stamp consumer still sees exactly {band, 0xFFFF}. */
+#define PKTDEPTH_UI_STAMP_BTMMAP 0xFFFDu
+/* Same mechanism, second class: the FPS overlay text inside the map block.
+ * Peeled separately so the bottom pass can draw it through its OWN ortho
+ * window (small, top-left, ~top-screen scale) instead of the map's
+ * magnifying one. Deliberately NEARER than the map's stamp: the text draws
+ * last and overlays the map's panel pixels, so it must win the LEQUAL test
+ * against the map's written depth. */
+#define PKTDEPTH_UI_STAMP_BTMFPS 0xFFFEu
+/* Third class: picture sprites that want ONLY the seam-closing far-edge UV
+ * inset (N3DS_ConvertTriangleVerts) and are never routed off the top
+ * screen -- the track-select and adventure-hub map sheets. The renderer
+ * re-pins their z/w to the 0xFFFF pin at the ordered-UI append: ordered-UI
+ * layering is draw-order-under-EQUAL-depth, and an off-pin stamp there
+ * would let earlier-drawn quad rects occlude these sprites. Never stamp
+ * 1:1 glyph text with this class -- the inset's gradient change duplicates
+ * rows on 1:1 content. */
+#define PKTDEPTH_UI_STAMP_UIPIC 0xFFFCu
+
 typedef enum
 {
 	a_position,

@@ -21,8 +21,7 @@
 #if defined(CTR_NATIVE) && CTR_NATIVE_DIRECT_EMIT
 
 /*
- * Runtime A/B toggle: SELECT+D-LEFT on 3DS (n3ds_backend.c d-pad combo
- * family), dumpreq 'directemit' in Azahar. Read live per node rather than
+ * Runtime A/B toggle: dumpreq 'directemit'. Read live per node rather than
  * latched at BeginScene: unlike 'drawmerge' (whose flip changes barrier
  * semantics), both legs here produce byte-identical bins, so a mid-frame
  * flip just splits one frame's content between two equivalent paths.
@@ -343,6 +342,16 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 								extern int NativeWide_GlowStretchX(int x);
 
 								dx = (s16)NativeWide_GlowStretchX((int)dx);
+							}
+							/* Menu backdrop: same ramp as the window border these
+							 * strips sit inside, which is UI and already takes it --
+							 * see MakeVertexQuad's copy. Mutually exclusive with the
+							 * UI branch above by depth (the backdrop is midband). */
+							if (s_menubdNodeActive)
+							{
+								extern int NativeWide_UiShiftX(int x);
+
+								dx = (s16)NativeWide_UiShiftX((int)dx);
 							}
 							dst[k].x = dx;
 							dst[k].y = (s16)((float)(s16)(xyWord >> 16) + ofsY);

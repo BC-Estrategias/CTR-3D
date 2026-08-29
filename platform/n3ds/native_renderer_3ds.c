@@ -334,34 +334,14 @@ global_variable int s_backdropVertUsed = 0;
 /*
  * DEFAULT ON: this fixes a broad class of UI layering defects (menu and
  * character-select text layering, the selected portrait being covered by its own
- * highlight) and costs one known regression, which is the trade the owner chose.
- * Flip with dumpreq 'uiorder'.
+ * highlight). Flip with dumpreq 'uiorder'.
  *
- * KNOWN REGRESSION: with this ON, the gradient backdrop behind the rotating
- * character on character select does not draw. Established by measurement:
- *   - The gradient is NOT in this list. Proved on the 4P character-select
- *     screen, where four gradients at four known quadrants make an
- *     unmistakable fingerprint: 'uidump' reports 33 segments / 420 verts and
- *     NOT ONE quad matching any preview box. (The three ~460x92 slabs an
- *     earlier hunt identified as "the gradient" from the 1P dump are panel and
- *     border geometry that shares the rectangle. Identifying content by
- *     bounding box alone is how that went wrong.) This pass therefore cannot be
- *     reordering the gradient; it changes something around it.
- *   - dropped=0, so it is not a capacity loss.
- *   - REFUTED by runtime A/B, each individually: the s43 sky-first accumulator
- *     ('skyfirst'), backface culling ('bfcull', still 1 when the gradient
- *     appeared), the depth-stamp pin ('uipin'), WHERE the pass runs ('uilast'),
- *     and the direct-emit fast path ('directemit').
- *   - Degrades with draw order rather than failing outright: in 4P the gradient
- *     is whole behind P1, PARTIAL behind P2, absent behind P3 and P4. Whatever
- *     kills it dies mid-way, not at a clean boundary.
- *
- * LEADING SUSPECT, untested: the full-screen opaque untextured backdrop fill
- * (4P 'uidump' seg00, box -64,0..576,216) IS classified UI, so this pass pulls
- * it out of the state bins and redraws it at frame end, after all world
- * content. A full-screen opaque fill relocating to the end of the frame is the
- * right shape to erase background content that is not itself UI. Next step:
- * exclude that fill from UI routing and see whether the gradient returns.
+ * The character-select diorama gradient is NOT this pass's content and not its
+ * regression: the backdrop strips never enter this list (4P 'uidump': 33
+ * segments, none at a preview box). They are screen-space quads with no
+ * captured depth, pinned to the far plane through the menu-backdrop span
+ * (native_gpu.c, NativeGpu_MarkMenuBackdropRange) like the rest of the
+ * backdrop class.
  */
 int g_dbg_uiOrder = 1;
 /*
@@ -374,8 +354,9 @@ int g_dbg_uiOrder = 1;
  *
  * Diagnostic only. Any combination other than both-ON is a known-broken state
  * (see the header above for why), so this is not a supported configuration --
- * it exists to answer "which half did it?" and should be removed once the
- * character-select gradient regression is attributed.
+ * it exists to answer "which half did it?". The character-select gradient
+ * regression that motivated it is attributed (menu-backdrop span,
+ * native_gpu.c); strip this with the next probe sweep.
  */
 int g_dbg_uiPin = 1;
 /*
@@ -387,7 +368,8 @@ int g_dbg_uiPin = 1;
  * Exists to answer one binary question about the character-select gradient
  * regression: is that content NEVER DRAWN, or drawn and then PAINTED OVER by UI
  * that now comes last? Moving the pass earlier separates those without another
- * round of reading code. Diagnostic only; remove once attributed.
+ * round of reading code. Diagnostic only; the regression is attributed
+ * (menu-backdrop span, native_gpu.c) -- strip with the next probe sweep.
  */
 int g_dbg_uiLast = 1;
 /* Multiple of 3. A text-heavy menu (track lists, high scores) is the peak
@@ -415,6 +397,102 @@ global_variable u32 s_uiOrdDropped = 0;
  * whether this list is near ITS capacity. */
 global_variable u32 s_uiOrdPrimsMax = 0;
 global_variable u32 s_uiOrdPrims = 0;
+
+/*
+ * BOTTOM-SCREEN MINIMAP (dumpreq 'btmmap', default ON).
+ *
+ * The in-race map block (UI_RenderFrame_Racing: sheet + racer/ghost/warpball
+ * icons) is address-tagged at emission (NativeGpu_MarkUiMapRange, the sky-span
+ * mechanism) and restamped PKTDEPTH_UI_STAMP_BTMMAP by the resolver -- still
+ * inside the >= 0xFFC0 UI band, so the stereo flatten and widescreen ramp are
+ * unchanged. The UI branch below peels those triangles into this parallel
+ * ordered list instead of s_uiOrd*, and N3DS_DrawBottomMapPass replays them
+ * onto the bottom render target with an ortho window fitted around their own
+ * screen rect -- same untouched vertices, magnified by the window, so the dots
+ * cannot drift off the sheet. Runs after the stereo right eye (nothing here is
+ * journaled) and before FrameEnd. Requires uiorder+uipin (the resolver only
+ * retags while the pin owns the band). The stamp itself is applied regardless
+ * of 'btmmap' -- it also keys the seam-closing far-edge UV inset
+ * (N3DS_ConvertTriangleVerts) -- so the PEEL below carries the gate: with
+ * 'btmmap' off the stamped map flows into the ordinary ordered-UI list and
+ * draws on the top screen as before, inset included.
+ */
+int g_dbg_btmMap = 1;
+/*
+ * Bottom-console visibility (dumpreq 'stats', default OFF -- release posture).
+ * Gates every painter that writes glyphs into the bottom framebuffer: the
+ * stats drip (N3DS_StatsDripRow) and Platform_Log's stdout echo
+ * (native_log.c), both through N3DS_ConsolePaintAllowed. Composition, the
+ * [PERF]/SD sinks and the netload stderr mirror are untouched -- only the
+ * PANEL goes quiet. Boot text stays visible until the first present
+ * (N3DS_GfxPresent wipes and arms the quiet then), so an asset error that
+ * aborts before the game runs is still readable on the screen.
+ */
+int g_dbg_statsConsole = 0;
+/* Last measured fps x10 (the stats block's own 64-frame window number),
+ * published for the bottom-screen FPS overlay (NativeUiMap_FpsOverlayText,
+ * native_gpu.c) -- which draws it in the game's own font inside the map
+ * block. External linkage on purpose: the consumer sits earlier in the TU. */
+unsigned long g_n3dsFpsX10 = 0;
+/* Multiple of 3. The map block is ~20 quads worst case (8 drivers + ghosts +
+ * warpball pair + 2 sheet halves); overflow closes the run early, extra draws
+ * not lost content, same policy as the UI list above. */
+#define N3DS_BTMM_RUN_CAP 384
+#define N3DS_BTMM_MAX_SEGS 16
+global_variable N3DS_Vertex s_btmmRunVerts[N3DS_BTMM_RUN_CAP];
+global_variable int s_btmmRunUsed = 0;
+global_variable int s_btmmRunBlend = -1;
+global_variable int s_btmmRunDoubling = -1;
+global_variable int s_btmmRunAtlas = -1;
+global_variable N3DS_MergeSegment s_btmmSegs[N3DS_BTMM_MAX_SEGS];
+global_variable int s_btmmSegCount = 0;
+global_variable u32 s_btmmDropped = 0;
+/* Union bbox (PSX coords) of everything peeled this frame -- the raw input to
+ * the display window fit. */
+global_variable short s_btmmFrameBox[4];
+global_variable int s_btmmFrameHasBox = 0;
+/* Latched display window. Grows to include the raw box immediately (a dot
+ * stepping outside must never clip), re-centers only when the raw box jumps
+ * (mode/track change) -- so racer dots wandering near the sheet edge cannot
+ * make the window shimmy every frame. */
+global_variable short s_btmmWin[4];
+global_variable int s_btmmWinValid = 0;
+global_variable int s_btmmWasActive = 0;
+/* FPS-overlay class (PKTDEPTH_UI_STAMP_BTMFPS): the map block's text glyphs,
+ * kept out of the map's segment list and window so they can be drawn through
+ * their own non-magnifying window at the panel's top-left. Sized for GLYPHS,
+ * not draws: the sub-page decode tier can hand every glyph a different atlas
+ * cell, so a short string legally splits into one segment per glyph -- the
+ * first sizing (4 segs) saturated on "FPS 25.2", silently dropping the F and
+ * producing the sitting's dropped=896 ([BTMMAP] forensics line fpsSegs=4 at
+ * the cap convicted it). One segment per glyph plus slack is the honest
+ * budget. */
+#define N3DS_BTMF_RUN_CAP 192
+#define N3DS_BTMF_MAX_SEGS 16
+global_variable N3DS_Vertex s_btmfRunVerts[N3DS_BTMF_RUN_CAP];
+global_variable int s_btmfRunUsed = 0;
+global_variable int s_btmfRunBlend = -1;
+global_variable int s_btmfRunDoubling = -1;
+global_variable int s_btmfRunAtlas = -1;
+global_variable N3DS_MergeSegment s_btmfSegs[N3DS_BTMF_MAX_SEGS];
+global_variable int s_btmfSegCount = 0;
+global_variable short s_btmfFrameBox[4];
+global_variable int s_btmfFrameHasBox = 0;
+/* Drop forensics: a nonzero dropped total appeared the first Arcade race after
+ * the FPS split landed (dropped=896, source unknown). Split the total by which
+ * limit fired so the [BTMMAP] release line convicts a specific cap instead of
+ * inviting theory. Peaks say how close the seg lists run in normal play. */
+global_variable u32 s_btmmDropSegFull = 0;
+global_variable u32 s_btmmDropRunCap = 0;
+global_variable u32 s_btmmDropVbo = 0;
+global_variable u32 s_btmfDropSegFull = 0;
+global_variable u32 s_btmfDropRunCap = 0;
+global_variable u32 s_btmfDropVbo = 0;
+global_variable int s_btmmSegsPeak = 0;
+global_variable int s_btmfSegsPeak = 0;
+/* Last FPS-overlay window actually used (PSX units), for the activation log --
+ * the clipped-F hunt needs the window the GPU really got, not the theory. */
+global_variable short s_btmfWinDbg[4];
 
 /* Diagnostics for the stats block: draws emitted by the merge path split
  * by class, plus the events that cost extra draws or a mid-frame barrier. */
@@ -475,7 +553,7 @@ enum N3DS_BlendCloseCause
 int g_dbg_trackAfterMerge = 0;
 
 /*
- * Bottom-screen verbosity (SELECT+X, dumpreq 'verbose'). OFF by default: the
+ * Bottom-screen verbosity (dumpreq 'verbose'). OFF by default: the
  * stats block had accreted every instrument this port has ever needed --
  * decode-cache hits/misses/evictions/stale, sub-page routing, hazard
  * counters, scene begin/end, audio thread microsecond profile, per-bucket perf
@@ -491,7 +569,7 @@ int g_dbg_trackAfterMerge = 0;
 int g_dbg_statsVerbose = 0;
 
 /*
- * AUTOMATED CONFIG SWEEP (SELECT+B, dumpreq 'sweep').
+ * AUTOMATED CONFIG SWEEP (dumpreq 'sweep').
  *
  * The hardware run that motivated this produced retail n=13 windows against
  * ours n=137, clustered in different stretches of the same race -- so the one
@@ -608,7 +686,7 @@ static void N3DS_SweepApply(int idx)
 	g_dbg_ablateConfig = cfg->name;
 
 	/*
-	 * Forced, not carried: the sweep no longer varies bias, so a stray SELECT+Y
+	 * Forced, not carried: the sweep no longer varies bias, so a stray bias set
 	 * before the sweep started would otherwise ride along through every config
 	 * and silently make the whole run un-comparable to the last one.
 	 */
@@ -697,9 +775,8 @@ int g_dbg_resolveMemo = 1;
  * probe itself worth only ~1us -- this test plus its function call is one
  * of the remaining preamble suspects. Toggle ON = skip the test entirely:
  * pause backgrounds/wipes may show stale frames while ON (instrument, not
- * a shipping mode). Runtime A/B: dumpreq 'fbtest' in Azahar (SELECT+ZR was
- * reassigned to the native track renderer toggle, rung 3a -- this probe is
- * dumpreq-only now). If the A/B pays, the shippable form is arm-time invalidation
+ * a shipping mode). Runtime A/B: dumpreq 'fbtest' (dumpreq-only, no chord).
+ * If the A/B pays, the shippable form is arm-time invalidation
  * of display-region cache entries (once per frame) instead of a per-
  * triangle test -- see docs/NATIVE_TRACK_RENDERER_DESIGN.md section 9. */
 int g_dbg_skipFbTriTest = 0;
@@ -1414,7 +1491,108 @@ global_variable u32 s_subPageEvictHazards = 0;
  * case this design assumes (design doc "Instrumentation").
  */
 global_variable u32 s_trianglesRoutedSubPage = 0;
+/* Invisible-tire hunt probe: per-clut throttles for [TIREHUNT] resolve
+ * logging -- the reference clut resolves ~120x/sec and starves a shared cap. */
+global_variable u32 s_tirehuntLogs0 = 0;   /* clut 0x40c0 (icon 0, the suspect) */
+global_variable u32 s_tirehuntLogsRef = 0; /* clut 0x4001 (icon 1, reference) */
+global_variable u32 s_tirehuntDumps = 0;   /* auto-armed tridumps on icon-0 crossings */
+
+/*
+ * Invisible-tire hunt, merge-stage trace (dumpreq `tirelog`). The 36-byte
+ * tridump records addressing only (page/clut/uv/xy/atlas); every axis it
+ * omits is what this logs, continuously, for every tire-clut triangle
+ * (CLUT rows 256-259 = 0x4000..0x40FF, the 17 rotation icons):
+ *   [TV]  per triangle at DrawTriangles: texView pass, blend mode, atlas,
+ *         path taken (Bbin@used / Rseg@runpos / UI), depth ordinals
+ *         (emitOrdinal x3 + parallax), vertex colour -- the depth and
+ *         colour a blink could hide in.
+ *   [TS]  blend-run close that carried tire verts: cause + the state
+ *         RECORDED into the segment (what the GPU will actually get).
+ *   [TB]/[TO]/[TF]/[TT] flush-time emits of tire-carrying bins / spilled
+ *         opaque segs / blend segs / the open tail run.
+ *   [TVBO] frame-VBO append that overlaps an earlier append this frame --
+ *         an aliasing clobber would track frame structure (crossings)
+ *         while pinned frames stay stable, which fits the paradox.
+ * Remove with the hunt. */
+int g_dbg_tireVtxLog = 0;
+/* Mirror of s_frameCounter for the FPS-overlay frame bridge
+ * (NativeUiMap_FpsOverlayText, native_gpu.c) -- external linkage on purpose;
+ * updated once per BeginScene. Remove with the hunt. */
+unsigned long g_tirelogFrameNow = 0;
+global_variable int s_runHasTire = 0;
+global_variable u8 s_segHasTire[N3DS_MERGE_MAX_BLEND_SEGS];
+global_variable u8 s_osegHasTire[N3DS_MERGE_MAX_OPAQUE_SEGS];
+global_variable u8 s_binHasTire[N3DS_MERGE_BIN_COUNT];
+global_variable int s_tvboLastEnd = 0;
 global_variable u32 s_trianglesRoutedFullPage = 0;
+
+internal int N3DS_TireVtxIsTire(const GrVertex *t, int untextured)
+{
+	return !untextured && (((int)t[0].clut & 0xFF00) == 0x4000);
+}
+
+internal void N3DS_TireVtxLogTri(const GrVertex *t, int texView, int blendMode, int atlasIdx, int pixelBaseU, int pixelBaseV,
+                                 char pathTag, int pathA, int pathB)
+{
+	char msg[192];
+
+	snprintf(msg, sizeof(msg),
+	         "[TV] f=%lu p=%d c=%04x vw=%d bm=%d atl=%d pb=%d,%d %c%d@%d xy=%d,%d e=%04x,%04x,%04x w=%04x rgba=%02x%02x%02x%02x br=%d",
+	         (unsigned long)s_frameCounter, (int)t[0].page, (unsigned)(u16)t[0].clut, texView, blendMode, atlasIdx, pixelBaseU, pixelBaseV,
+	         pathTag, pathA, pathB, (int)t[0].x, (int)t[0].y, (unsigned)t[0].emitOrdinal, (unsigned)t[1].emitOrdinal,
+	         (unsigned)t[2].emitOrdinal, (unsigned)t[0].parallaxOrdinal, t[0].r, t[0].g, t[0].b, t[0].a, (int)t[0].bright);
+	N3DS_DebugLog(msg);
+}
+
+/* Frame-VBO append with a monotonicity tripwire: within one frame every
+ * append from this TU should land past the previous one; a base BELOW the
+ * running end means two live vertex ranges alias. Identical to the raw
+ * call when the trace is off. */
+internal int N3DS_TvboCheckedAppend(const N3DS_Vertex *verts, int count)
+{
+	int base = N3DS_C3DAppendVertices(verts, count);
+
+	if (g_dbg_tireVtxLog && (base >= 0))
+	{
+		if (base < s_tvboLastEnd)
+		{
+			char msg[96];
+
+			snprintf(msg, sizeof(msg), "[TVBO] OVERLAP f=%lu base=%d lastEnd=%d n=%d", (unsigned long)s_frameCounter, base, s_tvboLastEnd,
+			         count);
+			N3DS_DebugLog(msg);
+		}
+		if ((base + count) > s_tvboLastEnd)
+		{
+			s_tvboLastEnd = base + count;
+		}
+	}
+	return base;
+}
+
+/*
+ * Per-frame texture-decode attribution ([TEXDEC]). A scene cut's first draws
+ * can miss the whole new cast's pages in one frame, and the window averages
+ * smear that single frame away -- these split each frame's miss cost into
+ * decode (CPU texel loop) vs upload, plus the whole model pass's wall time,
+ * so a freeze frame is attributable from the log alone. All accumulation
+ * happens on the thread that runs the draws; folded, printed past the
+ * thresholds below, and reset at the top of NativeRenderer_SwapWindow on
+ * that same call chain.
+ */
+global_variable u32 s_texdecFrameSub = 0;
+global_variable u32 s_texdecFrameFull = 0;
+global_variable u64 s_texdecFrameDecTicks = 0;
+global_variable u64 s_texdecFrameUpTicks = 0;
+global_variable u64 s_texdecFrameMdlTicks = 0;
+global_variable u32 s_texdecWinSub = 0;
+global_variable u32 s_texdecWinFull = 0;
+global_variable u32 s_texdecWinUs = 0;
+global_variable u32 s_texdecWinMaxUs = 0;
+global_variable u32 s_texdecWinMaxSub = 0;
+global_variable u32 s_texdecWinMaxFull = 0;
+global_variable u32 s_texdecWinMaxMdlUs = 0;
+global_variable u32 s_texdecWinMaxFrame = 0;
 
 /* One increment per actual C3D_DrawArrays call (N3DS_FlushRun, called from
  * DrawTriangles) -- checks the design doc's own predicted "more, smaller
@@ -1461,6 +1639,11 @@ global_variable u16 s_decodeScratch[N3DS_DECODE_TEXTURE_DIM * N3DS_DECODE_TEXTUR
 /* Scratch for one decoded+tiled 64x64 sub-cell; mirrors s_decodeScratch's
  * role, sized for N3DS_SUBPAGE_DIM instead of N3DS_DECODE_TEXTURE_DIM. */
 global_variable u16 s_subpageDecodeScratch[N3DS_SUBPAGE_DIM * N3DS_SUBPAGE_DIM];
+
+/* Per-call CLUT resolve table for N3DS_DecodeAndTilePage -- file-scope like
+ * the decode scratches above (one decode runs at a time on the draw thread;
+ * never persisted between calls). */
+global_variable u16 s_decodeClutLut[256];
 
 /* Scratch for one converted atlas-run. Bounded by N3DS_MAX_RUN_VERTICES,
  * NOT the whole-frame budget: a run is flushed whenever the atlas changes
@@ -1546,88 +1729,145 @@ internal void N3DS_DecodeAndTilePage(s16 texPage, s16 clut, TexFormat format, N3
 	 *         "semi-transparent black" is visible, exactly as on PS1/PC). */
 	const u16 visMask = (view == N3DS_TEXVIEW_PASS2) ? 0x8000u : ((view == N3DS_TEXVIEW_PASS1) ? 0x7FFFu : 0xFFFFu);
 	const u16 killMask = (view == N3DS_TEXVIEW_PASS1) ? 0x8000u : 0x0000u;
+	/*
+	 * PSX BGR555 -> PICA200 GPU_RGBA5551. Both are 16-bit and both keep
+	 * 5 bits per channel, so this is a bit shuffle with no expansion or
+	 * loss.
+	 *
+	 * Source (PSX): bit 15 = STP, 14-10 = B, 9-5 = G, 4-0 = R.
+	 * Dest (PICA):  15-11 = R, 10-6 = G, 5-1 = B, 0 = A.
+	 *
+	 * Destination layout verified EMPIRICALLY, not inferred from the
+	 * format name -- inferring is precisely what once ruled
+	 * out a byte-order bug that turned out to be the bug. Converting a
+	 * solid R=0xF8,A=0xFF PNG with `tex3ds -r -z none -f rgba5551`
+	 * emits `01 f8` per texel, i.e. 0xF801 little-endian = R=31, G=0,
+	 * B=0, A=1. That pins R to the top 5 bits and alpha to bit 0.
+	 *
+	 * Alpha is one bit, set per the caller's view predicate (visMask/
+	 * killMask) -- punch-through for OPAQUE cells, the per-texel STP split
+	 * for PASS1/PASS2 cells. The single C3D_AlphaTest(GPU_GEQUAL, 1)
+	 * consumes all three unchanged.
+	 */
+#define N3DS_DECODE_CONVERT(c)                                                                                        \
+	((u16)((((c) & 0x001Fu) << 11) | ((((c) >> 5) & 0x1Fu) << 6) | ((((c) >> 10) & 0x1Fu) << 1) |                     \
+	       ((((c) & visMask) != 0) && (((c) & killMask) == 0) ? 1u : 0u)))
+	/*
+	 * CLUT formats resolve the palette ONCE per call into this table --
+	 * palette lookup, channel shuffle and the view predicate all collapse to
+	 * one indexed load per texel. This loop runs 65k texels per full-page
+	 * decode on a 268 MHz ARM11; the per-texel CLUT chase it replaces was
+	 * measured at ~16 ms per page ([TEXDEC]), which is what turned a scene
+	 * cut's cold-miss burst into a second-long freeze.
+	 *
+	 * CLUT entries wrap within the CLUT's own VRAM row: PC's VRAM sampler
+	 * inherits GL_REPEAT and wraps S independently of T, so it can never walk
+	 * into the next scanline. A 4-bit CLUT (16 entries, 16-aligned origin)
+	 * can't actually overflow -- masked for symmetry with the 8-bit case,
+	 * which reaches 239 texels into the next scanline unmasked.
+	 */
+	u16 *const lut = s_decodeClutLut;
+	/* Morton low bits contributed by u (u&7): precomputed; the v half is
+	 * constant per row and hoisted below. */
+	static const u8 uMort[8] = {0, 1, 4, 5, 16, 17, 20, 21};
 	int v;
+
+	if ((format == TF_4_BIT) || (format == TF_8_BIT))
+	{
+		const u16 *clutRow = &vram[clutOriginY * VRAM_WIDTH];
+		const int n = (format == TF_4_BIT) ? 16 : 256;
+		int i;
+
+		for (i = 0; i < n; i++)
+		{
+			const u16 c = clutRow[(clutOriginX + i) & (VRAM_WIDTH - 1)];
+
+			lut[i] = N3DS_DECODE_CONVERT(c);
+		}
+	}
 
 	for (v = 0; v < height; v++)
 	{
-		const int wordRow = pageOriginY + originV + v;
-		int u;
+		/* Page-relative source column (originU + u) -- VRAM addressing uses
+		 * it, but the Morton swizzle and destination tile indexing stay on
+		 * the local, 0-based u/v. VRAM word columns wrap the 1024-wide row
+		 * per WORD, exactly as before (a bottom-right page's 8bpp span does
+		 * wrap). */
+		const u16 *vramRow = &vram[(pageOriginY + originV + v) * VRAM_WIDTH];
+		const int vMort = ((v & 1) << 1) | ((v & 2) << 2) | ((v & 4) << 3);
+		const int rowTileBase = (v >> 3) * destStrideTiles;
+		int u = 0;
 
-		for (u = 0; u < width; u++)
+		switch (format)
 		{
-			/* Page-relative source column -- VRAM addressing uses this, but
-			 * the Morton swizzle and destination tile indexing below stay on
-			 * the local, 0-based u/v (unchanged math either way). */
-			const int pageU = originU + u;
-			u16 color16;
-			int morton, tileIndex, dstIndex;
-
-			switch (format)
+		case TF_4_BIT:
+		{
+			/* Word-aligned fast body only when page-U and local u agree on
+			 * alignment (originU % 4 == 0 -- true for the full-page and
+			 * sub-page tiers, the miss-storm paths). The track-atlas rects
+			 * pass arbitrary srcU and take the per-texel leg below. */
+			if ((originU & 3) == 0)
 			{
-			case TF_4_BIT:
-			{
-				const int wordCol = (pageOriginX + (pageU >> 2)) & (VRAM_WIDTH - 1);
-				const u16 word = vram[wordRow * VRAM_WIDTH + wordCol];
-				const int nibble = (word >> ((pageU & 3) * 4)) & 0xF;
-				/* Wrap within the CLUT's own VRAM row. PC's VRAM sampler
-				 * inherits GL_REPEAT and wraps S independently of T, so it
-				 * can never walk into the next scanline; a flat array index
-				 * silently would. A 4-bit CLUT (16 entries, 16-aligned
-				 * origin) can't actually overflow -- masked for symmetry
-				 * with the 8-bit case below, which can. */
-				color16 = vram[clutOriginY * VRAM_WIDTH + ((clutOriginX + nibble) & (VRAM_WIDTH - 1))];
-				break;
-			}
-			case TF_8_BIT:
-			{
-				const int wordCol = (pageOriginX + (pageU >> 1)) & (VRAM_WIDTH - 1);
-				const u16 word = vram[wordRow * VRAM_WIDTH + wordCol];
-				const int index = (word >> ((pageU & 1) * 8)) & 0xFF;
-				/* 256 entries from a 16-aligned origin reaches column 1263 of
-				 * a 1024-wide row, i.e. 239 texels into the NEXT scanline.
-				 * Wrap instead, matching PC's GL_REPEAT S-wrap (see the 4-bit
-				 * case above). */
-				color16 = vram[clutOriginY * VRAM_WIDTH + ((clutOriginX + index) & (VRAM_WIDTH - 1))];
-				break;
-			}
-			case TF_16_BIT:
-			case TF_32_BIT_RGBA: /* unreachable -- DrawTriangles never calls this path for it, see file header */
-			default:
-				color16 = vram[wordRow * VRAM_WIDTH + ((pageOriginX + pageU) & (VRAM_WIDTH - 1))];
-				break;
-			}
+				for (; (u + 3) < width; u += 4)
+				{
+					const u16 word = vramRow[(pageOriginX + ((originU + u) >> 2)) & (VRAM_WIDTH - 1)];
+					u16 *dst = &outTiled[((rowTileBase + (u >> 3)) * 64) + vMort + ((u & 4) << 2)];
 
-			morton = (u & 1) | ((v & 1) << 1) | ((u & 2) << 1) | ((v & 2) << 2) | ((u & 4) << 2) | ((v & 4) << 3);
-			tileIndex = ((v >> 3) * destStrideTiles + (u >> 3)) * 64;
-			dstIndex = tileIndex + morton;
+					dst[0] = lut[word & 0xF];
+					dst[1] = lut[(word >> 4) & 0xF];
+					dst[4] = lut[(word >> 8) & 0xF];
+					dst[5] = lut[(word >> 12) & 0xF];
+				}
+			}
+			for (; u < width; u++)
+			{
+				const int pageU = originU + u;
+				const u16 word = vramRow[(pageOriginX + (pageU >> 2)) & (VRAM_WIDTH - 1)];
 
-			/*
-			 * PSX BGR555 -> PICA200 GPU_RGBA5551. Both are 16-bit and both keep
-			 * 5 bits per channel, so this is a bit shuffle with no expansion or
-			 * loss -- unlike the previous RGBA8 path, which widened every
-			 * channel to 8 bits and wrote four separate bytes.
-			 *
-			 * Source (PSX): bit 15 = STP, 14-10 = B, 9-5 = G, 4-0 = R.
-			 * Dest (PICA):  15-11 = R, 10-6 = G, 5-1 = B, 0 = A.
-			 *
-			 * Destination layout verified EMPIRICALLY, not inferred from the
-			 * format name -- inferring is precisely what once ruled
-			 * out a byte-order bug that turned out to be the bug. Converting a
-			 * solid R=0xF8,A=0xFF PNG with `tex3ds -r -z none -f rgba5551`
-			 * emits `01 f8` per texel, i.e. 0xF801 little-endian = R=31, G=0,
-			 * B=0, A=1. That pins R to the top 5 bits and alpha to bit 0.
-			 *
-			 * Alpha is one bit, set per the caller's view predicate (visMask/
-			 * killMask above) -- punch-through for OPAQUE cells, the per-texel
-			 * STP split for PASS1/PASS2 cells. The single
-			 * C3D_AlphaTest(GPU_GEQUAL, 1) consumes all three unchanged.
-			 */
-			outTiled[dstIndex] = (u16)(((color16 & 0x001Fu) << 11) |       /* R */
-			                          (((color16 >> 5) & 0x1Fu) << 6) |   /* G */
-			                          (((color16 >> 10) & 0x1Fu) << 1) |  /* B */
-			                          ((((color16 & visMask) != 0) && ((color16 & killMask) == 0)) ? 1u : 0u));
+				outTiled[((rowTileBase + (u >> 3)) * 64) + vMort + uMort[u & 7]] = lut[(word >> ((pageU & 3) * 4)) & 0xF];
+			}
+			break;
+		}
+		case TF_8_BIT:
+		{
+			/* Texel pairs share one VRAM word; within a pair the odd texel's
+			 * Morton index is always the even one's + 1 (uMort steps by one
+			 * across each even/odd pair). Same alignment condition as above. */
+			if ((originU & 1) == 0)
+			{
+				for (; (u + 1) < width; u += 2)
+				{
+					const u16 word = vramRow[(pageOriginX + ((originU + u) >> 1)) & (VRAM_WIDTH - 1)];
+					u16 *dst = &outTiled[((rowTileBase + (u >> 3)) * 64) + vMort + uMort[u & 7]];
+
+					dst[0] = lut[word & 0xFF];
+					dst[1] = lut[word >> 8];
+				}
+			}
+			for (; u < width; u++)
+			{
+				const int pageU = originU + u;
+				const u16 word = vramRow[(pageOriginX + (pageU >> 1)) & (VRAM_WIDTH - 1)];
+
+				outTiled[((rowTileBase + (u >> 3)) * 64) + vMort + uMort[u & 7]] = lut[(word >> ((pageU & 1) * 8)) & 0xFF];
+			}
+			break;
+		}
+		case TF_16_BIT:
+		case TF_32_BIT_RGBA: /* unreachable -- DrawTriangles never calls this path for it, see file header */
+		default:
+		{
+			for (; u < width; u++)
+			{
+				const u16 c = vramRow[(pageOriginX + originU + u) & (VRAM_WIDTH - 1)];
+
+				outTiled[((rowTileBase + (u >> 3)) * 64) + vMort + uMort[u & 7]] = N3DS_DECODE_CONVERT(c);
+			}
+			break;
+		}
 		}
 	}
+#undef N3DS_DECODE_CONVERT
 }
 
 /* (u,v) -> flat index in a Morton-tiled (PICA 8x8 Z-order) buffer, the same
@@ -2024,15 +2264,28 @@ decodeIntoSlot:
 		 * destination scratch's own width in tiles.
 		 */
 		const int decodeWidth = N3DS_DECODE_TEXTURE_DIM;
+		const unsigned long long texdecT0 = N3DS_GetTickCount();
 
 		N3DS_DecodeAndTilePage(texPage, clut, format, view, 0, 0, decodeWidth, N3DS_DECODE_TEXTURE_DIM,
 		                        N3DS_DECODE_TEXTURE_DIM / 8, s_decodeScratch);
+		s_texdecFrameDecTicks += N3DS_GetTickCount() - texdecT0;
 	}
 	{
 		int atlasIdx, cellX, cellY;
+		const unsigned long long texdecT1 = N3DS_GetTickCount();
 
 		N3DS_CellIndexToAtlasCoord(oldestSlot, &atlasIdx, &cellX, &cellY);
 		N3DS_C3DUploadDecodedCell(atlasIdx, cellX, cellY, s_decodeScratch);
+		s_texdecFrameUpTicks += N3DS_GetTickCount() - texdecT1;
+		s_texdecFrameFull++;
+		if (g_dbg_tireVtxLog)
+		{
+			char upMsg[112];
+
+			snprintf(upMsg, sizeof(upMsg), "[TIREUP] f=%lu fp p=%d c=%04x vw=%d atl=%d cell=%d,%d", (unsigned long)s_frameCounter,
+			         (int)texPage, (unsigned)(u16)clut, (int)view, atlasIdx, cellX, cellY);
+			N3DS_DebugLog(upMsg);
+		}
 	}
 
 	s_decodeCache[oldestSlot].used = 1;
@@ -2236,6 +2489,20 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 		s_subPageCacheCapacityMisses++;
 	}
 
+#if defined(CTR_INTERNAL)
+	/* Invisible-tire hunt: tire sprites live on 4bpp pages 5-7; misses there
+	 * are rare in steady scenes, so log each with its cause. Remove with the
+	 * hunt. */
+	if ((texPage >= 5) && (texPage <= 7) && (format == TF_4_BIT))
+	{
+		char spMsg[144];
+
+		snprintf(spMsg, sizeof(spMsg), "[TIREMISS] f=%lu p=%d c=%04x vw=%d t=%d,%d stale=%d pg=%d cg=%d cap=%d", (unsigned long)s_frameCounter,
+		         (int)texPage, (unsigned)(u16)clut, (int)view, tileX, tileY, sawStaleKeyMatch, staleSawPageGen, staleSawClutGen, !sawStaleKeyMatch);
+		N3DS_DebugLog(spMsg);
+	}
+#endif
+
 	/* Stale twin not referenced this frame: re-decode into it directly
 	 * (see staleMatchSlot's comment; same-frame guard = the hazard rule). */
 	if ((staleMatchSlot >= 0) && (s_subPageCache[staleMatchSlot].lastUsedFrame != s_frameCounter))
@@ -2318,13 +2585,30 @@ decodeIntoSubSlot:
 	 * s_subpageDecodeScratch, unlike the full-page tier's format-clamped
 	 * decodeWidth<256 cases, which leave stale columns from a prior decode.
 	 */
-	N3DS_DecodeAndTilePage(texPage, clut, format, view, tileX * 64, tileY * 64, N3DS_SUBPAGE_DIM, N3DS_SUBPAGE_DIM,
-	                        N3DS_SUBPAGE_DIM / 8, s_subpageDecodeScratch);
+	{
+		const unsigned long long texdecT0 = N3DS_GetTickCount();
+
+		N3DS_DecodeAndTilePage(texPage, clut, format, view, tileX * 64, tileY * 64, N3DS_SUBPAGE_DIM, N3DS_SUBPAGE_DIM,
+		                        N3DS_SUBPAGE_DIM / 8, s_subpageDecodeScratch);
+		s_texdecFrameDecTicks += N3DS_GetTickCount() - texdecT0;
+	}
 	{
 		int atlasIdx, physCellX, physCellY, subX, subY;
+		const unsigned long long texdecT1 = N3DS_GetTickCount();
 
 		N3DS_SubCellIndexToAtlasCoord(oldestSlot, &atlasIdx, &physCellX, &physCellY, &subX, &subY);
 		N3DS_C3DUploadDecodedSubCell(atlasIdx, physCellX, physCellY, subX, subY, s_subpageDecodeScratch);
+		s_texdecFrameUpTicks += N3DS_GetTickCount() - texdecT1;
+		s_texdecFrameSub++;
+		if (g_dbg_tireVtxLog)
+		{
+			char upMsg[128];
+
+			snprintf(upMsg, sizeof(upMsg), "[TIREUP] f=%lu sp p=%d c=%04x vw=%d tile=%d,%d atl=%d cell=%d,%d sub=%d,%d stale=%d",
+			         (unsigned long)s_frameCounter, (int)texPage, (unsigned)(u16)clut, (int)view, tileX, tileY, atlasIdx, physCellX,
+			         physCellY, subX, subY, sawStaleKeyMatch);
+			N3DS_DebugLog(upMsg);
+		}
 	}
 
 	s_subPageCache[oldestSlot].used = 1;
@@ -2378,7 +2662,7 @@ internal void N3DS_FlushRun(int atlasIndex, int vertCount)
 	{
 		NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND);
 	}
-	baseVertex = N3DS_C3DAppendVertices(s_convertScratch, vertCount);
+	baseVertex = N3DS_TvboCheckedAppend(s_convertScratch, vertCount);
 	if (perfScopes)
 	{
 		NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_APPEND);
@@ -2530,10 +2814,14 @@ internal void N3DS_MergeCloseBlendRun(enum N3DS_BlendCloseCause cause)
 		return;
 	}
 
-	baseVertex = N3DS_C3DAppendVertices(s_convertScratch, s_runVertCount);
+	baseVertex = N3DS_TvboCheckedAppend(s_convertScratch, s_runVertCount);
 	if (baseVertex < 0)
 	{
 		s_droppedRuns++;
+		if (g_dbg_tireVtxLog && s_runHasTire)
+		{
+			N3DS_DebugLog("[TS] TIRE RUN DROPPED (frame VBO full)");
+		}
 	}
 	else
 	{
@@ -2544,7 +2832,18 @@ internal void N3DS_MergeCloseBlendRun(enum N3DS_BlendCloseCause cause)
 		seg->atlas = (u8)s_runAtlas;
 		seg->baseVertex = baseVertex;
 		seg->vertCount = s_runVertCount;
+		if (g_dbg_tireVtxLog && s_runHasTire)
+		{
+			char msg[128];
+
+			snprintf(msg, sizeof(msg), "[TS] f=%lu close cause=%d seg=%d bm=%d dbl=%d atl=%d base=%d n=%d",
+			         (unsigned long)s_frameCounter, (int)cause, s_mergeBlendSegCount - 1, (int)seg->blendMode, (int)seg->doubling,
+			         (int)seg->atlas, seg->baseVertex, seg->vertCount);
+			N3DS_DebugLog(msg);
+			s_segHasTire[s_mergeBlendSegCount - 1] = 1;
+		}
 	}
+	s_runHasTire = 0;
 	s_runVertCount = 0;
 	s_runAtlas = -1;
 }
@@ -2597,10 +2896,14 @@ internal void N3DS_MergeFlush(void)
 		{
 			continue;
 		}
-		baseVertex = N3DS_C3DAppendVertices(s_mergeBinVerts[i], s_mergeBinUsed[i]);
+		baseVertex = N3DS_TvboCheckedAppend(s_mergeBinVerts[i], s_mergeBinUsed[i]);
 		if (baseVertex < 0)
 		{
 			s_droppedRuns++;
+			if (g_dbg_tireVtxLog && s_binHasTire[i])
+			{
+				N3DS_DebugLog("[TB] TIRE BIN DROPPED (frame VBO full)");
+			}
 		}
 		else
 		{
@@ -2608,8 +2911,17 @@ internal void N3DS_MergeFlush(void)
 			               (i == N3DS_MERGE_UNTEX_BIN) ? N3DS_WHITE_ATLAS : i, baseVertex, s_mergeBinUsed[i], &lastDoubling);
 			s_mergeEmitOpaque++;
 			s_mergeVertsOpaque += (u32)s_mergeBinUsed[i];
+			if (g_dbg_tireVtxLog && s_binHasTire[i])
+			{
+				char msg[96];
+
+				snprintf(msg, sizeof(msg), "[TB] f=%lu bin=%d base=%d n=%d", (unsigned long)s_frameCounter, i, baseVertex,
+				         s_mergeBinUsed[i]);
+				N3DS_DebugLog(msg);
+			}
 		}
 		s_mergeBinUsed[i] = 0;
+		s_binHasTire[i] = 0;
 	}
 
 	for (i = 0; i < s_mergeOpaqueSegCount; i++)
@@ -2619,6 +2931,15 @@ internal void N3DS_MergeFlush(void)
 		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
 		s_mergeEmitOpaque++;
 		s_mergeVertsOpaque += (u32)seg->vertCount;
+		if (g_dbg_tireVtxLog && s_osegHasTire[i])
+		{
+			char msg[96];
+
+			snprintf(msg, sizeof(msg), "[TO] f=%lu oseg=%d/%d atl=%d base=%d n=%d", (unsigned long)s_frameCounter, i,
+			         s_mergeOpaqueSegCount, (int)seg->atlas, seg->baseVertex, seg->vertCount);
+			N3DS_DebugLog(msg);
+			s_osegHasTire[i] = 0;
+		}
 	}
 	s_mergeOpaqueSegCount = 0;
 
@@ -2629,16 +2950,29 @@ internal void N3DS_MergeFlush(void)
 		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
 		s_mergeEmitBlend++;
 		s_mergeVertsBlend += (u32)seg->vertCount;
+		if (g_dbg_tireVtxLog && s_segHasTire[i])
+		{
+			char msg[112];
+
+			snprintf(msg, sizeof(msg), "[TF] f=%lu seg=%d/%d bm=%d dbl=%d atl=%d base=%d n=%d", (unsigned long)s_frameCounter, i,
+			         s_mergeBlendSegCount, (int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount);
+			N3DS_DebugLog(msg);
+			s_segHasTire[i] = 0;
+		}
 	}
 	s_mergeBlendSegCount = 0;
 
 	if (s_runVertCount > 0)
 	{
-		int baseVertex = N3DS_C3DAppendVertices(s_convertScratch, s_runVertCount);
+		int baseVertex = N3DS_TvboCheckedAppend(s_convertScratch, s_runVertCount);
 
 		if (baseVertex < 0)
 		{
 			s_droppedRuns++;
+			if (g_dbg_tireVtxLog && s_runHasTire)
+			{
+				N3DS_DebugLog("[TT] TIRE TAIL DROPPED (frame VBO full)");
+			}
 		}
 		else
 		{
@@ -2646,8 +2980,17 @@ internal void N3DS_MergeFlush(void)
 			s_mergeEmitBlend++;
 			s_mergeVertsBlend += (u32)s_runVertCount;
 			s_blendCloseFrameEnd++;
+			if (g_dbg_tireVtxLog && s_runHasTire)
+			{
+				char msg[112];
+
+				snprintf(msg, sizeof(msg), "[TT] f=%lu tail bm=%d ut=%d atl=%d base=%d n=%d", (unsigned long)s_frameCounter,
+				         pendingBlendMode, pendingUntextured, s_runAtlas, baseVertex, s_runVertCount);
+				N3DS_DebugLog(msg);
+			}
 		}
 	}
+	s_runHasTire = 0;
 	s_runVertCount = 0;
 	s_runAtlas = -1;
 	/* TEV doubling was left wherever the last emit put it; -1 forces the
@@ -2684,7 +3027,7 @@ internal void N3DS_DrawBackdropPass(void)
 		return;
 	}
 	N3DS_MergeCloseBlendRun(N3DS_BLEND_CLOSE_STATE);
-	baseVertex = N3DS_C3DAppendVertices(s_backdropVerts, s_backdropVertUsed);
+	baseVertex = N3DS_TvboCheckedAppend(s_backdropVerts, s_backdropVertUsed);
 	/* baseVertex > 0 doubles as the splash-frame gate: boot/load-splash
 	 * frames clear via the same FILL packets but must present with ZERO
 	 * draws (the session-14 hang class lived in the draw path -- an
@@ -2726,7 +3069,7 @@ internal void N3DS_DrawSkyPass(void)
 	 * Close the run first, so it is recorded under the state it actually
 	 * accumulated with. */
 	N3DS_MergeCloseBlendRun(N3DS_BLEND_CLOSE_STATE);
-	baseVertex = N3DS_C3DAppendVertices(s_skyVerts, s_skyVertUsed);
+	baseVertex = N3DS_TvboCheckedAppend(s_skyVerts, s_skyVertUsed);
 	if (baseVertex >= 0)
 	{
 		N3DS_MergeEmit(0, 0, N3DS_WHITE_ATLAS, baseVertex, s_skyVertUsed, &lastDoubling);
@@ -2760,7 +3103,7 @@ internal void N3DS_UiOrderCloseRun(void)
 		s_uiOrdRunAtlas = -1;
 		return;
 	}
-	baseVertex = N3DS_C3DAppendVertices(s_uiOrdRunVerts, s_uiOrdRunUsed);
+	baseVertex = N3DS_TvboCheckedAppend(s_uiOrdRunVerts, s_uiOrdRunUsed);
 	if (baseVertex < 0)
 	{
 		s_uiOrdDropped += (u32)(s_uiOrdRunUsed / 3);
@@ -2831,6 +3174,179 @@ internal N3DS_Vertex *N3DS_UiOrderAppend(int blendMode, int doubling, int atlas)
 	dst = &s_uiOrdRunVerts[s_uiOrdRunUsed];
 	s_uiOrdRunUsed += 3;
 	s_uiOrdPrims++;
+	return dst;
+}
+
+/* Bottom-screen minimap: same run/segment shape as the ordered UI pass above
+ * (see the s_btmm* block near the top), just a much smaller list and a union
+ * bbox instead of per-segment boxes -- the box is a display-window input here,
+ * not a diagnostic. */
+internal void N3DS_BtmMapCloseRun(void)
+{
+	int baseVertex;
+
+	if (s_btmmRunUsed <= 0)
+	{
+		s_btmmRunAtlas = -1;
+		return;
+	}
+	if (s_btmmSegCount >= N3DS_BTMM_MAX_SEGS)
+	{
+		s_btmmDropped += (u32)(s_btmmRunUsed / 3);
+		s_btmmDropSegFull += (u32)(s_btmmRunUsed / 3);
+		s_btmmRunUsed = 0;
+		s_btmmRunAtlas = -1;
+		return;
+	}
+	baseVertex = N3DS_TvboCheckedAppend(s_btmmRunVerts, s_btmmRunUsed);
+	if (baseVertex < 0)
+	{
+		s_btmmDropped += (u32)(s_btmmRunUsed / 3);
+		s_btmmDropVbo += (u32)(s_btmmRunUsed / 3);
+	}
+	else
+	{
+		N3DS_MergeSegment *seg = &s_btmmSegs[s_btmmSegCount];
+		int k;
+
+		seg->blendMode = (u8)s_btmmRunBlend;
+		seg->doubling = (u8)s_btmmRunDoubling;
+		seg->atlas = (u8)s_btmmRunAtlas;
+		seg->baseVertex = baseVertex;
+		seg->vertCount = s_btmmRunUsed;
+		s_btmmSegCount++;
+
+		for (k = 0; k < s_btmmRunUsed; k++)
+		{
+			const short vx = (short)s_btmmRunVerts[k].x;
+			const short vy = (short)s_btmmRunVerts[k].y;
+
+			if (!s_btmmFrameHasBox)
+			{
+				s_btmmFrameBox[0] = vx;
+				s_btmmFrameBox[1] = vy;
+				s_btmmFrameBox[2] = vx;
+				s_btmmFrameBox[3] = vy;
+				s_btmmFrameHasBox = 1;
+			}
+			else
+			{
+				if (vx < s_btmmFrameBox[0]) { s_btmmFrameBox[0] = vx; }
+				if (vy < s_btmmFrameBox[1]) { s_btmmFrameBox[1] = vy; }
+				if (vx > s_btmmFrameBox[2]) { s_btmmFrameBox[2] = vx; }
+				if (vy > s_btmmFrameBox[3]) { s_btmmFrameBox[3] = vy; }
+			}
+		}
+	}
+	s_btmmRunUsed = 0;
+	s_btmmRunAtlas = -1;
+}
+
+internal N3DS_Vertex *N3DS_BtmMapAppend(int blendMode, int doubling, int atlas)
+{
+	N3DS_Vertex *dst;
+
+	if ((atlas != s_btmmRunAtlas) || (blendMode != s_btmmRunBlend) || (doubling != s_btmmRunDoubling) ||
+	    ((s_btmmRunUsed + 3) > N3DS_BTMM_RUN_CAP))
+	{
+		N3DS_BtmMapCloseRun();
+		s_btmmRunBlend = blendMode;
+		s_btmmRunDoubling = doubling;
+		s_btmmRunAtlas = atlas;
+	}
+	if ((s_btmmRunUsed + 3) > N3DS_BTMM_RUN_CAP)
+	{
+		s_btmmDropped++;
+		s_btmmDropRunCap++;
+		return NULL;
+	}
+	dst = &s_btmmRunVerts[s_btmmRunUsed];
+	s_btmmRunUsed += 3;
+	return dst;
+}
+
+/* FPS-overlay twin of the pair above (see the s_btmf* block). */
+internal void N3DS_BtmFpsCloseRun(void)
+{
+	int baseVertex;
+
+	if (s_btmfRunUsed <= 0)
+	{
+		s_btmfRunAtlas = -1;
+		return;
+	}
+	if (s_btmfSegCount >= N3DS_BTMF_MAX_SEGS)
+	{
+		s_btmmDropped += (u32)(s_btmfRunUsed / 3);
+		s_btmfDropSegFull += (u32)(s_btmfRunUsed / 3);
+		s_btmfRunUsed = 0;
+		s_btmfRunAtlas = -1;
+		return;
+	}
+	baseVertex = N3DS_TvboCheckedAppend(s_btmfRunVerts, s_btmfRunUsed);
+	if (baseVertex < 0)
+	{
+		s_btmmDropped += (u32)(s_btmfRunUsed / 3);
+		s_btmfDropVbo += (u32)(s_btmfRunUsed / 3);
+	}
+	else
+	{
+		N3DS_MergeSegment *seg = &s_btmfSegs[s_btmfSegCount];
+		int k;
+
+		seg->blendMode = (u8)s_btmfRunBlend;
+		seg->doubling = (u8)s_btmfRunDoubling;
+		seg->atlas = (u8)s_btmfRunAtlas;
+		seg->baseVertex = baseVertex;
+		seg->vertCount = s_btmfRunUsed;
+		s_btmfSegCount++;
+
+		for (k = 0; k < s_btmfRunUsed; k++)
+		{
+			const short vx = (short)s_btmfRunVerts[k].x;
+			const short vy = (short)s_btmfRunVerts[k].y;
+
+			if (!s_btmfFrameHasBox)
+			{
+				s_btmfFrameBox[0] = vx;
+				s_btmfFrameBox[1] = vy;
+				s_btmfFrameBox[2] = vx;
+				s_btmfFrameBox[3] = vy;
+				s_btmfFrameHasBox = 1;
+			}
+			else
+			{
+				if (vx < s_btmfFrameBox[0]) { s_btmfFrameBox[0] = vx; }
+				if (vy < s_btmfFrameBox[1]) { s_btmfFrameBox[1] = vy; }
+				if (vx > s_btmfFrameBox[2]) { s_btmfFrameBox[2] = vx; }
+				if (vy > s_btmfFrameBox[3]) { s_btmfFrameBox[3] = vy; }
+			}
+		}
+	}
+	s_btmfRunUsed = 0;
+	s_btmfRunAtlas = -1;
+}
+
+internal N3DS_Vertex *N3DS_BtmFpsAppend(int blendMode, int doubling, int atlas)
+{
+	N3DS_Vertex *dst;
+
+	if ((atlas != s_btmfRunAtlas) || (blendMode != s_btmfRunBlend) || (doubling != s_btmfRunDoubling) ||
+	    ((s_btmfRunUsed + 3) > N3DS_BTMF_RUN_CAP))
+	{
+		N3DS_BtmFpsCloseRun();
+		s_btmfRunBlend = blendMode;
+		s_btmfRunDoubling = doubling;
+		s_btmfRunAtlas = atlas;
+	}
+	if ((s_btmfRunUsed + 3) > N3DS_BTMF_RUN_CAP)
+	{
+		s_btmmDropped++;
+		s_btmfDropRunCap++;
+		return NULL;
+	}
+	dst = &s_btmfRunVerts[s_btmfRunUsed];
+	s_btmfRunUsed += 3;
 	return dst;
 }
 
@@ -2910,6 +3426,264 @@ internal void N3DS_DrawUiPass(void)
 	s_mergeDepthWriteState = -1;
 }
 
+/*
+ * Draw the frame's peeled minimap segments onto the BOTTOM render target (see
+ * the s_btmm* block near the top for the whole design). Called from EndScene
+ * strictly after N3DS_StereoRenderRightEye (nothing here is journaled, so the
+ * right eye can never replay a bottom-screen draw) and before N3DS_C3DEndFrame
+ * (the draws must join this frame's command list, against this frame's VBO).
+ * Unconditional at the call site: it drains and resets its own state even when
+ * it draws nothing, so a toggle flip or a menu frame cannot leave stale
+ * segments for the next frame.
+ */
+internal void N3DS_DrawBottomMapPass(void)
+{
+	int mapActive;
+	int fpsActive;
+	int active;
+
+	N3DS_BtmMapCloseRun();
+	N3DS_BtmFpsCloseRun();
+
+	if (s_btmmSegCount > s_btmmSegsPeak)
+	{
+		s_btmmSegsPeak = s_btmmSegCount;
+	}
+	if (s_btmfSegCount > s_btmfSegsPeak)
+	{
+		s_btmfSegsPeak = s_btmfSegCount;
+	}
+
+	mapActive = (s_btmmSegCount > 0) && s_btmmFrameHasBox && g_dbg_btmMap;
+	/* FPS overlay is ALWAYS-ON (owner call): any frame that emitted it draws
+	 * it -- menus, loads, pauses, races -- with or without the map. No stats-
+	 * console carve-out, also owner call ("useless to me, drawn in an
+	 * expensive way"): the glyph drip survives only as a pre-game boot-error
+	 * surface, and with this pass owning the panel every frame it effectively
+	 * never paints again. */
+	fpsActive = (s_btmfSegCount > 0) && s_btmfFrameHasBox && g_dbg_btmMap;
+	active = mapActive || fpsActive;
+	if (active)
+	{
+		const int dspW = (s_projectionDispW > 0) ? s_projectionDispW : 512;
+		const int dspH = (s_projectionDispH > 0) ? s_projectionDispH : 216;
+		/* Begin()'s window: the map's fitted window when the map is on screen;
+		 * a plain full-display window on FPS-only frames (the FPS block aims
+		 * its own window either way, and the clear doesn't care). */
+		int wl = 0;
+		int wt = 0;
+		int wr = dspW;
+		int wb = dspH;
+
+		if (mapActive)
+		{
+			/* Raw window: the frame's own content box, padded so the sheet's
+			 * outline never kisses the panel edge. */
+			int x0 = (int)s_btmmFrameBox[0] - 8;
+			int y0 = (int)s_btmmFrameBox[1] - 8;
+			int x1 = (int)s_btmmFrameBox[2] + 8;
+			int y1 = (int)s_btmmFrameBox[3] + 8;
+			int w;
+			int h;
+
+			if (!s_btmmWinValid)
+			{
+				s_btmmWin[0] = (short)x0;
+				s_btmmWin[1] = (short)y0;
+				s_btmmWin[2] = (short)x1;
+				s_btmmWin[3] = (short)y1;
+				s_btmmWinValid = 1;
+			}
+			else
+			{
+				/* Re-center on a jump (map repositioned: 1P<->3P, mode change);
+				 * otherwise grow-only, so wandering racer dots can enlarge the
+				 * window but never make it shimmy. */
+				const int wcx = ((int)s_btmmWin[0] + (int)s_btmmWin[2]) / 2;
+				const int wcy = ((int)s_btmmWin[1] + (int)s_btmmWin[3]) / 2;
+				const int rcx = (x0 + x1) / 2;
+				const int rcy = (y0 + y1) / 2;
+				int dx = wcx - rcx;
+				int dy = wcy - rcy;
+
+				if (dx < 0) { dx = -dx; }
+				if (dy < 0) { dy = -dy; }
+				if ((dx > 48) || (dy > 48))
+				{
+					s_btmmWin[0] = (short)x0;
+					s_btmmWin[1] = (short)y0;
+					s_btmmWin[2] = (short)x1;
+					s_btmmWin[3] = (short)y1;
+				}
+				else
+				{
+					if (x0 < (int)s_btmmWin[0]) { s_btmmWin[0] = (short)x0; }
+					if (y0 < (int)s_btmmWin[1]) { s_btmmWin[1] = (short)y0; }
+					if (x1 > (int)s_btmmWin[2]) { s_btmmWin[2] = (short)x1; }
+					if (y1 > (int)s_btmmWin[3]) { s_btmmWin[3] = (short)y1; }
+				}
+			}
+
+			/* Expand the latched window so the map keeps its APPARENT
+			 * proportions. PSX units are anamorphic -- the game authors for a
+			 * dispW x dispH (512x216) display stretched onto a 4:3 screen, so
+			 * horizontal units are ~1.78x denser than vertical ones. A window
+			 * shaped 4:3 in raw units therefore rendered every map ~1.6x too
+			 * wide (owner-caught). Matching the window's unit ratio to the
+			 * display's own (dispW:dispH) reproduces the top screen's pixel
+			 * aspect exactly, for any track and either widescreen mode. */
+			wl = (int)s_btmmWin[0];
+			wt = (int)s_btmmWin[1];
+			wr = (int)s_btmmWin[2];
+			wb = (int)s_btmmWin[3];
+			w = wr - wl;
+			h = wb - wt;
+
+			if ((w * dspH) >= (h * dspW))
+			{
+				const int grow = (((w * dspH) + dspW - 1) / dspW) - h;
+
+				wt -= grow / 2;
+				wb += grow - (grow / 2);
+			}
+			else
+			{
+				const int grow = (((h * dspW) + dspH - 1) / dspH) - w;
+
+				wl -= grow / 2;
+				wr += grow - (grow / 2);
+			}
+		}
+
+		if (N3DS_BottomMapDraw_Begin((float)wl, (float)wr, (float)wt, (float)wb))
+		{
+			int lastDoubling = -1;
+			int lastDepthWrite = -1;
+			int i;
+
+			for (i = 0; i < s_btmmSegCount; i++)
+			{
+				const N3DS_MergeSegment *seg = &s_btmmSegs[i];
+				const int wantWrite = ((seg->blendMode != 0) && g_dbg_fxNoDepthWrite) ? 0 : 1;
+
+				if ((int)seg->doubling != lastDoubling)
+				{
+					N3DS_C3DSetColorDoubling((int)seg->doubling);
+					lastDoubling = (int)seg->doubling;
+				}
+				if (wantWrite != lastDepthWrite)
+				{
+					N3DS_C3DSetDepthWrite(wantWrite);
+					lastDepthWrite = wantWrite;
+				}
+				N3DS_C3DSetBlendMode((int)seg->blendMode);
+				N3DS_C3DBindAtlas((int)seg->atlas);
+				N3DS_C3DDrawTriangles(seg->baseVertex, seg->vertCount / 3);
+			}
+
+			if (fpsActive)
+			{
+					/* FPS overlay through its OWN window: one display's worth
+				 * of units across the panel = the text renders at its
+				 * top-screen size (scale 1.0; raise for bigger), anchored
+				 * so its own top-RIGHT corner lands 6px off the panel's
+				 * right edge, 4px down (owner call). Its stamp is nearer
+				 * than the map's, so it wins the depth test over the map
+				 * pixels it overlays. */
+				const float fscale = 1.0f;
+				const float fw = (float)dspW / fscale;
+				const float fh = (float)dspH / fscale;
+				const float fl = (float)s_btmfFrameBox[2] - fw + (6.0f * fw / 320.0f);
+				const float ft = (float)s_btmfFrameBox[1] - (4.0f * fh / 240.0f);
+
+				s_btmfWinDbg[0] = (short)fl;
+				s_btmfWinDbg[1] = (short)ft;
+				s_btmfWinDbg[2] = (short)(fl + fw);
+				s_btmfWinDbg[3] = (short)(ft + fh);
+				N3DS_BottomMapDraw_SetWindow(fl, fl + fw, ft, ft + fh);
+				for (i = 0; i < s_btmfSegCount; i++)
+				{
+					const N3DS_MergeSegment *seg = &s_btmfSegs[i];
+					const int wantWrite = ((seg->blendMode != 0) && g_dbg_fxNoDepthWrite) ? 0 : 1;
+
+					if ((int)seg->doubling != lastDoubling)
+					{
+						N3DS_C3DSetColorDoubling((int)seg->doubling);
+						lastDoubling = (int)seg->doubling;
+					}
+					if (wantWrite != lastDepthWrite)
+					{
+						N3DS_C3DSetDepthWrite(wantWrite);
+						lastDepthWrite = wantWrite;
+					}
+					N3DS_C3DSetBlendMode((int)seg->blendMode);
+					N3DS_C3DBindAtlas((int)seg->atlas);
+					N3DS_C3DDrawTriangles(seg->baseVertex, seg->vertCount / 3);
+				}
+			}
+			N3DS_BottomMapDraw_End();
+			/* This pass touched doubling/depth-write/blend behind the
+			 * frame memos; force the next frame's first consumer to
+			 * reassert, same rule as the UI pass above. */
+			s_mergeDepthWriteState = -1;
+		}
+		else
+		{
+			/* No bottom target (allocation failed, logged by the backend):
+			 * stop retagging so the map returns to the top screen instead
+			 * of vanishing. */
+			g_dbg_btmMap = 0;
+			active = 0;
+		}
+	}
+
+	if (active != s_btmmWasActive)
+	{
+		char line[224];
+
+		if (active)
+		{
+			snprintf(line, sizeof(line), "[BTMMAP] on: segs=%d box=%d,%d..%d,%d win=%d,%d..%d,%d fpsSegs=%d fbox=%d,%d..%d,%d fwin=%d,%d..%d,%d",
+			         s_btmmSegCount, (int)s_btmmFrameBox[0], (int)s_btmmFrameBox[1], (int)s_btmmFrameBox[2], (int)s_btmmFrameBox[3],
+			         (int)s_btmmWin[0], (int)s_btmmWin[1], (int)s_btmmWin[2], (int)s_btmmWin[3], s_btmfSegCount,
+			         s_btmfFrameHasBox ? (int)s_btmfFrameBox[0] : 0, s_btmfFrameHasBox ? (int)s_btmfFrameBox[1] : 0,
+			         s_btmfFrameHasBox ? (int)s_btmfFrameBox[2] : 0, s_btmfFrameHasBox ? (int)s_btmfFrameBox[3] : 0, (int)s_btmfWinDbg[0],
+			         (int)s_btmfWinDbg[1], (int)s_btmfWinDbg[2], (int)s_btmfWinDbg[3]);
+		}
+		else
+		{
+			snprintf(line, sizeof(line), "[BTMMAP] off (dropped=%lu src mSeg=%lu mRun=%lu mVbo=%lu fSeg=%lu fRun=%lu fVbo=%lu peak m=%d f=%d)",
+			         (unsigned long)s_btmmDropped, (unsigned long)s_btmmDropSegFull, (unsigned long)s_btmmDropRunCap,
+			         (unsigned long)s_btmmDropVbo, (unsigned long)s_btmfDropSegFull, (unsigned long)s_btmfDropRunCap,
+			         (unsigned long)s_btmfDropVbo, s_btmmSegsPeak, s_btmfSegsPeak);
+		}
+		N3DS_DebugLog(line);
+		s_btmmWasActive = active;
+		if (!active)
+		{
+			/* The off line just reported this activation span's peak segment
+			 * counts; zero them so the next span reports its own peak. Left as a
+			 * boot-lifetime max, peak m= reads 0 at every pre-race FPS-only
+			 * toggle (map segs=0) and gets misread as "0 across a race the map
+			 * drew" -- the counter is right, its scope was wrong. */
+			s_btmmSegsPeak = 0;
+			s_btmfSegsPeak = 0;
+		}
+	}
+	if (!mapActive)
+	{
+		/* A race's window has no business surviving into the next one: the
+		 * sheet size is per-track, and menus always sit between (during which
+		 * the pass now stays active for the FPS overlay alone). */
+		s_btmmWinValid = 0;
+	}
+
+	s_btmmSegCount = 0;
+	s_btmmFrameHasBox = 0;
+	s_btmfSegCount = 0;
+	s_btmfFrameHasBox = 0;
+}
+
 /* A bin hit capacity mid-frame: spill it as one opaque segment (order-free,
  * so WHERE it lands in the segment list is irrelevant) and keep binning. */
 internal void N3DS_MergeSpillBin(int bin)
@@ -2924,10 +3698,14 @@ internal void N3DS_MergeSpillBin(int bin)
 		return;
 	}
 
-	baseVertex = N3DS_C3DAppendVertices(s_mergeBinVerts[bin], s_mergeBinUsed[bin]);
+	baseVertex = N3DS_TvboCheckedAppend(s_mergeBinVerts[bin], s_mergeBinUsed[bin]);
 	if (baseVertex < 0)
 	{
 		s_droppedRuns++;
+		if (g_dbg_tireVtxLog && s_binHasTire[bin])
+		{
+			N3DS_DebugLog("[TO] TIRE SPILL DROPPED (frame VBO full)");
+		}
 	}
 	else
 	{
@@ -2938,8 +3716,18 @@ internal void N3DS_MergeSpillBin(int bin)
 		seg->atlas = (u8)((bin == N3DS_MERGE_UNTEX_BIN) ? N3DS_WHITE_ATLAS : bin);
 		seg->baseVertex = baseVertex;
 		seg->vertCount = s_mergeBinUsed[bin];
+		if (g_dbg_tireVtxLog && s_binHasTire[bin])
+		{
+			char msg[96];
+
+			snprintf(msg, sizeof(msg), "[TO] f=%lu spill bin=%d oseg=%d base=%d n=%d", (unsigned long)s_frameCounter, bin,
+			         s_mergeOpaqueSegCount - 1, baseVertex, seg->vertCount);
+			N3DS_DebugLog(msg);
+			s_osegHasTire[s_mergeOpaqueSegCount - 1] = 1;
+		}
 	}
 	s_mergeBinUsed[bin] = 0;
+	s_binHasTire[bin] = 0;
 }
 
 /* This codebase has no 3-way min/max anywhere -- native_libgte.c's
@@ -2969,6 +3757,62 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
                                         int pixelBaseU, int pixelBaseV, int originU, int originV)
 {
 	int v;
+
+	/* Far-edge UV inset for the map-sheet sprite classes: the in-race map
+	 * (PKTDEPTH_UI_STAMP_BTMMAP, both routes -- bottom panel and top
+	 * screen) and the never-routed picture sprites (PKTDEPTH_UI_STAMP_UIPIC:
+	 * track-select and hub map sheets). Texel-centre numerators make a quad's sampled
+	 * span [a0+0.5, a1+0.5], so any non-1:1-scaled sprite shows a
+	 * half-texel band of the texel PAST its far edge -- for the map
+	 * sheet's two stacked half-icons that band is whatever VRAM holds
+	 * below each icon, which adds nothing under the map's additive blend
+	 * and reads as a dark seam line between the halves. Pull the far-edge
+	 * vertices (the triangle's per-axis maxima) back a whole texel to
+	 * a1-0.5: nothing past the authored rect is ever sampled. The NEAR
+	 * edge keeps the centre form -- stepping outward there can cross into
+	 * a neighbouring decode cell when the rect starts on a cell boundary.
+	 * Map class only: on 1:1 glyph text this gradient change would
+	 * duplicate rows. */
+	int insetMaxU = -1;
+	int insetMaxV = -1;
+
+	if (!untextured &&
+	    ((triVerts[0].emitOrdinal == PKTDEPTH_UI_STAMP_BTMMAP) || (triVerts[0].emitOrdinal == PKTDEPTH_UI_STAMP_UIPIC)))
+	{
+		int minU = triVerts[0].u, maxU = triVerts[0].u;
+		int minV = triVerts[0].v, maxV = triVerts[0].v;
+		int k;
+
+		for (k = 1; k < 3; k++)
+		{
+			if (triVerts[k].u < minU)
+			{
+				minU = triVerts[k].u;
+			}
+			if (triVerts[k].u > maxU)
+			{
+				maxU = triVerts[k].u;
+			}
+			if (triVerts[k].v < minV)
+			{
+				minV = triVerts[k].v;
+			}
+			if (triVerts[k].v > maxV)
+			{
+				maxV = triVerts[k].v;
+			}
+		}
+		/* Degenerate axes (all three verts on one texel row/column) keep
+		 * the centre form: insetting there would invert the span. */
+		if (maxU > minU)
+		{
+			insetMaxU = maxU;
+		}
+		if (maxV > minV)
+		{
+			insetMaxV = maxV;
+		}
+	}
 
 	for (v = 0; v < 3; v++)
 	{
@@ -3070,8 +3914,22 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
 		}
 		else
 		{
-			dst->u = (s16)(((pixelBaseU + ((int)src->u - originU)) << 1) + 1);
-			dst->v = (s16)(2047 - ((pixelBaseV + ((int)src->v - originV)) << 1));
+			int nu = ((pixelBaseU + ((int)src->u - originU)) << 1) + 1;
+			int nv = 2047 - ((pixelBaseV + ((int)src->v - originV)) << 1);
+
+			/* One texel = 2 numerator units; the V axis is flipped, so
+			 * "back toward the near edge" is -2 in U but +2 in V. */
+			if ((int)src->u == insetMaxU)
+			{
+				nu -= 2;
+			}
+			if ((int)src->v == insetMaxV)
+			{
+				nv += 2;
+			}
+
+			dst->u = (s16)nu;
+			dst->v = (s16)nv;
 		}
 
 		/* Raw u8 copy, no scale -- the *1/255 reciprocal-multiply that
@@ -3341,6 +4199,33 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 		*outOriginV = tileY0 * N3DS_SUBPAGE_DIM;
 		s_trianglesRoutedSubPage++;
 
+#if defined(CTR_INTERNAL)
+		if ((texPage == 7) && (((clut == 0x40c0) && (s_tirehuntLogs0 < 64)) || ((clut == 0x4001) && (s_tirehuntLogsRef < 6))))
+		{
+			char thMsg[160];
+
+			if (clut == 0x40c0)
+			{
+				s_tirehuntLogs0++;
+			}
+			else
+			{
+				s_tirehuntLogsRef++;
+			}
+			snprintf(thMsg, sizeof(thMsg), "[TIREHUNT] f=%lu sub p=%d c=%04x vw=%d u=%d..%d v=%d..%d atlas=%d pb=%d,%d org=%d,%d",
+			         (unsigned long)s_frameCounter, (int)texPage, (unsigned)clut, (int)view, minU, maxU, minV, maxV, *outAtlasIdx, *outPixelBaseU,
+			         *outPixelBaseV, *outOriginU, *outOriginV);
+			N3DS_DebugLog(thMsg);
+		}
+		/* A crossing is live: arm a next-frame triangle dump so the blink
+		 * frame's vertex records land on SD (crossings span 1-2 frames). */
+		if ((clut == 0x40c0) && (s_tirehuntDumps < 6) && !s_triDumpArm)
+		{
+			s_triDumpArm = 1;
+			s_tirehuntDumps++;
+		}
+#endif
+
 		/* Stamp AFTER the decode: FindOrDecode may itself have evicted,
 		 * which moves the sum -- a memo stored with the pre-decode stamp
 		 * would die on its first probe. */
@@ -3383,6 +4268,25 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 		*outOriginU = 0;
 		*outOriginV = 0;
 		s_trianglesRoutedFullPage++;
+
+#if defined(CTR_INTERNAL)
+		if ((texPage == 7) && (((clut == 0x40c0) && (s_tirehuntLogs0 < 64)) || ((clut == 0x4001) && (s_tirehuntLogsRef < 6))))
+		{
+			char thMsg[160];
+
+			if (clut == 0x40c0)
+			{
+				s_tirehuntLogs0++;
+			}
+			else
+			{
+				s_tirehuntLogsRef++;
+			}
+			snprintf(thMsg, sizeof(thMsg), "[TIREHUNT] full p=%d c=%04x vw=%d u=%d..%d v=%d..%d atlas=%d pb=%d,%d", (int)texPage, (unsigned)clut, (int)view,
+			         minU, maxU, minV, maxV, *outAtlasIdx, *outPixelBaseU, *outPixelBaseV);
+			N3DS_DebugLog(thMsg);
+		}
+#endif
 
 		s_rmemoValid = 1;
 		s_rmemoTier = 2;
@@ -3432,7 +4336,7 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 
 	N3DS_DebugLog("[CTR-3DS] renderer init ok, citro3d ready");
 
-	/* Hand the backend TU the VRAM buffer so its SELECT+R debug capture can
+	/* Hand the backend TU the VRAM buffer so its debug capture (dumpreq `capture`) can
 	 * write it to SD (see N3DS_DebugSetVRAMForDump). vram[] and the frame
 	 * counter shadow are stable globals, so registering their addresses once
 	 * is safe. */
@@ -3534,6 +4438,20 @@ void NativeRenderer_BeginScene(void)
 		N3DS_DebugLog(s_triDumpFile ? "[CTR-3DS] triangle dump armed for this frame" : "[CTR-3DS] triangle dump fopen FAILED");
 	}
 #endif
+
+	/* tirelog trace (remove with the hunt): the VBO monotonicity check and
+	 * the tire flags are frame-scope; EndScene's flush clears the flags on
+	 * merge frames, this covers non-merge frames and the toggle turning on
+	 * mid-session. */
+	g_tirelogFrameNow = (unsigned long)s_frameCounter;
+	if (g_dbg_tireVtxLog)
+	{
+		s_tvboLastEnd = 0;
+		s_runHasTire = 0;
+		memset(s_binHasTire, 0, sizeof(s_binHasTire));
+		memset(s_segHasTire, 0, sizeof(s_segHasTire));
+		memset(s_osegHasTire, 0, sizeof(s_osegHasTire));
+	}
 
 	/* Working-set estimate is per frame, so latch its peak and restart the
 	 * count at the frame boundary. BeginScene is guarded against re-entry by
@@ -3763,10 +4681,12 @@ void NativeRenderer_EndScene(void)
 	 */
 	{
 		extern void NativeModelDraw_IssueForWalk(void);
+		const unsigned long long texdecMdlT0 = N3DS_GetTickCount();
 
 		NativePerf_BeginScope(NATIVE_PERF_BUCKET_NATIVE_MODEL_DRAW);
 		NativeModelDraw_IssueForWalk();
 		NativePerf_EndScope(NATIVE_PERF_BUCKET_NATIVE_MODEL_DRAW);
+		s_texdecFrameMdlTicks += N3DS_GetTickCount() - texdecMdlT0;
 	}
 #endif
 
@@ -3871,7 +4791,7 @@ void NativeRenderer_EndScene(void)
 
 		/* Modulate off (bright=1 pipeline) so texels show unscaled. */
 		N3DS_C3DSetColorDoubling(0);
-		baseVertex = N3DS_C3DAppendVertices(quad, 6);
+		baseVertex = N3DS_TvboCheckedAppend(quad, 6);
 		if (baseVertex >= 0)
 		{
 			N3DS_C3DBindAtlas(atlasIndex);
@@ -3902,6 +4822,12 @@ void NativeRenderer_EndScene(void)
 	{
 		N3DS_StereoRenderRightEye();
 	}
+
+	/* Bottom-screen minimap, LAST of all: after the right-eye replay so its
+	 * target/state switches can never leak into the journaled eyes, before
+	 * FrameEnd so its draws join this frame's command list. Self-guarding --
+	 * drains its own state even when there is nothing to draw. */
+	N3DS_DrawBottomMapPass();
 
 	s_endSceneCount++;
 	// C3D_FrameEnd: the whole frame's queued GPU commands actually execute
@@ -3966,6 +4892,15 @@ internal void N3DS_StatsDripRow(void)
 {
 	const int r = s_statsCursor;
 
+	/* Consolidated console-visibility gate (map owns the panel / stats console
+	 * off / boot text still up) -- see g_dbg_statsConsole. Glyphs land in the
+	 * shared framebuffer at print time, so this must be gated at the painter,
+	 * not at present. Composition and the log mirror continue regardless. */
+	if (!N3DS_ConsolePaintAllowed())
+	{
+		return;
+	}
+
 	s_statsCursor = (s_statsCursor + 1) % N3DS_STATS_ROWS;
 	/* Unconditional, not diffed -- repainting an unchanged row is what makes
 	 * this self-cleaning. Rows the block never filled are blank by static
@@ -4019,6 +4954,47 @@ void NativeRenderer_SwapWindow(void)
 	/* Re-capture the forced diagnostic texture next frame (see
 	 * g_dbg_forceSingleTexture) so it always tracks a currently-loaded one. */
 	s_forcedTexValid = 0;
+
+	/*
+	 * [TEXDEC] fold: attribute the frame that just drew (s_frameCounter is
+	 * pre-increment here, so frame= matches). Per-frame line only past the
+	 * thresholds -- steady content (a few ms of stale re-decodes, model pass
+	 * under ~20ms) stays silent; a first-draw storm or a no-decode model
+	 * spike prints itself. Window totals/max feed the 64-frame stats block.
+	 */
+	{
+		const unsigned long long texdecFreq = N3DS_GetTickFrequency();
+		const unsigned long decUs = (unsigned long)((s_texdecFrameDecTicks * 1000000ULL) / texdecFreq);
+		const unsigned long upUs = (unsigned long)((s_texdecFrameUpTicks * 1000000ULL) / texdecFreq);
+		const unsigned long mdlUs = (unsigned long)((s_texdecFrameMdlTicks * 1000000ULL) / texdecFreq);
+		const unsigned long missUs = decUs + upUs;
+
+		s_texdecWinSub += s_texdecFrameSub;
+		s_texdecWinFull += s_texdecFrameFull;
+		s_texdecWinUs += (u32)missUs;
+		if ((missUs > mdlUs ? missUs : mdlUs) > s_texdecWinMaxUs)
+		{
+			s_texdecWinMaxUs = (u32)(missUs > mdlUs ? missUs : mdlUs);
+			s_texdecWinMaxSub = s_texdecFrameSub;
+			s_texdecWinMaxFull = s_texdecFrameFull;
+			s_texdecWinMaxMdlUs = (u32)mdlUs;
+			s_texdecWinMaxFrame = s_frameCounter;
+		}
+		if ((missUs >= 5000) || (mdlUs >= 20000))
+		{
+			char texdecLine[160];
+
+			snprintf(texdecLine, sizeof(texdecLine), "[TEXDEC] frame=%lu sub=%lu full=%lu decUs=%lu upUs=%lu mdlUs=%lu",
+			         (unsigned long)s_frameCounter, (unsigned long)s_texdecFrameSub, (unsigned long)s_texdecFrameFull,
+			         decUs, upUs, mdlUs);
+			N3DS_DebugLog(texdecLine);
+		}
+		s_texdecFrameSub = 0;
+		s_texdecFrameFull = 0;
+		s_texdecFrameDecTicks = 0;
+		s_texdecFrameUpTicks = 0;
+		s_texdecFrameMdlTicks = 0;
+	}
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_SWAP_WINDOW);
 
@@ -4093,6 +5069,9 @@ void NativeRenderer_SwapWindow(void)
 		}
 		s_lastStatFrames = frames;
 		s_lastStatVblanks = vblanks;
+		/* Publish for the bottom-screen FPS overlay -- computed here whether or
+		 * not the console block below ever paints. */
+		g_n3dsFpsX10 = nowX10;
 
 		/*
 		 * Row 1, not row 16: the block started halfway down when the console
@@ -4485,6 +5464,25 @@ void NativeRenderer_SwapWindow(void)
 				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] routing subPage=%lu fullPage=%lu",
 				         (unsigned long)s_trianglesRoutedSubPage, (unsigned long)s_trianglesRoutedFullPage);
 				N3DS_DebugLog(cacheLine);
+
+				/* [TEXDEC] window roll-up: totals plus the worst single
+				 * frame's split, so a one-frame storm stays visible even when
+				 * its per-frame line was below threshold. */
+				snprintf(cacheLine, sizeof(cacheLine),
+				         "[TEXDEC] win sub=%lu full=%lu us=%lu | max frame=%lu us=%lu sub=%lu full=%lu mdlUs=%lu",
+				         (unsigned long)s_texdecWinSub, (unsigned long)s_texdecWinFull, (unsigned long)s_texdecWinUs,
+				         (unsigned long)s_texdecWinMaxFrame, (unsigned long)s_texdecWinMaxUs,
+				         (unsigned long)s_texdecWinMaxSub, (unsigned long)s_texdecWinMaxFull,
+				         (unsigned long)s_texdecWinMaxMdlUs);
+				N3DS_DebugLog(cacheLine);
+				s_texdecWinSub = 0;
+				s_texdecWinFull = 0;
+				s_texdecWinUs = 0;
+				s_texdecWinMaxUs = 0;
+				s_texdecWinMaxSub = 0;
+				s_texdecWinMaxFull = 0;
+				s_texdecWinMaxMdlUs = 0;
+				s_texdecWinMaxFrame = 0;
 
 				if (g_dbg_statsVerbose)
 				printf("route  sub %-8lu full %-8lu  subMiss %-5lu subEvict %-5lu\n",
@@ -5038,7 +6036,7 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 			}
 
 			N3DS_C3DBindVramDisplayTex(slot);
-			baseVertex = N3DS_C3DAppendVertices(verts, 6);
+			baseVertex = N3DS_TvboCheckedAppend(verts, 6);
 			if (baseVertex >= 0)
 			{
 				N3DS_C3DDrawTriangles(baseVertex, 2);
@@ -5619,7 +6617,26 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 
 			if (s_mergeActive && g_dbg_uiOrder && g_dbg_packetDepth && (triVerts[0].emitOrdinal >= 0xFFC0u))
 			{
-				N3DS_Vertex *uiDst = N3DS_UiOrderAppend(s_currentBlendMode, untextured ? 0 : 1, atlasIdx);
+				N3DS_Vertex *uiDst;
+
+				/* Bottom-screen minimap: the resolver stamps the map block's
+				 * primitives one below the pin (see the s_btmm* block); peel
+				 * them into the parallel list BEFORE run coalescing, so a map
+				 * triangle can never share a segment with ordinary UI. The FPS
+				 * overlay's glyphs carry their own stamp and their own list,
+				 * because they draw through a different window. */
+				if (g_dbg_btmMap && (triVerts[0].emitOrdinal == PKTDEPTH_UI_STAMP_BTMMAP))
+				{
+					uiDst = N3DS_BtmMapAppend(s_currentBlendMode, untextured ? 0 : 1, atlasIdx);
+				}
+				else if (g_dbg_btmMap && (triVerts[0].emitOrdinal == PKTDEPTH_UI_STAMP_BTMFPS))
+				{
+					uiDst = N3DS_BtmFpsAppend(s_currentBlendMode, untextured ? 0 : 1, atlasIdx);
+				}
+				else
+				{
+					uiDst = N3DS_UiOrderAppend(s_currentBlendMode, untextured ? 0 : 1, atlasIdx);
+				}
 
 				if (uiDst != NULL)
 				{
@@ -5628,10 +6645,38 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 						NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
 					}
 					N3DS_ConvertTriangleVerts(uiDst, triVerts, untextured, cellX, cellY, pixelBaseU, pixelBaseV, originU, originV);
+					/* Unrouted map triangles (bottom screen off) and
+					 * picture-sprite triangles (menu/hub map sheets -- never
+					 * routed) draw in the ordinary ordered-UI list, where
+					 * layering is draw order under EQUAL depth -- the pin.
+					 * Their stamps are off-pin (kept for the UV inset), so
+					 * re-pin z/w here: leaving them a step farther would let
+					 * any earlier-drawn pinned quad's rect occlude them. The
+					 * routed leg keeps 0xFFFD -- the bottom pass needs the
+					 * map a step behind the FPS text's 0xFFFE. */
+					if ((triVerts[0].emitOrdinal == PKTDEPTH_UI_STAMP_UIPIC) ||
+					    (!g_dbg_btmMap && (triVerts[0].emitOrdinal == PKTDEPTH_UI_STAMP_BTMMAP)))
+					{
+						const s16 pinned = (s16)(0xFFFFu - 32768);
+
+						uiDst[0].z = pinned;
+						uiDst[1].z = pinned;
+						uiDst[2].z = pinned;
+						uiDst[0].w = pinned;
+						uiDst[1].w = pinned;
+						uiDst[2].w = pinned;
+					}
 					if (perfScopes)
 					{
 						NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
 					}
+				}
+				if (g_dbg_tireVtxLog && N3DS_TireVtxIsTire(triVerts, untextured))
+				{
+					/* A tire triangle here means its depth stamp landed in the
+					 * UI band -- a misclassification finding by itself. */
+					N3DS_TireVtxLogTri(triVerts, (int)texView, s_currentBlendMode, atlasIdx, pixelBaseU, pixelBaseV, 'U', 0,
+					                   (uiDst != NULL) ? 1 : 0);
 				}
 				continue;
 			}
@@ -5653,6 +6698,12 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 #ifdef CTR_INTERNAL
 			N3DS_TriDumpRecord(triVerts, !untextured, untextured ? 255 : (int)s_currentTexFormat, atlasIdx, pixelBaseU, pixelBaseV, originU, originV);
 #endif
+			if (g_dbg_tireVtxLog && N3DS_TireVtxIsTire(triVerts, untextured))
+			{
+				N3DS_TireVtxLogTri(triVerts, (int)texView, s_currentBlendMode, atlasIdx, pixelBaseU, pixelBaseV, 'B', bin,
+				                   s_mergeBinUsed[bin]);
+				s_binHasTire[bin] = 1;
+			}
 
 			if (perfScopes)
 			{
@@ -5694,6 +6745,12 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 #ifdef CTR_INTERNAL
 		N3DS_TriDumpRecord(triVerts, !untextured, untextured ? 255 : (int)s_currentTexFormat, atlasIdx, pixelBaseU, pixelBaseV, originU, originV);
 #endif
+		if (g_dbg_tireVtxLog && N3DS_TireVtxIsTire(triVerts, untextured))
+		{
+			N3DS_TireVtxLogTri(triVerts, (int)texView, s_currentBlendMode, atlasIdx, pixelBaseU, pixelBaseV, 'R', s_mergeBlendSegCount,
+			                   s_runVertCount);
+			s_runHasTire = 1;
+		}
 
 		if (perfScopes)
 		{

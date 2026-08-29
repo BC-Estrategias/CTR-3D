@@ -278,6 +278,28 @@ int g_dbg_flagStyle = FLAG_STYLE_RETAIL;
  * gate. See include/native_penta.h. */
 int g_pentaPal = 1;
 
+/* Boost-reserves HUD meter (game/UI/UI_Meter.c, UI_DrawReservesMeter). ON by
+ * default -- owner's call, matching the wider CTR mod scene where a reserves
+ * meter ships enabled. The `reserves` dumpreq and the future Options menu can
+ * turn it off. See include/native_reserves.h. */
+int g_reservesMeter = 1;
+
+/* Fix retail's mirrored-tire placement bug (game/DrawTires.c,
+ * DrawTiresReflection_BuildWheelLocalPairs). Retail's DrawTires_Reflection
+ * loses Instance.scale.x to a branch-delay-slot clobber and computes the
+ * wheels' lateral offset from instFlags&0x100 instead -- 9 units, not the
+ * ~144 the solid path uses -- so every reflected kart shows its wheel pairs
+ * merged on the centerline (real PS1 does this too). ON by default -- owner's
+ * call, a deliberate fix of shipped retail behaviour. The `tirefix` dumpreq
+ * can restore the retail bug for A/B. */
+int g_tireReflectFix = 1;
+
+#ifdef CTR_INTERNAL
+/* Invisible-tire hunt: dumpreq `tirepin` pins wheels to sprite 0. Remove with
+ * the hunt. */
+int g_tirehuntPin0 = 0;
+#endif
+
 /* See include/platform/native_gpu.h. Lives here, not in the 3DS renderer that
  * writes it, so the windowed instruments that READ it (native_perf.c, the
  * [OTPROF] block below) do not depend on a 3DS-only file being in the build. */
@@ -381,6 +403,14 @@ typedef struct
 	u32 prevSet[OTPROF_PREV_SET_SIZE];
 	u32 prevShapeSet[OTPROF_PREV_SET_SIZE];
 	u32 prevMSet[OTPROF_PREV_SET_SIZE];
+	/* fold N-2 packet hashes: a mid-OT DrawAllSplits barrier (FILL/MOVE/
+	 * framebuffer-feedback) folds one game frame TWICE, so consecutive folds
+	 * are the two disjoint halves of one frame and the N-1 comparison reads 0%
+	 * by construction. The same-parity N-2 set recovers the true frame-over-
+	 * frame reuse, which distinguishes a barrier-split artifact (N-2 high) from
+	 * a genuine cache collapse (N-2 also low). Main packet set only -- that is
+	 * the set the amnesia trigger reads. */
+	u32 prevSet2[OTPROF_PREV_SET_SIZE];
 
 	/* window accumulators */
 	u32 winFrames;
@@ -413,6 +443,275 @@ typedef struct
 } OTWalkProfileState;
 
 global_variable OTWalkProfileState s_otprof;
+
+/*
+ * Amnesia probe ([AMNESIA], profile builds): names the game event behind the
+ * cache-collapse burst class -- multi-second spans where pkreuse drops to ~0
+ * with content BELOW median while draw_all_splits multiplies. Watches the
+ * per-fold reuse ratio; when it collapses off a sustained-healthy baseline,
+ * logs the fold-level hash forensics (the full/shape/model reuse split
+ * localizes WHICH bytes changed: position-only vs appearance vs mesh), the
+ * dominant matrix run's actual R+TR words, and the game-thread context
+ * mirror (state snapshot + recent event ring, pushed via NativeAmnesia_*).
+ * The mirror is written on the game thread and read here on the walk thread
+ * unsynchronized: a torn read is one frame loose at worst, which forensic
+ * reading tolerates, and a lock could perturb the very timing being hunted.
+ */
+#define AMN_MIN_HASHED      100 /* below this the ratio is menu/empty noise */
+#define AMN_HEALTHY_PCT     25
+#define AMN_COLLAPSE_PCT    5
+#define AMN_ARM_FOLDS       30 /* sustained health required to arm the trigger */
+#define AMN_UNHEALTHY_BREAK 8  /* tolerated ramp-down before the streak resets */
+#define AMN_DETAIL_FOLDS    6
+#define AMN_RECOVER_FOLDS   2
+#define AMN_FORCE_END_FOLDS 3600
+#define AMN_MAX_EPISODES    16
+#define AMN_EV_RING         16
+#define AMN_EV_LOGGED       8
+
+int g_dbg_amnesia = 1; /* dumpreq `amnesia` */
+
+typedef struct
+{
+	u32 frame; /* s_amnesia.foldIdx at push time */
+	u32 kind;  /* AMN_EV_* (native_amnesia.h); 0 = empty slot */
+	s32 a;
+	s32 b;
+} AmnesiaEvent;
+
+typedef struct
+{
+	/* walk-thread detector */
+	u32 foldIdx;
+	s32 detLevel; /* walk-side copy of gLevel; a change resets the episode budget */
+	int detLevelValid;
+	u32 healthyStreak;
+	u32 unhealthyRun;
+	u32 recoverRun;
+	int episodeActive;
+	u32 episodeStartFold;
+	u32 episodeDetailLeft;
+	u32 episodeCount;
+	/* game-thread context mirror (unsynchronized; see block comment) */
+	u32 evWriteIdx;
+	AmnesiaEvent ev[AMN_EV_RING];
+	s32 gLevel;
+	u32 gMode1;
+	u32 gMode2;
+	s32 gClock;
+	s32 gFade;
+	s32 gCamX, gCamY, gCamZ;
+	s32 gCamPX, gCamPY, gCamPZ;
+	u32 gStateCalls; /* staleness tell: 0 = the game-side hook never ran */
+} AmnesiaState;
+
+global_variable AmnesiaState s_amnesia;
+
+void NativeAmnesia_FrameState(s32 level, u32 mode1, u32 mode2, s32 clockFx, s32 fade, s32 camX, s32 camY, s32 camZ)
+{
+	AmnesiaState *a = &s_amnesia;
+
+	a->gCamPX = a->gCamX;
+	a->gCamPY = a->gCamY;
+	a->gCamPZ = a->gCamZ;
+	a->gLevel = level;
+	a->gMode1 = mode1;
+	a->gMode2 = mode2;
+	a->gClock = clockFx;
+	a->gFade = fade;
+	a->gCamX = camX;
+	a->gCamY = camY;
+	a->gCamZ = camZ;
+	a->gStateCalls++;
+}
+
+void NativeAmnesia_NoteEvent(u32 kind, s32 a, s32 b)
+{
+	AmnesiaState *st = &s_amnesia;
+	AmnesiaEvent *e;
+
+	/* Repeat-guard: per-frame re-assertions (a camera snap held across a
+	 * respawn, mask refreshes in stuck states) would flood the ring and
+	 * evict the events worth reading. Costs the probe repeat fires of the
+	 * same event inside the window; the trigger question only needs one. */
+	if (st->evWriteIdx > 0)
+	{
+		const AmnesiaEvent *last = &st->ev[(st->evWriteIdx - 1) & (AMN_EV_RING - 1)];
+
+		if ((last->kind == kind) && (last->a == a) && ((st->foldIdx - last->frame) < 30))
+		{
+			return;
+		}
+	}
+	e = &st->ev[st->evWriteIdx & (AMN_EV_RING - 1)];
+	e->frame = st->foldIdx;
+	e->kind = kind;
+	e->a = a;
+	e->b = b;
+	st->evWriteIdx++;
+}
+
+internal void Amnesia_LogGameContext(void)
+{
+	AmnesiaState *a = &s_amnesia;
+	char evbuf[144];
+	u32 evlen = 0;
+	u32 n = (a->evWriteIdx < AMN_EV_LOGGED) ? a->evWriteIdx : AMN_EV_LOGGED;
+
+	evbuf[0] = '\0';
+	for (u32 i = 0; i < n; i++)
+	{
+		const AmnesiaEvent *e = &a->ev[(a->evWriteIdx - 1 - i) & (AMN_EV_RING - 1)];
+		int w;
+
+		if (e->kind == 0)
+		{
+			break;
+		}
+		w = snprintf(evbuf + evlen, sizeof(evbuf) - evlen, "%s%lu/%ld/%ld@-%lu", evlen ? " " : "", (unsigned long)e->kind, (long)e->a, (long)e->b,
+		             (unsigned long)(a->foldIdx - e->frame));
+		if ((w < 0) || ((u32)w >= sizeof(evbuf) - evlen))
+		{
+			break;
+		}
+		evlen += (u32)w;
+	}
+	OTPROF_LOG("[AMNESIA] game lvl=%ld mode=%08lx/%08lx clock=%ld fade=%ld pause=%lu cam=%ld,%ld,%ld dcam=%ld,%ld,%ld st=%lu", (long)a->gLevel,
+	           (unsigned long)a->gMode1, (unsigned long)a->gMode2, (long)a->gClock, (long)a->gFade, (unsigned long)(a->gMode1 & 0xFu), (long)a->gCamX,
+	           (long)a->gCamY, (long)a->gCamZ, (long)(a->gCamX - a->gCamPX), (long)(a->gCamY - a->gCamPY), (long)(a->gCamZ - a->gCamPZ),
+	           (unsigned long)a->gStateCalls);
+	OTPROF_LOG("[AMNESIA] ev n=%lu [%s]", (unsigned long)a->evWriteIdx, evbuf);
+}
+
+internal void Amnesia_LogDomMatrix(u8 domId, u32 domShare, u32 idsUsed)
+{
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	u32 w[8];
+
+	if (GTECapture_ReadMatrixWords(domId, w))
+	{
+		OTPROF_LOG("[AMNESIA] mtx dom=%lu share=%lu%% ids=%lu R=%08lx,%08lx,%08lx,%08lx,%08lx TR=%ld,%ld,%ld", (unsigned long)domId,
+		           (unsigned long)domShare, (unsigned long)idsUsed, (unsigned long)w[0], (unsigned long)w[1], (unsigned long)w[2], (unsigned long)w[3],
+		           (unsigned long)w[4], (long)(s32)w[5], (long)(s32)w[6], (long)(s32)w[7]);
+	}
+	else
+	{
+		OTPROF_LOG("[AMNESIA] mtx dom=%lu share=%lu%% ids=%lu (no words)", (unsigned long)domId, (unsigned long)domShare, (unsigned long)idsUsed);
+	}
+#else
+	(void)domId;
+	(void)domShare;
+	(void)idsUsed;
+#endif
+}
+
+internal void Amnesia_LogDetail(u32 reused, u32 reused2, u32 shapeReused, u32 mReused, u8 domId, u32 domShare, u32 idsUsed)
+{
+	const u32 h = s_otprof.frameHashCount ? s_otprof.frameHashCount : 1;
+	const u32 sh = s_otprof.frameShapeHashCount ? s_otprof.frameShapeHashCount : 1;
+	const u32 mh = s_otprof.frameMHashCount ? s_otprof.frameMHashCount : 1;
+	u32 single = 0;
+
+	for (u32 i = 0; i < 64; i++)
+	{
+		single += s_otprof.frameMSingleById[i];
+	}
+	/* pk2 = same-parity N-2 reuse; split=1 when the dry walk and real walk
+	 * disagree, the signature of a barrier-split partial fold. pk~0 with pk2
+	 * high and split=1 is the barrier artifact, not a real cache collapse. */
+	OTPROF_LOG("[AMNESIA] f=%lu pk=%lu%%/%lu pk2=%lu%% split=%d shp=%lu%% msh=%lu%%/%lu nodes=%lu prims=%lu dry=%lu mtx=%lu@%lu%%/%lu sdom=%lu/%lu multi=%lu",
+	           (unsigned long)s_amnesia.foldIdx, (unsigned long)(reused * 100u / h), (unsigned long)s_otprof.frameHashCount,
+	           (unsigned long)(reused2 * 100u / h), (s_otprof.frameDryNodes != s_otprof.frameNodes) ? 1 : 0, (unsigned long)(shapeReused * 100u / sh),
+	           (unsigned long)(mReused * 100u / mh), (unsigned long)s_otprof.frameMHashCount, (unsigned long)s_otprof.frameNodes,
+	           (unsigned long)s_otprof.framePrims, (unsigned long)s_otprof.frameDryNodes, (unsigned long)domId, (unsigned long)domShare,
+	           (unsigned long)idsUsed, (unsigned long)s_otprof.frameMSingleById[domId], (unsigned long)single, (unsigned long)s_otprof.frameMMulti);
+}
+
+internal void Amnesia_OnFold(u32 reused, u32 reused2, u32 shapeReused, u32 mReused, u8 domId, u32 domShare, u32 idsUsed)
+{
+	AmnesiaState *a = &s_amnesia;
+	const u32 hashed = s_otprof.frameHashCount;
+	const u32 pkPct = hashed ? (reused * 100u / hashed) : 0;
+	const u32 pkPct2 = hashed ? (reused2 * 100u / hashed) : 0;
+	/* A barrier-split partial fold reads 0% against N-1 (the disjoint other
+	 * half of the same frame) but high against its same-parity N-2 counterpart.
+	 * Count either as healthy so the split does not burn episodes, and require
+	 * BOTH to collapse before firing -- a real cache collapse fails both. */
+	const int healthy = (hashed >= AMN_MIN_HASHED) && ((pkPct >= AMN_HEALTHY_PCT) || (pkPct2 >= AMN_HEALTHY_PCT));
+
+	a->foldIdx++;
+
+	/* A new level restocks the episode budget: a long single-level sit (a full
+	 * intro) can otherwise spend it before the racing that the campaign cares
+	 * about. gLevel is the game-thread mirror, read here as everything else in
+	 * this block is -- forensic tolerance, no lock. */
+	if (!a->detLevelValid || (a->gLevel != a->detLevel))
+	{
+		a->detLevel = a->gLevel;
+		a->detLevelValid = 1;
+		a->episodeCount = 0;
+		a->episodeActive = 0;
+		a->healthyStreak = 0;
+		a->unhealthyRun = 0;
+	}
+
+	if (!g_dbg_amnesia)
+	{
+		a->healthyStreak = 0;
+		a->episodeActive = 0;
+		return;
+	}
+
+	if (a->episodeActive)
+	{
+		if (a->episodeDetailLeft > 0)
+		{
+			a->episodeDetailLeft--;
+			Amnesia_LogDetail(reused, reused2, shapeReused, mReused, domId, domShare, idsUsed);
+		}
+		a->recoverRun = healthy ? (a->recoverRun + 1) : 0;
+		if ((a->recoverRun >= AMN_RECOVER_FOLDS) || (a->foldIdx - a->episodeStartFold >= AMN_FORCE_END_FOLDS))
+		{
+			OTPROF_LOG("[AMNESIA] END f=%lu len=%lu pk=%lu%% forced=%d", (unsigned long)a->foldIdx, (unsigned long)(a->foldIdx - a->episodeStartFold),
+			           (unsigned long)pkPct, (a->recoverRun >= AMN_RECOVER_FOLDS) ? 0 : 1);
+			a->episodeActive = 0;
+			a->healthyStreak = 0;
+			a->unhealthyRun = 0;
+		}
+		return;
+	}
+
+	if (healthy)
+	{
+		a->healthyStreak++;
+		a->unhealthyRun = 0;
+		return;
+	}
+
+	if ((a->healthyStreak >= AMN_ARM_FOLDS) && (hashed >= AMN_MIN_HASHED) && (pkPct <= AMN_COLLAPSE_PCT) && (pkPct2 <= AMN_COLLAPSE_PCT) &&
+	    (a->episodeCount < AMN_MAX_EPISODES))
+	{
+		a->episodeActive = 1;
+		a->episodeCount++;
+		a->episodeStartFold = a->foldIdx;
+		a->episodeDetailLeft = AMN_DETAIL_FOLDS;
+		a->recoverRun = 0;
+		OTPROF_LOG("[AMNESIA] BEGIN #%lu f=%lu after=%lu healthy", (unsigned long)a->episodeCount, (unsigned long)a->foldIdx,
+		           (unsigned long)a->healthyStreak);
+		Amnesia_LogGameContext();
+		Amnesia_LogDomMatrix(domId, domShare, idsUsed);
+		a->episodeDetailLeft--;
+		Amnesia_LogDetail(reused, reused2, shapeReused, mReused, domId, domShare, idsUsed);
+		return;
+	}
+
+	/* Sub-collapse unhealthy folds (menus, transitions): tolerate a short
+	 * ramp so a 2-3 fold slide into collapse still fires the trigger. */
+	if (++a->unhealthyRun > AMN_UNHEALTHY_BREAK)
+	{
+		a->healthyStreak = 0;
+	}
+}
 
 internal u32 OTProf_HashWords(const u32 *words, u32 count)
 {
@@ -747,6 +1046,28 @@ internal void OTProf_FoldFrame(void)
 		}
 	}
 
+	/* Same-parity N-2 reuse: compare this fold against two folds ago, before
+	 * prevSet2 is overwritten below. See the prevSet2 declaration. */
+	u32 reused2 = 0;
+	for (u32 i = 0; i < s_otprof.frameHashCount; i++)
+	{
+		const u32 h = s_otprof.frameHashes[i];
+		u32 slot = (h * 2654435761u) & (OTPROF_PREV_SET_SIZE - 1);
+		while (s_otprof.prevSet2[slot] != 0)
+		{
+			if (s_otprof.prevSet2[slot] == h)
+			{
+				reused2++;
+				break;
+			}
+			slot = (slot + 1) & (OTPROF_PREV_SET_SIZE - 1);
+		}
+	}
+
+	/* Age the history: this fold's prevSet (N-1) becomes N-2 for the next
+	 * fold, then prevSet is rebuilt from this fold's hashes below. */
+	memcpy(s_otprof.prevSet2, s_otprof.prevSet, sizeof(s_otprof.prevSet2));
+
 	memset(s_otprof.prevSet, 0, sizeof(s_otprof.prevSet));
 	for (u32 i = 0; i < s_otprof.frameHashCount; i++)
 	{
@@ -828,6 +1149,14 @@ internal void OTProf_FoldFrame(void)
 		}
 		s_otprof.prevMSet[slot] = h;
 	}
+
+	Amnesia_OnFold(reused, reused2, shapeReused, mReused,
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+	               foldDomId, foldDomShare, foldIdsUsed
+#else
+	               0, 0, 0
+#endif
+	);
 
 	s_otprof.winFrames++;
 	s_otprof.winNodes += s_otprof.frameNodes;
@@ -1125,9 +1454,10 @@ int g_dbg_stPass2 = 1;
 
 /* Set per node by the OT walk (beside GTECapture_MarkOTNode): whether the node
  * the walk is about to hand to direct-emit or the parse path is sky-class (the
- * backdrop union or the star slice). Read by PacketDepth_ResolveXY, which sees
- * only screen coordinates, not the packet address. Self-resetting -- assigned
- * every node -- so it needs no separate per-walk clear.
+ * backdrop union, the star slice, or the menu backdrop span). Read by
+ * PacketDepth_ResolveXY, which sees only screen coordinates, not the packet
+ * address. Self-resetting -- assigned every node -- so it needs no separate
+ * per-walk clear.
  *
  * Unconditional for the same reason as the toggles above: native_direct_emit.c
  * reads both under CTR_NATIVE_DIRECT_EMIT, which does not imply capture. The
@@ -1137,6 +1467,36 @@ global_variable int s_skyNodeActive;
 /* s46: same per-packet tagging for the glow slice (subset of the sky span).
  * Read by the direct-emit vertex loop to decide the wide-window X stretch. */
 global_variable int s_glowNodeActive;
+/* Same per-node tagging for the in-race minimap block's span. Read by
+ * PacketDepth_ResolveXY's suppressed-2D leg to restamp map primitives for the
+ * 3DS bottom-screen map (PKTDEPTH_UI_STAMP_BTMMAP). */
+global_variable int s_uimapNodeActive;
+/* FPS-overlay sub-span of the map block (PKTDEPTH_UI_STAMP_BTMFPS). */
+global_variable int s_uifpsNodeActive;
+/* Picture-sprite span: menu/hub map sheets (PKTDEPTH_UI_STAMP_UIPIC). */
+global_variable int s_uipicNodeActive;
+/* Menu-backdrop span (character-select diorama strips). Read by
+ * PacketDepth_ResolveXY, which sees screen coordinates, not packet addresses. */
+global_variable int s_menubdNodeActive;
+
+/* Runtime A/B for the menu-backdrop stamp (dumpreq 'menubd'). OFF restores the
+ * raw emit ordinal, i.e. the strips buried behind the flag. */
+int g_dbg_menuBackdrop = 1;
+
+/*
+ * STEREO depth for the menu backdrop, in view.z units -- the axis
+ * s_stereoConv (1200) lives on, where the player kart band is ~256..2278.
+ * Split from the occlusion stamp on purpose, the same two-channel trick the
+ * checkered flag uses: occlusion has to stay at PKTDEPTH_MENU_BACKDROP or the
+ * flag stops losing to the strips, but that stamp is view.z ~32767, which
+ * parks the backdrop at effectively infinite parallax. Setting this pulls the
+ * PARALLAX plane forward without disturbing any layering.
+ *
+ * 0 = follow the occlusion stamp (backdrop at infinity). Otherwise the view.z
+ * plane the strips sit at: 1232 is the flag's anchor, 32 units behind the
+ * screen plane; larger values sit deeper. dumpreq 'menubdpar N'.
+ */
+int g_dbg_menuBdParZ = 0;
 
 /* ------------------------------------------------------------------------- */
 
@@ -1216,6 +1576,14 @@ enum
 	PKTDEPTH_UI_ORD_SHIFT = 2,                        /* 4 UI prims share a stamp */
 	PKTDEPTH_UI_BASE = 0xFFFF - PKTDEPTH_UI_BAND + 1, /* 0xFFC0 */
 	PKTDEPTH_WORLD_MAX = PKTDEPTH_UI_BASE - 1,        /* 0xFFBF */
+	/* Menu backdrop (character-select diorama strips, block above
+	 * NativeGpu_MarkMenuBackdropRange). Bounded on both sides and nowhere
+	 * near either: it must beat the menu checkered flag, which resolves as a
+	 * miss and so sits on the raw emit-ordinal band a few thousand above the
+	 * far pin, and must lose to the preview model, whose real stamp is
+	 * 0xFFFF - sz3 and lands near the near end for a close diorama pose.
+	 * Midband satisfies both with the widest margin available. */
+	PKTDEPTH_MENU_BACKDROP = 0x8000,
 	PKTDEPTH_OT_SHIFT = 6                             /* retail's maxDepth >> 6 */
 };
 
@@ -1475,6 +1843,46 @@ global_variable uintptr_t s_glowRangeEnd[2];
 global_variable uintptr_t s_starRangeStart[2];
 global_variable uintptr_t s_starRangeEnd[2];
 
+/* The character-select diorama backdrop (MM_Characters' RwdBlueRect strips --
+ * sky over ground, drawn into the preview window's farthest OT slot). They
+ * are synthesized screen-space quads: never projected, so no capture exists,
+ * and a menu walk records no OT buckets either, which leaves the resolver's
+ * miss exit handing them their raw emit ordinal. That is not survivable
+ * here -- the menu checkered flag resolves as a miss too (RaceFlag_DrawSelf
+ * marks its packets exempt so they keep retail's painter layering), so it
+ * shares that same band and covers them. The span exists to give these
+ * primitives a stated depth instead: PKTDEPTH_MENU_BACKDROP, between the
+ * flag's band and the preview model's real stamp. NOT sky-class -- the far
+ * pin loses to the flag.
+ *
+ * OVERWRITE semantics, not a union: panel prims emit between the per-player
+ * marks in multi-player character select, so a union would swallow them,
+ * while overwriting pins only the last player marked -- exact for 1P, the
+ * only character select the 3DS menu reaches. Inert on PC (no depth test). */
+global_variable uintptr_t s_menubdRangeStart[2];
+global_variable uintptr_t s_menubdRangeEnd[2];
+
+/* The in-race minimap block (UI_RenderFrame_Racing: map sheet + racer/ghost/
+ * warpball icons, emitted back-to-back with nothing interleaved). Consumed by
+ * the resolver's suppressed-2D leg to restamp those primitives
+ * PKTDEPTH_UI_STAMP_BTMMAP for the 3DS bottom-screen map. Own span, same
+ * write/read indices and lifecycle as the sky pair. */
+global_variable uintptr_t s_uimapRangeStart[2];
+global_variable uintptr_t s_uimapRangeEnd[2];
+/* FPS-overlay sub-span of the map block (drawn between the map marks), so the
+ * bottom pass can give the text its own non-magnifying window. */
+global_variable uintptr_t s_uifpsRangeStart[2];
+global_variable uintptr_t s_uifpsRangeEnd[2];
+/* Picture-sprite span (PKTDEPTH_UI_STAMP_UIPIC): 2D sprites that want the
+ * far-edge UV inset but never route anywhere -- the track-select and
+ * adventure-hub map sheets, which show the same half-quad seam the in-race
+ * map did. Overwrite semantics like the map span, NOT a union: the two
+ * producers are mutually exclusive per frame, and a union of distant marks
+ * would swallow unrelated prims between them -- a swallowed 1:1 font glyph
+ * would get the inset's gradient change and duplicate rows. */
+global_variable uintptr_t s_uipicRangeStart[2];
+global_variable uintptr_t s_uipicRangeEnd[2];
+
 void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end)
 {
 	/* UNION across the frame's backdrop producers. Two register their spans:
@@ -1556,6 +1964,48 @@ void NativeGpu_MarkStarRange(uintptr_t start, uintptr_t end)
 	}
 }
 
+void NativeGpu_MarkMenuBackdropRange(uintptr_t start, uintptr_t end)
+{
+	if (end <= start)
+	{
+		return;
+	}
+	/* Overwrite, no union: see the span comment. */
+	s_menubdRangeStart[s_skyRangeWriteIdx] = start;
+	s_menubdRangeEnd[s_skyRangeWriteIdx] = end;
+}
+
+void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end)
+{
+	if (end <= start)
+	{
+		return; /* map block skipped this frame (menus, 2P/4P, speedo mode) */
+	}
+	/* One producer, one contiguous block: overwrite, no union. */
+	s_uimapRangeStart[s_skyRangeWriteIdx] = start;
+	s_uimapRangeEnd[s_skyRangeWriteIdx] = end;
+}
+
+void NativeGpu_MarkUiFpsRange(uintptr_t start, uintptr_t end)
+{
+	if (end <= start)
+	{
+		return;
+	}
+	s_uifpsRangeStart[s_skyRangeWriteIdx] = start;
+	s_uifpsRangeEnd[s_skyRangeWriteIdx] = end;
+}
+
+void NativeGpu_MarkUiPicRange(uintptr_t start, uintptr_t end)
+{
+	if (end <= start)
+	{
+		return;
+	}
+	s_uipicRangeStart[s_skyRangeWriteIdx] = start;
+	s_uipicRangeEnd[s_skyRangeWriteIdx] = end;
+}
+
 void NativeGpu_PublishSkyRange(void)
 {
 	s_skyRangeReadIdx = s_skyRangeWriteIdx;
@@ -1570,6 +2020,14 @@ void NativeGpu_ClearSkyRange(void)
 	s_glowRangeEnd[s_skyRangeWriteIdx] = 0;
 	s_starRangeStart[s_skyRangeWriteIdx] = 0;
 	s_starRangeEnd[s_skyRangeWriteIdx] = 0;
+	s_menubdRangeStart[s_skyRangeWriteIdx] = 0;
+	s_menubdRangeEnd[s_skyRangeWriteIdx] = 0;
+	s_uimapRangeStart[s_skyRangeWriteIdx] = 0;
+	s_uimapRangeEnd[s_skyRangeWriteIdx] = 0;
+	s_uifpsRangeStart[s_skyRangeWriteIdx] = 0;
+	s_uifpsRangeEnd[s_skyRangeWriteIdx] = 0;
+	s_uipicRangeStart[s_skyRangeWriteIdx] = 0;
+	s_uipicRangeEnd[s_skyRangeWriteIdx] = 0;
 }
 
 internal int NativeGpu_IsSkyPacket(uintptr_t addr)
@@ -1585,6 +2043,26 @@ internal int NativeGpu_IsGlowPacket(uintptr_t addr)
 internal int NativeGpu_IsStarPacket(uintptr_t addr)
 {
 	return (addr >= s_starRangeStart[s_skyRangeReadIdx]) && (addr < s_starRangeEnd[s_skyRangeReadIdx]);
+}
+
+internal int NativeGpu_IsMenuBackdropPacket(uintptr_t addr)
+{
+	return (addr >= s_menubdRangeStart[s_skyRangeReadIdx]) && (addr < s_menubdRangeEnd[s_skyRangeReadIdx]);
+}
+
+internal int NativeGpu_IsUiMapPacket(uintptr_t addr)
+{
+	return (addr >= s_uimapRangeStart[s_skyRangeReadIdx]) && (addr < s_uimapRangeEnd[s_skyRangeReadIdx]);
+}
+
+internal int NativeGpu_IsUiFpsPacket(uintptr_t addr)
+{
+	return (addr >= s_uifpsRangeStart[s_skyRangeReadIdx]) && (addr < s_uifpsRangeEnd[s_skyRangeReadIdx]);
+}
+
+internal int NativeGpu_IsUiPicPacket(uintptr_t addr)
+{
+	return (addr >= s_uipicRangeStart[s_skyRangeReadIdx]) && (addr < s_uipicRangeEnd[s_skyRangeReadIdx]);
 }
 
 #endif
@@ -1701,6 +2179,28 @@ global_variable u32 s_pendingDepthSpread;
  */
 int g_dbg_pktDepthStrictMtx = 0;
 int g_dbg_pktDepthMissOrdinal = 0;
+/*
+ * Partial-hit fill (dumpreq `pdfill [N]`). The capture table is
+ * direct-mapped, so a later same-frame projection can steal any corner's
+ * slot; the resolve loop then fails the WHOLE primitive on that one corner
+ * and the no-bucket exit leaves it on the raw emit ordinal -- z near the
+ * far pin, buried behind everything (the invisible-tire blink: a sprite
+ * quad's 4 corners all resolve or none do). When the resolved corners
+ * agree on a matrix, their own max depth is the primitive's depth to
+ * within its own thickness -- strictly better than either fallback.
+ *
+ * Modes: 0 = off (whole-prim miss fallbacks, the blink). 1 = fill on ANY
+ * hit -- too loose: a prim whose corners were NEVER stored (synthesized 2D
+ * quads; the char-select gradient) can catch a STRANGER's entry at a
+ * coincident pixel and surface for just that frame (the gradient flicker).
+ * 2 (default) = fill only on an honest partial hit: at most one corner
+ * missing, OR >= 2 hits that agree in depth to within
+ * PKTDEPTH_PARTIAL_SPREAD_MAX -- one object's corners agree, strangers at
+ * screen-quad distances do not.
+ */
+#define PKTDEPTH_PARTIAL_SPREAD_MAX 64
+int g_dbg_pktDepthPartialFill = 2;
+global_variable u32 s_pktDepthPartialFilled;
 
 internal void PacketDepth_NoteExtent(u16 stamp, u16 *lo, u16 *hi)
 {
@@ -1782,6 +2282,7 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 	int hits = 0;
 	int mixed = 0;
 	int missed = 0;
+	int firstMissIdx = -1;
 	/* Is this primitive part of the checkered flag's registered prim
 	 * range? Latched once here rather than re-queried per branch -- it decides
 	 * BOTH that the occlusion pass must ignore the captures and that the
@@ -1838,6 +2339,44 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		return 1;
 	}
 
+	if (g_dbg_menuBackdrop && s_menubdNodeActive)
+	{
+		/*
+		 * MENU BACKDROP (character-select diorama strips). Same shape as the
+		 * sky leg above and taken for the same reason: no captured depth
+		 * exists, and none of the fallbacks below can supply one -- a menu
+		 * walk records no OT buckets, so the miss exit would hand these back
+		 * their raw emit ordinal and the flag would bury them. Flat across
+		 * the primitive; a backdrop panel has no per-vertex relief.
+		 */
+		u16 par = PKTDEPTH_MENU_BACKDROP;
+
+		/* Parallax rides its own plane when asked -- see g_dbg_menuBdParZ. */
+		if (g_dbg_menuBdParZ > 0)
+		{
+			par = PacketDepth_ClampWorld(0xFFFFu - (u16)g_dbg_menuBdParZ);
+		}
+		*out = PKTDEPTH_MENU_BACKDROP;
+		if (perVert)
+		{
+			for (i = 0; i < n; i++)
+			{
+				perVert[i] = PKTDEPTH_MENU_BACKDROP;
+			}
+		}
+		if (perVertPar)
+		{
+			for (i = 0; i < n; i++)
+			{
+				perVertPar[i] = par;
+			}
+		}
+		PacketDepth_NoteExtent(*out, &s_pktDepth.realMin, &s_pktDepth.realMax);
+		s_pendingDepthIsModel = 0;
+		s_pendingDepthSpread = 0;
+		return 1;
+	}
+
 	if (GTECapture_LookupSuppressed())
 	{
 		/* 2D in the UI band: no depth exists, and it must stay on top of every
@@ -1880,6 +2419,45 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		{
 			*out = PacketDepth_UiStamp(s_pktUiOrdinal);
 			s_pktUiOrdinal++;
+#if defined(__3DS__)
+			/* Bottom-screen minimap: the map block's primitives (tagged by
+			 * s_uimapNodeActive, same node mechanism as the sky span) get their
+			 * own band stamp so the renderer can peel them from the ordered UI
+			 * list onto the bottom target. Only while the ordered-UI pin owns
+			 * the band (stamp == 0xFFFF): the uipin/uiorder diagnostic legs use
+			 * per-ordinal stamps where 0xFFFE is a legitimate UI position, and
+			 * retagging there would misroute a stranger. */
+			{
+				extern int g_dbg_btmMap;
+
+				if (*out == 0xFFFFu)
+				{
+					/* FPS glyphs route only, so they keep the bottom-screen
+					 * gate: unrouted they stay ordinary pinned UI. */
+					if (g_dbg_btmMap && s_uifpsNodeActive)
+					{
+						*out = PKTDEPTH_UI_STAMP_BTMFPS;
+					}
+					/* The map stamp is NOT gated on the bottom-screen toggle:
+					 * besides routing the peel (which carries its own gate), it
+					 * keys the far-edge UV inset in N3DS_ConvertTriangleVerts,
+					 * which must hold wherever the map draws -- the top screen
+					 * shows the same half-texel seam, just less magnified. */
+					else if (s_uimapNodeActive)
+					{
+						*out = PKTDEPTH_UI_STAMP_BTMMAP;
+					}
+					/* Picture-sprite class (menu/hub map sheets): inset
+					 * only, never routed -- the renderer re-pins these to
+					 * 0xFFFF at the ordered-UI append so pinned layering
+					 * stays EQUAL. */
+					else if (s_uipicNodeActive)
+					{
+						*out = PKTDEPTH_UI_STAMP_UIPIC;
+					}
+				}
+			}
+#endif
 		}
 		PacketDepth_NoteExtent(*out, &s_pktDepth.uiMin, &s_pktDepth.uiMax);
 		s_pktDepth.suppressed2d++;
@@ -1999,40 +2577,49 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 
 	/* `!missed` guard: an exempt primitive skips the lookups entirely rather
 	 * than running them and discarding -- see the block above for why hits
-	 * must stay 0. Identical to the old unconditional loop otherwise, since
-	 * missed can only be pre-set by that one branch. */
-	for (i = 0; !missed && (i < n); i++)
+	 * must stay 0. The scan covers ALL vertices even after a miss (it used to
+	 * break at the first one): the partial-hit fill below needs every corner
+	 * that DID resolve, and a break would report hits=0 whenever the stolen
+	 * slot happened to be vertex 0's. */
+	if (!missed)
 	{
-		u16 sz3;
-		u8 thisMtx;
+		for (i = 0; i < n; i++)
+		{
+			u16 sz3;
+			u8 thisMtx;
 
-		if (!GTECapture_LookupDepthEx(xs[i], ys[i], &sz3, &thisMtx))
-		{
-			missed = 1;
-			break;
-		}
+			if (!GTECapture_LookupDepthEx(xs[i], ys[i], &sz3, &thisMtx))
+			{
+				missed = 1;
+				if (firstMissIdx < 0)
+				{
+					firstMissIdx = i;
+				}
+				continue;
+			}
 
-		if (hits == 0)
-		{
-			firstMtx = thisMtx;
-		}
-		else if (thisMtx != firstMtx)
-		{
-			mixed = 1;
-		}
-		hits++;
+			if (hits == 0)
+			{
+				firstMtx = thisMtx;
+			}
+			else if (thisMtx != firstMtx)
+			{
+				mixed = 1;
+			}
+			hits++;
 
-		if (perVert)
-		{
-			sz3s[i] = sz3;
-		}
-		if (sz3 > maxSz3)
-		{
-			maxSz3 = sz3;
-		}
-		if (sz3 < minSz3)
-		{
-			minSz3 = sz3;
+			if (perVert)
+			{
+				sz3s[i] = sz3;
+			}
+			if (sz3 > maxSz3)
+			{
+				maxSz3 = sz3;
+			}
+			if (sz3 < minSz3)
+			{
+				minSz3 = sz3;
+			}
 		}
 	}
 
@@ -2079,11 +2666,12 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		}
 
 		/* s45 miss forensics -- see the sample array declarations. The missing
-		 * vertex is xs[i]/ys[i] (the loop broke at i; exempt pre-sets missed
-		 * with the loop never run, and is excluded as a miss by design). The
-		 * `out` field is patched at whichever of the three exits actually
-		 * fires, so a sample records not just where the miss was but which
-		 * fallback the primitive really took. */
+		 * vertex is xs/ys at firstMissIdx (exempt pre-sets missed with the
+		 * loop never run, and is excluded as a miss by design). The `out`
+		 * field is patched at whichever of the exits actually fires, so a
+		 * sample records not just where the miss was but which fallback the
+		 * primitive really took. */
+		const int mi = (firstMissIdx >= 0) ? firstMissIdx : 0;
 		int missSampIdx = -1;
 		if (s_pktMissSampFrameStamp != s_pktDepth.frames)
 		{
@@ -2095,8 +2683,8 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		 * prims parked at (-1024,-1024) -- both parse early every frame and ate
 		 * the whole window. Only tri/quad prims with plausibly on-screen
 		 * coordinates are worth a slot. */
-		if (g_dbg_modelDepthCheck && !exempt && (s_pktMissSampCount < PKTMISS_SAMPLE_N) && (s_pktMissSampThisFrame < 2) && (i < n) && (n >= 3) &&
-		    (xs[i] > -64) && (xs[i] < 640) && (ys[i] > 0) && (ys[i] < 480))
+		if (g_dbg_modelDepthCheck && !exempt && (s_pktMissSampCount < PKTMISS_SAMPLE_N) && (s_pktMissSampThisFrame < 2) && (firstMissIdx >= 0) &&
+		    (n >= 3) && (xs[mi] > -64) && (xs[mi] < 640) && (ys[mi] > 0) && (ys[mi] < 480))
 		{
 			int dx, dy, nbr = 0;
 			u16 staleZ = 0;
@@ -2109,19 +2697,19 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 					u16 nbrSz3;
 					u8 nbrMtx;
 
-					if (((dx != 0) || (dy != 0)) && GTECapture_LookupDepthEx((s16)(xs[i] + dx), (s16)(ys[i] + dy), &nbrSz3, &nbrMtx))
+					if (((dx != 0) || (dy != 0)) && GTECapture_LookupDepthEx((s16)(xs[mi] + dx), (s16)(ys[mi] + dy), &nbrSz3, &nbrMtx))
 					{
 						nbr++;
 					}
 				}
 			}
-			(void)GTECapture_LookupDepthStale(xs[i], ys[i], &staleZ, &staleAge);
+			(void)GTECapture_LookupDepthStale(xs[mi], ys[mi], &staleZ, &staleAge);
 			{
 				s16 occX, occY;
 				int occGen;
 				u16 occZ;
 
-				(void)GTECapture_ProbeSlot(xs[i], ys[i], &occX, &occY, &occGen, &occZ);
+				(void)GTECapture_ProbeSlot(xs[mi], ys[mi], &occX, &occY, &occGen, &occZ);
 				s_pktMissSampOccX[s_pktMissSampCount] = occX;
 				s_pktMissSampOccY[s_pktMissSampCount] = occY;
 				s_pktMissSampOccZ[s_pktMissSampCount] = occZ;
@@ -2129,16 +2717,79 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 			}
 			s_pktMissSampThisFrame++;
 			missSampIdx = (int)s_pktMissSampCount++;
-			s_pktMissSampX[missSampIdx] = xs[i];
-			s_pktMissSampY[missSampIdx] = ys[i];
+			s_pktMissSampX[missSampIdx] = xs[mi];
+			s_pktMissSampY[missSampIdx] = ys[mi];
 			s_pktMissSampVerts[missSampIdx] = (u8)n;
 			s_pktMissSampHits[missSampIdx] = (u8)hits;
 			s_pktMissSampNbr[missSampIdx] = (u8)nbr;
 			s_pktMissSampSlot[missSampIdx] = (u16)s_gpu.otCurrentSlotIdx;
 			s_pktMissSampOut[missSampIdx] = 0xFFFEu;
-			s_pktMissSampHitZ[missSampIdx] = ((hits > 0) && (perVert != NULL)) ? sz3s[0] : 0xFFFFu;
+			/* sz3s[0] is only meaningful when vertex 0 itself hit. */
+			s_pktMissSampHitZ[missSampIdx] = ((hits > 0) && (perVert != NULL) && (firstMissIdx != 0)) ? sz3s[0] : 0xFFFFu;
 			s_pktMissSampStaleZ[missSampIdx] = staleZ;
 			s_pktMissSampStaleAge[missSampIdx] = (u8)((staleAge > 255u) ? 255u : staleAge);
+		}
+
+		if ((g_dbg_pktDepthPartialFill != 0) && (hits > 0) && !mixed &&
+		    ((g_dbg_pktDepthPartialFill == 1) || (hits >= (n - 1)) ||
+		     ((hits >= 2) && ((u32)(maxSz3 - minSz3) <= PKTDEPTH_PARTIAL_SPREAD_MAX))))
+		{
+			/* See the flag's declaration comment. Flat across the primitive:
+			 * the missing corner has no per-vertex depth to contribute, and a
+			 * flat sprite/small poly is what this population is. */
+			*out = PacketDepth_ClampWorld(0xFFFFu - maxSz3);
+			s_pktDepthPartialFilled++;
+#if defined(CTR_INTERNAL) && defined(__3DS__)
+			{
+				/* Gradient-flicker forensics (remove with the hunt): who gets
+				 * filled, with how many hits and what agreement. Throttled per
+				 * frame; only while the tirelog trace is armed. */
+				extern int g_dbg_tireVtxLog;
+				static u32 s_pdfillLogFrame;
+				static u32 s_pdfillLogCount;
+
+				if (g_dbg_tireVtxLog)
+				{
+					if (s_pdfillLogFrame != s_pktDepth.frames)
+					{
+						s_pdfillLogFrame = s_pktDepth.frames;
+						s_pdfillLogCount = 0;
+					}
+					if (s_pdfillLogCount < 24)
+					{
+						s_pdfillLogCount++;
+						Platform_LogInstrument("[PDFILL] pf=%u n=%d hits=%d spread=%u xy0=%d,%d xy1=%d,%d out=%04x\n",
+						                       (unsigned)s_pktDepth.frames, n, hits, (unsigned)(maxSz3 - minSz3), (int)xs[0],
+						                       (int)ys[0], (n > 1) ? (int)xs[1] : 0, (n > 1) ? (int)ys[1] : 0, (unsigned)*out);
+					}
+				}
+			}
+#endif
+			PacketDepth_NoteExtent(*out, &s_pktDepth.realMin, &s_pktDepth.realMax);
+			s_pendingDepthSpread = 0;
+			if (missSampIdx >= 0)
+			{
+				s_pktMissSampOut[missSampIdx] = *out;
+			}
+			if (perVert)
+			{
+				int k;
+
+				for (k = 0; k < n; k++)
+				{
+					perVert[k] = *out;
+				}
+			}
+			if (perVertPar)
+			{
+				int k;
+
+				for (k = 0; k < n; k++)
+				{
+					perVertPar[k] = *out;
+				}
+			}
+			return 1;
 		}
 
 		if (s_gpu.otCurrentSlotIdx == NATIVE_GPU_NO_CONTENT_BUCKET)
@@ -3092,6 +3743,24 @@ void MakeVertexQuad(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1, VERTTYPE *p2, 
 			for (vi = 0; vi < 4; vi++)
 			{
 				vertex[vi].x = (float)NativeWide_GlowStretchX((int)vertex[vi].x);
+			}
+		}
+
+		/* Menu backdrop: the diorama strips are authored to the same retail
+		 * rect as the window border around them, but the border is UI and
+		 * takes the widescreen X ramp while these packet quads do not -- so
+		 * wide left the strips short of the border on both sides. Same ramp,
+		 * same screen X, so the two agree by construction. AFTER the resolve,
+		 * which keys on the raw coordinates the stores used, and identity
+		 * whenever wide is off. */
+		if (s_menubdNodeActive)
+		{
+			extern int NativeWide_UiShiftX(int x);
+			int vi;
+
+			for (vi = 0; vi < 4; vi++)
+			{
+				vertex[vi].x = (float)NativeWide_UiShiftX((int)vertex[vi].x);
 			}
 		}
 	}
@@ -4270,16 +4939,20 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 			GTECapture_MarkOTNode(basePacket); /* gate widened with BeginOTWalk above */
-			/* Sky-class tag (backdrop union or star slice): set before the
-			 * direct-emit fast path AND the parse path below, so whichever one
-			 * resolves this node's depth sees it.
+			/* Sky-class tag (backdrop union or star slice), and the menu-backdrop
+			 * tag beside it: set before the direct-emit fast path AND the parse
+			 * path below, so whichever one resolves this node's depth sees it.
 			 * Self-resetting -- 0 for every non-sky node -- so no per-walk clear.
 			 * (Verified the range does NOT over-catch UI-band nodes in-race:
 			 * a walk-order guard here counted zero rescues across a full test run
 			 * -- the minimap black box was the sky PASS clobbering the open blend
 			 * run's state memo, fixed in N3DS_DrawSkyPass.) */
 			s_skyNodeActive = NativeGpu_IsSkyPacket((uintptr_t)basePacket) || NativeGpu_IsStarPacket((uintptr_t)basePacket);
+			s_menubdNodeActive = NativeGpu_IsMenuBackdropPacket((uintptr_t)basePacket);
 			s_glowNodeActive = NativeGpu_IsGlowPacket((uintptr_t)basePacket);
+			s_uimapNodeActive = NativeGpu_IsUiMapPacket((uintptr_t)basePacket);
+			s_uifpsNodeActive = NativeGpu_IsUiFpsPacket((uintptr_t)basePacket);
+			s_uipicNodeActive = NativeGpu_IsUiPicPacket((uintptr_t)basePacket);
 #endif
 			if (tagLength > 0)
 			{
@@ -5452,4 +6125,73 @@ int NativeWide_GlowStretchX(int x)
 	}
 #endif
 	return x + (((x - 256) * m) / 256);
+}
+
+/* ---------------- bottom-screen minimap: game-side hooks ---------------- */
+/* Called unconditionally from game/ (UI_RenderFrame_Racing, MainMain) via the
+ * local-extern hook idiom; every PC leg returns 0, so retail behavior there is
+ * byte-identical. */
+
+/* Nonzero when the resolver is actually restamping the map block for the
+ * bottom screen (PKTDEPTH_UI_STAMP_BTMMAP). The game uses this to run the map
+ * block even in speedometer mode: routed primitives never reach the top
+ * screen, so retail's map-or-speedo exclusivity is preserved up there while
+ * the map still feeds the bottom panel. */
+int NativeUiMap_RouteActive(void)
+{
+#if defined(__3DS__)
+	extern int g_dbg_btmMap;
+	extern int g_dbg_uiOrder;
+	extern int g_dbg_uiPin;
+
+	return g_dbg_btmMap && g_dbg_uiOrder && g_dbg_uiPin && g_dbg_packetDepth;
+#else
+	return 0;
+#endif
+}
+
+/* HudAndDebugFlags bits OR'd in once at boot (MainMain). Bit 8 = speedometer
+ * mode: with the map on the bottom screen, the top screen's map slot is empty,
+ * so the speedometer is the better retail-shaped default there. Retail (and
+ * PC) boot to map mode; Triangle still toggles. */
+int NativeUiMap_BootHudFlags(void)
+{
+#if defined(__3DS__)
+	return 8;
+#else
+	return 0;
+#endif
+}
+
+/* Fills buf with the FPS overlay drawn inside the map block, in the game's
+ * own HUD font -- it allocates from the same bracketed primMem span as the
+ * map, so it routes to the bottom screen with it and shares its window.
+ * Returns 0 (draw nothing) until the first measurement window lands, whenever
+ * routing is off, and always on PC. */
+int NativeUiMap_FpsOverlayText(char *buf, int bufSize)
+{
+#if defined(__3DS__)
+	extern unsigned long g_n3dsFpsX10;
+	extern int g_dbg_tireVtxLog;
+	extern unsigned long g_tirelogFrameNow;
+
+	if (!NativeUiMap_RouteActive() || (g_n3dsFpsX10 == 0))
+	{
+		return 0;
+	}
+	/* Invisible-tire hunt (remove with the hunt): while the tirelog trace is
+	 * armed, show the renderer frame counter instead of FPS so a screen
+	 * capture can be matched to the [TV]/[TIREUP] log lines exactly. */
+	if (g_dbg_tireVtxLog)
+	{
+		snprintf(buf, (size_t)bufSize, "F %lu", g_tirelogFrameNow);
+		return 1;
+	}
+	snprintf(buf, (size_t)bufSize, "FPS %lu.%lu", g_n3dsFpsX10 / 10UL, g_n3dsFpsX10 % 10UL);
+	return 1;
+#else
+	(void)buf;
+	(void)bufSize;
+	return 0;
+#endif
 }

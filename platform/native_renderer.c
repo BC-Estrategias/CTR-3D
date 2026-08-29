@@ -1731,7 +1731,7 @@ int NativeRenderer_CaptureVRAMState(void *dst, int dstSize)
 /*
  * --vram-capture <file> [--vram-capture-vblank N]: dump the CPU-side PSX VRAM
  * mirror (via CaptureVRAMState) to a raw 1024x512xu16-LE file at vblank N,
- * then exit. Same format as the 3DS SELECT+R/dumpreq vramdump.bin, so
+ * then exit. Same format as the 3DS debug capture's vramdump.bin (dumpreq `capture`), so
  * tools/texdump/* work on both -- built for PC-vs-3DS same-scene VRAM diffs,
  * since texture mapping is established at load time and reshuffles per
  * reload.

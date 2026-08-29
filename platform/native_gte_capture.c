@@ -94,6 +94,11 @@ typedef struct
 	 * the 4:3 screen). */
 	u8 paintNearFlat[GTE_CAPTURE_PAINTNEAR_MAX];
 	u32 paintNearN;
+	// The 8 CP2C words that opened each matrix run, so a census consumer can
+	// identify WHICH matrix a run id is (R+TR values, not just a count).
+	// Slots behind a zero mtxStores count are stale from prior frames; the
+	// saturation slot (last id) holds only its most recent run's words.
+	u32 mtxWords[GTE_CAPTURE_MTX_IDS][8];
 } GTECaptureBuffer;
 
 // Cost ablation. This switch removes both per-vertex calls without a
@@ -278,6 +283,7 @@ void GTECapture_NoteMatrix(const void *words8)
 	{
 		buf->mtxUsed = s_gteMtxCurId + 1;
 	}
+	memcpy(buf->mtxWords[s_gteMtxCurId], words8, sizeof(buf->mtxWords[0]));
 }
 
 void GTECapture_PublishForWalk(void)
@@ -442,6 +448,19 @@ int g_dbg_decalAxisFix = 1;
  * (owner-judged in Azahar). dumpreq `decalbias N`. 3DS only: the PC renderer
  * does not depth-test packets, and its golden output must not move. */
 int g_dbg_decalNearBias = 32;
+/* "Under" mode inside a fixed bracket: content that retail draws UNDER the
+ * road by painter's order (the mirrored ice-reflection tires), so it must
+ * LOSE the ground depth tie, not win it -- the exact mirror of the decal
+ * rule above. Stores take the same relief-clearing margin FARTHER instead of
+ * nearer; one knob (`decalbias N`) tunes both directions. Toggled around the
+ * DrawTires_Reflection calls; cleared by the bracket teardown so a mid-frame
+ * early-out cannot leak it. */
+global_variable int s_instAxisFixedUnder;
+
+void GTECapture_SetFixedShiftUnder(int on)
+{
+	s_instAxisFixedUnder = (on != 0);
+}
 
 #define GTE_INSTAXIS_UNRESOLVED 99
 #define GTE_INSTAXIS_MTX_NONE 0xFFFFFFFFu
@@ -672,6 +691,7 @@ void GTECapture_EndInstanceDepth(void)
 		 * against. */
 		s_instAxisActive = 0;
 		s_instAxisFixed = 0;
+		s_instAxisFixedUnder = 0;
 		s_instAxisShift = GTE_INSTAXIS_UNRESOLVED;
 		s_instAxisMtxAtClassify = GTE_INSTAXIS_MTX_NONE;
 		s_paintUnderActive = 0;
@@ -851,12 +871,24 @@ void GTECapture_Store(s16 sx, s16 sy, s64 sxFull, s64 syFull, u16 sz3, s32 hOver
 #if defined(__3DS__)
 		/* Ground-decal nearer bias (g_dbg_decalNearBias) -- fixed brackets only,
 		 * after the axis unscale so it is in the track's view.z units. Floor of
-		 * 1 keeps a hit distinguishable from empty, same as the unscale. */
+		 * 1 keeps a hit distinguishable from empty, same as the unscale. In
+		 * "under" mode (the mirrored ice-reflection tires) the same margin is
+		 * applied FARTHER instead: that content must lose the ground tie, the
+		 * way retail's painter's order tucked it beneath the opaque road. */
 		if (s_instAxisFixed && (g_dbg_decalNearBias > 0))
 		{
-			int b = (int)sz3 - g_dbg_decalNearBias;
+			if (s_instAxisFixedUnder)
+			{
+				u32 b = (u32)sz3 + (u32)g_dbg_decalNearBias;
 
-			sz3 = (u16)((b >= 1) ? b : 1);
+				sz3 = (b > 0xFFFFu) ? (u16)0xFFFFu : (u16)b;
+			}
+			else
+			{
+				int b = (int)sz3 - g_dbg_decalNearBias;
+
+				sz3 = (u16)((b >= 1) ? b : 1);
+			}
 		}
 
 		/* Paint-under farther bias, same units and placement as the decal bias. */
@@ -1095,6 +1127,21 @@ u32 GTECapture_ReadMatrixCensus(u8 *outDomId, u32 *outIdsUsed)
 	*outDomId = (u8)bestId;
 	*outIdsUsed = buf->mtxUsed;
 	return total ? (best * 100u) / total : 0;
+}
+
+// Read-buffer companion to the census: the CP2C words behind a run id.
+// Returns 0 for an id that stored nothing this frame (its words slot may be
+// stale from an earlier frame).
+int GTECapture_ReadMatrixWords(u8 id, u32 out[8])
+{
+	const GTECaptureBuffer *buf = &s_gteCaptureBuf[s_gteCaptureReadIdx];
+
+	if ((id >= GTE_CAPTURE_MTX_IDS) || (buf->mtxStores[id] == 0))
+	{
+		return 0;
+	}
+	memcpy(out, buf->mtxWords[id], sizeof(buf->mtxWords[0]));
+	return 1;
 }
 
 // Walk-thread state: BeginOTWalk/MarkOTNode/LookupSuppressed all run on

@@ -68,6 +68,30 @@ void NativeGpu_MarkGlowRange(uintptr_t start, uintptr_t end);
  * world sits between them and the sky pair and a union would swallow it.
  * Same lifecycle as the sky pair. */
 void NativeGpu_MarkStarRange(uintptr_t start, uintptr_t end);
+/* UI_RenderFrame_Racing marks its minimap block (map sheet + racer icons)
+ * through this so the 3DS can restamp those primitives for the bottom-screen
+ * map (PKTDEPTH_UI_STAMP_BTMMAP, dumpreq 'btmmap'). One producer, one
+ * contiguous block per frame, so this overwrites rather than unions. Same
+ * lifecycle as the sky pair; inert on PC (nothing consumes the tag there). */
+void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end);
+/* Sub-span of the map block: the FPS overlay text, restamped
+ * PKTDEPTH_UI_STAMP_BTMFPS so the bottom pass can draw it through its own
+ * (non-magnifying) window. Marked strictly inside the map bracket; the
+ * resolver checks this span before the map's. Same lifecycle. */
+void NativeGpu_MarkUiFpsRange(uintptr_t start, uintptr_t end);
+/* Picture-sprite span (PKTDEPTH_UI_STAMP_UIPIC): 2D picture sprites that get
+ * the seam-closing far-edge UV inset but are never routed off the top screen
+ * -- the track-select and adventure-hub map sheets. Sheet quads only, never
+ * 1:1 glyph text (the inset duplicates rows on 1:1 content). One producer
+ * per frame, overwrite semantics; same lifecycle; inert on PC. */
+void NativeGpu_MarkUiPicRange(uintptr_t start, uintptr_t end);
+/* The character-select diorama backdrop (MM_Characters' RwdBlueRect strips):
+ * screen-space quads with no captured depth, which the resolver would
+ * otherwise leave on the raw emit ordinal where the menu flag buries them.
+ * Stamped PKTDEPTH_MENU_BACKDROP instead -- between the flag's band and the
+ * preview model. One producer per frame, overwrite semantics; same lifecycle
+ * as the sky pair; inert on PC. Runtime A/B: dumpreq 'menubd' (default ON). */
+void NativeGpu_MarkMenuBackdropRange(uintptr_t start, uintptr_t end);
 void NativeGpu_PublishSkyRange(void);
 void NativeGpu_ClearSkyRange(void);
 // Model-space vector that produced this screen coordinate (same rendezvous
@@ -98,6 +122,9 @@ int GTECapture_LookupModelEx(s16 sx, s16 sy, s16 outV[3], u8 *outMtxId);
 void GTECapture_NoteMatrix(const void *words8);
 // Read-buffer census: returns dominant-id Store share in percent.
 u32 GTECapture_ReadMatrixCensus(u8 *outDomId, u32 *outIdsUsed);
+// The 8 CP2C words (R11..R33 packed, TRX/Y/Z) that opened run `id`; 0 if the
+// id stored nothing this frame.
+int GTECapture_ReadMatrixWords(u8 id, u32 out[8]);
 
 // EVICTION CENSUS -- the direct measurement of the failure this file
 // already documents for the skybox (see GTECapture_SetStoreSuppressed): the
@@ -141,6 +168,12 @@ void GTECapture_BeginInstanceDepth(const struct Instance *inst, const struct Pus
  * Same shift encoding as the classifier (2 = divide the stored SZ3 by 4).
  * Closed by GTECapture_EndInstanceDepth. */
 void GTECapture_BeginFixedDepthShift(int shift);
+/* "Under" mode inside a fixed bracket: stores take the decal margin FARTHER
+ * instead of nearer, so the content loses the ground depth tie -- for what
+ * retail tucks UNDER the opaque road by painter's order (the mirrored
+ * ice-reflection tires). Toggle around the DrawTires_Reflection calls; the
+ * bracket teardown clears it. No-op on PC (the bias is 3DS-only). */
+void GTECapture_SetFixedShiftUnder(int on);
 void GTECapture_EndInstanceDepth(void);
 // Runtime A/B for the unscale (dumpreq 'pktaxisfix'); default ON, OFF is the
 // ice-pond vanish. The [PKTAXIS] instrument rides --model-depth-check.
