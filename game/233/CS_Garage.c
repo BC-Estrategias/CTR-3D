@@ -1,4 +1,5 @@
 #include <common.h>
+#include <native_penta.h>
 
 enum GarageInputMask
 {
@@ -120,6 +121,9 @@ void CS_Garage_MenuProc(struct RectMenu *menu)
 	{
 		statBarLength = &gGarage.statBarLengths[i];
 		s16 stat = gGarage.statBarTargetLengths[MDC->engineID * 3 + i];
+#ifdef CTR_NATIVE
+		stat = NativePenta_StatBarLength(stat, MDC);
+#endif
 
 		if (*statBarLength < stat)
 		{
