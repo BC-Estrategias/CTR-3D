@@ -53,6 +53,18 @@ extern int g_dbg_modelRender;
 // caller computes it because the writer identifiers live in game/. Getting it
 // wrong in the 0 direction is what made N. Tropy's ghost draw solid.
 //
+// ghostComposite: this instance uses the GHOST writer at nonzero alphaScale
+// (an alpha-zero ghost tail-calls the normal writer, so the caller folds the
+// alpha test in). The ghost writer's primitive is a two-packet composite --
+// a flat B-F mask of the scratch fade colour under an ABR-1 additive body
+// whose colours went through the writer's own gte_dpct -- and the draw side
+// reproduces all three legs. Implies forceSemiTrans.
+//
+// fadeColorWord: the RenderBucket scratch fadeColor word the ghost writer's
+// mask packet reads, captured here because only the instance setup callback
+// writes it and BeginInstance runs right after that callback. Ignored unless
+// ghostComposite.
+//
 // specularLit: this instance uses one of the two specular writers (KEY_TOKEN /
 // LIT_TEXTURE). Those writers build their colour from their own lcir/dpcs on
 // the raw rolling colour and never consume LoadPrimColors' dpct, so the fade
@@ -68,7 +80,7 @@ extern int g_dbg_modelRender;
 // this path and the packet stamps inherit). Only read under
 // --model-depth-check; may be NULL, which skips the check for this instance.
 int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, int specularLit,
-                                  const struct Instance *inst);
+                                  const struct Instance *inst, int ghostComposite, u32 fadeColorWord);
 
 // One triangle, in the exact form the software GTE was about to consume:
 // packedXY3[i] is that corner's GTE VXY register (VX in the low halfword, VY in

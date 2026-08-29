@@ -111,6 +111,19 @@ struct NativeModelEmitInstance
 	u8 forceSemiTrans;
 
 	/*
+	 * GHOST-writer composite (RenderBucket_DrawInstPrim_GhostAtRange). Every primitive of that
+	 * writer is TWO packets: a flat B-F mask of the scratch fadeColor over the triangle's
+	 * footprint, then an additive body -- textured prims get their tpage ABR field overwritten
+	 * to 1, untextured ones draw behind the writer's own ABR-1 DR_TPAGE -- whose colours went
+	 * through the writer's per-prim gte_dpct (IR0 = alphaScale, FC = the setup callback's far
+	 * colour). Subtract-then-add is the whole ghost look; either half alone reads as a washed-out
+	 * solid. Implies forceSemiTrans. fade* is the mask colour, captured at BeginInstance because
+	 * only the instance setup callback writes the scratch word.
+	 */
+	u8 ghostComposite;
+	u8 fadeR, fadeG, fadeB;
+
+	/*
 	 * Depth-axis regime of this instance's mvp. Retail's instance pipeline is regime-scaled:
 	 * RenderBucket_AdjustViewPositionForMvp shifts MVP translation <<2 when the instance origin is
 	 * nearer than 0x1000 view units, and DRAW_HUGE shifts >>2. trueViewZ = mvpViewZ >> depthShift;
@@ -355,7 +368,7 @@ internal int NativeModelEmit_TexIsSemiTrans(const struct TextureLayout *tex)
 }
 
 int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, int specularLit,
-                                  const struct Instance *worldInst)
+                                  const struct Instance *worldInst, int ghostComposite, u32 fadeColorWord)
 {
 	struct NativeModelEmitSnapshot *dst = &s_modelEmitBuf[s_modelEmitWriteIdx];
 	struct NativeModelEmitInstance *inst;
@@ -524,6 +537,10 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 	inst->firstTri = dst->triCount;
 	inst->triCount = 0;
 	inst->forceSemiTrans = (u8)(forceSemiTrans ? 1 : 0);
+	inst->ghostComposite = (u8)(ghostComposite ? 1 : 0);
+	inst->fadeR = (u8)(fadeColorWord & 0xff);
+	inst->fadeG = (u8)((fadeColorWord >> 8) & 0xff);
+	inst->fadeB = (u8)((fadeColorWord >> 16) & 0xff);
 	inst->depthShift = s_modelEmitPendingDepthShift;
 #if defined(CTR_NATIVE_GTE_CAPTURE) && CTR_NATIVE_GTE_CAPTURE
 	inst->paintUnder = (u8)GTECapture_InstPaintsUnder(worldInst);
@@ -718,16 +735,15 @@ int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const in
 			v[i].b = (u8)(((u32)color3[i] >> 16) & 0xff);
 			v[i]._pad = 0;
 
-			/* forceSemiTrans excluded: the GHOST and DEPTH_FADE writers never
-			 * run LoadPrimColors' dpct -- they do their own per-prim gte_dpcs
-			 * -- so replaying the NORMAL writer's fade on their content is
-			 * applying a colour transform retail never applies. Shipping
-			 * without this test made TT ghosts nearly invisible and put an
-			 * unintended tint on Hot Air Skyway's depth-fade barriers.
-			 * Their own dpcs replay is the known gap
-			 * recorded in the field comment above; until it lands, their
-			 * captured colours stay pre-fade, which is yesterday's behaviour. */
-			if (g_dbg_modelFade && (mi->alphaScale != 0) && !mi->forceSemiTrans)
+			/* The GHOST writer's own per-prim gte_dpct is THIS transform --
+			 * same op, same IR0 (alphaScale), same far colour -- so ghost
+			 * instances take the replay. DEPTH_FADE stays excluded: its fade
+			 * is per-vertex SZ through RenderBucket_DepthFadeColor, a
+			 * different transform, and replaying this one on its content (Hot
+			 * Air Skyway's barriers) applies a colour change retail never
+			 * makes. Its captured colours stay pre-fade -- the remaining
+			 * known gap recorded in the field comment above. */
+			if (g_dbg_modelFade && (mi->alphaScale != 0) && (!mi->forceSemiTrans || mi->ghostComposite))
 			{
 				v[i].r = NativeModelEmit_FadeComponent(v[i].r, mi->fcR, mi->alphaScale);
 				v[i].g = NativeModelEmit_FadeComponent(v[i].g, mi->fcG, mi->alphaScale);
@@ -1242,11 +1258,19 @@ internal int NativeModelDraw_FaceBlend(const struct NativeModelEmitFace *face, c
 		return (int)face->blendOverride;
 	}
 
+	if (inst->ghostComposite)
+	{
+		/* The ghost writer forces its body additive regardless of the page:
+		 * textured prims get their tpage ABR field overwritten to 1, untextured
+		 * ones draw behind the writer's own ABR-1 DR_TPAGE. The B-F mask under
+		 * it is emitted by the draw loop, not classified here. */
+		return BM_ADD;
+	}
+
 	if (inst->forceSemiTrans)
 	{
-		/* The writer decided ABE; the tpage still decides HOW. An untextured
-		 * ghost face has tpage 0, giving ABR 0 = B/2 + F/2 -- the ordinary
-		 * half-and-half blend, which is what a ghost should look like. */
+		/* The writer decided ABE; the tpage still decides HOW (the DEPTH_FADE
+		 * writer emits the texture's own tpage word untouched). */
 		return (int)((face->tpage >> 5) & 3) + 1;
 	}
 
@@ -1268,7 +1292,7 @@ void NativeModelDraw_IssueForWalk(void)
 	const struct NativeModelEmitSnapshot *snap = &s_modelEmitBuf[s_modelEmitReadIdx];
 	static u32 s_logCountdown = 512;
 	static u32 s_totalAppendFail = 0;
-	u32 drawsIssued = 0, trisDrawn = 0, instDrawn = 0, appendFailed = 0, blendTrisDrawn = 0;
+	u32 drawsIssued = 0, trisDrawn = 0, instDrawn = 0, appendFailed = 0, blendTrisDrawn = 0, maskTrisDrawn = 0;
 	u32 i;
 
 	if (g_dbg_modelRender == 0)
@@ -1329,6 +1353,72 @@ void NativeModelDraw_IssueForWalk(void)
 			continue;
 		}
 
+		/*
+		 * GHOST composite, mask half: under every one of its primitives the
+		 * ghost writer draws a flat B-F triangle of the scratch fade colour;
+		 * the additive body then relights the darkened footprint. One
+		 * untextured BM_SUBTRACT run per instance, ahead of its bodies.
+		 * Batching every mask before every body differs from retail's per-prim
+		 * interleave only where the instance's triangles overlap on screen and
+		 * the subtraction saturates at 0; the faces cannot depth-occlude each
+		 * other in either order (blended runs write no depth).
+		 */
+		if ((pass == 1) && inst->ghostComposite)
+		{
+			struct NativeModelDrawRun maskRun = {0, 0, -1, 0, BM_SUBTRACT};
+
+			for (t = 0; t < inst->triCount; t++)
+			{
+				const struct NativeModelEmitVert *src = &snap->verts[(inst->firstTri + t) * 3];
+				N3DS_Vertex out[3];
+				int offset;
+				int v;
+
+				for (v = 0; v < 3; v++)
+				{
+					out[v].x = src[v].x;
+					out[v].y = src[v].y;
+					out[v].z = src[v].z;
+					out[v].w = src[v].z;
+					out[v].u = 0;
+					out[v].v = 0;
+					out[v].r = inst->fadeR;
+					out[v].g = inst->fadeG;
+					out[v].b = inst->fadeB;
+					out[v]._pad = 0;
+				}
+
+				if (!instanceBound)
+				{
+					instanceBound = 1;
+					N3DS_ModelDraw_Instance(qx, qy, qw, h);
+					instDrawn++;
+				}
+
+				offset = N3DS_C3DAppendVertices(out, 3);
+				if (offset < 0)
+				{
+					appendFailed++;
+					break;
+				}
+
+				if ((maskRun.triCount > 0) && (offset == (maskRun.startVertex + (maskRun.triCount * 3))))
+				{
+					maskRun.triCount++;
+				}
+				else
+				{
+					NativeModelDraw_FlushRun(&maskRun, &drawsIssued);
+					maskRun.startVertex = offset;
+					maskRun.triCount = 1;
+				}
+
+				maskTrisDrawn++;
+			}
+
+			NativeModelDraw_FlushRun(&maskRun, &drawsIssued);
+		}
+
 		for (t = 0; t < inst->triCount; t++)
 		{
 			const u32 triIndex = inst->firstTri + t;
@@ -1355,6 +1445,17 @@ void NativeModelDraw_IssueForWalk(void)
 			 * lose everything except its translucent texels.
 			 */
 			if ((pass == 1) && !faceIsBlended)
+			{
+				continue;
+			}
+
+			/*
+			 * An untextured blended face has no PASS1 half: with no texels
+			 * there is no STP split, the writer's whole primitive is the blend
+			 * (the ghost's G3 body). Drawing it in pass 0 would paint it solid
+			 * under its own pass-1 blend.
+			 */
+			if ((pass == 0) && faceIsBlended && !face->textured)
 			{
 				continue;
 			}
@@ -1506,9 +1607,9 @@ void NativeModelDraw_IssueForWalk(void)
 		 * are indistinguishable by eye. inst= counts instance BINDS, so it now
 		 * exceeds the instance count on frames with blended content: an instance
 		 * that appears in both passes binds twice, by design. */
-		Platform_LogInstrument("[MDLDRAW] toggle=%d inst=%lu draws=%lu tris=%lu blendTris=%lu appendFail=%lu appendFailTotal=%lu\n", g_dbg_modelRender,
+		Platform_LogInstrument("[MDLDRAW] toggle=%d inst=%lu draws=%lu tris=%lu blendTris=%lu ghostMask=%lu appendFail=%lu appendFailTotal=%lu\n", g_dbg_modelRender,
 		                       (unsigned long)instDrawn, (unsigned long)drawsIssued, (unsigned long)trisDrawn, (unsigned long)blendTrisDrawn,
-		                       (unsigned long)appendFailed, (unsigned long)s_totalAppendFail);
+		                       (unsigned long)maskTrisDrawn, (unsigned long)appendFailed, (unsigned long)s_totalAppendFail);
 	}
 }
 #endif /* __3DS__ */
@@ -1523,13 +1624,15 @@ int g_dbg_modelRender = 0;
 int g_dbg_modelDepthCheck = 0;
 
 int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, int specularLit,
-                                  const struct Instance *worldInst)
+                                  const struct Instance *worldInst, int ghostComposite, u32 fadeColorWord)
 {
 	(void)idpp;
 	(void)pb;
 	(void)forceSemiTrans;
 	(void)specularLit;
 	(void)worldInst;
+	(void)ghostComposite;
+	(void)fadeColorWord;
 	return 0;
 }
 

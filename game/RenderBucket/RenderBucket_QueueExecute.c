@@ -30,7 +30,7 @@ struct InstDrawPerPlayer;
 struct PushBuffer;
 struct TextureLayout;
 extern int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const struct PushBuffer *pb, int forceSemiTrans, int specularLit,
-                                         const struct Instance *inst);
+                                         const struct Instance *inst, int ghostComposite, u32 fadeColorWord);
 extern int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex, int blendOverride);
 extern void NativeModelEmit_EndInstance(void);
 extern int NativeModelEmit_SkipRetailDraw(void);
@@ -4579,9 +4579,17 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 	 * capture can work out for itself. Computed here rather than passed as a raw
 	 * selector so the RB_RETAIL_INST_PRIM_* identifiers stay in game/.
 	 *
-	 * Missing this is what drew N. Tropy's Time Trial ghost solid. */
+	 * Missing this is what drew N. Tropy's Time Trial ghost solid.
+	 *
+	 * GHOST is alpha-aware because the writer is: at alphaScale 0 it tail-calls
+	 * the normal writer (opaque, no mask), so the classification must degrade
+	 * with it. The scratch fadeColor word rides along for the ghost's B-F mask
+	 * half -- the setup callback has already run by this point, so the scratch
+	 * holds exactly what the writer's mask packets would read. */
 	const u32 mdlPrimWriter = (u32)(uintptr_t)ctx->inst->funcPtr[1];
-	const int mdlForceBlend = (mdlPrimWriter == RB_RETAIL_INST_PRIM_GHOST) || (mdlPrimWriter == RB_RETAIL_INST_PRIM_DEPTH_FADE);
+	const int mdlGhost = (mdlPrimWriter == RB_RETAIL_INST_PRIM_GHOST) && (ctx->idpp->alphaScale != 0);
+	const int mdlDepthFade = (mdlPrimWriter == RB_RETAIL_INST_PRIM_DEPTH_FADE);
+	const int mdlForceBlend = mdlGhost || mdlDepthFade;
 	/* The two specular-lit writers (USE_SPECULAR_LIGHT combos): flat colour
 	 * through the light-colour matrix, dpcs toward the instance colour, glint
 	 * ramp, additive lit front faces. Classified by WRITER, not by testing
@@ -4590,7 +4598,8 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 	 * runtime toggle is folded in here so a flip lands on an instance boundary. */
 	const int mdlSpecular = ((mdlPrimWriter == RB_RETAIL_INST_PRIM_KEY_TOKEN) || (mdlPrimWriter == RB_RETAIL_INST_PRIM_LIT_TEXTURE)) &&
 	                        NativeModelEmit_SpecularEnabled();
-	const int mdlCapture = NativeModelEmit_BeginInstance(ctx->idpp, ctx->pb, mdlForceBlend, mdlSpecular, ctx->inst);
+	const int mdlCapture = NativeModelEmit_BeginInstance(ctx->idpp, ctx->pb, mdlForceBlend, mdlSpecular, ctx->inst, mdlGhost,
+	                                                     RenderBucket_Scratch()->split.fadeColor.word);
 	/* State 1 means the native path REPLACES this one, so the packet write
 	 * below is skipped and what reaches the screen is unambiguously ours.
 	 * Evaluated once per instance, not per triangle, and only meaningful when
@@ -4714,11 +4723,12 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 			// and a declined triangle still needs its packet written.
 			int mdlClaimed = 0;
 
-			/* Specular writers draw NOTHING for an untextured triangle (both
-			 * bail on tex == 0), so the capture must decline it too --
-			 * claiming it would draw geometry retail never shows. Declined =
-			 * mdlClaimed stays 0, and the writer's own no-op handles the rest. */
-			if (mdlCapture && !(mdlSpecular && tex == 0))
+			/* The specular writers and DEPTH_FADE draw NOTHING for an
+			 * untextured triangle (all three bail on tex == 0), so the capture
+			 * must decline it too -- claiming it would draw geometry retail
+			 * never shows. Declined = mdlClaimed stays 0, and the writer's own
+			 * no-op handles the rest. */
+			if (mdlCapture && !((mdlSpecular || mdlDepthFade) && tex == 0))
 			{
 				const u32 mdlXY[3] = {ctx->tempPacked[1].xy, ctx->tempPacked[2].xy, ctx->tempPacked[3].xy};
 				const u32 mdlZ[3] = {ctx->tempPacked[1].z, ctx->tempPacked[2].z, ctx->tempPacked[3].z};
