@@ -11,4 +11,14 @@ int NativeCD_Init(void);
 // a no-op on host-file overrides, on allocation failure, and off the 3DS.
 void NativeCD_PrefetchExtent(int encodedLoc, int byteSize);
 
+// Chunked variant for extents too large to read in one synchronous call while
+// the per-vblank music sequencer must keep ticking. Begin returns nonzero when
+// a pending prefetch exists to pump (it is a no-op returning 0 if the range is
+// already cached, unavailable, allocation fails, or off the 3DS); the caller
+// then calls Pump once per frame with a sector budget until it returns nonzero
+// (done). The extent only serves reads after the final Pump publishes it, so
+// the consumer must finish pumping before issuing the reads it wants cached.
+int NativeCD_PrefetchExtentBegin(int encodedLoc, int byteSize);
+int NativeCD_PrefetchPump(int maxSectors);
+
 #endif

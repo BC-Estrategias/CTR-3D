@@ -47,6 +47,54 @@ void LOAD_NativePrefetchCrateIntro(struct BigHeader *bigfile)
 		NativeCD_PrefetchExtent(bigfile->cdpos + entry[group[i]].offset, entry[group[i]].size);
 	}
 }
+
+// Prefetch all nine Oxide-intro cutscene scenes (VRAM/LEV/PTR per scene,
+// contiguous in BIGFILE) into the CD read cache as one spanning extent, so
+// every scene-switch read — and the adventure-mode replay of the same intro —
+// is served from RAM and the SD card stays exclusive to the intro's XA stream.
+// Called once per frame during the scene-1 load; each call reads a bounded
+// chunk so the per-vblank music sequencer keeps ticking, and the pump must
+// finish before the level files are queued (the extent serves no reads until
+// complete). Returns nonzero when there is nothing left to pump (finished,
+// already cached, unavailable, or PC).
+int LOAD_NativeIntroCutscenePrefetchStep(struct BigHeader *bigfile)
+{
+	// 64 sectors (128KB) per pumped frame keeps each SD read well under a
+	// frame on the slow-card target while still finishing the ~4.4MB intro
+	// span in under a second of load screen.
+	enum
+	{
+		LOAD_INTRO_PREFETCH_SECTORS_PER_FRAME = 64
+	};
+
+	struct BigEntry *entry;
+	int firstIndex;
+	int lastIndex;
+	int spanBytes;
+
+	if (bigfile == NULL)
+	{
+		return 1;
+	}
+
+	firstIndex = LOAD_GetBigfileIndex(INTRO_RACE_TODAY, LOAD_LEVEL_LOD_1P, LVI_VRAM);
+	lastIndex = LOAD_GetBigfileIndex(INTRO_OXIDE, LOAD_LEVEL_LOD_1P, LVI_PTR);
+
+	if ((firstIndex < 0) || (lastIndex < firstIndex) || (lastIndex >= bigfile->numEntry))
+	{
+		return 1;
+	}
+
+	entry = BIG_GETENTRY(bigfile);
+	spanBytes = (entry[lastIndex].offset - entry[firstIndex].offset) * LOAD_CD_DATA_SECTOR_SIZE + entry[lastIndex].size;
+
+	if (!NativeCD_PrefetchExtentBegin(bigfile->cdpos + entry[firstIndex].offset, spanBytes))
+	{
+		return 1;
+	}
+
+	return NativeCD_PrefetchPump(LOAD_INTRO_PREFETCH_SECTORS_PER_FRAME);
+}
 #endif
 
 // NOTE(aalhendi): ASM-verified NTSC-U 926 0x8007c118-0x8007c208.

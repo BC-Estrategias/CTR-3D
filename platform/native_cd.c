@@ -250,6 +250,11 @@ struct NativeCDPrefetchExtent
 global_variable struct NativeCDPrefetchExtent s_cdPrefetch[NATIVE_CD_PREFETCH_MAX];
 global_variable s32 s_cdPrefetchCount;
 
+// In-flight chunked prefetch (data == NULL means idle). The extent is published
+// into s_cdPrefetch only once fully read, so partial data can never serve a read.
+global_variable struct NativeCDPrefetchExtent s_cdPrefetchPending;
+global_variable u32 s_cdPrefetchPendingRead;
+
 internal u8 *NativeCD_PrefetchLookup(s32 fileIndex, u32 sector, s32 sectors)
 {
 	s32 i;
@@ -319,6 +324,104 @@ void NativeCD_PrefetchExtent(int encodedLoc, int byteSize)
 #else
 	(void)encodedLoc;
 	(void)byteSize;
+#endif
+}
+
+int NativeCD_PrefetchExtentBegin(int encodedLoc, int byteSize)
+{
+#if defined(__3DS__)
+	s32 fileIndex;
+	u32 startSector;
+	u32 sectorCount;
+	u8 *buffer;
+
+	if (s_cdPrefetchPending.data != NULL)
+	{
+		return 1;
+	}
+
+	if ((byteSize <= 0) || (s_cdPrefetchCount >= NATIVE_CD_PREFETCH_MAX))
+	{
+		return 0;
+	}
+
+	fileIndex = (encodedLoc >> 24) & 0xff;
+	startSector = (u32)(encodedLoc & 0xffffff);
+	sectorCount = ((u32)byteSize + (NATIVE_CD_SECTOR_SIZE - 1)) / NATIVE_CD_SECTOR_SIZE;
+
+	if ((fileIndex < 0) || (fileIndex >= s_nativeCdFileCount) || (s_nativeCdFiles[fileIndex].source != NATIVE_CD_FILE_DISC))
+	{
+		return 0;
+	}
+
+	if (NativeCD_PrefetchLookup(fileIndex, startSector, (s32)sectorCount) != NULL)
+	{
+		return 0;
+	}
+
+	buffer = (u8 *)malloc((size_t)sectorCount * NATIVE_CD_SECTOR_SIZE);
+	if (buffer == NULL)
+	{
+		return 0;
+	}
+
+	s_cdPrefetchPending.fileIndex = fileIndex;
+	s_cdPrefetchPending.startSector = startSector;
+	s_cdPrefetchPending.sectorCount = sectorCount;
+	s_cdPrefetchPending.data = buffer;
+	s_cdPrefetchPendingRead = 0;
+	return 1;
+#else
+	(void)encodedLoc;
+	(void)byteSize;
+	return 0;
+#endif
+}
+
+int NativeCD_PrefetchPump(int maxSectors)
+{
+#if defined(__3DS__)
+	u32 chunk;
+
+	if (s_cdPrefetchPending.data == NULL)
+	{
+		return 1;
+	}
+
+	chunk = s_cdPrefetchPending.sectorCount - s_cdPrefetchPendingRead;
+	if ((maxSectors > 0) && ((u32)maxSectors < chunk))
+	{
+		chunk = (u32)maxSectors;
+	}
+
+	if (!NativeDiscImage_ReadDataSectors(&s_nativeCdFiles[s_cdPrefetchPending.fileIndex].discFile, s_cdPrefetchPending.startSector + s_cdPrefetchPendingRead, chunk,
+	                                     s_cdPrefetchPending.data + (size_t)s_cdPrefetchPendingRead * NATIVE_CD_SECTOR_SIZE))
+	{
+		free(s_cdPrefetchPending.data);
+		s_cdPrefetchPending.data = NULL;
+		return 1;
+	}
+
+	s_cdPrefetchPendingRead += chunk;
+	if (s_cdPrefetchPendingRead < s_cdPrefetchPending.sectorCount)
+	{
+		return 0;
+	}
+
+	if (s_cdPrefetchCount < NATIVE_CD_PREFETCH_MAX)
+	{
+		s_cdPrefetch[s_cdPrefetchCount++] = s_cdPrefetchPending;
+	}
+	else
+	{
+		free(s_cdPrefetchPending.data);
+	}
+
+	s_cdPrefetchPending.data = NULL;
+	return 1;
+#else
+	(void)maxSectors;
+	return 1;
 #endif
 }
 

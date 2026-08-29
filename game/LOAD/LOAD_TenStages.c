@@ -425,6 +425,19 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
 	}
 	case 6:
 	{
+#ifdef CTR_NATIVE
+		// Fill the CD read cache with every intro-cutscene scene before the
+		// level files are queued: scene 1's own reads then hit RAM, and the
+		// later scene switches never touch the SD card while the intro's XA
+		// stream is running. Pumped in per-frame chunks so the vblank-driven
+		// music sequencer keeps ticking; must stay above the LEV_SWAP mempack
+		// setup below, which cannot be re-entered on a held stage.
+		if ((levelID == INTRO_RACE_TODAY) && !LOAD_NativeIntroCutscenePrefetchStep(bigfile))
+		{
+			// quit and restart stage 6 next frame
+			return loadingStage;
+		}
+#endif
 		if (!boolPlayMusicDuringLoading)
 		{
 			// NOTE(aalhendi): ASM-verified NTSC-U 926 0x80033ef8-0x80033f14 for async bank parse and volume restore.

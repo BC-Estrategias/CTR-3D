@@ -354,6 +354,7 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
 void LOAD_LevelFile(int levelID);
 #ifdef CTR_NATIVE
 void LOAD_NativePrefetchCrateIntro(struct BigHeader *bigfile);
+int LOAD_NativeIntroCutscenePrefetchStep(struct BigHeader *bigfile);
 #endif
 
 void LOAD_HowlCallback(u8 result, u8 *unk);
