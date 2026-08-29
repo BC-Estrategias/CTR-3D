@@ -1,5 +1,13 @@
 #include <common.h>
 
+#ifdef CTR_NATIVE
+// Menu-content hooks (platform/native_options.c) -- same local-extern idiom as
+// UI_RenderFrame.c. PC legs are passthroughs; the 3DS legs swap the row set
+// (no VS/BATTLE, adds OPTIONS) and open the native options box.
+extern struct MenuRow *NativeOptions_MainMenuRows(struct MenuRow *rows);
+extern s32 NativeOptions_HandleMainMenuChoice(struct RectMenu *mainMenu, s32 choose);
+#endif
+
 // NOTE(aalhendi): ASM-verified against retail 230 0x800abaf0-0x800abcac.
 u8 MM_TransitionInOut(struct TransitionMeta *meta, int framesPassed, int numFrames)
 {
@@ -52,6 +60,10 @@ void MM_MenuProc_Main(struct RectMenu *mainMenu)
 	{
 		mainMenu->rows = &D230.rowsMainMenuWithScrapbook[0];
 	}
+
+#ifdef CTR_NATIVE
+	mainMenu->rows = NativeOptions_MainMenuRows(mainMenu->rows);
+#endif
 
 	MM_ParseCheatCodes();
 	MM_ToggleRows_Difficulty();
@@ -153,6 +165,13 @@ void MM_MenuProc_Main(struct RectMenu *mainMenu)
 
 	// get LNG index of row selected
 	s16 choose = mainMenu->rows[mainMenu->rowSelected].stringIndex;
+
+#ifdef CTR_NATIVE
+	if (NativeOptions_HandleMainMenuChoice(mainMenu, choose))
+	{
+		return;
+	}
+#endif
 
 	// Adventure Mode
 	if (choose == LNG_ADVENTURE)

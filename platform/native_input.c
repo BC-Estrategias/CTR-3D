@@ -113,8 +113,7 @@ global_variable s32 s_lastActiveControllerSlot = -1;
  * the 3DS renderer doesn't handle split-screen yet, and with the mux off
  * retail's own "insert controller" gate keeps VS/battle unenterable -- the
  * desired hiding, with no game/ menu surgery. Deliberate opt-in for renderer
- * work stays via Platform_InputDebugPadMux: on 3DS dumpreq `padmux [N]` and
- * the SELECT+ZR active-pad cycle. */
+ * work stays via Platform_InputDebugPadMux: on 3DS dumpreq `padmux [N]`. */
 global_variable s32 s_padMuxAll = 0;
 
 extern s32 g_padCommEnable;

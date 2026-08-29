@@ -130,6 +130,7 @@
 #include "platform/native_savestate.c"
 #include "platform/native_state.c"
 #include "platform/native_str.c"
+#include "platform/native_options.c"
 
 #ifndef CC
 #if __GNUC__
