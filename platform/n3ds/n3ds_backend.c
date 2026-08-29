@@ -664,11 +664,13 @@ static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange 
  * The track's drawOrder tie-break weight, in view.z units per drawOrder step,
  * uploaded as hParam.w (docs/GROUND_DECAL_PASS_DESIGN.md 3/4).
  *
- * What an overlay face has to outrank is not the flat plane of the face below
- * it but that face's RELIEF -- a quadblock's centre vertex is displaced, so
- * the road rises through a flat turbo pad or road marking by real world units.
- * The weight must therefore exceed the relief, measured at 6: a Caves turbo
- * pad shows ground through itself at 4 and is clean at 6.
+ * 1.0 is the shipped scale. Raising it globally cannot separate a coplanar
+ * overlay pair whose authored draw_order_high bytes are EQUAL (the weight only
+ * multiplies the authored gap) and shoves every other face harder in the
+ * bargain -- the missing gap is baked instead (native_track_mesh.c pulls
+ * turbo-pad faces 8 drawOrder steps nearer). That baked delta scales by THIS
+ * value, so it must stay >= 1 to keep outranking the base quad's centre-vertex
+ * relief (~5 world units).
  *
  * The shove is per-face and global -- weight * that face's signed drawOrder
  * byte -- so the ceiling below, not this number, is what keeps an extreme
@@ -677,7 +679,7 @@ static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange 
  * write and the dumpreq token) live in this TU, which is its own TU so the
  * unity-build tentative-definition collision hazard does not apply here.
  */
-#define N3DS_TRACK_DRAWORDER_WEIGHT_DEFAULT 6.0f
+#define N3DS_TRACK_DRAWORDER_WEIGHT_DEFAULT 1.0f
 static float s_trackDrawOrderWeight = N3DS_TRACK_DRAWORDER_WEIGHT_DEFAULT;
 static int s_trackULocUvOffset = -1, s_trackULocStereo = -1;
 /* Memo for the blend pass's depth-write state, so a frame with no semi-

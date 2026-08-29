@@ -2829,6 +2829,22 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 			u32 drawOrderLow = CTR_ReadU32LE(&block->draw_order_low);
 			int doubleSided = (drawOrderLow & QUADBLOCK_DRAW_ORDER_LOW_DOUBLE_SIDED) != 0;
 
+			/* Turbo pads are overlay quadblocks laid near-coplanar over a
+			 * plain base road tile, separated on retail only by painter's
+			 * order. On the depth substrate the shader's tie-break multiplies
+			 * the pair's AUTHORED draw_order_high gap, so a pair authored with
+			 * equal bytes ties at any weight -- bake the missing gap here
+			 * instead. 8 steps times the shipped weight (hParam.w, 1 view.z
+			 * unit/step -- the baked delta scales by it, so that weight must
+			 * stay >= 1) outranks the base quad's centre-vertex relief (~5
+			 * world units). The key needs BOTH bits: on trigger quads
+			 * terrain_type is a trigger-payload bitmask, and TRIGGER alone
+			 * also covers weapon-react/mask-grab/hub quads. */
+			int padDrawOrderBias = (((CTR_ReadU16LE(&block->quadFlags) & QUADBLOCK_FLAG_TRIGGER) != 0) &&
+			                        ((block->terrain_type & COLL_STEP_TRIGGER_TURBO_PAD_MASK) != 0))
+			                           ? 8
+			                           : 0;
+
 			for (int face = 0; face < 4; face++)
 			{
 				uintptr_t texPtr = (uintptr_t)block->ptr_texture_mid[face];
@@ -2954,7 +2970,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 				}
 
 				u16 texRef = NativeTrackMesh_InternTexture(texPtr);
-				s8 drawOrder = (s8)((const u8 *)&block->draw_order_high)[face];
+				/* Pad bias saturates rather than wrapping (an s8 wrap would
+				 * flip nearest to farthest), and lands BEFORE the FIX 1a
+				 * widening below so the leaf's recorded range covers the
+				 * biased value -- outside that range, the shader's [0,1]
+				 * fraction clamp (FIX 1b) flattens exactly these faces. */
+				int drawOrderInt = (int)(s8)((const u8 *)&block->draw_order_high)[face] - padDrawOrderBias;
+				s8 drawOrder = (s8)((drawOrderInt < -128) ? -128 : drawOrderInt);
 				u32 baseVert = s_trackMesh.vertCount;
 
 				/* FIX 1a: widen this leaf's drawOrder range to cover every
