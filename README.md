@@ -167,6 +167,7 @@ main.c (entrypoint)
 ## Credits
 
 - [CTR-ModSDK](https://github.com/CTR-tools/CTR-ModSDK) — the decompilation project this is built on
+- [ReservesMeter](https://github.com/CTR-tools/CTR-ModSDK/tree/main/mods/Modules/ReservesMeter) by Superstarxalien — the in-race boost-reserves meter's design (geometry, fill scale, colors) follows this community mod
 - [PsyCross](https://github.com/OpenDriver2/PsyCross) — original PS1 compatibility code from which parts of CTR Native's owned platform layer and PsyQ facade headers are derived
 - [SDL3](https://github.com/libsdl-org/SDL) — cross-platform multimedia
 - Crash Team Racing is a trademark of Sony Computer Entertainment / Naughty Dog

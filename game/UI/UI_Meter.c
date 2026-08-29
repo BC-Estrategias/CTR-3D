@@ -1,4 +1,5 @@
 #include <common.h>
+#include <native_reserves.h>
 
 enum
 {
@@ -344,3 +345,117 @@ void UI_DrawSlideMeter(s16 posX, s16 posY, struct Driver *driver)
 		meterLength = barWidth;
 	}
 }
+
+#if defined(CTR_NATIVE)
+
+enum
+{
+	UI_RESERVES_METER_BAR_H = 5,
+	UI_RESERVES_METER_GAP = 2,
+	UI_RESERVES_METER_WIDTH_NUM = 0xe,
+	UI_RESERVES_METER_WIDTH_DIV = 0x960,
+	UI_RESERVES_METER_YELLOW_ABOVE = 1600,
+	UI_RESERVES_METER_GREEN_AT = 3840,
+};
+
+// Boost-reserves meter (driver->reserves). Geometry, scale and colors follow the
+// community-standard ReservesMeter mod (CTR-ModSDK mods/Modules/ReservesMeter):
+// a bar as wide as the slide bar (5px tall vs the mod's 3 -- legibility on the
+// 3DS screen), fill = reserves * 0xE / 0x960 px (pegs
+// around 8400 units), red -> yellow above 1600 -> green at 3840 (four
+// 960ms game-seconds) -> blue when pegged. Blue means "bar maxed", not a fire
+// state. 1P sits directly below the slide bar like the mod; splitscreen
+// viewports have no room below the anchor, so they stack above the slide bar
+// instead. Gated by g_reservesMeter at the call site -- see
+// include/native_reserves.h.
+void UI_DrawReservesMeter(s16 posX, s16 posY, struct Driver *driver)
+{
+	const struct GameTracker *gGT = sdata->gGT;
+	const int barWidth = UI_SLIDE_METER_BAR_W;
+	const int barHeight = UI_RESERVES_METER_BAR_H;
+
+	// posY is the slide bar's bottom edge (its box spans upward from here)
+	if (gGT->numPlyrCurrGame < 2)
+	{
+		posY = (s16)(posY + UI_RESERVES_METER_GAP + barHeight);
+	}
+	else
+	{
+		int slideHeight = gGT->numPlyrCurrGame >= UI_SLIDE_METER_SPLIT_PLAYER_COUNT ? UI_SLIDE_METER_BAR_H_SPLIT : UI_SLIDE_METER_BAR_H_FULL;
+
+		posY = (s16)(posY - slideHeight - UI_RESERVES_METER_GAP);
+	}
+
+	int meterLength = 0;
+	int pegged = 0;
+	if (driver->reserves > 0)
+	{
+		meterLength = ((int)driver->reserves * UI_RESERVES_METER_WIDTH_NUM) / UI_RESERVES_METER_WIDTH_DIV;
+		if (meterLength >= barWidth)
+		{
+			meterLength = barWidth;
+			pegged = 1;
+		}
+		if (meterLength < 1)
+		{
+			meterLength = 1;
+		}
+	}
+
+	RECT box;
+	s16 topX = posX - barWidth;
+	s16 topY = posY - barHeight;
+	box.x = topX;
+	box.y = topY;
+	box.w = barWidth;
+	box.h = barHeight;
+	Color black = MakeColor(0, 0, 0);
+	CTR_Box_DrawWireBox(&box, &black, gGT->pushBuffer_UI.ptrOT, &gGT->backBuffer->primMem);
+
+	const PrimCode primCode = {.poly = {.quad = 1, .renderCode = RenderCode_Polygon}};
+	ColorCode colorCode = MakeColorCode(0xff, 0, 0, primCode);
+
+	if (pegged)
+	{
+		colorCode = MakeColorCode(0, 0, 0xff, primCode);
+	}
+	else if (driver->reserves > UI_RESERVES_METER_YELLOW_ABOVE)
+	{
+		if (driver->reserves < UI_RESERVES_METER_GREEN_AT)
+		{
+			colorCode = MakeColorCode(0xff, 0xff, 0, primCode);
+		}
+		else
+		{
+			colorCode = MakeColorCode(0, 0xff, 0, primCode);
+		}
+	}
+
+	for (int i = 0; i < UI_SLIDE_METER_PRIM_COUNT; i++)
+	{
+		PolyF4 *p;
+		GetPrimMem(p);
+		if (p == nullptr)
+		{
+			return;
+		}
+
+		p->colorCode = colorCode;
+
+		p->v[0].pos.y = topY;
+		p->v[1].pos.y = topY;
+		p->v[2].pos.y = posY;
+		p->v[3].pos.y = posY;
+
+		p->v[0].pos.x = posX - meterLength;
+		p->v[1].pos.x = posX;
+		p->v[2].pos.x = posX - meterLength;
+		p->v[3].pos.x = posX;
+
+		AddPrimitive(p, gGT->pushBuffer_UI.ptrOT);
+		colorCode = MakeColorCode(UI_SLIDE_METER_EMPTY_R, UI_SLIDE_METER_EMPTY_G, UI_SLIDE_METER_EMPTY_B, primCode);
+		meterLength = barWidth;
+	}
+}
+
+#endif /* CTR_NATIVE */
