@@ -419,6 +419,23 @@ global_variable u32 s_uiOrdPrims = 0;
  */
 int g_dbg_btmMap = 1;
 /*
+ * Map on BOTH screens (dumpreq 'mapboth', default ON). When the map span was
+ * emitted by the game's own draw-on-top condition (map mode / 3P --
+ * NativeGpu_UiMapRetailTop, carried on the span itself), the peel below
+ * COPIES each map triangle: one into the bottom list as ever, one back into
+ * the ordinary ordered-UI list re-pinned like the unrouted leg, so the top
+ * screen keeps retail's map at retail's position while the bottom panel
+ * magnifies it. Speedo-mode spans (RouteActive override) are never copied --
+ * the override is legal precisely because routed prims stay off the top
+ * screen there. Off = today's move-only routing.
+ */
+int g_dbg_mapBoth = 1;
+/* Copy-leg forensics for the [BTMMAP] on line: total top copies emitted since
+ * boot. Nonzero proves the copy leg fires; the on line samples it with the
+ * retailTop flag so a missing top map can be attributed to the mode signal vs
+ * the leg itself. */
+global_variable unsigned long s_mbTopCopyTris = 0;
+/*
  * Bottom-console visibility (dumpreq 'stats', default OFF -- release posture).
  * Gates every painter that writes glyphs into the bottom framebuffer: the
  * stats drip (N3DS_StatsDripRow) and Platform_Log's stdout echo
@@ -3643,12 +3660,14 @@ internal void N3DS_DrawBottomMapPass(void)
 
 		if (active)
 		{
-			snprintf(line, sizeof(line), "[BTMMAP] on: segs=%d box=%d,%d..%d,%d win=%d,%d..%d,%d fpsSegs=%d fbox=%d,%d..%d,%d fwin=%d,%d..%d,%d",
+			snprintf(line, sizeof(line),
+			         "[BTMMAP] on: segs=%d box=%d,%d..%d,%d win=%d,%d..%d,%d fpsSegs=%d fbox=%d,%d..%d,%d fwin=%d,%d..%d,%d retail=%d both=%d copies=%lu",
 			         s_btmmSegCount, (int)s_btmmFrameBox[0], (int)s_btmmFrameBox[1], (int)s_btmmFrameBox[2], (int)s_btmmFrameBox[3],
 			         (int)s_btmmWin[0], (int)s_btmmWin[1], (int)s_btmmWin[2], (int)s_btmmWin[3], s_btmfSegCount,
 			         s_btmfFrameHasBox ? (int)s_btmfFrameBox[0] : 0, s_btmfFrameHasBox ? (int)s_btmfFrameBox[1] : 0,
 			         s_btmfFrameHasBox ? (int)s_btmfFrameBox[2] : 0, s_btmfFrameHasBox ? (int)s_btmfFrameBox[3] : 0, (int)s_btmfWinDbg[0],
-			         (int)s_btmfWinDbg[1], (int)s_btmfWinDbg[2], (int)s_btmfWinDbg[3]);
+			         (int)s_btmfWinDbg[1], (int)s_btmfWinDbg[2], (int)s_btmfWinDbg[3], NativeGpu_UiMapRetailTop(), g_dbg_mapBoth,
+			         (unsigned long)s_mbTopCopyTris);
 		}
 		else
 		{
@@ -6669,6 +6688,45 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 					if (perfScopes)
 					{
 						NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+					}
+				}
+				/* Map mode: the routed copy above feeds the bottom panel;
+				 * emit a SECOND copy into the ordinary ordered-UI list so
+				 * the top screen keeps retail's map (see g_dbg_mapBoth).
+				 * Re-pin exactly like the unrouted leg -- an off-pin stamp
+				 * among 0xFFFF pins would let any earlier-drawn quad's rect
+				 * occlude the map. The far-edge UV inset keys off the stamp
+				 * inside ConvertTriangleVerts, so this copy gets it too.
+				 * Speedo-mode spans report retailTop=0 and are never copied
+				 * (RouteActive's legality rests on routed prims staying off
+				 * the top screen there). Independent of the bottom append's
+				 * success: a full bottom list must not hole the top map. */
+				if (g_dbg_btmMap && g_dbg_mapBoth && (triVerts[0].emitOrdinal == PKTDEPTH_UI_STAMP_BTMMAP) &&
+				    ((g_dbg_mapBoth >= 2) || NativeGpu_UiMapRetailTop()))
+				{
+					N3DS_Vertex *topDst = N3DS_UiOrderAppend(s_currentBlendMode, untextured ? 0 : 1, atlasIdx);
+
+					s_mbTopCopyTris++;
+					if (topDst != NULL)
+					{
+						const s16 pinned = (s16)(0xFFFFu - 32768);
+
+						if (perfScopes)
+						{
+							NativePerf_BeginScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+						}
+						N3DS_ConvertTriangleVerts(topDst, triVerts, untextured, cellX, cellY, pixelBaseU, pixelBaseV, originU,
+						                          originV);
+						topDst[0].z = pinned;
+						topDst[1].z = pinned;
+						topDst[2].z = pinned;
+						topDst[0].w = pinned;
+						topDst[1].w = pinned;
+						topDst[2].w = pinned;
+						if (perfScopes)
+						{
+							NativePerf_EndScope(NATIVE_PERF_BUCKET_DRAW_TRIANGLES_CONVERT);
+						}
 					}
 				}
 				if (g_dbg_tireVtxLog && N3DS_TireVtxIsTire(triVerts, untextured))

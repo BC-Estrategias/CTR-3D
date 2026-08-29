@@ -4086,6 +4086,40 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_btmMap ? "[CTR-3DS] btmmap: ON (minimap on the bottom screen)"
 					                           : "[CTR-3DS] btmmap: off (minimap on the top screen, console restored)");
 				}
+				else if (strncmp(word, "mapboth", 7) == 0)
+				{
+					extern int g_dbg_mapBoth;
+					const char *arg = word + 7;
+
+					/* Map-mode top copy: with the speedo toggled off (or in
+					 * 3P), the map draws on BOTH screens -- retail position on
+					 * top, magnified on the bottom. OFF = move-only routing
+					 * (bottom screen only), today's behaviour. Speedo mode is
+					 * never affected: its map block only exists because of
+					 * the route override and stays off the top screen.
+					 * 'mapboth 0/1' sets, bare 'mapboth' toggles. */
+					while ((*arg == ' ') || (*arg == '\t'))
+					{
+						arg++;
+					}
+					if ((*arg >= '0') && (*arg <= '9'))
+					{
+						/* 2 = diagnostic: copy WITHOUT the retailTop mode
+						 * signal (also copies in speedo mode). */
+						g_dbg_mapBoth = atoi(arg);
+					}
+					else
+					{
+						g_dbg_mapBoth = !g_dbg_mapBoth;
+					}
+					{
+						char msg[96];
+
+						snprintf(msg, sizeof(msg), "[CTR-3DS] mapboth: %d %s", g_dbg_mapBoth,
+						         g_dbg_mapBoth ? "(map mode draws the map on both screens)" : "(map mode leaves the map bottom-only)");
+						N3DS_DebugLog(msg);
+					}
+				}
 				else if (strncmp(word, "amnesia", 7) == 0)
 				{
 #ifdef CTR_NATIVE_OTWALK_PROFILE

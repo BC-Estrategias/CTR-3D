@@ -5,8 +5,9 @@
 // icons) for the 3DS bottom-screen map routing -- same class and same
 // local-extern idiom as UI_RenderFrame_Racing's bracket. Routed when the
 // bottom map is on; drawn in place with the seam-closing far-edge UV inset
-// when it is off.
-extern void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end);
+// when it is off. retailTop stays 0: the hub map moves to the bottom
+// screen, never copies to both.
+extern void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end, int retailTop);
 #endif
 
 enum AHMapIconID
@@ -721,7 +722,7 @@ void AH_Map_Main(void)
 		               &gGT->backBuffer->primMem, gGT->pushBuffer_UI.ptrOT, 1);
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-		NativeGpu_MarkUiMapRange(hubMapPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor);
+		NativeGpu_MarkUiMapRange(hubMapPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor, 0);
 #endif
 
 		UI_DrawSlideMeter(hud[AH_MAP_HUD_SLOT_SLIDE_METER].x, hud[AH_MAP_HUD_SLOT_SLIDE_METER].y, advDriver);

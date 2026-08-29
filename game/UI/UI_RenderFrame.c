@@ -4,8 +4,10 @@
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
 // Register the in-race minimap block's packet span for the 3DS bottom-screen
 // map routing. Same local-extern idiom and same header-checked-later guarantee
-// as DrawSky.c's NativeGpu_MarkSkyRange.
-extern void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end);
+// as DrawSky.c's NativeGpu_MarkSkyRange. retailTop = the game's own HUD
+// condition emitted the block (map mode / 3P), not the RouteActive override;
+// such a block draws on BOTH screens on the 3DS.
+extern void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end, int retailTop);
 #endif
 #ifdef CTR_NATIVE
 // Bottom-screen map hook (platform/native_gpu.c). RouteActive lets the map
@@ -838,7 +840,12 @@ void UI_RenderFrame_Racing()
 		}
 	}
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-	NativeGpu_MarkUiMapRange(uiMapPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor);
+	// retailTop mirrors the block condition above minus the uiMapRouted
+	// override: map mode (speedo bit clear) or 3P, where retail itself puts
+	// the map on the top screen. In speedo mode the block ran only because
+	// routing asked for it, and must stay off the top screen.
+	NativeGpu_MarkUiMapRange(uiMapPrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor,
+	                         ((sdata->HudAndDebugFlags & 8) == 0) || (numPlyr == 3));
 #endif
 
 	bVar3 = false;

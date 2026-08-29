@@ -1869,6 +1869,11 @@ global_variable uintptr_t s_menubdRangeEnd[2];
  * write/read indices and lifecycle as the sky pair. */
 global_variable uintptr_t s_uimapRangeStart[2];
 global_variable uintptr_t s_uimapRangeEnd[2];
+/* Nonzero when the frame's map span came from the game's own draw-on-top
+ * condition rather than the RouteActive override -- the 3DS copies such a
+ * span to both screens instead of moving it. Rides the span's own
+ * double-buffer lifecycle so it can never describe a stale range. */
+global_variable int s_uimapRangeRetailTop[2];
 /* FPS-overlay sub-span of the map block (drawn between the map marks), so the
  * bottom pass can give the text its own non-magnifying window. */
 global_variable uintptr_t s_uifpsRangeStart[2];
@@ -1975,7 +1980,7 @@ void NativeGpu_MarkMenuBackdropRange(uintptr_t start, uintptr_t end)
 	s_menubdRangeEnd[s_skyRangeWriteIdx] = end;
 }
 
-void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end)
+void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end, int retailTop)
 {
 	if (end <= start)
 	{
@@ -1984,6 +1989,14 @@ void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end)
 	/* One producer, one contiguous block: overwrite, no union. */
 	s_uimapRangeStart[s_skyRangeWriteIdx] = start;
 	s_uimapRangeEnd[s_skyRangeWriteIdx] = end;
+	s_uimapRangeRetailTop[s_skyRangeWriteIdx] = retailTop;
+}
+
+/* Read on the walk, published index -- same cadence as the stamps it
+ * qualifies. Zero whenever the frame carried no map span. */
+int NativeGpu_UiMapRetailTop(void)
+{
+	return s_uimapRangeRetailTop[s_skyRangeReadIdx];
 }
 
 void NativeGpu_MarkUiFpsRange(uintptr_t start, uintptr_t end)
@@ -2024,6 +2037,7 @@ void NativeGpu_ClearSkyRange(void)
 	s_menubdRangeEnd[s_skyRangeWriteIdx] = 0;
 	s_uimapRangeStart[s_skyRangeWriteIdx] = 0;
 	s_uimapRangeEnd[s_skyRangeWriteIdx] = 0;
+	s_uimapRangeRetailTop[s_skyRangeWriteIdx] = 0;
 	s_uifpsRangeStart[s_skyRangeWriteIdx] = 0;
 	s_uifpsRangeEnd[s_skyRangeWriteIdx] = 0;
 	s_uipicRangeStart[s_skyRangeWriteIdx] = 0;

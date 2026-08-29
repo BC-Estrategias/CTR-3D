@@ -72,8 +72,15 @@ void NativeGpu_MarkStarRange(uintptr_t start, uintptr_t end);
  * through this so the 3DS can restamp those primitives for the bottom-screen
  * map (PKTDEPTH_UI_STAMP_BTMMAP, dumpreq 'btmmap'). One producer, one
  * contiguous block per frame, so this overwrites rather than unions. Same
- * lifecycle as the sky pair; inert on PC (nothing consumes the tag there). */
-void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end);
+ * lifecycle as the sky pair; inert on PC (nothing consumes the tag there).
+ * retailTop = nonzero when the game's own HUD condition emitted the block
+ * (retail would draw it on the top screen); zero when it exists only because
+ * NativeUiMap_RouteActive overrode the speedo-mode skip, or for the hub map.
+ * The 3DS draws retailTop blocks on BOTH screens (top copy re-pinned into the
+ * ordered-UI list, dumpreq 'mapboth'); override blocks stay bottom-only --
+ * routing's legality in speedo mode rests on them never reaching the top. */
+void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end, int retailTop);
+int NativeGpu_UiMapRetailTop(void);
 /* Sub-span of the map block: the FPS overlay text, restamped
  * PKTDEPTH_UI_STAMP_BTMFPS so the bottom pass can draw it through its own
  * (non-magnifying) window. Marked strictly inside the map bracket; the
