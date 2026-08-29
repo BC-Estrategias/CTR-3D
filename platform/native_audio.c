@@ -43,6 +43,23 @@
  */
 #define NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES 128
 
+/*
+ * Chunked first-play decode. The head chunk is what a key-on pays on the game
+ * thread; it must outlast the DSP's worst-case read (4x pitch = 176.4k
+ * samples/s) until the audio thread's next wake (~8ms), with margin: 8192
+ * samples covers ~46ms at 4x. The pump budget per wake (~2 wakes/frame) gives
+ * ~1M samples/s of fill throughput -- more than 5x ahead of worst-case
+ * consumption -- in chunk-sized lock holds so a game-thread key-on never
+ * waits on more than one chunk.
+ */
+#define NATIVE_AUDIO_HW_DECODE_HEAD_SAMPLES 8192
+#define NATIVE_AUDIO_HW_DECODE_CHUNK_SAMPLES 4096
+#define NATIVE_AUDIO_HW_DECODE_PUMP_SAMPLES 16384
+
+/* dumpreq `syncdecode`: kill switch back to full synchronous decode at
+ * key-on (the pre-chunking behavior), for A/B on hardware. */
+int g_dbg_hwSyncDecode = 0;
+
 struct NativeAudioHwSampleCacheEntry
 {
 	u32 addr;
@@ -56,6 +73,15 @@ struct NativeAudioHwSampleCacheEntry
 	u32 spuBytes; /* SPU-side extent (16 bytes per 28 samples), for overlap tests */
 	int used;
 	int stale; /* slot allocated but content invalidated by an SpuWrite */
+	/* Chunked-decode cursor: key-on decodes only a head chunk on the game
+	 * thread and the audio thread pumps the rest, so `decoded < count` means
+	 * the tail is still all-zero (the slot is zero-filled first -- an overrun
+	 * reads silence, never recycled PCM). The ADPCM predictor pair lives here
+	 * so the block walk can resume across calls. */
+	int decoded;
+	u32 nextBlock;
+	int histOld;
+	int histOlder;
 };
 
 global_variable struct NativeAudioHwSampleCacheEntry s_hwSampleCache[NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES];
@@ -115,6 +141,15 @@ global_variable struct
 	int windowArenaGrows;
 	int arenaPeakKiB;
 	int frameKeyOns;
+	/* HW sample-cache lifecycle, to attribute a decode storm to its trigger:
+	 * full resets vs. entries staled by SpuWrite vs. in-place stream
+	 * refreshes (each refresh is itself a decode), plus the write volume
+	 * that drove the invalidation. 3DS-only paths feed these; they print as
+	 * zeros on PC. */
+	int windowHwResets;
+	int windowHwStaled;
+	int windowHwRefresh;
+	int windowSpuWriteBytes;
 } s_voiceProf;
 #endif
 
@@ -2251,10 +2286,16 @@ internal void NativeAudio_HwStreamInvalidateRange(u32 writeStart, u32 writeEnd)
 				{
 					N3DS_HwVoiceStoreCommit(entry->pcm, pcm.count);
 					entry->count = pcm.count;
+					/* Refresh is a complete decode: leave no pending tail for
+					 * the pump (a streaming rewrite may land mid-fill). */
+					entry->decoded = pcm.count;
 					entry->loopStart = loopStart;
 					entry->loopEnd = loopEnd;
 					entry->loopEnabled = loopEnabled;
 					entry->spuBytes = ((u32)(pcm.count + 27) / 28u) * 16u;
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+					s_voiceProf.windowHwRefresh++;
+#endif
 					/* Voices and channels deliberately untouched: the DSP
 					 * loop keeps reading this memory and simply hears the
 					 * fresh content -- that IS the streaming semantics. */
@@ -2266,6 +2307,9 @@ internal void NativeAudio_HwStreamInvalidateRange(u32 writeStart, u32 writeEnd)
 		}
 
 		entry->stale = 1;
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+		s_voiceProf.windowHwStaled++;
+#endif
 		for (v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
 		{
 			if (s_audio.voices[v].pcm == entry->pcm)
@@ -2274,6 +2318,109 @@ internal void NativeAudio_HwStreamInvalidateRange(u32 writeStart, u32 writeEnd)
 				s_audio.voices[v].sampleDirty = 1;
 			}
 		}
+	}
+}
+
+/*
+ * Resumable ADPCM fill for one cache entry: the same nibble walk as
+ * NativeAudio_DecodeSpuSample, but bounded by maxSamples and carrying the
+ * predictor pair in the entry so later calls continue where this one
+ * stopped. Produces multiples of 28 (one block) up to the scan-derived
+ * count; on any disagreement with the scan it clamps to count and leaves
+ * the tail as the zero-fill (silence). Flushes what it produced for the
+ * DSP. Caller holds the output lock. Returns samples produced.
+ */
+internal int NativeAudio_HwDecodeChunk(struct NativeAudioHwSampleCacheEntry *entry, int maxSamples)
+{
+	int from = entry->decoded;
+
+	while ((entry->decoded < entry->count) && ((entry->decoded - from) < maxSamples))
+	{
+		u32 block = entry->nextBlock;
+		u8 soundParameter;
+		u8 flags;
+		int i;
+
+		if ((block + 16 > NATIVE_AUDIO_SPU_MEMSIZE) || (entry->decoded + 28 > entry->capacity))
+		{
+			entry->decoded = entry->count;
+			break;
+		}
+
+		soundParameter = s_audio.spu.memory[block];
+		flags = s_audio.spu.memory[block + 1];
+
+		for (i = 0; i < 14; i++)
+		{
+			u8 packed = s_audio.spu.memory[block + 2 + i];
+
+			entry->pcm[entry->decoded++] = (s16)NativeAudio_DecodeAdpcmNibble(soundParameter, packed & 0xf, &entry->histOld, &entry->histOlder);
+			entry->pcm[entry->decoded++] = (s16)NativeAudio_DecodeAdpcmNibble(soundParameter, (packed >> 4) & 0xf, &entry->histOld, &entry->histOlder);
+		}
+
+		entry->nextBlock = block + 16;
+
+		if ((flags & ADPCM_LOOP_END) != 0)
+		{
+			entry->decoded = entry->count;
+			break;
+		}
+	}
+
+	if (entry->decoded > from)
+	{
+		N3DS_HwVoiceStoreCommit(entry->pcm + from, entry->decoded - from);
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+		s_voiceProf.windowDecodedSamples += entry->decoded - from;
+#endif
+	}
+
+	return entry->decoded - from;
+}
+
+/*
+ * Once per audio-thread wake (n3ds_audio_thread.c): finish any entry whose
+ * key-on only decoded the head chunk. Budgeted and split into short lock
+ * holds -- see the NATIVE_AUDIO_HW_DECODE_* sizing note.
+ */
+void NativeAudio_HwDecodePumpForAudioThread(void)
+{
+	int budget = NATIVE_AUDIO_HW_DECODE_PUMP_SAMPLES;
+
+	while (budget > 0)
+	{
+		struct NativeAudioHwSampleCacheEntry *pending = NULL;
+		int produced;
+		int chunk;
+		int i;
+
+		NativeAudio_LockOutput();
+		for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+		{
+			struct NativeAudioHwSampleCacheEntry *entry = &s_hwSampleCache[i];
+
+			if (entry->used && !entry->stale && (entry->decoded < entry->count))
+			{
+				pending = entry;
+				break;
+			}
+		}
+
+		if (pending == NULL)
+		{
+			NativeAudio_UnlockOutput();
+			return;
+		}
+
+		chunk = (budget < NATIVE_AUDIO_HW_DECODE_CHUNK_SAMPLES) ? budget : NATIVE_AUDIO_HW_DECODE_CHUNK_SAMPLES;
+		produced = NativeAudio_HwDecodeChunk(pending, chunk);
+		NativeAudio_UnlockOutput();
+
+		if (produced <= 0)
+		{
+			return;
+		}
+		budget -= produced;
 	}
 }
 #endif
@@ -2303,6 +2450,9 @@ internal void NativeAudio_ResetVoicePcmArenaNoLock(int markDirty)
 	}
 
 #if defined(__3DS__)
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+	s_voiceProf.windowHwResets++;
+#endif
 	/* The linear store's pointers just went stale with the voices'.
 	 * StoreReset also silences every hardware channel BEFORE the store is
 	 * recycled; safe against the mirror because every caller of this
@@ -2450,6 +2600,7 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 		struct NativeAudioHwSampleCacheEntry *entry = NativeAudio_HwSampleCacheLookup(voice->attr.addr, voice->attr.loop_addr);
 
 		(void)arenaMarker;
+		(void)pcm;
 		if (entry == NULL)
 		{
 			entry = NativeAudio_HwSampleSlotAcquire(voice->attr.addr, voice->attr.loop_addr, scanCount);
@@ -2463,32 +2614,27 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 				return 0;
 			}
 
-			memset(&pcm, 0, sizeof(pcm));
-			pcm.samples = entry->pcm;
-			pcm.capacity = entry->capacity;
-			if (!NativeAudio_DecodeSpuSample(voice->attr.addr, &pcm))
-			{
-				entry->stale = 1;
-				NativeAudio_FreeVoicePcm(voice);
-				voice->active = 0;
-				voice->sampleDirty = 0;
-				return 0;
-			}
-			N3DS_HwVoiceStoreCommit(entry->pcm, pcm.count);
-
-#if CTR_NATIVE_AUDIO_DECODE_PROFILE
-			s_voiceProf.windowDecodedSamples += pcm.count;
-#endif
-
-			entry->count = pcm.count;
+			entry->count = scanCount;
 			entry->loopStart = loopStart;
 			entry->loopEnd = loopEnd;
 			entry->loopEnabled = loopEnabled;
-			entry->spuBytes = ((u32)(pcm.count + 27) / 28u) * 16u;
+			entry->spuBytes = ((u32)(scanCount + 27) / 28u) * 16u;
+			entry->decoded = 0;
+			entry->nextBlock = voice->attr.addr;
+			entry->histOld = 0;
+			entry->histOlder = 0;
+
+			/* Zero-fill before the head chunk so anything reading past the
+			 * decode cursor -- recycled slot content included -- hears
+			 * silence. One whole-range flush covers zeros and head both;
+			 * the pump flushes its own chunks as they land. */
+			memset(entry->pcm, 0, (size_t)scanCount * sizeof(s16));
+			NativeAudio_HwDecodeChunk(entry, g_dbg_hwSyncDecode ? scanCount : NATIVE_AUDIO_HW_DECODE_HEAD_SAMPLES);
+			N3DS_HwVoiceStoreCommit(entry->pcm, scanCount);
 
 			NativeAudio_FreeVoicePcm(voice);
 			voice->pcm = entry->pcm;
-			voice->sampleCount = pcm.count;
+			voice->sampleCount = entry->count;
 		}
 		else
 		{
@@ -6711,6 +6857,9 @@ u32 NativeAudio_SpuWrite(const u8 *addr, u32 size)
 	}
 
 	memcpy(&s_audio.spu.memory[wptrOfs], addr, size);
+#if CTR_NATIVE_AUDIO_DECODE_PROFILE
+	s_voiceProf.windowSpuWriteBytes += (int)size;
+#endif
 #if defined(__3DS__)
 	/* Range-precise: refresh playing entries in place (SPU streaming), mark
 	 * only actually-overwritten entries stale. The v1 nuke-everything here
@@ -7339,13 +7488,19 @@ internal int NativeAudio_DebugConsumeFrameKeyOns(void)
 internal void NativeAudio_DebugFormatVoiceProfWindow(char *buf, int bufSize, int maxFrameUs, int maxFrameKeyOns)
 {
 	snprintf(buf, (size_t)bufSize,
-	         "[PERF-VOICE] keyOns=%d decodeCalls=%d decodedSamples=%d scannedBlocks=%d arenaGrows=%d arenaPeakKiB=%d maxFrameUs=%d maxFrameKeyOns=%d",
+	         "[PERF-VOICE] keyOns=%d decodeCalls=%d decodedSamples=%d scannedBlocks=%d arenaGrows=%d arenaPeakKiB=%d maxFrameUs=%d maxFrameKeyOns=%d"
+	         " hwResets=%d hwStaled=%d hwRefresh=%d spuWriteKiB=%d",
 	         s_voiceProf.windowKeyOns, s_voiceProf.windowDecodeCalls, s_voiceProf.windowDecodedSamples, s_voiceProf.windowScannedBlocks,
-	         s_voiceProf.windowArenaGrows, s_voiceProf.arenaPeakKiB, maxFrameUs, maxFrameKeyOns);
+	         s_voiceProf.windowArenaGrows, s_voiceProf.arenaPeakKiB, maxFrameUs, maxFrameKeyOns, s_voiceProf.windowHwResets, s_voiceProf.windowHwStaled,
+	         s_voiceProf.windowHwRefresh, s_voiceProf.windowSpuWriteBytes >> 10);
 	s_voiceProf.windowKeyOns = 0;
 	s_voiceProf.windowDecodeCalls = 0;
 	s_voiceProf.windowDecodedSamples = 0;
 	s_voiceProf.windowScannedBlocks = 0;
 	s_voiceProf.windowArenaGrows = 0;
+	s_voiceProf.windowHwResets = 0;
+	s_voiceProf.windowHwStaled = 0;
+	s_voiceProf.windowHwRefresh = 0;
+	s_voiceProf.windowSpuWriteBytes = 0;
 }
 #endif

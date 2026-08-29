@@ -70,6 +70,14 @@ extern void NativeAudio_XAPumpForAudioThread(void);
 extern int NativeAudio_RenderXAParcelForAudioThread(void);
 
 /*
+ * Same hand-matched cross-TU contract. Finishes the chunked first-play
+ * decode of any hardware sample-cache entry whose key-on only produced the
+ * head chunk. Takes the render lock itself in short holds, so call it with
+ * NO locks held, like the XA pump above.
+ */
+extern void NativeAudio_HwDecodePumpForAudioThread(void);
+
+/*
  * Same hand-matched cross-TU contract. Drains native_audio.c's own half of
  * the worker profile (the lifecycle/mirror split inside the render call
  * above, which only that file can see) in ticks from N3DS_AudioTicksNow, and
@@ -971,6 +979,9 @@ static void N3DS_AudioThreadMain(void *arg)
 		                                        is non-recursive (docs/AUDIO_THREADING_DESIGN.md,
 		                                        "Verification findings"). */
 		s_profPumpTicks += svcGetSystemTick() - now;
+
+		NativeAudio_HwDecodePumpForAudioThread(); /* once per wake, no locks held -- takes the
+		                                             render lock itself in chunk-sized holds */
 	}
 
 	threadExit(0);
