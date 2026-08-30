@@ -26,6 +26,7 @@ int g_dbg_renderThread = 1;
 
 #include "n3ds/n3ds_render_thread.h"
 #include "n3ds/n3ds_backend.h"
+#include "n3ds/n3ds_beat.h"
 
 #define NATIVE_RENDER_QUEUE_RING 64
 
@@ -243,6 +244,7 @@ static void NativeRenderQueue_WorkerMain(void)
 		const u64 idleStart = SDL_GetPerformanceCounter();
 #endif
 		N3DS_RenderWorkWait();
+		N3DS_BeatMark(N3DS_BEAT_THREAD_RENDERWORKER, N3DS_BEAT_WHERE_OK);
 #ifdef CTR_INTERNAL
 		s_wpIdleTicks += SDL_GetPerformanceCounter() - idleStart;
 		s_wpIdleWaits++;
@@ -274,7 +276,9 @@ static void NativeRenderQueue_WorkerMain(void)
 				 * handshake: the lock pairs above and below, the done-signal,
 				 * and the wake wait. */
 				NativePerf_BeginScope(NATIVE_PERF_BUCKET_WORKER_EXEC);
+				N3DS_BeatMark(N3DS_BEAT_THREAD_RENDERWORKER, N3DS_BEAT_WHERE_EXEC_JOB);
 				NativeRenderQueue_ExecuteJob(&job);
+				N3DS_BeatMark(N3DS_BEAT_THREAD_RENDERWORKER, N3DS_BEAT_WHERE_OK);
 				NativePerf_EndScope(NATIVE_PERF_BUCKET_WORKER_EXEC);
 #ifdef CTR_INTERNAL
 				s_wpTicks[wbucket] += SDL_GetPerformanceCounter() - execStart;
@@ -330,8 +334,10 @@ unsigned int NativeRenderQueue_Post(const struct NativeRenderJob *job)
 			blockStart = SDL_GetPerformanceCounter();
 		}
 #endif
+		N3DS_BeatMark(N3DS_BEAT_THREAD_MAIN, N3DS_BEAT_WHERE_QUEUE_POST_WAIT);
 		N3DS_RenderDoneWait();
 	}
+	N3DS_BeatMark(N3DS_BEAT_THREAD_MAIN, N3DS_BEAT_WHERE_OK);
 
 #ifdef CTR_INTERNAL
 	if (blocked)
@@ -371,8 +377,10 @@ void NativeRenderQueue_Wait(unsigned int ticket)
 #ifdef CTR_INTERNAL
 			s_qsWaitBlockTicks += SDL_GetPerformanceCounter() - waitStart;
 #endif
+			N3DS_BeatMark(N3DS_BEAT_THREAD_MAIN, N3DS_BEAT_WHERE_OK);
 			return;
 		}
+		N3DS_BeatMark(N3DS_BEAT_THREAD_MAIN, N3DS_BEAT_WHERE_QUEUE_TICKET_WAIT);
 		N3DS_RenderDoneWait();
 	}
 }

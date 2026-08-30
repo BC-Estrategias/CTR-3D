@@ -13,6 +13,8 @@
 #include <unistd.h> /* fsync -- the SD log's timed durability commit */
 
 #include "n3ds_backend.h"
+#include "n3ds_beat.h"
+#include "n3ds_render_thread.h" /* N3DS_RenderWorkerIsSelf -- which thread the frame-begin guard is running on */
 #include "ctr_shbin.h"
 #ifdef CTR_NATIVE_TRACK_RENDERER
 /* Rung 3a step 2's sibling shader, built by the exact same picasso -> bin2s
@@ -38,6 +40,22 @@
 #define N3DS_LOG_PREV_PATH "sdmc:/ctr3ds.prev.log"
 
 static FILE *s_logFile = NULL;
+
+/*
+ * Guards N3DS_DebugLog's buffered-sink append + throttled-flush block
+ * (stderr and s_logFile's fputs/fputc, the shared flush-gate timestamp, and
+ * the [LOGFLUSH] accumulators N3DS_LogFlushStats drains). svcOutputDebugString
+ * needs no lock -- it is a syscall, not buffered stdio.
+ *
+ * N3DS_DebugLog has three legitimate callers -- the game thread, the render
+ * worker (N3DS_GuardedFrameBegin's stall logging), and the audio thread (the
+ * [BEAT] watchdog) -- so two threads can genuinely append to the SAME FILE*
+ * at once. devkitARM's newlib does not lock stdio's internal buffer state
+ * across threads, so an unguarded concurrent fputs/fflush pair here would
+ * race on that buffer's write pointer. Initialized in N3DS_EarlyInit, before
+ * any other thread exists.
+ */
+static LightLock s_logBufferLock;
 
 /*
  * 3dslink netload stderr streaming: when sent over Wi-Fi via 3dslink, HBL
@@ -116,6 +134,11 @@ static void N3DS_NetloadStreamInit(void)
 
 void N3DS_EarlyInit(void)
 {
+	/* Before anything can call N3DS_DebugLog (the netload-stream connect
+	 * message a few lines down does exactly that) and long before any worker
+	 * thread exists to contend for it. */
+	LightLock_Init(&s_logBufferLock);
+
 	consoleDebugInit(debugDevice_SVC);
 
 	/* One-deep rotation BEFORE the truncating open: "w" wipes the previous
@@ -174,6 +197,8 @@ void N3DS_DebugLog(const char *msg)
 	}
 
 	svcOutputDebugString(msg, (int)strlen(msg));
+
+	LightLock_Lock(&s_logBufferLock);
 
 	if (s_netloadStreamActive)
 	{
@@ -239,16 +264,20 @@ void N3DS_DebugLog(const char *msg)
 			}
 		}
 	}
+
+	LightLock_Unlock(&s_logBufferLock);
 }
 
 void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count)
 {
+	LightLock_Lock(&s_logBufferLock);
 	*worstUs = s_logFlushWorstUs;
 	*totalUs = s_logFlushTotalUs;
 	*count = s_logFlushCount;
 	s_logFlushWorstUs = 0;
 	s_logFlushTotalUs = 0;
 	s_logFlushCount = 0;
+	LightLock_Unlock(&s_logBufferLock);
 }
 
 /*
@@ -1090,6 +1119,26 @@ int g_dbg_widescreen = 2;
  * yet eroded) is a look call, not a derivable constant. */
 int g_dbg_trackAlphaRef = 1;
 
+/*
+ * Bounded C3D_FrameBegin with stall recovery (Rosalina-freeze hardening,
+ * docs/PORT_FEASIBILITY_3DS.md). Rosalina's kernel extension freezes ALL app
+ * threads AND the GSP sysmodule's own threads together (svcKernelSetState
+ * 0x10000, mask 2|1), thawing both on menu close; HOME/lid suspend only
+ * freeze the app side and thaw cleanly. The one place this port can wait
+ * forever is inside C3D_FrameBegin itself -- C3Di_WaitAndClearQueue calls
+ * gxCmdQueueWait(-1) unconditionally (SYNCDRAW only adds an extra untimed
+ * C3D_FrameSync() ahead of it), which blocks in gspWaitForAnyEvent until the
+ * GX queue's bound completion counters advance. A P3D/PPF completion event
+ * lost across the freeze/thaw wedges that wait permanently.
+ *
+ * 1 (default): route every C3D_FrameBegin through N3DS_GuardedFrameBegin
+ * below -- a bounded C3D_FRAME_NONBLOCK retry loop woken by a gsp event
+ * callback, logging escalating stall lines instead of hanging silently. 0:
+ * the exact unguarded call, for A/B against a suspected regression.
+ * Runtime: dumpreq `gxguard [N]`.
+ */
+int g_dbg_gxGuard = 1;
+
 void N3DS_C3DSetProjection(float left, float right, float bottom)
 {
 	if (g_dbg_widescreen == 2)
@@ -1205,6 +1254,131 @@ static void N3DS_BindPacketDrawState(void)
 	N3DS_StereoUploadUniform(s_uLocStereoUi, (const float(*)[4])s_stereoVecUi);
 }
 
+/* Pulsed by N3DS_GxPulseCallback whenever GSP reports a P3D (command list
+ * done) or PPF (display transfer done) completion -- the two events that
+ * advance citro3d's bound GX queue. RESET_STICKY: a pulse that lands between
+ * a waiter's last check and its next wait is not lost. Purely a wake-up
+ * optimisation, not the correctness mechanism -- N3DS_GuardedFrameBegin
+ * re-checks the real queue state (C3D_FrameBegin itself) on every timeout
+ * regardless of whether this fired, so a missed or coalesced pulse costs at
+ * most one poll period, never a hang. */
+static LightEvent s_gxPulseEvent;
+
+static void N3DS_GxPulseCallback(void *user)
+{
+	(void)user;
+	LightEvent_Signal(&s_gxPulseEvent);
+}
+
+/* threadId for N3DS_BeatMark calls made from code that can legitimately run
+ * on either the game thread or the render worker, depending on whether
+ * NativeRenderQueue routing is active for this frame (CtrGpu_ExecDrawOTag
+ * runs Platform_BeginScene -> ... -> N3DS_C3DBeginFrame on whichever thread
+ * executes the frame's first DrawOTag/DrawPrim job). */
+static int N3DS_BeatCurrentThreadId(void)
+{
+	return N3DS_RenderWorkerIsSelf() ? N3DS_BEAT_THREAD_RENDERWORKER : N3DS_BEAT_THREAD_MAIN;
+}
+
+/*
+ * The port's only C3D_FrameBegin entry point (see g_dbg_gxGuard's comment
+ * for why it is guarded). wantSyncDraw non-zero emulates
+ * C3D_FRAME_SYNCDRAW's own frame-to-frame alignment boundedly (50ms cap, then
+ * proceeds regardless) instead of calling the library's untimed
+ * C3D_FrameSync(); the actual frame-begin always goes through
+ * C3D_FRAME_NONBLOCK so this function owns the only wait, timed against the
+ * pulse event with a short poll period so a lost pulse costs milliseconds,
+ * not a hang.
+ *
+ * Marks THIS thread's heartbeat FRAMEBEGIN for the span and back to OK on
+ * return -- see n3ds_beat.h for why that has to be a single set/clear pair,
+ * not a mark per retry.
+ */
+static void N3DS_GuardedFrameBegin(u8 wantSyncDraw)
+{
+	int beatThread;
+	u64 startTick;
+	u64 nextGateMs;
+	unsigned int recoverN;
+
+	if (!g_dbg_gxGuard)
+	{
+		C3D_FrameBegin(wantSyncDraw ? C3D_FRAME_SYNCDRAW : 0);
+		return;
+	}
+
+	beatThread = N3DS_BeatCurrentThreadId();
+	N3DS_BeatMark(beatThread, N3DS_BEAT_WHERE_FRAMEBEGIN);
+	startTick = svcGetSystemTick();
+
+	if (wantSyncDraw)
+	{
+		const u32 c0 = C3D_FrameCounter(0);
+		const u32 c1 = C3D_FrameCounter(1);
+
+		for (;;)
+		{
+			const u64 waitedMs = ((svcGetSystemTick() - startTick) * 1000ull) / SYSCLOCK_ARM11;
+
+			if ((C3D_FrameCounter(0) != c0) && (C3D_FrameCounter(1) != c1))
+			{
+				break;
+			}
+			if (waitedMs >= 50)
+			{
+				break;
+			}
+			LightEvent_Clear(&s_gxPulseEvent);
+			LightEvent_WaitTimeout(&s_gxPulseEvent, 4 * 1000 * 1000);
+		}
+	}
+
+	nextGateMs = 1000;
+	recoverN = 0;
+	for (;;)
+	{
+		u64 waitedMs;
+
+		if (C3D_FrameBegin(C3D_FRAME_NONBLOCK))
+		{
+			break;
+		}
+
+		waitedMs = ((svcGetSystemTick() - startTick) * 1000ull) / SYSCLOCK_ARM11;
+		if (waitedMs >= nextGateMs)
+		{
+			char msg[96];
+
+			recoverN++;
+			/* vb0/vb1 moving across successive lines = GSP's event relay is
+			 * alive and only this queue's completion was lost; both frozen =
+			 * the relay itself is dead and nothing is recoverable from
+			 * application code. */
+			snprintf(msg, sizeof(msg), "[BEAT] GXRECOVER n=%u waitedMs=%u vb0=%lu vb1=%lu", recoverN, (unsigned)waitedMs,
+			         (unsigned long)C3D_FrameCounter(0), (unsigned long)C3D_FrameCounter(1));
+			N3DS_DebugLog(msg);
+			/*
+			 * The documented recovery kick past this point would be
+			 * gxCmdQueueInterrupt(GSPGPU_EVENT_P3D/PPF), faking the lost
+			 * completion so the bound queue advances -- but it is not a
+			 * public libctru symbol in the installed headers (no
+			 * 3ds/gpu/gxqueue.h; gx.h declares only
+			 * Clear/Add/Run/Stop/Wait/SetCallback + GX_BindQueue), so there
+			 * is no supported way to call it. Recovery beyond logging is not
+			 * possible from application code with this libctru; the wait
+			 * keeps polling and self-heals if the completion was merely
+			 * delayed rather than lost.
+			 */
+			nextGateMs = (recoverN < 3) ? (1000 + (u64)recoverN * 500) : (nextGateMs + 2000);
+		}
+
+		LightEvent_Clear(&s_gxPulseEvent);
+		LightEvent_WaitTimeout(&s_gxPulseEvent, 4 * 1000 * 1000);
+	}
+
+	N3DS_BeatMark(beatThread, N3DS_BEAT_WHERE_OK);
+}
+
 int N3DS_C3DInit(void)
 {
 	/* 4x citro3d's 256KB default. Both hardware crashes to date
@@ -1218,6 +1392,23 @@ int N3DS_C3DInit(void)
 	if (!C3D_Init(4 * C3D_DEFAULT_CMDBUF_SIZE))
 	{
 		return 0;
+	}
+
+	/*
+	 * Arm the gxguard wake source (see g_dbg_gxGuard's comment) before
+	 * anything can call N3DS_C3DBeginFrame. Slots are free -- citro3d itself
+	 * only registers VBlank0/VBlank1 -- and oneShot=false since every frame
+	 * needs the same callback. Runs on the gsp event thread, so it must do
+	 * nothing but signal.
+	 */
+	LightEvent_Init(&s_gxPulseEvent, RESET_STICKY);
+	gspSetEventCallback(GSPGPU_EVENT_P3D, N3DS_GxPulseCallback, NULL, false);
+	gspSetEventCallback(GSPGPU_EVENT_PPF, N3DS_GxPulseCallback, NULL, false);
+	{
+		char msg[48];
+
+		snprintf(msg, sizeof(msg), "[BEAT] armed gxguard=%d", g_dbg_gxGuard);
+		N3DS_DebugLog(msg);
 	}
 
 	s_renderTarget = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
@@ -1596,7 +1787,7 @@ void N3DS_C3DBeginFrame(void)
 	N3DS_StereoLatchFrame();
 
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: enter (SYNCDRAW wait)");
-	C3D_FrameBegin(g_dbg_frameSync ? C3D_FRAME_SYNCDRAW : 0);
+	N3DS_GuardedFrameBegin(g_dbg_frameSync ? 1 : 0);
 	N3DS_FrameTrace("[CTR-3DS] FrameBegin: returned");
 	/* Depth clears to FAR. Mtx_OrthoTilt maps LARGER vertex z to SMALLER
 	 * stored depth (verified empirically, see below), so far = max. */
@@ -1692,8 +1883,16 @@ static unsigned s_gtFrames;
 
 void N3DS_C3DEndFrame(void)
 {
+	/* C3D_FrameEnd only submits the command list -- it does not itself wait
+	 * for the GPU (that wait is deferred to the NEXT frame's
+	 * N3DS_GuardedFrameBegin) -- but it is bracketed the same way so a future
+	 * libctru version that blocks here is not a silent hole in the coverage. */
+	const int beatThread = N3DS_BeatCurrentThreadId();
+
 	N3DS_FrameTrace("[CTR-3DS] FrameEnd: enter (submit)");
+	N3DS_BeatMark(beatThread, N3DS_BEAT_WHERE_FRAMEEND);
 	C3D_FrameEnd(0);
+	N3DS_BeatMark(beatThread, N3DS_BEAT_WHERE_OK);
 	N3DS_FrameTrace("[CTR-3DS] FrameEnd: returned");
 
 	/* Read here rather than in BeginFrame so the pair is sampled once per
@@ -3630,6 +3829,10 @@ unsigned int N3DS_ReadButtons(void)
 	 *   vol [N]     -- output-stage gain, percent of SPU-faithful amplitude
 	 *                  (retail's 0x3fff master is half digital scale, so 200
 	 *                  = full scale and the default). Bare resets to default.
+	 *   gxguard [N] -- bounded C3D_FrameBegin with stall-recovery logging
+	 *                  (Rosalina-freeze hardening, default ON). Bare token
+	 *                  toggles, N sets 0/1. OFF calls libctru's C3D_FrameBegin
+	 *                  directly, for A/B against a suspected regression.
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -3700,6 +3903,21 @@ unsigned int N3DS_ReadButtons(void)
 					g_dbg_frameSync ^= 1;
 					N3DS_DebugLog(g_dbg_frameSync ? "[CTR-3DS] framesync: ON (FrameBegin waits for hw vblank)"
 					                              : "[CTR-3DS] framesync: OFF (begin immediately)");
+				}
+				else if (strncmp(word, "gxguard", 7) == 0)
+				{
+					/* Bounded C3D_FrameBegin + stall logging (default ON). Bare
+					 * token toggles; 'gxguard N' sets 0/1. */
+					if (word[7] == ' ')
+					{
+						g_dbg_gxGuard = (atoi(&word[8]) != 0) ? 1 : 0;
+					}
+					else
+					{
+						g_dbg_gxGuard = !g_dbg_gxGuard;
+					}
+					N3DS_DebugLog(g_dbg_gxGuard ? "[CTR-3DS] gxguard: ON (bounded FrameBegin + stall recovery logging)"
+					                            : "[CTR-3DS] gxguard: off (raw C3D_FrameBegin, no bound)");
 				}
 				else if (strncmp(word, "sdlog", 5) == 0)
 				{
@@ -5198,7 +5416,96 @@ unsigned long N3DS_LinearFreeBytes(void)
 	return (unsigned long)linearSpaceFree();
 }
 
+/*
+ * Once-per-frame main-thread heartbeat, thaw detector, and light watchdog
+ * (Rosalina-freeze hardening, docs/PORT_FEASIBILITY_3DS.md). Called exactly
+ * once per frame regardless of render-thread routing, so it is the one place
+ * guaranteed to run on the game thread every frame.
+ */
+static void N3DS_BeatMainTick(void)
+{
+	static u64 s_beatLastTick;
+	static unsigned int s_beatFrameCount;
+	static unsigned int s_beatPrevAudioCounter;
+	static unsigned int s_beatPrevRwCounter;
+	static u64 s_beatMainStallStartTick;
+	const u64 now = svcGetSystemTick();
+
+	if (s_beatLastTick != 0)
+	{
+		const u64 gapMs = ((now - s_beatLastTick) * 1000ull) / SYSCLOCK_ARM11;
+
+		/* A gap this large cannot be ordinary frame variance -- it is the
+		 * signature of a Rosalina freeze/thaw (or HOME/lid suspend) that just
+		 * released this thread. Re-arm the boot-time frame-bracket trace so
+		 * the next few C3D_FrameBegin/End calls narrate themselves, the same
+		 * way the first few frames of boot do. */
+		if (gapMs > 500)
+		{
+			char msg[48];
+
+			snprintf(msg, sizeof(msg), "[BEAT] THAW gapMs=%u", (unsigned)gapMs);
+			N3DS_DebugLog(msg);
+			s_frameTraceBudget = 64;
+		}
+	}
+	s_beatLastTick = now;
+
+	N3DS_BeatMark(N3DS_BEAT_THREAD_MAIN, N3DS_BEAT_WHERE_OK);
+	s_beatFrameCount++;
+
+	if ((s_beatFrameCount % 256) == 0)
+	{
+		unsigned int audioCounter = 0;
+		int audioWhere = N3DS_BEAT_WHERE_OK;
+		unsigned int rwCounter = 0;
+		int rwWhere = N3DS_BEAT_WHERE_OK;
+		int audioStuck;
+		int rwStuck;
+
+		N3DS_BeatRead(N3DS_BEAT_THREAD_AUDIO, &audioCounter, &audioWhere);
+		/* Either worker may legitimately not exist (Old3DS, spawn failure,
+		 * or the 'renderthread' A/B switched off) -- its counter then sits
+		 * at 0 forever, which must never itself read as a stall. */
+		N3DS_BeatRead(N3DS_BEAT_THREAD_RENDERWORKER, &rwCounter, &rwWhere);
+
+		audioStuck = (audioCounter != 0) && (audioCounter == s_beatPrevAudioCounter);
+		rwStuck = (rwCounter != 0) && (rwCounter == s_beatPrevRwCounter);
+
+		if (audioStuck || rwStuck)
+		{
+			char msg[128];
+			unsigned int ageMs;
+
+			if (s_beatMainStallStartTick == 0)
+			{
+				s_beatMainStallStartTick = now;
+			}
+			ageMs = (unsigned int)(((now - s_beatMainStallStartTick) * 1000ull) / SYSCLOCK_ARM11);
+
+			snprintf(msg, sizeof(msg), "[BEAT] STALL aw=%u@%s rw=%u@%s main=%u ageMs=%u", audioCounter, N3DS_BeatWhereName(audioWhere),
+			         rwCounter, N3DS_BeatWhereName(rwWhere), s_beatFrameCount, ageMs);
+			N3DS_DebugLog(msg);
+		}
+		else
+		{
+			s_beatMainStallStartTick = 0;
+		}
+
+		{
+			char msg[64];
+
+			snprintf(msg, sizeof(msg), "[BEAT] main=%u aw=%u rw=%u", s_beatFrameCount, audioCounter, rwCounter);
+			N3DS_DebugLog(msg);
+		}
+
+		s_beatPrevAudioCounter = audioCounter;
+		s_beatPrevRwCounter = rwCounter;
+	}
+}
+
 int N3DS_MainLoopActive(void)
 {
+	N3DS_BeatMainTick();
 	return aptMainLoop() ? 1 : 0;
 }

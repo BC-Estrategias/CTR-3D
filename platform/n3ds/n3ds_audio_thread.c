@@ -19,6 +19,7 @@
 
 #include "n3ds_audio_thread.h"
 #include "n3ds_backend.h" /* N3DS_DebugLog only -- plain-scalar boundary header, no game types */
+#include "n3ds_beat.h"
 
 /*
  * Defined in native_audio.c (the unity build's own translation unit).
@@ -879,6 +880,71 @@ static int N3DS_NdspCushionTarget(void)
 	return (cushion < 12) ? cushion : 12;
 }
 
+/*
+ * Cross-thread stall watchdog (Rosalina-freeze hardening,
+ * docs/PORT_FEASIBILITY_3DS.md). This thread's own wait (svcWaitSynchronization
+ * above) is capped at one XA period, so it can never wedge itself -- which is
+ * what makes it a trustworthy place to notice ANOTHER thread that has: if
+ * main or the render worker's heartbeat counter has not moved since the last
+ * check while this thread kept waking normally, one of them is stuck in an
+ * untimed wait (see N3DS_GuardedFrameBegin, n3ds_backend.c). A thread that
+ * has not yet made its first mark (main before its first frame, a worker
+ * that never started) reads as a counter at 0, which must never be reported
+ * as a stall.
+ *
+ * wakeCount is the caller's own dedicated counter, not s_profWakes -- that one
+ * is drained to 0 by N3DS_AudioThreadGetProfile on an unrelated cadence and
+ * would desync this function's every-64 gate and its logged `aw=` value.
+ */
+static void N3DS_BeatWatchdogCheck(unsigned int wakeCount)
+{
+	static unsigned int s_awPrevMain;
+	static unsigned int s_awPrevRw;
+	static u64 s_awStallStartTick;
+	static u64 s_awLastLogTick;
+	unsigned int mainCounter = 0;
+	int mainWhere = N3DS_BEAT_WHERE_OK;
+	unsigned int rwCounter = 0;
+	int rwWhere = N3DS_BEAT_WHERE_OK;
+	int mainStuck;
+	int rwStuck;
+
+	N3DS_BeatRead(N3DS_BEAT_THREAD_MAIN, &mainCounter, &mainWhere);
+	N3DS_BeatRead(N3DS_BEAT_THREAD_RENDERWORKER, &rwCounter, &rwWhere);
+
+	mainStuck = (mainCounter != 0) && (mainCounter == s_awPrevMain);
+	rwStuck = (rwCounter != 0) && (rwCounter == s_awPrevRw);
+
+	if (mainStuck || rwStuck)
+	{
+		const u64 now = svcGetSystemTick();
+
+		if (s_awStallStartTick == 0)
+		{
+			s_awStallStartTick = now;
+			s_awLastLogTick = 0;
+		}
+
+		if ((((now - s_awLastLogTick) * 1000ull) / SYSCLOCK_ARM11) >= 2000ull)
+		{
+			const unsigned int ageMs = (unsigned int)(((now - s_awStallStartTick) * 1000ull) / SYSCLOCK_ARM11);
+			char msg[128];
+
+			snprintf(msg, sizeof(msg), "[BEAT] STALL main=%u@%s rw=%u@%s aw=%u ageMs=%u", mainCounter, N3DS_BeatWhereName(mainWhere),
+			         rwCounter, N3DS_BeatWhereName(rwWhere), wakeCount, ageMs);
+			N3DS_DebugLog(msg);
+			s_awLastLogTick = now;
+		}
+	}
+	else
+	{
+		s_awStallStartTick = 0;
+	}
+
+	s_awPrevMain = mainCounter;
+	s_awPrevRw = rwCounter;
+}
+
 static void N3DS_AudioThreadMain(void *arg)
 {
 	const u64 xaPeriodTicks = SYSCLOCK_ARM11 / 60;
@@ -903,6 +969,19 @@ static void N3DS_AudioThreadMain(void *arg)
 			break;
 		}
 		s_profWakes++;
+
+		{
+			/* Independent of s_profWakes -- see N3DS_BeatWatchdogCheck's own
+			 * comment for why that one can't double as this gate. */
+			static unsigned int s_beatWakeCounter;
+
+			N3DS_BeatMark(N3DS_BEAT_THREAD_AUDIO, N3DS_BEAT_WHERE_AUDIO_RENDER);
+			s_beatWakeCounter++;
+			if ((s_beatWakeCounter % 64) == 0)
+			{
+				N3DS_BeatWatchdogCheck(s_beatWakeCounter);
+			}
+		}
 
 		for (;;) /* drain the current lifecycle backlog, one vblank at a time */
 		{
