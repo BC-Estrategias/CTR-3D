@@ -63,6 +63,14 @@ void N3DS_AudioThreadStopAndJoin(void);
  */
 void N3DS_AudioThreadShutdown(void);
 
+/*
+ * Rosalina-freeze bisect: N3DS_AudioThreadShutdown, then latch the sink
+ * permanently down -- unlike a plain Shutdown, a later NativeAudio_SpuInit
+ * call (every XA play request) will NOT bring ndsp back up. One-way for the
+ * rest of the process lifetime; no restart path.
+ */
+void N3DS_NdspForceOff(void);
+
 /* Did Init actually secure a real core-1 worker thread? If false, the
  * caller must render (and discard) synchronously on the main thread instead
  * -- see NativeAudio_StepVBlank's 3DS fallback branch. */

@@ -194,6 +194,7 @@ static volatile int s_audioThreadRunning; /* set true only after a real thread o
  */
 static int s_ndspInitAttempted;
 static int s_ndspUp;
+static int s_ndspForcedOff; /* dumpreq `ndspoff` latch: blocks N3DS_NdspSinkInit permanently */
 static s16 *s_ndspPcm;                                  /* linearAlloc: BLOCK_COUNT x AGG_FRAMES x stereo */
 static ndspWaveBuf s_ndspBufs[N3DS_NDSP_BLOCK_COUNT];   /* statuses start 0 = NDSP_WBUF_FREE */
 static int s_ndspBufParcels[N3DS_NDSP_BLOCK_COUNT];     /* vblanks of audio in each handed-over buffer */
@@ -242,6 +243,11 @@ static void N3DS_NdspSinkInit(void)
 	Result rc;
 	char line[96];
 	float mix[12];
+
+	if (s_ndspForcedOff)
+	{
+		return;
+	}
 
 	if (s_ndspInitAttempted)
 	{
@@ -687,10 +693,15 @@ void N3DS_HwVoiceStoreReset(void)
 {
 	int v;
 
-	/* Channels first: the store's contents are about to be recycled. */
-	for (v = 0; v < N3DS_HW_VOICE_COUNT; v++)
+	/* Channels first: the store's contents are about to be recycled. Skipped
+	 * with the sink down (dumpreq `ndspoff`) -- the DSP owns nothing to
+	 * silence and ndspChnWaveBufClear would touch a torn-down channel. */
+	if (s_ndspUp)
 	{
-		ndspChnWaveBufClear(v);
+		for (v = 0; v < N3DS_HW_VOICE_COUNT; v++)
+		{
+			ndspChnWaveBufClear(v);
+		}
 	}
 	s_hwStoreUsed = 0;
 	s_hwStoreResets++;
@@ -1235,6 +1246,16 @@ void N3DS_AudioThreadShutdown(void)
 int N3DS_AudioThreadIsRunning(void)
 {
 	return s_audioThreadRunning;
+}
+
+void N3DS_NdspForceOff(void)
+{
+	N3DS_AudioThreadShutdown();
+	/* Shutdown clears s_ndspInitAttempted so a later re-Init can normally
+	 * bring the sink back; this latch keeps N3DS_NdspSinkInit refusing even
+	 * though NativeAudio_SpuInit calls N3DS_AudioThreadInit on every XA play
+	 * request. */
+	s_ndspForcedOff = 1;
 }
 
 int N3DS_AudioThreadGetBacklog(void)

@@ -3833,6 +3833,11 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  (Rosalina-freeze hardening, default ON). Bare token
 	 *                  toggles, N sets 0/1. OFF calls libctru's C3D_FrameBegin
 	 *                  directly, for A/B against a suspected regression.
+	 *   texwarm [N] -- load-screen texture pre-warm (default ON): decodes every
+	 *                  loaded model's textures at the level-load boundary
+	 *                  instead of on the crate-intro's kart-spawn frame. Bare
+	 *                  token toggles, N sets 0/1. [TEXWARM] reports pages/
+	 *                  subpages/us once per level.
 	 *   audiothread -- Rosalina-freeze bisect: stop and join the core-1 audio
 	 *                  worker thread at runtime (one-way, no restart). The
 	 *                  ndsp sink stays up; NativeAudio_StepVBlank's
@@ -3843,6 +3848,17 @@ unsigned int N3DS_ReadButtons(void)
 	 *   rosabisect  -- both of the above in order: stop the audio worker,
 	 *                  then APT_SetAppCpuTimeLimit(0). One word per boot-run
 	 *                  is what the dumpreq channel actually supports.
+	 *   ndspoff     -- Rosalina-freeze bisect round 2: stop the audio worker
+	 *                  (if running) and tear down the ndsp sink permanently
+	 *                  (N3DS_NdspForceOff) -- audio stays silent for the rest
+	 *                  of the run, every ndspChn.../ndspWaveBuf/ndspSetOutputMode
+	 *                  call site is gated on the sink-up flag already, and a
+	 *                  later XA play request cannot bring it back.
+	 *   speedoff    -- Rosalina-freeze bisect round 2: osSetSpeedupEnable(false)
+	 *                  -- drops the New3DS 804 MHz clock-up back to O3DS speed.
+	 *   rosabisect2 -- both of the above (ndspoff + speedoff). Checked BEFORE
+	 *                  rosabisect above -- same "rosabisect" prefix, and
+	 *                  strncmp would otherwise match the shorter word first.
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -3929,6 +3945,24 @@ unsigned int N3DS_ReadButtons(void)
 					N3DS_DebugLog(g_dbg_gxGuard ? "[CTR-3DS] gxguard: ON (bounded FrameBegin + stall recovery logging)"
 					                            : "[CTR-3DS] gxguard: off (raw C3D_FrameBegin, no bound)");
 				}
+				else if (strncmp(word, "texwarm", 7) == 0)
+				{
+					extern int g_dbg_texWarm;
+
+					/* Bare token toggles; 'texwarm N' sets 0/1. State lives
+					 * renderer-side (platform/native_model_texwarm.c); this
+					 * file only flips the plain-scalar flag it shares. */
+					if (word[7] == ' ')
+					{
+						g_dbg_texWarm = (atoi(&word[8]) != 0) ? 1 : 0;
+					}
+					else
+					{
+						g_dbg_texWarm = !g_dbg_texWarm;
+					}
+					N3DS_DebugLog(g_dbg_texWarm ? "[CTR-3DS] texwarm: ON (load-screen texture pre-warm)"
+					                            : "[CTR-3DS] texwarm: off (first draw decodes cold)");
+				}
 				else if (strncmp(word, "audiothread", 11) == 0)
 				{
 					/* Rosalina-freeze bisect: stop and join the core-1 audio
@@ -3961,6 +3995,35 @@ unsigned int N3DS_ReadButtons(void)
 					rc = APT_SetAppCpuTimeLimit((u32)pct);
 					snprintf(msg, sizeof(msg), "[CTR-3DS] cpulimit %d: rc=0x%08lx", pct, (unsigned long)rc);
 					N3DS_DebugLog(msg);
+				}
+				else if (strncmp(word, "ndspoff", 7) == 0)
+				{
+					/* Rosalina-freeze bisect round 2: permanently release the
+					 * DSP -- N3DS_NdspForceOff stops the audio worker (if
+					 * running), tears the sink down, and latches it so a
+					 * later XA play request cannot reinitialize ndsp. */
+					extern void N3DS_NdspForceOff(void);
+
+					N3DS_NdspForceOff();
+					N3DS_DebugLog("[CTR-3DS] ndspoff: DSP released");
+				}
+				else if (strncmp(word, "speedoff", 8) == 0)
+				{
+					/* Rosalina-freeze bisect round 2: drop the New3DS
+					 * 804MHz clock-up back to O3DS speed. */
+					osSetSpeedupEnable(false);
+					N3DS_DebugLog("[CTR-3DS] speedoff: New3DS clock-up disabled");
+				}
+				else if (strncmp(word, "rosabisect2", 11) == 0)
+				{
+					/* Both round-2 bisect legs at once: release the DSP, then
+					 * drop the clock-up. Checked before the shorter
+					 * "rosabisect" token above -- same prefix. */
+					extern void N3DS_NdspForceOff(void);
+
+					N3DS_NdspForceOff();
+					osSetSpeedupEnable(false);
+					N3DS_DebugLog("[CTR-3DS] rosabisect2: DSP released, New3DS clock-up disabled");
 				}
 				else if (strncmp(word, "rosabisect", 10) == 0)
 				{
