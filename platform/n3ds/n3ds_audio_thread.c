@@ -1196,7 +1196,7 @@ void N3DS_AudioThreadNotifyVBlank(void)
 	svcSignalEvent(s_audioWakeHandle);
 }
 
-void N3DS_AudioThreadShutdown(void)
+void N3DS_AudioThreadStopAndJoin(void)
 {
 	if (s_audioThreadRunning && (s_audioThread != NULL))
 	{
@@ -1207,6 +1207,19 @@ void N3DS_AudioThreadShutdown(void)
 		s_audioThread = NULL;
 		s_audioThreadRunning = 0;
 	}
+	/*
+	 * Wake handle and ndsp sink are deliberately left up: N3DS_AudioThreadIsRunning()
+	 * now reads false, so NativeAudio_StepVBlank's main-thread fallback starts
+	 * submitting to the same sink on the very next vblank (see that function's
+	 * 3DS branch) -- exactly the path already exercised whenever Init never
+	 * secured a worker in the first place. One-way: nothing here restarts the
+	 * worker.
+	 */
+}
+
+void N3DS_AudioThreadShutdown(void)
+{
+	N3DS_AudioThreadStopAndJoin();
 	if (s_audioWakeHandle != 0)
 	{
 		svcCloseHandle(s_audioWakeHandle);

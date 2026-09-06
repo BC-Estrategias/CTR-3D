@@ -3833,6 +3833,16 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  (Rosalina-freeze hardening, default ON). Bare token
 	 *                  toggles, N sets 0/1. OFF calls libctru's C3D_FrameBegin
 	 *                  directly, for A/B against a suspected regression.
+	 *   audiothread -- Rosalina-freeze bisect: stop and join the core-1 audio
+	 *                  worker thread at runtime (one-way, no restart). The
+	 *                  ndsp sink stays up; NativeAudio_StepVBlank's
+	 *                  main-thread fallback keeps audio audible.
+	 *   cpulimit N  -- Rosalina-freeze bisect: calls APT_SetAppCpuTimeLimit(N)
+	 *                  at runtime, independent of the audio worker's own
+	 *                  claim. Bare token = 0.
+	 *   rosabisect  -- both of the above in order: stop the audio worker,
+	 *                  then APT_SetAppCpuTimeLimit(0). One word per boot-run
+	 *                  is what the dumpreq channel actually supports.
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
@@ -3918,6 +3928,53 @@ unsigned int N3DS_ReadButtons(void)
 					}
 					N3DS_DebugLog(g_dbg_gxGuard ? "[CTR-3DS] gxguard: ON (bounded FrameBegin + stall recovery logging)"
 					                            : "[CTR-3DS] gxguard: off (raw C3D_FrameBegin, no bound)");
+				}
+				else if (strncmp(word, "audiothread", 11) == 0)
+				{
+					/* Rosalina-freeze bisect: stop and join the core-1 audio
+					 * worker at runtime, leaving the ndsp sink up so
+					 * NativeAudio_StepVBlank's main-thread fallback keeps
+					 * audio audible. One-way -- the worker does not restart. */
+					extern void N3DS_AudioThreadStopAndJoin(void);
+
+					N3DS_AudioThreadStopAndJoin();
+					N3DS_DebugLog("[CTR-3DS] audiothread: STOPPED (main-thread fallback)");
+				}
+				else if (strncmp(word, "cpulimit", 8) == 0)
+				{
+					/* Rosalina-freeze bisect: reassert APT_SetAppCpuTimeLimit at
+					 * runtime, independent of the audio worker's own core-1
+					 * claim. Bare token = 0 (release the syscore reservation). */
+					const char *arg = word + 8;
+					int pct = 0;
+					char msg[64];
+					Result rc;
+
+					while ((*arg == ' ') || (*arg == '\t'))
+					{
+						arg++;
+					}
+					if ((*arg >= '0') && (*arg <= '9'))
+					{
+						pct = atoi(arg);
+					}
+					rc = APT_SetAppCpuTimeLimit((u32)pct);
+					snprintf(msg, sizeof(msg), "[CTR-3DS] cpulimit %d: rc=0x%08lx", pct, (unsigned long)rc);
+					N3DS_DebugLog(msg);
+				}
+				else if (strncmp(word, "rosabisect", 10) == 0)
+				{
+					/* Both bisect legs at once, in the order that matters:
+					 * release the audio worker's core-1 claim, then reassert
+					 * the app CPU time limit to 0. */
+					extern void N3DS_AudioThreadStopAndJoin(void);
+					char msg[80];
+					Result rc;
+
+					N3DS_AudioThreadStopAndJoin();
+					rc = APT_SetAppCpuTimeLimit(0);
+					snprintf(msg, sizeof(msg), "[CTR-3DS] rosabisect: audiothread STOPPED, cpulimit 0 rc=0x%08lx", (unsigned long)rc);
+					N3DS_DebugLog(msg);
 				}
 				else if (strncmp(word, "sdlog", 5) == 0)
 				{

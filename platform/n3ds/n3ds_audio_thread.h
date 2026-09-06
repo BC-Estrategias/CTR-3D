@@ -46,9 +46,20 @@ void N3DS_AudioThreadInit(void);
 void N3DS_AudioThreadNotifyVBlank(void);
 
 /*
- * Stop and join the worker thread, if one was ever created. No-op
- * (null-safe) if N3DS_AudioThreadInit was never called, or never reached a
- * running thread -- safe to call unconditionally from NativeAudio_Shutdown.
+ * Stop and join the worker thread, if one was ever created, but leave the
+ * wake handle and ndsp sink up. No-op (null-safe) if no worker is running.
+ * N3DS_AudioThreadIsRunning() reads false immediately after, so
+ * NativeAudio_StepVBlank's main-thread fallback takes over submitting to the
+ * same sink from the next vblank -- a runtime bisect switch, not a shutdown;
+ * there is no way back to the worker in this process lifetime.
+ */
+void N3DS_AudioThreadStopAndJoin(void);
+
+/*
+ * Stop and join the worker thread (via N3DS_AudioThreadStopAndJoin), then
+ * close the wake handle and tear down the ndsp sink. No-op (null-safe) if
+ * N3DS_AudioThreadInit was never called, or never reached a running thread --
+ * safe to call unconditionally from NativeAudio_Shutdown.
  */
 void N3DS_AudioThreadShutdown(void);
 
