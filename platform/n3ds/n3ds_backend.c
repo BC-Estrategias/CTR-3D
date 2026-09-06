@@ -56,6 +56,9 @@ static FILE *s_logFile = NULL;
  * any other thread exists.
  */
 static LightLock s_logBufferLock;
+/* Rosalina-freeze bisect: 1 = stop emitting svcOutputDebugString (the SD and
+ * netload sinks are unaffected). dumpreq `dbgoff`. */
+static int s_logSvcOff = 0;
 
 /*
  * 3dslink netload stderr streaming: when sent over Wi-Fi via 3dslink, HBL
@@ -196,7 +199,10 @@ void N3DS_DebugLog(const char *msg)
 		return;
 	}
 
-	svcOutputDebugString(msg, (int)strlen(msg));
+	if (!s_logSvcOff)
+	{
+		svcOutputDebugString(msg, (int)strlen(msg));
+	}
 
 	LightLock_Lock(&s_logBufferLock);
 
@@ -3854,6 +3860,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  of the run, every ndspChn.../ndspWaveBuf/ndspSetOutputMode
 	 *                  call site is gated on the sink-up flag already, and a
 	 *                  later XA play request cannot bring it back.
+	 *   dbgoff      -- Rosalina-freeze bisect: stop emitting svcOutputDebugString.
 	 *   speedoff    -- Rosalina-freeze bisect round 2: osSetSpeedupEnable(false)
 	 *                  -- drops the New3DS 804 MHz clock-up back to O3DS speed.
 	 *   rosabisect2 -- both of the above (ndspoff + speedoff). Checked BEFORE
@@ -3862,7 +3869,10 @@ unsigned int N3DS_ReadButtons(void)
 	 * Polled every 64 frames so the SD probe cost stays negligible on real
 	 * hardware; the request file is deleted first so one request fires once. */
 	{
-		static unsigned int s_dumpPollCountdown = 64;
+		/* 1, not 64: the first poll happens on the first button read of the
+		 * boot so a request staged on the card before launch applies ahead of
+		 * the boot-time loads (texwarm, speedoff), not a second into the intro. */
+		static unsigned int s_dumpPollCountdown = 1;
 
 		if (--s_dumpPollCountdown == 0)
 		{
@@ -3873,22 +3883,59 @@ unsigned int N3DS_ReadButtons(void)
 			{
 				extern int g_dbg_disableSubPage;
 				extern int g_dbg_forceSingleTexture;
-				/* 24, was 16: "stereoconv 12000" (16 chars) no longer fits a
-				 * 15-char payload. Everything else is unchanged. */
+				/* The file holds one request per line; each poll consumes the
+				 * FIRST line only and writes the remainder back, so a multi-line
+				 * file drains one request per poll (~64 frames apart) in file
+				 * order. A word is at most 23 chars ("stereoconv 12000" is 16). */
 				char word[24];
-				size_t got = fread(word, 1, sizeof(word) - 1, req);
+				char file[256];
+				size_t got = fread(file, 1, sizeof(file) - 1, req);
+				size_t lineLen = 0;
+				const char *rest;
+				int consumed = 0;
 
-				word[got] = '\0';
+				file[got] = '\0';
 				fclose(req);
 
-				/* Consumed = successfully deleted. On a host filesystem
-				 * (Azahar) a freshly written file can be transiently held
-				 * open by the OS (AV scan); remove() then fails, and acting
-				 * anyway re-fires the same request every poll -- a TOGGLE
-				 * request flapped a dozen in-place rebuilds that way. Skip
-				 * this poll instead: the file survives and the next poll
-				 * retries the whole read+delete. */
-				if (remove("sdmc:/dumpreq.txt") != 0)
+				while ((file[lineLen] != '\0') && (file[lineLen] != '\n') && (file[lineLen] != '\r'))
+				{
+					lineLen++;
+				}
+				if (lineLen > sizeof(word) - 1)
+				{
+					lineLen = sizeof(word) - 1;
+				}
+				memcpy(word, file, lineLen);
+				word[lineLen] = '\0';
+
+				rest = file + lineLen;
+				while ((*rest == '\n') || (*rest == '\r') || (*rest == ' '))
+				{
+					rest++;
+				}
+
+				/* Consumed = the first line is gone from the card. On a host
+				 * filesystem (Azahar) a freshly written file can be transiently
+				 * held open by the OS (AV scan); the remove()/rewrite then fails,
+				 * and acting anyway re-fires the same request every poll -- a
+				 * TOGGLE request flapped a dozen in-place rebuilds that way. Skip
+				 * this poll instead: the file survives and the next poll retries. */
+				if (*rest == '\0')
+				{
+					consumed = (remove("sdmc:/dumpreq.txt") == 0);
+				}
+				else
+				{
+					FILE *out = fopen("sdmc:/dumpreq.txt", "wb");
+
+					if (out != NULL)
+					{
+						consumed = (fputs(rest, out) >= 0);
+						fclose(out);
+					}
+				}
+
+				if (!consumed)
 				{
 					/* not consumed -- retried next poll */
 				}
@@ -4006,6 +4053,11 @@ unsigned int N3DS_ReadButtons(void)
 
 					N3DS_NdspForceOff();
 					N3DS_DebugLog("[CTR-3DS] ndspoff: DSP released");
+				}
+				else if (strncmp(word, "dbgoff", 6) == 0)
+				{
+					s_logSvcOff = 1;
+					N3DS_DebugLog("[CTR-3DS] dbgoff: svcOutputDebugString silenced");
 				}
 				else if (strncmp(word, "speedoff", 8) == 0)
 				{
