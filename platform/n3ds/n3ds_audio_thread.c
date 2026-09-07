@@ -944,6 +944,7 @@ static void N3DS_BeatWatchdogCheck(unsigned int wakeCount)
 			snprintf(msg, sizeof(msg), "[BEAT] STALL main=%u@%s rw=%u@%s aw=%u ageMs=%u", mainCounter, N3DS_BeatWhereName(mainWhere),
 			         rwCounter, N3DS_BeatWhereName(rwWhere), wakeCount, ageMs);
 			N3DS_DebugLog(msg);
+			N3DS_LogFlushNow();
 			s_awLastLogTick = now;
 		}
 	}

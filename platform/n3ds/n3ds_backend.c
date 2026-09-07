@@ -1410,6 +1410,7 @@ static void N3DS_GuardedFrameBegin(u8 wantSyncDraw)
 			snprintf(msg, sizeof(msg), "[BEAT] GXRECOVER n=%u waitedMs=%u vb0=%lu vb1=%lu", recoverN, (unsigned)waitedMs,
 			         (unsigned long)C3D_FrameCounter(0), (unsigned long)C3D_FrameCounter(1));
 			N3DS_DebugLog(msg);
+			N3DS_LogFlushNow();
 			/*
 			 * The documented recovery kick past this point would be
 			 * gxCmdQueueInterrupt(GSPGPU_EVENT_P3D/PPF), faking the lost

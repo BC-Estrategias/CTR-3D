@@ -619,6 +619,8 @@ unsigned int N3DS_ReadButtons(void);
  * and Luma shows them on hardware, so this is the one output channel that works
  * without a screen or a writable SD card. */
 void N3DS_DebugLog(const char *msg);
+/* Immediate SD commit of the buffered log (freeze/stall evidence). */
+void N3DS_LogFlushNow(void);
 
 /* Points stderr at that same debug channel. Call before anything that can fail,
  * so early startup errors are visible even though the screen console does not
