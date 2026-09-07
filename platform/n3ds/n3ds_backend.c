@@ -1183,6 +1183,14 @@ int g_dbg_trackAlphaRef = 1;
  * Runtime: dumpreq `gxguard [N]`.
  */
 int g_dbg_gxGuard = 1;
+/*
+ * Rosalina-freeze display recovery experiment (default OFF, dumpreq
+ * `rosafix`): after a thaw longer than 2s, the game thread provably keeps
+ * running while both LCDs stay on their last frame, so re-run the GPU-right
+ * handshake APT performs on HOME-menu resume (release + acquire), clear the
+ * LCD force-black state, and present both screens again.
+ */
+int g_dbg_rosaFix = 0;
 
 void N3DS_C3DSetProjection(float left, float right, float bottom)
 {
@@ -3901,6 +3909,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  later XA play request cannot bring it back.
 	 *   dbgoff      -- Rosalina-freeze bisect: stop emitting svcOutputDebugString.
 	 *   nextboot    -- boot barrier: stop consuming lines until the next power-on.
+	 *   rosafix [N] -- Rosalina-freeze display recovery experiment (default OFF).
 	 *   no3d        -- Rosalina-freeze bisect: gfxSet3D(false) at runtime.
 	 *   logclose    -- Rosalina-freeze bisect: fclose the SD log file (sdlog off).
 	 *   speedoff    -- Rosalina-freeze bisect round 2: osSetSpeedupEnable(false)
@@ -4095,6 +4104,11 @@ unsigned int N3DS_ReadButtons(void)
 
 					N3DS_NdspForceOff();
 					N3DS_DebugLog("[CTR-3DS] ndspoff: DSP released");
+				}
+				else if (strncmp(word, "rosafix", 7) == 0)
+				{
+					g_dbg_rosaFix = (word[7] == ' ') ? ((atoi(&word[8]) != 0) ? 1 : 0) : !g_dbg_rosaFix;
+					N3DS_DebugLog(g_dbg_rosaFix ? "[CTR-3DS] rosafix: ON (GPU-right re-acquire after a >2s thaw)" : "[CTR-3DS] rosafix: off");
 				}
 				else if (strncmp(word, "nextboot", 8) == 0)
 				{
@@ -5680,13 +5694,26 @@ static void N3DS_BeatMainTick(void)
 		 * way the first few frames of boot do. */
 		if (gapMs > 500)
 		{
-			char msg[48];
+			char msg[96];
 
-			snprintf(msg, sizeof(msg), "[BEAT] THAW gapMs=%u", (unsigned)gapMs);
+			snprintf(msg, sizeof(msg), "[BEAT] THAW gapMs=%u vb0=%lu vb1=%lu", (unsigned)gapMs, (unsigned long)C3D_FrameCounter(0),
+			         (unsigned long)C3D_FrameCounter(1));
 			N3DS_DebugLog(msg);
 			s_frameTraceBudget = 64;
 			s_beatPostThawFrames = 600;
 			N3DS_LogFlushNow();
+			if (g_dbg_rosaFix && (gapMs > 2000))
+			{
+				Result rc;
+
+				GSPGPU_ReleaseRight();
+				rc = GSPGPU_AcquireRight(0);
+				GSPGPU_SetLcdForceBlack(0);
+				gfxSwapBuffers();
+				snprintf(msg, sizeof(msg), "[BEAT] ROSAFIX acquire rc=%08lx", (unsigned long)rc);
+				N3DS_DebugLog(msg);
+				N3DS_LogFlushNow();
+			}
 		}
 	}
 	s_beatLastTick = now;
@@ -5702,9 +5729,10 @@ static void N3DS_BeatMainTick(void)
 		s_beatPostThawFrames--;
 		if ((s_beatPostThawFrames % 64) == 0)
 		{
-			char msg[64];
+			char msg[96];
 
-			snprintf(msg, sizeof(msg), "[BEAT] ALIVE post-thaw main=%u", s_beatFrameCount);
+			snprintf(msg, sizeof(msg), "[BEAT] ALIVE post-thaw main=%u vb0=%lu vb1=%lu", s_beatFrameCount,
+			         (unsigned long)C3D_FrameCounter(0), (unsigned long)C3D_FrameCounter(1));
 			N3DS_DebugLog(msg);
 			N3DS_LogFlushNow();
 		}
