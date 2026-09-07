@@ -3874,6 +3874,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  call site is gated on the sink-up flag already, and a
 	 *                  later XA play request cannot bring it back.
 	 *   dbgoff      -- Rosalina-freeze bisect: stop emitting svcOutputDebugString.
+	 *   nextboot    -- boot barrier: stop consuming lines until the next power-on.
 	 *   no3d        -- Rosalina-freeze bisect: gfxSet3D(false) at runtime.
 	 *   logclose    -- Rosalina-freeze bisect: fclose the SD log file (sdlog off).
 	 *   speedoff    -- Rosalina-freeze bisect round 2: osSetSpeedupEnable(false)
@@ -4068,6 +4069,14 @@ unsigned int N3DS_ReadButtons(void)
 
 					N3DS_NdspForceOff();
 					N3DS_DebugLog("[CTR-3DS] ndspoff: DSP released");
+				}
+				else if (strncmp(word, "nextboot", 8) == 0)
+				{
+					/* Boot barrier: the lines after this one stay on the card
+					 * for the NEXT power-on, so one file can script several
+					 * boots without a trip to the SD card in between. */
+					s_dumpPollCountdown = 0x7fffffffu;
+					N3DS_DebugLog("[CTR-3DS] nextboot: dumpreq polling stopped for this boot");
 				}
 				else if (strncmp(word, "no3d", 4) == 0)
 				{
