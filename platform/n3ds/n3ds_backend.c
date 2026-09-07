@@ -204,7 +204,18 @@ void N3DS_DebugLog(const char *msg)
 		svcOutputDebugString(msg, (int)strlen(msg));
 	}
 
+	/* The render worker logs from the OT walk; if it is ever seen parked
+	 * here by the watchdog, the SD flush on another thread is what the
+	 * game thread is really waiting for. */
+	if (N3DS_RenderWorkerIsSelf())
+	{
+		N3DS_BeatMark(N3DS_BEAT_THREAD_RENDERWORKER, N3DS_BEAT_WHERE_LOGWAIT);
+	}
 	LightLock_Lock(&s_logBufferLock);
+	if (N3DS_RenderWorkerIsSelf())
+	{
+		N3DS_BeatMark(N3DS_BEAT_THREAD_RENDERWORKER, N3DS_BEAT_WHERE_OK);
+	}
 
 	if (s_netloadStreamActive)
 	{
@@ -271,6 +282,21 @@ void N3DS_DebugLog(const char *msg)
 		}
 	}
 
+	LightLock_Unlock(&s_logBufferLock);
+}
+
+/* Immediate SD commit of everything buffered so far, bypassing the timed
+ * flush gate: used the instant a freeze/thaw is detected, because the
+ * evidence that the process is still alive afterwards is worthless if it
+ * only ever sits in a buffer the next power-cycle discards. */
+void N3DS_LogFlushNow(void)
+{
+	LightLock_Lock(&s_logBufferLock);
+	if (s_logFile != NULL)
+	{
+		fflush(s_logFile);
+		fsync(fileno(s_logFile));
+	}
 	LightLock_Unlock(&s_logBufferLock);
 }
 
@@ -5640,6 +5666,7 @@ static void N3DS_BeatMainTick(void)
 	static unsigned int s_beatPrevAudioCounter;
 	static unsigned int s_beatPrevRwCounter;
 	static u64 s_beatMainStallStartTick;
+	static unsigned int s_beatPostThawFrames;
 	const u64 now = svcGetSystemTick();
 
 	if (s_beatLastTick != 0)
@@ -5658,12 +5685,30 @@ static void N3DS_BeatMainTick(void)
 			snprintf(msg, sizeof(msg), "[BEAT] THAW gapMs=%u", (unsigned)gapMs);
 			N3DS_DebugLog(msg);
 			s_frameTraceBudget = 64;
+			s_beatPostThawFrames = 600;
+			N3DS_LogFlushNow();
 		}
 	}
 	s_beatLastTick = now;
 
 	N3DS_BeatMark(N3DS_BEAT_THREAD_MAIN, N3DS_BEAT_WHERE_OK);
 	s_beatFrameCount++;
+
+	/* Post-thaw window: prove the game thread keeps turning after a freeze
+	 * even when nothing reaches the screens -- one committed line every 64
+	 * frames for ~10s, then back to the normal cadence. */
+	if (s_beatPostThawFrames > 0)
+	{
+		s_beatPostThawFrames--;
+		if ((s_beatPostThawFrames % 64) == 0)
+		{
+			char msg[64];
+
+			snprintf(msg, sizeof(msg), "[BEAT] ALIVE post-thaw main=%u", s_beatFrameCount);
+			N3DS_DebugLog(msg);
+			N3DS_LogFlushNow();
+		}
+	}
 
 	if ((s_beatFrameCount % 256) == 0)
 	{

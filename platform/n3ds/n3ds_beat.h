@@ -43,6 +43,7 @@
 #define N3DS_BEAT_WHERE_EXEC_JOB          5
 #define N3DS_BEAT_WHERE_AUDIO_RENDER      6
 #define N3DS_BEAT_WHERE_GSP_IPC           7
+#define N3DS_BEAT_WHERE_LOGWAIT           8
 
 /* Marks progress for one thread: increments its counter and records where.
  * threadId outside [0, N3DS_BEAT_THREAD_COUNT) is a no-op. */

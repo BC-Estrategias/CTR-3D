@@ -91,6 +91,10 @@ const char *N3DS_BeatWhereName(int whereTag)
 		{
 			return "GSPIPC";
 		}
+		case N3DS_BEAT_WHERE_LOGWAIT:
+		{
+			return "LOGWAIT";
+		}
 		default:
 		{
 			return "?";
