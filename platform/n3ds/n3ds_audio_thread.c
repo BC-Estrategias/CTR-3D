@@ -1083,6 +1083,7 @@ void N3DS_AudioThreadInit(void)
 	bool isNew3DS;
 	s32 mainPriority;
 	s32 audioPriority;
+	int audioCore;
 
 	if (s_audioThreadRunning)
 	{
@@ -1152,20 +1153,17 @@ void N3DS_AudioThreadInit(void)
 	}
 
 	/*
-	 * SDL's own n3ds audio backend uses 30 here for a light callback thread
-	 * that mostly sleeps waiting on DSP completion; this mixer is
-	 * compute-bound well over 100% of real-time even alone, so a light-thread
-	 * budget would starve it. 80 is a first-guess tunable, not a settled
-	 * number -- adjust from measured backlog/drop-rate.
+	 * Cores 2 and 3 are the New3DS's app-available cores; core 1 is the
+	 * system core, shared with the sysmodules and with Luma's Rosalina menu
+	 * thread. Reserving core 1 for the app (APT_SetAppCpuTimeLimit) and
+	 * parking a higher-than-main-priority thread on it wedges Luma 13.3.2's
+	 * Rosalina menu-leave into a console hard-lock (hardware bisect with
+	 * tools/hello-world-3ds), so the worker never touches core 1 and no
+	 * core-1 time is reserved. Core 3 first (nothing else of ours runs
+	 * there); core 2 second (shared with the render worker, which runs at
+	 * main priority); otherwise the main-thread fallback. Never a thread on
+	 * main's own core: core_id=-1 means "all CPUs" and resolves to core 0.
 	 */
-	if (!R_SUCCEEDED(APT_SetAppCpuTimeLimit(80)))
-	{
-		/* Could not secure core 1 -- do NOT fall back to a same-core
-		 * thread; caller must keep rendering synchronously. */
-		N3DS_DebugLog("[CTR-3DS] audio worker: NO (AppCpuTimeLimit refused) -- main-thread fallback");
-		return;
-	}
-
 	mainPriority = 0x30;
 	svcGetThreadPriority(&mainPriority, CUR_THREAD_HANDLE);
 	audioPriority = mainPriority - 1;
@@ -1179,18 +1177,32 @@ void N3DS_AudioThreadInit(void)
 	}
 	/* Clamp mirrors SDL_n3dsaudio.c's real audio-thread convention: 0x18 is
 	 * reserved for video, 0x30 is the default for the main thread. Higher
-	 * priority than main is fine and intentional here BECAUSE this only
-	 * runs once core 1 (a distinct core from main) is confirmed reachable
-	 * by the checks above -- never reached on the same core as main. */
+	 * priority than main is fine here only because the worker is always on
+	 * a core distinct from main's. */
 
-	s_audioThread = threadCreate(N3DS_AudioThreadMain, NULL, 32 * 1024, audioPriority, 1 /* system core */, false);
+	audioCore = 3;
+	s_audioThread = threadCreate(N3DS_AudioThreadMain, NULL, 32 * 1024, audioPriority, audioCore, false);
+	if (s_audioThread == NULL)
+	{
+		audioCore = 2;
+		s_audioThread = threadCreate(N3DS_AudioThreadMain, NULL, 32 * 1024, audioPriority, audioCore, false);
+	}
 
 	/* threadCreate returns NULL on failure (thread.h) -- a clean failure
 	 * mode, not a crash. If this happens, the caller falls back to
-	 * synchronous rendering, same as the two checks above. */
+	 * synchronous rendering, same as the checks above. */
 	s_audioThreadRunning = (s_audioThread != NULL);
-	N3DS_DebugLog(s_audioThreadRunning ? "[CTR-3DS] audio worker: UP (core 1)"
-	                                   : "[CTR-3DS] audio worker: NO (threadCreate failed) -- main-thread fallback");
+	if (s_audioThreadRunning)
+	{
+		char msg[64];
+
+		snprintf(msg, sizeof(msg), "[CTR-3DS] audio worker: UP (core %d)", audioCore);
+		N3DS_DebugLog(msg);
+	}
+	else
+	{
+		N3DS_DebugLog("[CTR-3DS] audio worker: NO (threadCreate failed on cores 3 and 2) -- main-thread fallback");
+	}
 }
 
 void N3DS_AudioThreadNotifyVBlank(void)
