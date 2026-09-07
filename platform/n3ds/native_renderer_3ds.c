@@ -1512,7 +1512,6 @@ global_variable u32 s_trianglesRoutedSubPage = 0;
  * logging -- the reference clut resolves ~120x/sec and starves a shared cap. */
 global_variable u32 s_tirehuntLogs0 = 0;   /* clut 0x40c0 (icon 0, the suspect) */
 global_variable u32 s_tirehuntLogsRef = 0; /* clut 0x4001 (icon 1, reference) */
-global_variable u32 s_tirehuntDumps = 0;   /* auto-armed tridumps on icon-0 crossings */
 
 /*
  * Invisible-tire hunt, merge-stage trace (dumpreq `tirelog`). The 36-byte
@@ -1610,6 +1609,15 @@ global_variable u32 s_texdecWinMaxSub = 0;
 global_variable u32 s_texdecWinMaxFull = 0;
 global_variable u32 s_texdecWinMaxMdlUs = 0;
 global_variable u32 s_texdecWinMaxFrame = 0;
+/* Worst single decode+upload this frame -- names WHICH texture is churning,
+ * not just how much. Ticks (not us) so the per-decode compare stays a
+ * subtraction and a compare; converted once at fold time. */
+global_variable u64 s_texdecFrameWorstTicks = 0;
+global_variable u16 s_texdecFrameWorstPage = 0;
+global_variable u16 s_texdecFrameWorstClut = 0;
+global_variable u8 s_texdecFrameWorstIsSub = 0;
+global_variable s8 s_texdecFrameWorstTileX = -1;
+global_variable s8 s_texdecFrameWorstTileY = -1;
 
 /* One increment per actual C3D_DrawArrays call (N3DS_FlushRun, called from
  * DrawTriangles) -- checks the design doc's own predicted "more, smaller
@@ -2266,6 +2274,8 @@ decodeIntoSlot:
 	s_lastCellHit = oldestSlot;
 
 	{
+		unsigned long long texdecEventT0;
+
 		/*
 		 * A PSX texture page is 256 TEXELS wide in EVERY colour mode -- the
 		 * mode only changes how many VRAM words those 256 texels occupy (64 at
@@ -2280,28 +2290,40 @@ decodeIntoSlot:
 		 * GL_REPEAT). destStrideTiles stays N3DS_DECODE_TEXTURE_DIM/8, the
 		 * destination scratch's own width in tiles.
 		 */
-		const int decodeWidth = N3DS_DECODE_TEXTURE_DIM;
-		const unsigned long long texdecT0 = N3DS_GetTickCount();
-
-		N3DS_DecodeAndTilePage(texPage, clut, format, view, 0, 0, decodeWidth, N3DS_DECODE_TEXTURE_DIM,
-		                        N3DS_DECODE_TEXTURE_DIM / 8, s_decodeScratch);
-		s_texdecFrameDecTicks += N3DS_GetTickCount() - texdecT0;
-	}
-	{
-		int atlasIdx, cellX, cellY;
-		const unsigned long long texdecT1 = N3DS_GetTickCount();
-
-		N3DS_CellIndexToAtlasCoord(oldestSlot, &atlasIdx, &cellX, &cellY);
-		N3DS_C3DUploadDecodedCell(atlasIdx, cellX, cellY, s_decodeScratch);
-		s_texdecFrameUpTicks += N3DS_GetTickCount() - texdecT1;
-		s_texdecFrameFull++;
-		if (g_dbg_tireVtxLog)
 		{
-			char upMsg[112];
+			const int decodeWidth = N3DS_DECODE_TEXTURE_DIM;
+			const unsigned long long texdecT0 = N3DS_GetTickCount();
 
-			snprintf(upMsg, sizeof(upMsg), "[TIREUP] f=%lu fp p=%d c=%04x vw=%d atl=%d cell=%d,%d", (unsigned long)s_frameCounter,
-			         (int)texPage, (unsigned)(u16)clut, (int)view, atlasIdx, cellX, cellY);
-			N3DS_DebugLog(upMsg);
+			texdecEventT0 = texdecT0;
+			N3DS_DecodeAndTilePage(texPage, clut, format, view, 0, 0, decodeWidth, N3DS_DECODE_TEXTURE_DIM,
+			                        N3DS_DECODE_TEXTURE_DIM / 8, s_decodeScratch);
+			s_texdecFrameDecTicks += N3DS_GetTickCount() - texdecT0;
+		}
+		{
+			int atlasIdx, cellX, cellY;
+			const unsigned long long texdecT1 = N3DS_GetTickCount();
+			unsigned long long texdecT2;
+
+			N3DS_CellIndexToAtlasCoord(oldestSlot, &atlasIdx, &cellX, &cellY);
+			N3DS_C3DUploadDecodedCell(atlasIdx, cellX, cellY, s_decodeScratch);
+			texdecT2 = N3DS_GetTickCount();
+			s_texdecFrameUpTicks += texdecT2 - texdecT1;
+			s_texdecFrameFull++;
+			if ((texdecT2 - texdecEventT0) > s_texdecFrameWorstTicks)
+			{
+				s_texdecFrameWorstTicks = texdecT2 - texdecEventT0;
+				s_texdecFrameWorstPage = (u16)texPage;
+				s_texdecFrameWorstClut = (u16)clut;
+				s_texdecFrameWorstIsSub = 0;
+			}
+			if (g_dbg_tireVtxLog)
+			{
+				char upMsg[112];
+
+				snprintf(upMsg, sizeof(upMsg), "[TIREUP] f=%lu fp p=%d c=%04x vw=%d atl=%d cell=%d,%d", (unsigned long)s_frameCounter,
+				         (int)texPage, (unsigned)(u16)clut, (int)view, atlasIdx, cellX, cellY);
+				N3DS_DebugLog(upMsg);
+			}
 		}
 	}
 
@@ -2603,28 +2625,44 @@ decodeIntoSubSlot:
 	 * decodeWidth<256 cases, which leave stale columns from a prior decode.
 	 */
 	{
-		const unsigned long long texdecT0 = N3DS_GetTickCount();
+		unsigned long long texdecEventT0;
 
-		N3DS_DecodeAndTilePage(texPage, clut, format, view, tileX * 64, tileY * 64, N3DS_SUBPAGE_DIM, N3DS_SUBPAGE_DIM,
-		                        N3DS_SUBPAGE_DIM / 8, s_subpageDecodeScratch);
-		s_texdecFrameDecTicks += N3DS_GetTickCount() - texdecT0;
-	}
-	{
-		int atlasIdx, physCellX, physCellY, subX, subY;
-		const unsigned long long texdecT1 = N3DS_GetTickCount();
-
-		N3DS_SubCellIndexToAtlasCoord(oldestSlot, &atlasIdx, &physCellX, &physCellY, &subX, &subY);
-		N3DS_C3DUploadDecodedSubCell(atlasIdx, physCellX, physCellY, subX, subY, s_subpageDecodeScratch);
-		s_texdecFrameUpTicks += N3DS_GetTickCount() - texdecT1;
-		s_texdecFrameSub++;
-		if (g_dbg_tireVtxLog)
 		{
-			char upMsg[128];
+			const unsigned long long texdecT0 = N3DS_GetTickCount();
 
-			snprintf(upMsg, sizeof(upMsg), "[TIREUP] f=%lu sp p=%d c=%04x vw=%d tile=%d,%d atl=%d cell=%d,%d sub=%d,%d stale=%d",
-			         (unsigned long)s_frameCounter, (int)texPage, (unsigned)(u16)clut, (int)view, tileX, tileY, atlasIdx, physCellX,
-			         physCellY, subX, subY, sawStaleKeyMatch);
-			N3DS_DebugLog(upMsg);
+			texdecEventT0 = texdecT0;
+			N3DS_DecodeAndTilePage(texPage, clut, format, view, tileX * 64, tileY * 64, N3DS_SUBPAGE_DIM, N3DS_SUBPAGE_DIM,
+			                        N3DS_SUBPAGE_DIM / 8, s_subpageDecodeScratch);
+			s_texdecFrameDecTicks += N3DS_GetTickCount() - texdecT0;
+		}
+		{
+			int atlasIdx, physCellX, physCellY, subX, subY;
+			const unsigned long long texdecT1 = N3DS_GetTickCount();
+			unsigned long long texdecT2;
+
+			N3DS_SubCellIndexToAtlasCoord(oldestSlot, &atlasIdx, &physCellX, &physCellY, &subX, &subY);
+			N3DS_C3DUploadDecodedSubCell(atlasIdx, physCellX, physCellY, subX, subY, s_subpageDecodeScratch);
+			texdecT2 = N3DS_GetTickCount();
+			s_texdecFrameUpTicks += texdecT2 - texdecT1;
+			s_texdecFrameSub++;
+			if ((texdecT2 - texdecEventT0) > s_texdecFrameWorstTicks)
+			{
+				s_texdecFrameWorstTicks = texdecT2 - texdecEventT0;
+				s_texdecFrameWorstPage = (u16)texPage;
+				s_texdecFrameWorstClut = (u16)clut;
+				s_texdecFrameWorstIsSub = 1;
+				s_texdecFrameWorstTileX = (s8)tileX;
+				s_texdecFrameWorstTileY = (s8)tileY;
+			}
+			if (g_dbg_tireVtxLog)
+			{
+				char upMsg[128];
+
+				snprintf(upMsg, sizeof(upMsg), "[TIREUP] f=%lu sp p=%d c=%04x vw=%d tile=%d,%d atl=%d cell=%d,%d sub=%d,%d stale=%d",
+				         (unsigned long)s_frameCounter, (int)texPage, (unsigned)(u16)clut, (int)view, tileX, tileY, atlasIdx, physCellX,
+				         physCellY, subX, subY, sawStaleKeyMatch);
+				N3DS_DebugLog(upMsg);
+			}
 		}
 	}
 
@@ -4236,13 +4274,6 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 			         *outPixelBaseV, *outOriginU, *outOriginV);
 			N3DS_DebugLog(thMsg);
 		}
-		/* A crossing is live: arm a next-frame triangle dump so the blink
-		 * frame's vertex records land on SD (crossings span 1-2 frames). */
-		if ((clut == 0x40c0) && (s_tirehuntDumps < 6) && !s_triDumpArm)
-		{
-			s_triDumpArm = 1;
-			s_tirehuntDumps++;
-		}
 #endif
 
 		/* Stamp AFTER the decode: FindOrDecode may itself have evicted,
@@ -5001,11 +5032,27 @@ void NativeRenderer_SwapWindow(void)
 		}
 		if ((missUs >= 5000) || (mdlUs >= 20000))
 		{
-			char texdecLine[160];
+			char texdecLine[224];
+			int len;
 
-			snprintf(texdecLine, sizeof(texdecLine), "[TEXDEC] frame=%lu sub=%lu full=%lu decUs=%lu upUs=%lu mdlUs=%lu",
-			         (unsigned long)s_frameCounter, (unsigned long)s_texdecFrameSub, (unsigned long)s_texdecFrameFull,
-			         decUs, upUs, mdlUs);
+			len = snprintf(texdecLine, sizeof(texdecLine), "[TEXDEC] frame=%lu sub=%lu full=%lu decUs=%lu upUs=%lu mdlUs=%lu",
+			               (unsigned long)s_frameCounter, (unsigned long)s_texdecFrameSub, (unsigned long)s_texdecFrameFull,
+			               decUs, upUs, mdlUs);
+			if ((len > 0) && ((size_t)len < sizeof(texdecLine)) && (s_texdecFrameWorstTicks > 0))
+			{
+				const unsigned long worstUs = (unsigned long)((s_texdecFrameWorstTicks * 1000000ULL) / texdecFreq);
+
+				if (s_texdecFrameWorstIsSub)
+				{
+					snprintf(texdecLine + len, sizeof(texdecLine) - (size_t)len, " worst=p%x c%x t%d,%d us=%lu", (unsigned)s_texdecFrameWorstPage,
+					         (unsigned)s_texdecFrameWorstClut, (int)s_texdecFrameWorstTileX, (int)s_texdecFrameWorstTileY, worstUs);
+				}
+				else
+				{
+					snprintf(texdecLine + len, sizeof(texdecLine) - (size_t)len, " worst=p%x c%x full us=%lu", (unsigned)s_texdecFrameWorstPage,
+					         (unsigned)s_texdecFrameWorstClut, worstUs);
+				}
+			}
 			N3DS_DebugLog(texdecLine);
 		}
 		s_texdecFrameSub = 0;
@@ -5013,6 +5060,7 @@ void NativeRenderer_SwapWindow(void)
 		s_texdecFrameDecTicks = 0;
 		s_texdecFrameUpTicks = 0;
 		s_texdecFrameMdlTicks = 0;
+		s_texdecFrameWorstTicks = 0;
 	}
 
 	NativePerf_BeginScope(NATIVE_PERF_BUCKET_SWAP_WINDOW);
