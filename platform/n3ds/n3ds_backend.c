@@ -274,6 +274,19 @@ void N3DS_DebugLog(const char *msg)
 	LightLock_Unlock(&s_logBufferLock);
 }
 
+void N3DS_LogCloseFile(void)
+{
+	LightLock_Lock(&s_logBufferLock);
+	if (s_logFile != NULL)
+	{
+		fflush(s_logFile);
+		fclose(s_logFile);
+		s_logFile = NULL;
+	}
+	g_dbg_sdLog = 0;
+	LightLock_Unlock(&s_logBufferLock);
+}
+
 void N3DS_LogFlushStats(unsigned *worstUs, unsigned *totalUs, unsigned *count)
 {
 	LightLock_Lock(&s_logBufferLock);
@@ -3861,6 +3874,8 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  call site is gated on the sink-up flag already, and a
 	 *                  later XA play request cannot bring it back.
 	 *   dbgoff      -- Rosalina-freeze bisect: stop emitting svcOutputDebugString.
+	 *   no3d        -- Rosalina-freeze bisect: gfxSet3D(false) at runtime.
+	 *   logclose    -- Rosalina-freeze bisect: fclose the SD log file (sdlog off).
 	 *   speedoff    -- Rosalina-freeze bisect round 2: osSetSpeedupEnable(false)
 	 *                  -- drops the New3DS 804 MHz clock-up back to O3DS speed.
 	 *   rosabisect2 -- both of the above (ndspoff + speedoff). Checked BEFORE
@@ -4053,6 +4068,21 @@ unsigned int N3DS_ReadButtons(void)
 
 					N3DS_NdspForceOff();
 					N3DS_DebugLog("[CTR-3DS] ndspoff: DSP released");
+				}
+				else if (strncmp(word, "no3d", 4) == 0)
+				{
+					/* Rosalina-freeze bisect: drop the top screen to 2D at the
+					 * gfx level (the port's stereo rendering keeps emitting both
+					 * eyes; only the left is displayed). */
+					gfxSet3D(false);
+					N3DS_DebugLog("[CTR-3DS] no3d: gfxSet3D(false)");
+				}
+				else if (strncmp(word, "logclose", 8) == 0)
+				{
+					/* Rosalina-freeze bisect: release the SD log file this
+					 * process otherwise holds open for its whole lifetime. */
+					N3DS_DebugLog("[CTR-3DS] logclose: closing sdmc:/ctr3ds.log");
+					N3DS_LogCloseFile();
 				}
 				else if (strncmp(word, "dbgoff", 6) == 0)
 				{
