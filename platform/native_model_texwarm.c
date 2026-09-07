@@ -47,7 +47,7 @@
 #define TEXWARM_MAX_KEYS   256
 #define TEXWARM_MAX_MODELS 256
 
-int g_dbg_texWarm = 1;
+int g_dbg_texWarm = 0;
 
 struct NativeTexWarmKey
 {

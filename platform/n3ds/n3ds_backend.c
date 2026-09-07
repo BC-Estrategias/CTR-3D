@@ -3852,7 +3852,7 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  (Rosalina-freeze hardening, default ON). Bare token
 	 *                  toggles, N sets 0/1. OFF calls libctru's C3D_FrameBegin
 	 *                  directly, for A/B against a suspected regression.
-	 *   texwarm [N] -- load-screen texture pre-warm (default ON): decodes every
+	 *   texwarm [N] -- load-screen texture pre-warm (default OFF): decodes every
 	 *                  loaded model's textures at the level-load boundary
 	 *                  instead of on the crate-intro's kart-spawn frame. Bare
 	 *                  token toggles, N sets 0/1. [TEXWARM] reports pages/
