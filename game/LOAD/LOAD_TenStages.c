@@ -437,6 +437,16 @@ int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *
 			// quit and restart stage 6 next frame
 			return loadingStage;
 		}
+
+		// Same reasoning for the boot crate intro: its XA voice-cache warm and
+		// CD-cache prefetch used to run synchronously in StateZero, before
+		// frame 1 -- freezing the boot splash black for the whole disc/SD
+		// cost. Pumped here instead, per frame, in the same held-stage slot.
+		if ((levelID == NAUGHTY_DOG_CRATE) && !LOAD_NativeCrateIntroSplashStep(bigfile))
+		{
+			// quit and restart stage 6 next frame
+			return loadingStage;
+		}
 #endif
 		if (!boolPlayMusicDuringLoading)
 		{

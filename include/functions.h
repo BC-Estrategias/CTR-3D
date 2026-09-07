@@ -353,8 +353,9 @@ void *LOAD_XnfFile(char *filename, void *ptrDestination, int *size);
 int LOAD_TenStages(struct GameTracker *gGT, int loadingStage, struct BigHeader *bigfile);
 void LOAD_LevelFile(int levelID);
 #ifdef CTR_NATIVE
-void LOAD_NativePrefetchCrateIntro(struct BigHeader *bigfile);
+int LOAD_NativePrefetchCrateIntroStep(struct BigHeader *bigfile, int budgetSectors);
 int LOAD_NativeIntroCutscenePrefetchStep(struct BigHeader *bigfile);
+int LOAD_NativeCrateIntroSplashStep(struct BigHeader *bigfile);
 #endif
 
 void LOAD_HowlCallback(u8 result, u8 *unk);

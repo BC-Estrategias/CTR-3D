@@ -687,18 +687,18 @@ void StateZero()
 	VSyncCallback(MainDrawCb_Vsync);
 
 #ifdef CTR_NATIVE
-	// Build the XA voice-line cache before any intro CSEQ music or XA begins.
-	// The build is a large synchronous disc/SD read on this thread, and the
-	// music sequencer ticks from the per-vblank callback on this same thread,
-	// so building it once audio is playing stalls the sequencer and tears an
-	// audible gap in the intro. The SCEA splash stays on screen meanwhile.
-	// Self-gates to a no-op after the first build (and on PC).
-	NativeAudio_VoiceCacheEnsure();
-
-	// Same reasoning for the crate-intro level files: prefetch them into the CD
-	// read cache now, in the silent SCEA window, so the in-load reads hit RAM
-	// and never stall the sequencer mid-song. No-op on PC.
-	LOAD_NativePrefetchCrateIntro(sdata->ptrBigfile1);
+	// The XA voice-cache warm and crate-intro CD-cache prefetch used to run
+	// synchronously here, before frame 1 -- a large blocking disc/SD read on
+	// this thread that froze the boot splash black for the whole cost (up to
+	// low-teens seconds on a slow card) instead of just ducking the sequencer
+	// for it. Both are now pumped per frame from stage 6 of LOAD_TenStages
+	// (LOAD_NativeCrateIntroSplashStep, held on levelID == NAUGHTY_DOG_CRATE,
+	// same mechanism as the Oxide-intro cutscene prefetch above it) so this
+	// thread's frame loop -- and the VSync-driven music sequencer -- keeps
+	// running while the work happens. The "Start your engines" XA line played
+	// a few lines below reads over the cold/uncached path exactly as it did
+	// before either optimization existed; only the crate intro's own voice
+	// lines and level reads, later, depend on the caches being ready by then.
 
 	// 3DS boots to speedometer mode (bit 8): the minimap lives on the bottom
 	// screen there (UI_RenderFrame_Racing routes it), so the speedometer is

@@ -16,36 +16,114 @@ void LOAD_StringToUpper(char *path)
 
 #ifdef CTR_NATIVE
 #include <platform/native_cd.h>
+#include <platform/native_audio.h>
 
-// Prefetch the boot crate-intro level files (VRAM + LEV) into the native CD read
-// cache before any intro music starts. The music sequencer ticks per-vblank on
-// this thread, so the mid-load disc/SD reads would otherwise stall it and tear
-// an audible gap; served from RAM they cost nothing. The crate group has no PTR
-// entry (BI_NDBOX + LVI_PTR aliases the next group), so only VRAM and LEV.
-void LOAD_NativePrefetchCrateIntro(struct BigHeader *bigfile)
+// Resumable state for the boot crate-intro level-file prefetch (VRAM then LEV)
+// into the native CD read cache. The crate group has no PTR entry (BI_NDBOX +
+// LVI_PTR aliases the next group), so only these two extents.
+internal struct
+{
+	int groupIndex; /* 0 = VRAM, 1 = LEV, 2 = done */
+} s_lfCratePrefetch;
+
+// Begin/step form of the crate-intro prefetch: call once per frame with a
+// per-call sector budget (0 = uncapped) until it returns nonzero. Served from
+// RAM, the mid-load disc/SD reads for these files cost nothing once cached,
+// instead of stalling the per-vblank music sequencer.
+int LOAD_NativePrefetchCrateIntroStep(struct BigHeader *bigfile, int budgetSectors)
 {
 	struct BigEntry *entry;
 	int group[2];
-	int i;
 
 	if (bigfile == NULL)
 	{
-		return;
+		return 1;
+	}
+	if (s_lfCratePrefetch.groupIndex >= 2)
+	{
+		return 1;
 	}
 
 	entry = BIG_GETENTRY(bigfile);
 	group[0] = LOAD_GetBigfileIndex(NAUGHTY_DOG_CRATE, LOAD_LEVEL_LOD_1P, LVI_VRAM);
 	group[1] = LOAD_GetBigfileIndex(NAUGHTY_DOG_CRATE, LOAD_LEVEL_LOD_1P, LVI_LEV);
 
-	for (i = 0; i < 2; i++)
+	while (s_lfCratePrefetch.groupIndex < 2)
 	{
-		if ((group[i] < 0) || (group[i] >= bigfile->numEntry))
+		int idx = group[s_lfCratePrefetch.groupIndex];
+
+		if ((idx < 0) || (idx >= bigfile->numEntry))
 		{
+			s_lfCratePrefetch.groupIndex++;
 			continue;
 		}
 
-		NativeCD_PrefetchExtent(bigfile->cdpos + entry[group[i]].offset, entry[group[i]].size);
+		if (!NativeCD_PrefetchExtentBegin(bigfile->cdpos + entry[idx].offset, entry[idx].size))
+		{
+			// already cached, unavailable, or PC: nothing to pump for this extent
+			s_lfCratePrefetch.groupIndex++;
+			continue;
+		}
+
+		if (!NativeCD_PrefetchPump(budgetSectors))
+		{
+			return 0; // more of this extent remains
+		}
+
+		s_lfCratePrefetch.groupIndex++;
 	}
+
+	return 1;
+}
+
+// Orchestrates the two resumable boot-splash disc jobs for the crate intro:
+// the XA voice-cache warm (MUSIC memo + GAME/EXTRA RAM caches) must finish
+// before the CD-cache prefetch starts, so the crate intro's own voice lines
+// never contend with its level-file reads for the same SD bandwidth. Held at
+// the stage-6 call site (see LOAD_TenStages) until both report done.
+//
+// A slow SD card that can't finish inside a reasonable number of held frames
+// forces the rest through synchronously here (bounded, logged) rather than
+// letting the crate intro's audio start against a half-built cache -- same
+// blocking cost the un-split code always paid, just as a last resort instead
+// of the default path.
+int LOAD_NativeCrateIntroSplashStep(struct BigHeader *bigfile)
+{
+	enum
+	{
+		LOAD_CRATE_SPLASH_SECTORS_PER_FRAME = 64,
+		LOAD_CRATE_SPLASH_FALLBACK_FRAMES = 2400, // ~40s at 60fps: generous even for the slow-card target
+	};
+
+	local_persist u32 s_lfCrateSplashFrames;
+
+	NativeAudio_VoiceCacheEnsureBegin();
+	s_lfCrateSplashFrames++;
+
+	if (s_lfCrateSplashFrames > LOAD_CRATE_SPLASH_FALLBACK_FRAMES)
+	{
+		Platform_Log("[SPLASHIO] fallback: forcing synchronous completion after %u held frames\n", s_lfCrateSplashFrames);
+		while (!NativeAudio_VoiceCacheEnsureStep(0))
+		{
+		}
+		while (!LOAD_NativePrefetchCrateIntroStep(bigfile, 0))
+		{
+		}
+		s_lfCrateSplashFrames = 0;
+		return 1;
+	}
+
+	if (!NativeAudio_VoiceCacheEnsureStep(LOAD_CRATE_SPLASH_SECTORS_PER_FRAME))
+	{
+		return 0;
+	}
+	if (!LOAD_NativePrefetchCrateIntroStep(bigfile, LOAD_CRATE_SPLASH_SECTORS_PER_FRAME))
+	{
+		return 0;
+	}
+
+	s_lfCrateSplashFrames = 0;
+	return 1;
 }
 
 // Prefetch all nine Oxide-intro cutscene scenes (VRAM/LEV/PTR per scene,

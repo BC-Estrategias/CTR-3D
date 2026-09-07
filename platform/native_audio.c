@@ -3672,16 +3672,43 @@ internal int NativeAudio_XAVoiceCacheOpen(struct NativeAudioXaSource *source, co
 	return 1;
 }
 
-/* One category's build pass: group wanted tracks by physical file, read each
- * file's needed span ONCE (chunked, sequential -- per-CALL SD cost is the
- * whole reason this runs at the loading screen), then de-interleave every
- * wanted track's matching sectors into the blob. */
-internal void NativeAudio_XAVoiceCacheBuildCategory(int categoryID, int *tracksOut, int *sectorsOut)
+/* Aggregate progress for the whole splash-screen audio warm (music warm +
+ * both voice-cache categories); see NativeAudio_VoiceCacheEnsureBegin/Step. */
+internal struct
 {
-	int numWanted = 0;
-	u32 filesWanted = 0;
-	int xaID;
+	b32 active;
+	int stage; /* 0=music warm, 1=cache GAME, 2=cache EXTRA, 3=finalize */
+	int tracks;
+	int sectors;
+	u32 splashSteps;
+	u32 splashSectors;
+} s_vce;
+
+/* Resumable state for one category's build pass (GAME then EXTRA). A step
+ * reads at most one bounded chunk of one file's span per call -- per-CALL SD
+ * cost is the whole reason this runs spread across the loading screen instead
+ * of blocking -- and only de-interleaves a file's wanted tracks into the blob
+ * once that file's whole span has landed (CPU-only work, not chunked). */
+internal struct
+{
+	b32 active;
+	b32 srcOpen;
+	int categoryID;
+	int numWanted;
+	u32 filesWanted;
 	int fileNumber;
+	struct NativeAudioXaSource src;
+	u8 *fileBuf;
+	int span;
+	int pos;
+} s_xacb;
+
+internal void NativeAudio_XAVoiceCacheBuildCategoryBegin(int categoryID)
+{
+	int xaID;
+
+	memset(&s_xacb, 0, sizeof(s_xacb));
+	s_xacb.categoryID = categoryID;
 
 	for (xaID = 0; xaID < NATIVE_AUDIO_XA_TRACK_INDEX_MAX; xaID++)
 	{
@@ -3695,79 +3722,116 @@ internal void NativeAudio_XAVoiceCacheBuildCategory(int categoryID, int *tracksO
 		{
 			continue;
 		}
-		s_xaVoiceCacheScratch[numWanted].xaID = xaID;
-		s_xaVoiceCacheScratch[numWanted].info = info;
-		numWanted++;
-		filesWanted |= 1u << info.fileNumber;
+		s_xaVoiceCacheScratch[s_xacb.numWanted].xaID = xaID;
+		s_xaVoiceCacheScratch[s_xacb.numWanted].info = info;
+		s_xacb.numWanted++;
+		s_xacb.filesWanted |= 1u << info.fileNumber;
+	}
+	s_xacb.active = 1;
+}
+
+/* Advances the category build by at most `budgetSectors` sectors of disc/SD
+ * I/O (0 = uncapped, still bounded by NATIVE_DISC_IMAGE_CHUNK_SECTORS per
+ * call). Returns nonzero once this category has no more files to process. */
+internal int NativeAudio_XAVoiceCacheBuildCategoryStep(int budgetSectors)
+{
+	if (!s_xacb.active)
+	{
+		return 1;
 	}
 
-	for (fileNumber = 0; fileNumber < 32; fileNumber++)
+	while (!s_xacb.srcOpen)
 	{
-		struct NativeAudioXaSource src;
 		char path[128];
-		u8 *fileBuf;
-		int span = 0;
-		int pos;
 		int i;
 
-		if ((filesWanted & (1u << fileNumber)) == 0)
+		if (s_xacb.fileNumber >= 32)
 		{
+			s_xacb.active = 0;
+			return 1;
+		}
+		if ((s_xacb.filesWanted & (1u << s_xacb.fileNumber)) == 0)
+		{
+			s_xacb.fileNumber++;
 			continue;
 		}
-		if (!NativeAudio_BuildXAPath(path, sizeof(path), categoryID, fileNumber) || !NativeAudio_XASourceOpen(&src, path, 0))
+		if (!NativeAudio_BuildXAPath(path, sizeof(path), s_xacb.categoryID, s_xacb.fileNumber) || !NativeAudio_XASourceOpen(&s_xacb.src, path, 0))
 		{
 			NativeAudio_XAVoiceCacheLog("[XAPRELOAD] cannot open %s -- its tracks stay on the SD path", path);
+			s_xacb.fileNumber++;
 			continue;
 		}
 
-		for (i = 0; i < numWanted; i++)
+		s_xacb.span = 0;
+		for (i = 0; i < s_xacb.numWanted; i++)
 		{
-			if (s_xaVoiceCacheScratch[i].info.fileNumber == fileNumber)
+			if (s_xaVoiceCacheScratch[i].info.fileNumber == s_xacb.fileNumber)
 			{
 				int trackSpan = s_xaVoiceCacheScratch[i].info.numSectors;
 
-				if (trackSpan > src.totalSectors)
+				if (trackSpan > s_xacb.src.totalSectors)
 				{
-					trackSpan = src.totalSectors;
+					trackSpan = s_xacb.src.totalSectors;
 				}
-				if (trackSpan > span)
+				if (trackSpan > s_xacb.span)
 				{
-					span = trackSpan;
+					s_xacb.span = trackSpan;
 				}
 			}
 		}
 
-		fileBuf = (span > 0) ? (u8 *)malloc((size_t)span * (size_t)src.sectorSize) : NULL;
-		if (fileBuf == NULL)
+		s_xacb.fileBuf = (s_xacb.span > 0) ? (u8 *)malloc((size_t)s_xacb.span * (size_t)s_xacb.src.sectorSize) : NULL;
+		if (s_xacb.fileBuf == NULL)
 		{
-			NativeAudio_XAVoiceCacheLog("[XAPRELOAD] no %d KiB scratch for %s -- its tracks stay on the SD path", (span * src.sectorSize) >> 10, path);
-			NativeAudio_XASourceClose(&src);
+			NativeAudio_XAVoiceCacheLog("[XAPRELOAD] no %d KiB scratch for %s -- its tracks stay on the SD path",
+			                            (s_xacb.span * s_xacb.src.sectorSize) >> 10, path);
+			NativeAudio_XASourceClose(&s_xacb.src);
+			s_xacb.fileNumber++;
 			continue;
 		}
 
-		for (pos = 0; pos < span;)
-		{
-			int chunk = span - pos;
+		s_xacb.pos = 0;
+		s_xacb.srcOpen = 1;
+	}
 
-			if (chunk > NATIVE_DISC_IMAGE_CHUNK_SECTORS)
-			{
-				chunk = NATIVE_DISC_IMAGE_CHUNK_SECTORS;
-			}
-			if (!NativeAudio_XASourceReadSectors(&src, pos, chunk, fileBuf + (size_t)pos * (size_t)src.sectorSize, &s_xaDiscScratchPending))
-			{
-				break;
-			}
-			pos += chunk;
-		}
-		if (pos < span)
+	if (s_xacb.pos < s_xacb.span)
+	{
+		int chunk = s_xacb.span - s_xacb.pos;
+
+		if (chunk > NATIVE_DISC_IMAGE_CHUNK_SECTORS)
 		{
-			NativeAudio_XAVoiceCacheLog("[XAPRELOAD] short read on %s (%d of %d sectors) -- its tracks stay on the SD path", path, pos, span);
-			free(fileBuf);
-			NativeAudio_XASourceClose(&src);
-			continue;
+			chunk = NATIVE_DISC_IMAGE_CHUNK_SECTORS;
+		}
+		if ((budgetSectors > 0) && (chunk > budgetSectors))
+		{
+			chunk = budgetSectors;
 		}
 
-		for (i = 0; i < numWanted; i++)
+		if (!NativeAudio_XASourceReadSectors(&s_xacb.src, s_xacb.pos, chunk, s_xacb.fileBuf + (size_t)s_xacb.pos * (size_t)s_xacb.src.sectorSize,
+		                                     &s_xaDiscScratchPending))
+		{
+			NativeAudio_XAVoiceCacheLog("[XAPRELOAD] short read on file %d cat=%d (%d of %d sectors) -- its tracks stay on the SD path",
+			                            s_xacb.fileNumber, s_xacb.categoryID, s_xacb.pos, s_xacb.span);
+			free(s_xacb.fileBuf);
+			s_xacb.fileBuf = NULL;
+			NativeAudio_XASourceClose(&s_xacb.src);
+			s_xacb.srcOpen = 0;
+			s_xacb.fileNumber++;
+			return 0;
+		}
+
+		s_xacb.pos += chunk;
+		if (s_xacb.pos < s_xacb.span)
+		{
+			return 0;
+		}
+	}
+
+	/* Span fully read (or zero-length): de-interleave wanted tracks. */
+	{
+		int i;
+
+		for (i = 0; i < s_xacb.numWanted; i++)
 		{
 			const struct NativeAudioXaTrackInfo *info = &s_xaVoiceCacheScratch[i].info;
 			struct NativeAudioXaVoiceCacheTrack *track;
@@ -3775,15 +3839,15 @@ internal void NativeAudio_XAVoiceCacheBuildCategory(int categoryID, int *tracksO
 			int matched = 0;
 			int s;
 
-			if (info->fileNumber != fileNumber)
+			if (info->fileNumber != s_xacb.fileNumber)
 			{
 				continue;
 			}
 
-			trackSpan = (info->numSectors > src.totalSectors) ? src.totalSectors : info->numSectors;
+			trackSpan = (info->numSectors > s_xacb.src.totalSectors) ? s_xacb.src.totalSectors : info->numSectors;
 			for (s = 0; s < trackSpan; s++)
 			{
-				if (NativeAudio_IsXAAudioSector(fileBuf + (size_t)s * (size_t)src.sectorSize, src.sectorBase, info->channelFilter))
+				if (NativeAudio_IsXAAudioSector(s_xacb.fileBuf + (size_t)s * (size_t)s_xacb.src.sectorSize, s_xacb.src.sectorBase, info->channelFilter))
 				{
 					matched++;
 				}
@@ -3795,86 +3859,41 @@ internal void NativeAudio_XAVoiceCacheBuildCategory(int categoryID, int *tracksO
 
 			s_xaAudioSectorCountMemo[info->entryIndex] = matched;
 
-			if (s_xaVoiceCache.blobUsed + (u32)matched * (u32)src.sectorSize > NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES)
+			if (s_xaVoiceCache.blobUsed + (u32)matched * (u32)s_xacb.src.sectorSize > NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES)
 			{
-				NativeAudio_XAVoiceCacheLog("[XAPRELOAD] budget full at cat=%d xa=%d (%u KiB) -- track stays on the SD path", categoryID,
+				NativeAudio_XAVoiceCacheLog("[XAPRELOAD] budget full at cat=%d xa=%d (%u KiB) -- track stays on the SD path", s_xacb.categoryID,
 				                            (int)s_xaVoiceCacheScratch[i].xaID, (unsigned)(s_xaVoiceCache.blobUsed >> 10));
 				continue;
 			}
 
 			track = &s_xaVoiceCache.tracks[info->entryIndex];
 			track->byteOffset = s_xaVoiceCache.blobUsed;
-			track->sectorSize = (s16)src.sectorSize;
-			track->sectorBase = (s16)src.sectorBase;
+			track->sectorSize = (s16)s_xacb.src.sectorSize;
+			track->sectorBase = (s16)s_xacb.src.sectorBase;
 			for (s = 0; s < trackSpan; s++)
 			{
-				const u8 *sec = fileBuf + (size_t)s * (size_t)src.sectorSize;
+				const u8 *sec = s_xacb.fileBuf + (size_t)s * (size_t)s_xacb.src.sectorSize;
 
-				if (NativeAudio_IsXAAudioSector(sec, src.sectorBase, info->channelFilter))
+				if (NativeAudio_IsXAAudioSector(sec, s_xacb.src.sectorBase, info->channelFilter))
 				{
-					memcpy(s_xaVoiceCache.blob + s_xaVoiceCache.blobUsed, sec, (size_t)src.sectorSize);
-					s_xaVoiceCache.blobUsed += (u32)src.sectorSize;
+					memcpy(s_xaVoiceCache.blob + s_xaVoiceCache.blobUsed, sec, (size_t)s_xacb.src.sectorSize);
+					s_xaVoiceCache.blobUsed += (u32)s_xacb.src.sectorSize;
 				}
 			}
 			track->sectorCount = matched;
-			*tracksOut += 1;
-			*sectorsOut += matched;
+			s_vce.tracks += 1;
+			s_vce.sectors += matched;
 		}
-
-		free(fileBuf);
-		NativeAudio_XASourceClose(&src);
 	}
+
+	free(s_xacb.fileBuf);
+	s_xacb.fileBuf = NULL;
+	NativeAudio_XASourceClose(&s_xacb.src);
+	s_xacb.srcOpen = 0;
+	s_xacb.fileNumber++;
+	return 0;
 }
 #endif /* __3DS__ */
-
-#if defined(__3DS__)
-internal void NativeAudio_MusicCountWarm(void);
-#endif
-
-void NativeAudio_VoiceCacheEnsure(void)
-{
-#if defined(__3DS__)
-	local_persist b32 s_voiceCacheTried;
-	int tracks = 0;
-	int sectors = 0;
-
-	if (s_voiceCacheTried)
-	{
-		return;
-	}
-	s_voiceCacheTried = 1;
-
-	/* Independent of the RAM cache below (MUSIC is never cached): fills the
-	 * per-track sector-count memo so no MUSIC open ever scans mid-game. */
-	NativeAudio_MusicCountWarm();
-
-	s_xaVoiceCache.blob = (u8 *)malloc(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES);
-	if (s_xaVoiceCache.blob == NULL)
-	{
-		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] no %u KiB for the voice cache -- voice lines stay on the SD path",
-		                            (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
-		return;
-	}
-
-	NativeAudio_XAVoiceCacheBuildCategory(NATIVE_AUDIO_XA_CATEGORY_GAME, &tracks, &sectors);
-	NativeAudio_XAVoiceCacheBuildCategory(NATIVE_AUDIO_XA_CATEGORY_EXTRA, &tracks, &sectors);
-
-	if (tracks <= 0)
-	{
-		/* Nothing landed (unreadable XNF, all files failed): give the 16 MiB
-		 * back and leave `built` unset so opens fall through silently instead
-		 * of logging a per-play miss for a cache that never existed. */
-		free(s_xaVoiceCache.blob);
-		s_xaVoiceCache.blob = NULL;
-		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] build produced no tracks -- voice lines stay on the SD path");
-		return;
-	}
-	s_xaVoiceCache.built = 1;
-
-	NativeAudio_XAVoiceCacheLog("[XAPRELOAD] voice cache built: %d tracks, %d sectors, %u KiB of %u KiB budget", tracks, sectors,
-	                            (unsigned)(s_xaVoiceCache.blobUsed >> 10), (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
-#endif
-}
 
 #if defined(__3DS__)
 /* MUSIC tracks are not cached in RAM (11 MiB, and the voice cache is nearly
@@ -3888,28 +3907,38 @@ void NativeAudio_VoiceCacheEnsure(void)
  * pass, each bounded by its own XNF slot exactly as NativeAudio_XAStreamOpenTrack
  * bounds it (an unbounded count would report the whole channel's length for a
  * short track and the game would then play silence out to the fake end).
- * Boot-time only, from NativeAudio_VoiceCacheEnsure, inside the silent splash
- * where a stall costs nothing; the game thread never scans a MUSIC file. */
+ * Resumable, driven from the crate-intro load stage inside the silent splash;
+ * the game thread never scans a MUSIC file. */
 #define NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS 32
 
-internal void NativeAudio_MusicCountWarm(void)
+internal u8 s_mcwChunkBuf[NATIVE_DISC_IMAGE_CHUNK_SECTORS * XA_FULL_SECTOR_SIZE];
+internal struct
 {
-	local_persist u8 s_warmChunkBuf[NATIVE_DISC_IMAGE_CHUNK_SECTORS * XA_FULL_SECTOR_SIZE];
-	local_persist struct
+	b32 active;
+	b32 srcOpen;
+	int numTracks;
+	u32 filesWanted;
+	int warmed;
+	int fileNumber;
+	struct NativeAudioXaSource src;
+	int maxBound;
+	int sector;
+	struct
 	{
 		int xaID;
 		int bound; /* scan bound for this track within its file, in sectors */
 		int count;
 		struct NativeAudioXaTrackInfo info;
-	} s_warmTracks[NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS];
-	int numTracks = 0;
-	u32 filesWanted = 0;
-	int warmed = 0;
-	int xaID;
-	int fileNumber;
-	int t;
+	} tracks[NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS];
+} s_mcw;
 
-	for (xaID = 0; (xaID < NATIVE_AUDIO_XA_TRACK_INDEX_MAX) && (numTracks < NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS); xaID++)
+internal void NativeAudio_MusicCountWarmBegin(void)
+{
+	int xaID;
+
+	memset(&s_mcw, 0, sizeof(s_mcw));
+
+	for (xaID = 0; (xaID < NATIVE_AUDIO_XA_TRACK_INDEX_MAX) && (s_mcw.numTracks < NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS); xaID++)
 	{
 		struct NativeAudioXaTrackInfo info;
 
@@ -3921,104 +3950,262 @@ internal void NativeAudio_MusicCountWarm(void)
 		{
 			continue;
 		}
-		s_warmTracks[numTracks].xaID = xaID;
-		s_warmTracks[numTracks].info = info;
-		s_warmTracks[numTracks].bound = 0;
-		s_warmTracks[numTracks].count = 0;
-		numTracks++;
-		filesWanted |= 1u << info.fileNumber;
+		s_mcw.tracks[s_mcw.numTracks].xaID = xaID;
+		s_mcw.tracks[s_mcw.numTracks].info = info;
+		s_mcw.numTracks++;
+		s_mcw.filesWanted |= 1u << info.fileNumber;
+	}
+	s_mcw.active = 1;
+}
+
+internal void NativeAudio_MusicCountWarmFinishFile(void)
+{
+	int t;
+
+	for (t = 0; t < s_mcw.numTracks; t++)
+	{
+		if ((s_mcw.tracks[t].info.fileNumber != s_mcw.fileNumber) || (s_mcw.tracks[t].count <= 0))
+		{
+			continue;
+		}
+		s_xaAudioSectorCountMemo[s_mcw.tracks[t].info.entryIndex] = s_mcw.tracks[t].count;
+		s_mcw.warmed++;
+		NativeAudio_XAVoiceCacheLog("[XAWARM] music xa=%d entry=%d file=S%02d ch=%d slot=%d sectors=%d", s_mcw.tracks[t].xaID,
+		                            s_mcw.tracks[t].info.entryIndex, s_mcw.fileNumber, s_mcw.tracks[t].info.channelFilter,
+		                            s_mcw.tracks[t].info.numSectors, s_mcw.tracks[t].count);
+	}
+	NativeAudio_XASourceClose(&s_mcw.src);
+	s_mcw.srcOpen = 0;
+	s_mcw.fileNumber++;
+}
+
+/* Advances the music warm pass by at most `budgetSectors` sectors of disc/SD
+ * I/O (0 = uncapped, still bounded by NATIVE_DISC_IMAGE_CHUNK_SECTORS per
+ * call). Returns nonzero once every wanted MUSIC file has been scanned. */
+internal int NativeAudio_MusicCountWarmStep(int budgetSectors)
+{
+	int chunk;
+	int i;
+
+	if (!s_mcw.active)
+	{
+		return 1;
 	}
 
-	for (fileNumber = 0; fileNumber < 32; fileNumber++)
+	while (!s_mcw.srcOpen)
 	{
-		struct NativeAudioXaSource src;
 		char path[128];
-		int maxBound = 0;
-		int sector = 0;
+		int t;
 
-		if ((filesWanted & (1u << fileNumber)) == 0)
+		if (s_mcw.fileNumber >= 32)
 		{
+			NativeAudio_XAVoiceCacheLog("[XAWARM] music count memo warmed for %d of %d tracks", s_mcw.warmed, s_mcw.numTracks);
+			s_mcw.active = 0;
+			return 1;
+		}
+		if ((s_mcw.filesWanted & (1u << s_mcw.fileNumber)) == 0)
+		{
+			s_mcw.fileNumber++;
 			continue;
 		}
-		if (!NativeAudio_BuildXAPath(path, sizeof(path), NATIVE_AUDIO_XA_CATEGORY_MUSIC, fileNumber) || !NativeAudio_XASourceOpen(&src, path, 0))
+		if (!NativeAudio_BuildXAPath(path, sizeof(path), NATIVE_AUDIO_XA_CATEGORY_MUSIC, s_mcw.fileNumber) ||
+		    !NativeAudio_XASourceOpen(&s_mcw.src, path, 0))
 		{
-			NativeAudio_XAVoiceCacheLog("[XAWARM] music file S%02d.XA: open failed -- its tracks scan on first play", fileNumber);
+			NativeAudio_XAVoiceCacheLog("[XAWARM] music file S%02d.XA: open failed -- its tracks scan on first play", s_mcw.fileNumber);
+			s_mcw.fileNumber++;
 			continue;
 		}
-		if ((src.sectorSize <= 0) || (src.sectorSize > XA_FULL_SECTOR_SIZE))
+		if ((s_mcw.src.sectorSize <= 0) || (s_mcw.src.sectorSize > XA_FULL_SECTOR_SIZE))
 		{
-			NativeAudio_XASourceClose(&src);
+			NativeAudio_XASourceClose(&s_mcw.src);
+			s_mcw.fileNumber++;
 			continue;
 		}
 
-		for (t = 0; t < numTracks; t++)
+		s_mcw.maxBound = 0;
+		for (t = 0; t < s_mcw.numTracks; t++)
 		{
 			int bound;
 
-			if (s_warmTracks[t].info.fileNumber != fileNumber)
+			if (s_mcw.tracks[t].info.fileNumber != s_mcw.fileNumber)
 			{
 				continue;
 			}
-			bound = src.totalSectors;
-			if ((s_warmTracks[t].info.numSectors > 0) && (s_warmTracks[t].info.numSectors < bound))
+			bound = s_mcw.src.totalSectors;
+			if ((s_mcw.tracks[t].info.numSectors > 0) && (s_mcw.tracks[t].info.numSectors < bound))
 			{
-				bound = s_warmTracks[t].info.numSectors;
+				bound = s_mcw.tracks[t].info.numSectors;
 			}
-			s_warmTracks[t].bound = bound;
-			if (bound > maxBound)
+			s_mcw.tracks[t].bound = bound;
+			if (bound > s_mcw.maxBound)
 			{
-				maxBound = bound;
+				s_mcw.maxBound = bound;
 			}
 		}
-
-		while (sector < maxBound)
-		{
-			int chunk = maxBound - sector;
-			int i;
-
-			if (chunk > NATIVE_DISC_IMAGE_CHUNK_SECTORS)
-			{
-				chunk = NATIVE_DISC_IMAGE_CHUNK_SECTORS;
-			}
-			if (!NativeAudio_XASourceReadSectors(&src, sector, chunk, s_warmChunkBuf, &s_xaDiscScratchPending))
-			{
-				break;
-			}
-			for (i = 0; i < chunk; i++)
-			{
-				const u8 *raw = &s_warmChunkBuf[(size_t)i * (size_t)src.sectorSize];
-				int index = sector + i;
-
-				for (t = 0; t < numTracks; t++)
-				{
-					if ((s_warmTracks[t].info.fileNumber == fileNumber) && (index < s_warmTracks[t].bound) &&
-					    NativeAudio_IsXAAudioSector(raw, src.sectorBase, s_warmTracks[t].info.channelFilter))
-					{
-						s_warmTracks[t].count++;
-					}
-				}
-			}
-			sector += chunk;
-		}
-		NativeAudio_XASourceClose(&src);
-
-		for (t = 0; t < numTracks; t++)
-		{
-			if ((s_warmTracks[t].info.fileNumber != fileNumber) || (s_warmTracks[t].count <= 0))
-			{
-				continue;
-			}
-			s_xaAudioSectorCountMemo[s_warmTracks[t].info.entryIndex] = s_warmTracks[t].count;
-			warmed++;
-			NativeAudio_XAVoiceCacheLog("[XAWARM] music xa=%d entry=%d file=S%02d ch=%d slot=%d sectors=%d", s_warmTracks[t].xaID,
-			                            s_warmTracks[t].info.entryIndex, fileNumber, s_warmTracks[t].info.channelFilter,
-			                            s_warmTracks[t].info.numSectors, s_warmTracks[t].count);
-		}
+		s_mcw.sector = 0;
+		s_mcw.srcOpen = 1;
 	}
 
-	NativeAudio_XAVoiceCacheLog("[XAWARM] music count memo warmed for %d of %d tracks", warmed, numTracks);
+	chunk = s_mcw.maxBound - s_mcw.sector;
+	if (chunk <= 0)
+	{
+		NativeAudio_MusicCountWarmFinishFile();
+		return 0;
+	}
+	if (chunk > NATIVE_DISC_IMAGE_CHUNK_SECTORS)
+	{
+		chunk = NATIVE_DISC_IMAGE_CHUNK_SECTORS;
+	}
+	if ((budgetSectors > 0) && (chunk > budgetSectors))
+	{
+		chunk = budgetSectors;
+	}
+
+	if (!NativeAudio_XASourceReadSectors(&s_mcw.src, s_mcw.sector, chunk, s_mcwChunkBuf, &s_xaDiscScratchPending))
+	{
+		/* short read: stop scanning this file, finalize whatever landed */
+		s_mcw.sector = s_mcw.maxBound;
+		NativeAudio_MusicCountWarmFinishFile();
+		return 0;
+	}
+
+	for (i = 0; i < chunk; i++)
+	{
+		const u8 *raw = &s_mcwChunkBuf[(size_t)i * (size_t)s_mcw.src.sectorSize];
+		int index = s_mcw.sector + i;
+		int t;
+
+		for (t = 0; t < s_mcw.numTracks; t++)
+		{
+			if ((s_mcw.tracks[t].info.fileNumber == s_mcw.fileNumber) && (index < s_mcw.tracks[t].bound) &&
+			    NativeAudio_IsXAAudioSector(raw, s_mcw.src.sectorBase, s_mcw.tracks[t].info.channelFilter))
+			{
+				s_mcw.tracks[t].count++;
+			}
+		}
+	}
+	s_mcw.sector += chunk;
+
+	if (s_mcw.sector >= s_mcw.maxBound)
+	{
+		NativeAudio_MusicCountWarmFinishFile();
+	}
+	return 0;
 }
 #endif
+
+/* Orchestrates the resumable splash-screen audio warm: MUSIC sector-count
+ * memo, then the GAME and EXTRA voice-line RAM caches, in that order so the
+ * caches (bigger, budget-limited) never crowd out the memo that every MUSIC
+ * open depends on. Self-gates to a no-op after the first Begin (and on PC). */
+void NativeAudio_VoiceCacheEnsureBegin(void)
+{
+#if defined(__3DS__)
+	local_persist b32 s_voiceCacheTried;
+
+	if (s_voiceCacheTried)
+	{
+		return;
+	}
+	s_voiceCacheTried = 1;
+
+	memset(&s_vce, 0, sizeof(s_vce));
+	s_vce.active = 1;
+
+	s_xaVoiceCache.blob = (u8 *)malloc(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES);
+	if (s_xaVoiceCache.blob == NULL)
+	{
+		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] no %u KiB for the voice cache -- voice lines stay on the SD path",
+		                            (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
+	}
+
+	/* Independent of the RAM cache below (MUSIC is never cached): fills the
+	 * per-track sector-count memo so no MUSIC open ever scans mid-game. */
+	NativeAudio_MusicCountWarmBegin();
+#endif
+}
+
+/* Call once per frame with a per-call sector budget (0 = uncapped) until it
+ * returns nonzero. Safe to call after completion (returns 1 immediately). */
+int NativeAudio_VoiceCacheEnsureStep(int budgetSectors)
+{
+#if defined(__3DS__)
+	if (!s_vce.active)
+	{
+		return 1;
+	}
+	s_vce.splashSteps++;
+	s_vce.splashSectors += (u32)((budgetSectors > 0) ? budgetSectors : NATIVE_DISC_IMAGE_CHUNK_SECTORS);
+
+	switch (s_vce.stage)
+	{
+	case 0:
+		if (!NativeAudio_MusicCountWarmStep(budgetSectors))
+		{
+			return 0;
+		}
+		s_vce.stage = (s_xaVoiceCache.blob != NULL) ? 1 : 3;
+		if (s_vce.stage == 1)
+		{
+			NativeAudio_XAVoiceCacheBuildCategoryBegin(NATIVE_AUDIO_XA_CATEGORY_GAME);
+		}
+		return 0;
+	case 1:
+		if (!NativeAudio_XAVoiceCacheBuildCategoryStep(budgetSectors))
+		{
+			return 0;
+		}
+		s_vce.stage = 2;
+		NativeAudio_XAVoiceCacheBuildCategoryBegin(NATIVE_AUDIO_XA_CATEGORY_EXTRA);
+		return 0;
+	case 2:
+		if (!NativeAudio_XAVoiceCacheBuildCategoryStep(budgetSectors))
+		{
+			return 0;
+		}
+		s_vce.stage = 3;
+		break;
+	default:
+		break;
+	}
+
+	if (s_vce.tracks <= 0)
+	{
+		/* Nothing landed (unreadable XNF, all files failed, or no blob):
+		 * give the 16 MiB back and leave `built` unset so opens fall through
+		 * silently instead of logging a per-play miss for a cache that never
+		 * existed. */
+		if (s_xaVoiceCache.blob != NULL)
+		{
+			free(s_xaVoiceCache.blob);
+			s_xaVoiceCache.blob = NULL;
+		}
+		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] build produced no tracks -- voice lines stay on the SD path");
+	}
+	else
+	{
+		s_xaVoiceCache.built = 1;
+		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] voice cache built: %d tracks, %d sectors, %u KiB of %u KiB budget", s_vce.tracks, s_vce.sectors,
+		                            (unsigned)(s_xaVoiceCache.blobUsed >> 10), (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
+	}
+	NativeAudio_XAVoiceCacheLog("[SPLASHIO] steps=%u sectors=%u", s_vce.splashSteps, s_vce.splashSectors);
+	s_vce.active = 0;
+	return 1;
+#else
+	(void)budgetSectors;
+	return 1;
+#endif
+}
+
+// One-shot fallback for callers outside the load-stage pump (and the sole PC
+// no-op path): runs every step back-to-back with no per-call budget cap.
+void NativeAudio_VoiceCacheEnsure(void)
+{
+	NativeAudio_VoiceCacheEnsureBegin();
+	while (!NativeAudio_VoiceCacheEnsureStep(0))
+	{
+	}
+}
 
 // Core streaming primitive: reads and decodes exactly one more matching XA
 // sector into the ring, entirely outside the lock, then takes
