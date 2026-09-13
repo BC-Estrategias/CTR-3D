@@ -102,11 +102,11 @@ typedef struct
  * them onto a world-bucket stamp -- outside the UI band, so no widescreen X
  * ramp and no stereo flatten, while the fruit and icon they sit behind take
  * both. Re-pinned to 0xFFFF at the ordered-UI append exactly like UIPIC. Also
- * keys the far-edge UV inset, but only on axes the sprite is NOT drawn 1:1
- * on: the quadrants meet at their far edges, so the past-edge texel band
- * reads as a seam line through the burst centre; on a 1:1 axis retail's own
- * one-unit mirrored overlap already tiles exactly under texel-centre
- * sampling, and insetting there would double-draw the overlap column. */
+ * keys the far-edge UV inset on every axis: the quadrants meet at their far
+ * edges, so the past-edge texel band reads as a seam line through the burst
+ * centre. Retail's one-unit mirrored overlap (which hid the PS1's past-edge
+ * first column) draws that seam column twice under this inset, so the game
+ * drops it while NativeUiShine_ExactTiling reports the inset live. */
 #define PKTDEPTH_UI_STAMP_HUDSHINE 0xFFFBu
 
 typedef enum

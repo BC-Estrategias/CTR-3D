@@ -6209,6 +6209,25 @@ int NativeWide_GlowStretchX(int x)
  * local-extern hook idiom; every PC leg returns 0, so retail behavior there is
  * byte-identical. */
 
+/* Nonzero while the HUD shine's far-edge UV inset is live: the shine is
+ * stamped into the UI band (g_dbg_hudShine) and the stamp the inset keys on
+ * exists, which needs packet depth and the ordered-UI pin owning the band.
+ * UI_WeaponBG_DrawShine then makes its mirrored halves tile exactly instead
+ * of overlapping by one unit per whole unit of scale: that overlap hid the
+ * PS1's past-edge first column, and under the inset it draws the seam column
+ * twice. PC returns 0 and keeps retail's geometry. */
+int NativeUiShine_ExactTiling(void)
+{
+#if defined(__3DS__)
+	extern int g_dbg_uiOrder;
+	extern int g_dbg_uiPin;
+
+	return g_dbg_hudShine && g_dbg_packetDepth && g_dbg_uiOrder && g_dbg_uiPin;
+#else
+	return 0;
+#endif
+}
+
 /* Nonzero when the resolver is actually restamping the map block for the
  * bottom screen (PKTDEPTH_UI_STAMP_BTMMAP). The game uses this to run the map
  * block even in speedometer mode: routed primitives never reach the top

@@ -3869,48 +3869,12 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
 		{
 			insetMaxV = maxV;
 		}
-		/* HUD shine: four mirrored quadrant quads meeting at their far edges.
-		 * Retail overlaps each mirrored pair by one unit per whole unit of
-		 * scale, because on the PS1 a mirrored quad's first column samples the
-		 * texel past the edge and the overlap hides that column under the
-		 * neighbour's last real one. Under texel-centre sampling a 1:1 axis
-		 * already tiles exactly that way -- every pixel lands one good sample
-		 * -- and pulling the far edge in would double-draw the overlap column
-		 * instead. So the inset is for the scaled axes only, where no overlap
-		 * exists and the past-edge band shows as a seam line. */
-		if (triVerts[0].emitOrdinal == PKTDEPTH_UI_STAMP_HUDSHINE)
-		{
-			float minX = triVerts[0].x, maxX = triVerts[0].x;
-			float minY = triVerts[0].y, maxY = triVerts[0].y;
-
-			for (k = 1; k < 3; k++)
-			{
-				if (triVerts[k].x < minX)
-				{
-					minX = triVerts[k].x;
-				}
-				if (triVerts[k].x > maxX)
-				{
-					maxX = triVerts[k].x;
-				}
-				if (triVerts[k].y < minY)
-				{
-					minY = triVerts[k].y;
-				}
-				if (triVerts[k].y > maxY)
-				{
-					maxY = triVerts[k].y;
-				}
-			}
-			if ((int)(maxX - minX) == (maxU - minU))
-			{
-				insetMaxU = -1;
-			}
-			if ((int)(maxY - minY) == (maxV - minV))
-			{
-				insetMaxV = -1;
-			}
-		}
+		/* HUD shine: four mirrored quadrant quads meeting at their far edges,
+		 * inset on every axis. Retail overlaps each mirrored pair by one unit
+		 * per whole unit of scale to hide the PS1's past-edge first column;
+		 * under texel-centre sampling that overlap draws the seam column twice
+		 * (the subtractive pass darkens it), so the game drops it whenever
+		 * NativeUiShine_ExactTiling (native_gpu.c) reports this inset live. */
 	}
 
 	for (v = 0; v < 3; v++)

@@ -1,5 +1,14 @@
 #include <common.h>
 
+#ifdef CTR_NATIVE
+// Platform hook (platform/native_gpu.c), same local-extern idiom as
+// UI_RenderFrame.c: nonzero when the renderer samples texel centres and insets
+// the far edge of the wumpa shine's quads, so its mirrored halves must tile
+// exactly instead of overlapping. The PC leg returns 0 and keeps retail's
+// geometry byte for byte.
+extern int NativeUiShine_ExactTiling(void);
+#endif
+
 enum
 {
 	UI_ICON_FIXED_SHIFT = 0xc,
@@ -98,6 +107,22 @@ void UI_WeaponBG_DrawShine(struct Icon *icon, s16 posX, s16 posY, struct PrimMem
 	bottomY = posY + heightOffset;
 	angleY = angleY >> UI_ICON_FIXED_SHIFT;
 	topY = bottomY - angleY;
+
+#ifdef CTR_NATIVE
+	// angleX/angleY now hold the overlap between each mirrored half and its
+	// neighbour: one unit per whole unit of scale. On the PS1 a mirrored quad's
+	// first column samples the texel past the edge, and the overlap hides that
+	// column under the neighbour's last real one. A renderer that samples texel
+	// centres and insets the far edge has no such column, and the overlap then
+	// draws the seam column twice.
+	if (NativeUiShine_ExactTiling())
+	{
+		angleX = 0;
+		angleY = 0;
+		leftX = rightX;
+		topY = bottomY;
+	}
+#endif
 
 	for (quadIndex = 0; quadIndex < UI_ICON_QUAD_COUNT; quadIndex++)
 	{
