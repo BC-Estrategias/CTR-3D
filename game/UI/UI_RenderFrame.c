@@ -8,6 +8,9 @@
 // condition emitted the block (map mode / 3P), not the RouteActive override;
 // such a block draws on BOTH screens on the 3DS.
 extern void NativeGpu_MarkUiMapRange(uintptr_t start, uintptr_t end, int retailTop);
+// The juiced-wumpa shine (UI_Weapon_DrawBG) draws into the player's OT, not the
+// UI OT, so nothing downstream classifies it as UI without this span mark.
+extern void NativeGpu_MarkHudShineRange(uintptr_t start, uintptr_t end);
 #endif
 #ifdef CTR_NATIVE
 // Bottom-screen map hook (platform/native_gpu.c). RouteActive lets the map
@@ -555,6 +558,13 @@ void UI_RenderFrame_Racing()
 
 			if ((playerStruct->numWumpas >= DRIVER_WUMPA_JUICED_COUNT) && ((playerStruct->actionsFlagSet & ACTION_RACE_FINISHED) == 0))
 			{
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+				// Both shines allocate back to back from backBuffer->primMem with
+				// nothing between them, so [cursor-before, cursor-after) is exactly
+				// this player's shine quads.
+				uintptr_t shinePrimStart = (uintptr_t)gGT->backBuffer->primMem.cursor;
+#endif
+
 				// draw shining background behind wumpa fruit
 				UI_Weapon_DrawBG(hudStructPtr[UI_HUD_SLOT_RACING_WEAPON_BG].x, hudStructPtr[UI_HUD_SLOT_RACING_WEAPON_BG].y,
 				                 hudStructPtr[UI_HUD_SLOT_RACING_WEAPON_BG].scale, playerStruct);
@@ -566,6 +576,10 @@ void UI_RenderFrame_Racing()
 					UI_Weapon_DrawBG(hudStructPtr[UI_HUD_SLOT_BATTLE_WEAPON_BG].x, hudStructPtr[UI_HUD_SLOT_BATTLE_WEAPON_BG].y,
 					                 hudStructPtr[UI_HUD_SLOT_BATTLE_WEAPON_BG].scale, playerStruct);
 				}
+
+#if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
+				NativeGpu_MarkHudShineRange(shinePrimStart, (uintptr_t)gGT->backBuffer->primMem.cursor);
+#endif
 			}
 
 			// go to next player

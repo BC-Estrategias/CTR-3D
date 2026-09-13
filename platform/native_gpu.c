@@ -1475,6 +1475,10 @@ global_variable int s_uimapNodeActive;
 global_variable int s_uifpsNodeActive;
 /* Picture-sprite span: menu/hub map sheets (PKTDEPTH_UI_STAMP_UIPIC). */
 global_variable int s_uipicNodeActive;
+/* Juiced-wumpa HUD shine span (PKTDEPTH_UI_STAMP_HUDSHINE): UI_Weapon_DrawBG's
+ * quads, which retail links into the player's OT. Read by the resolver and by
+ * the direct-emit fast path's UI stand-aside, beside the suppress latch. */
+global_variable int s_hudshineNodeActive;
 /* Menu-backdrop span (character-select diorama strips). Read by
  * PacketDepth_ResolveXY, which sees screen coordinates, not packet addresses. */
 global_variable int s_menubdNodeActive;
@@ -1482,6 +1486,15 @@ global_variable int s_menubdNodeActive;
 /* Runtime A/B for the menu-backdrop stamp (dumpreq 'menubd'). OFF restores the
  * raw emit ordinal, i.e. the strips buried behind the flag. */
 int g_dbg_menuBackdrop = 1;
+
+/*
+ * Runtime A/B for the HUD shine's UI-band classification (dumpreq 'hudshine').
+ * ON = UI_Weapon_DrawBG's quads take the UI band (widescreen X ramp, stereo
+ * flatten, far-edge inset) although retail links them into the player's OT.
+ * OFF restores the world-bucket fallback: the burst stays at retail X while
+ * the fruit and icon it backs move with the wide window.
+ */
+int g_dbg_hudShine = 1;
 
 /*
  * STEREO depth for the menu backdrop, in view.z units -- the axis
@@ -1887,6 +1900,14 @@ global_variable uintptr_t s_uifpsRangeEnd[2];
  * would get the inset's gradient change and duplicate rows. */
 global_variable uintptr_t s_uipicRangeStart[2];
 global_variable uintptr_t s_uipicRangeEnd[2];
+/* Juiced-wumpa HUD shine spans (PKTDEPTH_UI_STAMP_HUDSHINE): one per player
+ * per frame, kept as separate entries -- split-screen HUDs interleave
+ * world-anchored primitives (lock-on reticle, head arrows) between two
+ * players' shines, so a union would swallow them. */
+#define HUDSHINE_SPANS_MAX 4
+global_variable uintptr_t s_hudshineRangeStart[2][HUDSHINE_SPANS_MAX];
+global_variable uintptr_t s_hudshineRangeEnd[2][HUDSHINE_SPANS_MAX];
+global_variable int s_hudshineRangeCount[2];
 
 void NativeGpu_MarkSkyRange(uintptr_t start, uintptr_t end)
 {
@@ -2019,6 +2040,19 @@ void NativeGpu_MarkUiPicRange(uintptr_t start, uintptr_t end)
 	s_uipicRangeEnd[s_skyRangeWriteIdx] = end;
 }
 
+void NativeGpu_MarkHudShineRange(uintptr_t start, uintptr_t end)
+{
+	int n = s_hudshineRangeCount[s_skyRangeWriteIdx];
+
+	if ((end <= start) || (n >= HUDSHINE_SPANS_MAX))
+	{
+		return;
+	}
+	s_hudshineRangeStart[s_skyRangeWriteIdx][n] = start;
+	s_hudshineRangeEnd[s_skyRangeWriteIdx][n] = end;
+	s_hudshineRangeCount[s_skyRangeWriteIdx] = n + 1;
+}
+
 void NativeGpu_PublishSkyRange(void)
 {
 	s_skyRangeReadIdx = s_skyRangeWriteIdx;
@@ -2042,6 +2076,7 @@ void NativeGpu_ClearSkyRange(void)
 	s_uifpsRangeEnd[s_skyRangeWriteIdx] = 0;
 	s_uipicRangeStart[s_skyRangeWriteIdx] = 0;
 	s_uipicRangeEnd[s_skyRangeWriteIdx] = 0;
+	s_hudshineRangeCount[s_skyRangeWriteIdx] = 0;
 }
 
 internal int NativeGpu_IsSkyPacket(uintptr_t addr)
@@ -2077,6 +2112,20 @@ internal int NativeGpu_IsUiFpsPacket(uintptr_t addr)
 internal int NativeGpu_IsUiPicPacket(uintptr_t addr)
 {
 	return (addr >= s_uipicRangeStart[s_skyRangeReadIdx]) && (addr < s_uipicRangeEnd[s_skyRangeReadIdx]);
+}
+
+internal int NativeGpu_IsHudShinePacket(uintptr_t addr)
+{
+	int i;
+
+	for (i = 0; i < s_hudshineRangeCount[s_skyRangeReadIdx]; i++)
+	{
+		if ((addr >= s_hudshineRangeStart[s_skyRangeReadIdx][i]) && (addr < s_hudshineRangeEnd[s_skyRangeReadIdx][i]))
+		{
+			return 1;
+		}
+	}
+	return 0;
 }
 
 #endif
@@ -2391,7 +2440,14 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		return 1;
 	}
 
-	if (GTECapture_LookupSuppressed())
+	/* The HUD shine (UI_Weapon_DrawBG) is 2D UI that retail links into the
+	 * player's OT, so the suppress latch never sees it; its span mark takes it
+	 * down this leg instead, to the band stamp the fruit and icon it backs
+	 * already carry. Without this it lands on the world-bucket fallback below:
+	 * correct occlusion, but outside the band, so no widescreen X ramp and no
+	 * stereo flatten -- the burst stays at retail X while the fruit moves with
+	 * the wide window. */
+	if (GTECapture_LookupSuppressed() || (g_dbg_hudShine && s_hudshineNodeActive))
 	{
 		/* 2D in the UI band: no depth exists, and it must stay on top of every
 		 * world stamp. Ordinal ordering is preserved WITHIN the band so UI
@@ -2468,6 +2524,12 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 					else if (s_uipicNodeActive)
 					{
 						*out = PKTDEPTH_UI_STAMP_UIPIC;
+					}
+					/* HUD shine: same never-routed, re-pinned treatment as the
+					 * picture sprites, plus the scale-aware far-edge inset. */
+					else if (s_hudshineNodeActive)
+					{
+						*out = PKTDEPTH_UI_STAMP_HUDSHINE;
 					}
 				}
 			}
@@ -4967,6 +5029,7 @@ void ParsePrimitivesLinkedList(u32 *p, int singlePrimitive)
 			s_uimapNodeActive = NativeGpu_IsUiMapPacket((uintptr_t)basePacket);
 			s_uifpsNodeActive = NativeGpu_IsUiFpsPacket((uintptr_t)basePacket);
 			s_uipicNodeActive = NativeGpu_IsUiPicPacket((uintptr_t)basePacket);
+			s_hudshineNodeActive = NativeGpu_IsHudShinePacket((uintptr_t)basePacket);
 #endif
 			if (tagLength > 0)
 			{

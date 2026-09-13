@@ -3869,6 +3869,10 @@ unsigned int N3DS_ReadButtons(void)
 	 *                  wide FOV window at 4:3 pixel scale); `wide 1` is the
 	 *                  rejected anamorphic stretch. Button: folded into the
 	 *                  SELECT+START master.
+	 *   hudshine [N] -- g_dbg_hudShine: the juiced-wumpa HUD shine takes the
+	 *                  UI band (widescreen ramp, stereo flatten, seam inset)
+	 *                  although retail links it into the player's OT. Bare
+	 *                  toggles, N sets 0/1. Default ON.
 	 *   bilinear    -- toggle g_dbg_trackBilinear (default OFF): track-atlas
 	 *                  sampler bilinear <-> nearest. Live, no rebuild.
 	 *                  Button: SELECT+D-RIGHT.
@@ -5173,6 +5177,25 @@ unsigned int N3DS_ReadButtons(void)
 					snprintf(mpMsg, sizeof(mpMsg), "[CTR-3DS] menubdpar: stereo plane view.z %d%s", g_dbg_menuBdParZ,
 					         (g_dbg_menuBdParZ == 0) ? " (follow occlusion = infinity)" : "");
 					N3DS_DebugLog(mpMsg);
+				}
+				else if (strncmp(word, "hudshine", 8) == 0)
+				{
+					extern int g_dbg_hudShine;
+
+					/* Juiced-wumpa HUD shine in the UI band (DEFAULT ON,
+					 * native_gpu.c PacketDepth_ResolveXY). OFF leaves it on the
+					 * world-bucket fallback: no widescreen ramp, no stereo
+					 * flatten, no far-edge inset. */
+					if (word[8] == ' ')
+					{
+						g_dbg_hudShine = (atoi(&word[9]) != 0) ? 1 : 0;
+					}
+					else
+					{
+						g_dbg_hudShine = !g_dbg_hudShine;
+					}
+					N3DS_DebugLog(g_dbg_hudShine ? "[CTR-3DS] hudshine: ON (wumpa shine in the UI band)"
+					                             : "[CTR-3DS] hudshine: off (shine on the world-bucket fallback)");
 				}
 				else if (strncmp(word, "menubd", 6) == 0)
 				{
