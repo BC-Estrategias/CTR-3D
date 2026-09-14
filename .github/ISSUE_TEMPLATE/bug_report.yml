@@ -75,5 +75,5 @@ body:
       options:
         - label: I am using my own NTSC-U disc dump in raw BIN (MODE2/2352) format
           required: true
-        - label: "3DS: I am on a New 3DS / New 3DS XL / New 2DS XL (original 3DS/2DS are not supported)"
-          required: true
+        - label: "3DS only: I am on a New 3DS / New 3DS XL / New 2DS XL (the original 3DS/2DS is not supported). PC reporters can leave this unchecked."
+          required: false
