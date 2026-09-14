@@ -137,5 +137,21 @@ else
     echo "WARN: rg not found; skipped risky-pattern scans."
 fi
 
+# The 3DS release artifact is built with -DCTR_INTERNAL=OFF, which strips the
+# dumpreq parser. Its word table is the only source of the literal "dumpreq" in
+# the binary, so finding that string means the gate was left ON.
+echo
+echo "== Debug surface: 3DS artifact =="
+CTR_3DSX="${CTR_3DSX:-build-3ds-release/ctr_native.3dsx}"
+if [[ -f "${CTR_3DSX}" ]]; then
+    if strings "${CTR_3DSX}" 2>/dev/null | grep -q dumpreq; then
+        echo "WARN: ${CTR_3DSX} contains \"dumpreq\" -- built with CTR_INTERNAL ON; rebuild with -DCTR_INTERNAL=OFF."
+    else
+        echo "ok: ${CTR_3DSX} carries no dumpreq parser."
+    fi
+else
+    echo "skipped: ${CTR_3DSX} not present (set CTR_3DSX to the artifact to check it)."
+fi
+
 echo
 echo "Release audit completed. Risk-scan matches are audit prompts, not automatic proof."
