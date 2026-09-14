@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a problem with CTR Native
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Which build were you running?
+      options:
+        - New 3DS
+        - New 3DS XL
+        - New 2DS XL
+        - PC — Windows
+        - PC — Linux
+    validations:
+      required: true
+
+  - type: input
+    id: luma-version
+    attributes:
+      label: Luma3DS version
+      description: 3DS only. Leave blank on PC.
+      placeholder: e.g. v14.1
+    validations:
+      required: false
+
+  - type: input
+    id: sd-card
+    attributes:
+      label: SD card make and size
+      description: 3DS only. Leave blank on PC.
+      placeholder: e.g. SanDisk Ultra 64GB
+    validations:
+      required: false
+
+  - type: input
+    id: game-version
+    attributes:
+      label: Game version
+      description: >-
+        3DS: the version shown in the HOME Menu description.
+        PC: the output of `ctr_native --version`.
+      placeholder: e.g. beta-7_1 (a1b2c3d)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect to happen, and what happened instead? Include steps to reproduce.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: >-
+        3DS: create an empty file at /3ds/ctr_native/enable-log.txt on the
+        SD card, reproduce the problem, then attach /ctr3ds.log from the SD
+        card root here. Delete enable-log.txt afterwards -- logging costs a
+        small stutter every couple of seconds.
+        PC: attach Crash Team Racing.log, written next to ctr_native.exe.
+      placeholder: Drag and drop the log file here.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: requirements
+    attributes:
+      label: Requirements
+      options:
+        - label: I am using my own NTSC-U disc dump in raw BIN (MODE2/2352) format
+          required: true
+        - label: "3DS only: I am on a New 3DS / New 3DS XL / New 2DS XL (the original 3DS/2DS is not supported). PC reporters can leave this unchecked."
+          required: false
