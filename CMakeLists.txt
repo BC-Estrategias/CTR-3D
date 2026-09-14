@@ -252,9 +252,17 @@ endif()
 # state: ladder step 1 -- load-time resident-mesh builder, count-only ([TRKMESH]
 # line per level), draws nothing on any platform yet. The 3DS draw side lands
 # behind this same gate.
+#
+# ON by default on 3DS: it is the shipping renderer there, and its OFF leg no
+# longer links (see the note at CTR_NATIVE_GTE_CAPTURE). PC keeps OFF.
+if(NINTENDO_3DS)
+    set(CTR_NATIVE_TRACK_RENDERER_DEFAULT ON)
+else()
+    set(CTR_NATIVE_TRACK_RENDERER_DEFAULT OFF)
+endif()
 option(CTR_NATIVE_TRACK_RENDERER
     "Native track renderer: resident track meshes from level data (in progress)"
-    OFF)
+    ${CTR_NATIVE_TRACK_RENDERER_DEFAULT})
 
 # Bake-parity diff (s38, roadmap "track bake pre-export"): PC-only diagnostic
 # that verifies the resident track mesh against retail's own emitted packets
@@ -318,9 +326,16 @@ endif()
 # above: nothing here reaches the GPU, so requiring OT_DEPTH/DRAW_MERGE would
 # only stop the measurement from running in configs where it is perfectly
 # valid. Rung 2's draw side will add them when it lands.
+#
+# ON by default on 3DS for the same reason as the track renderer above.
+if(NINTENDO_3DS)
+    set(CTR_NATIVE_MODEL_RENDERER_DEFAULT ON)
+else()
+    set(CTR_NATIVE_MODEL_RENDERER_DEFAULT OFF)
+endif()
 option(CTR_NATIVE_MODEL_RENDERER
     "PICA-native model renderer: instance topology, per-frame census, triangle capture (in progress)"
-    OFF)
+    ${CTR_NATIVE_MODEL_RENDERER_DEFAULT})
 if(CTR_NATIVE_MODEL_RENDERER)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_MODEL_RENDERER=1)
 endif()
@@ -450,9 +465,19 @@ endif()
 # the exact truncated screen coordinate the GTE writes to the packet. No
 # visible effect alone -- see docs/GTE_CAPTURE_DESIGN.md. Shared
 # infrastructure for CTR_NATIVE_VERTEX_DESNAP and later stereo/perspective-UV.
+#
+# ON by default on 3DS: stereo 3D is built on the capture table, and the 3DS
+# renderer calls into this gate's code unconditionally (NativeGpu_UiMapRetailTop
+# for the both-screens map, g_dbg_decalNearBias for the decal bracket), so the
+# OFF leg does not link there. PC keeps OFF -- nothing consumes it.
+if(NINTENDO_3DS)
+    set(CTR_NATIVE_GTE_CAPTURE_DEFAULT ON)
+else()
+    set(CTR_NATIVE_GTE_CAPTURE_DEFAULT OFF)
+endif()
 option(CTR_NATIVE_GTE_CAPTURE
     "Populate the GTE sub-pixel capture side table (infrastructure only, no visible effect)"
-    OFF)
+    ${CTR_NATIVE_GTE_CAPTURE_DEFAULT})
 
 # Consume the capture table in the vertex builders and vertex shader to draw
 # geometry at its true sub-pixel position instead of PS1-style whole-pixel
