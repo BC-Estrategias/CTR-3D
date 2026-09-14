@@ -23,8 +23,22 @@ if(NOT NINTENDO_3DS)
     set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE NEVER)
 endif()
 
+# The build ID needs git. An MSYS2 login shell (how the 3DS target is built)
+# carries no git on PATH, and the calls below are ERROR_QUIET, so without a
+# fallback every such build silently stamps "unknown-dirty". Prefer PATH,
+# then Git for Windows. The MSYS cmake reads a drive-letter path as RELATIVE
+# (it yields <source>/C:/Program Files/...), so the POSIX-form hints must come
+# first; the native cmake ignores those and takes the drive-letter forms.
+find_program(CTR_NATIVE_GIT NAMES git
+    HINTS "/c/Program Files/Git/cmd" "/c/Program Files/Git/bin"
+          "C:/Program Files/Git/cmd" "C:/Program Files/Git/bin"
+    NO_CACHE)
+if(NOT CTR_NATIVE_GIT OR NOT EXISTS "${CTR_NATIVE_GIT}")
+    set(CTR_NATIVE_GIT git)
+endif()
+
 execute_process(
-    COMMAND git rev-parse --short=12 HEAD
+    COMMAND ${CTR_NATIVE_GIT} rev-parse --short=12 HEAD
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE CTR_NATIVE_GIT_HASH
     OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -35,7 +49,7 @@ if(NOT CTR_NATIVE_GIT_HASH)
 endif()
 
 execute_process(
-    COMMAND git diff --quiet --exit-code
+    COMMAND ${CTR_NATIVE_GIT} diff --quiet --exit-code
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     RESULT_VARIABLE CTR_NATIVE_GIT_DIRTY
     ERROR_QUIET
