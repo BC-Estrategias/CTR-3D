@@ -142,19 +142,28 @@ static void N3DS_NetloadStreamInit(void)
 	s_netloadStreamActive = 1;
 }
 
-void N3DS_EarlyInit(void)
-{
-	/* Before anything can call N3DS_DebugLog (the netload-stream connect
-	 * message a few lines down does exactly that) and long before any worker
-	 * thread exists to contend for it. */
-	LightLock_Init(&s_logBufferLock);
+/* One failed open, not one per line: an unwritable card would otherwise cost
+ * an SD round trip for every message. Matches the single attempt the eager
+ * open used to make. */
+static int s_logOpenFailed = 0;
 
-	consoleDebugInit(debugDevice_SVC);
+/*
+ * Opens the SD log on the first message that is actually going to be written,
+ * so a build with logging off leaves no ctr3ds.log on the card at all. Callers
+ * must hold s_logBufferLock: every other s_logFile touch in this file does,
+ * and two threads log concurrently.
+ */
+static void N3DS_LogOpenFileLocked(void)
+{
+	if ((s_logFile != NULL) || s_logOpenFailed)
+	{
+		return;
+	}
 
 	/* One-deep rotation BEFORE the truncating open: "w" wipes the previous
-	 * boot's log, so a crash -> relaunch sequence would otherwise truncate
+	 * run's log, so a crash -> relaunch sequence would otherwise truncate
 	 * the crashed run's log before it can be read. Keeps exactly the last
-	 * two boots, never grows unbounded. */
+	 * two, never grows unbounded. */
 	remove(N3DS_LOG_PREV_PATH);
 	rename(N3DS_LOG_PATH, N3DS_LOG_PREV_PATH);
 
@@ -166,6 +175,20 @@ void N3DS_EarlyInit(void)
 		 * the timed flush in N3DS_DebugLog. */
 		setvbuf(s_logFile, NULL, _IOFBF, 16384);
 	}
+	else
+	{
+		s_logOpenFailed = 1;
+	}
+}
+
+void N3DS_EarlyInit(void)
+{
+	/* Before anything can call N3DS_DebugLog (the netload-stream connect
+	 * message a few lines down does exactly that) and long before any worker
+	 * thread exists to contend for it. */
+	LightLock_Init(&s_logBufferLock);
+
+	consoleDebugInit(debugDevice_SVC);
 
 	N3DS_NetloadStreamInit();
 	if (s_netloadStreamActive)
@@ -230,10 +253,15 @@ void N3DS_DebugLog(const char *msg)
 		fputc('\n', stderr);
 	}
 
-	/* g_dbg_sdLog off: no fputs either, not just no flush. A buffered write
-	 * is only free until the 16KB buffer fills, and then stdio flushes it
-	 * wherever it happens to be -- mid-corner, unthrottled, exactly the stall
-	 * this switch exists to remove. */
+	/* g_dbg_sdLog off: no fputs either, not just no flush, and no file. A
+	 * buffered write is only free until the 16KB buffer fills, and then stdio
+	 * flushes it wherever it happens to be -- mid-corner, unthrottled, exactly
+	 * the stall this switch exists to remove. */
+	if (g_dbg_sdLog)
+	{
+		N3DS_LogOpenFileLocked();
+	}
+
 	if ((s_logFile != NULL) && g_dbg_sdLog)
 	{
 		fputs(msg, s_logFile);
