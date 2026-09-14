@@ -253,6 +253,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "[CTR Native] Failed to initialize asset paths.\n");
 #if defined(__3DS__)
 		N3DS_DebugLog("[CTR-3DS] FAIL: NativeAssets_Init");
+		N3DS_ShowFatalAssetScreen(NULL);
 #endif
 		return NativeConsole_Return(1);
 	}
@@ -292,6 +293,7 @@ int main(int argc, char *argv[])
 	{
 #if defined(__3DS__)
 		N3DS_DebugLog("[CTR-3DS] FAIL: NativeAssets_Validate (disc image missing?)");
+		N3DS_ShowFatalAssetScreen(NativeAssets_GetAssetDir());
 #endif
 		return NativeConsole_Return(1);
 	}

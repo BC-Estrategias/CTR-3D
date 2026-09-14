@@ -405,6 +405,56 @@ void N3DS_SleepMs(unsigned int ms)
 	svcSleepThread((s64)ms * 1000000LL);
 }
 
+/* 60 seconds of vblanks. The panel is the last thing the process does, so a
+ * console left on a shelf still powers down rather than sitting lit. */
+#define N3DS_FATAL_SCREEN_VBLANKS 3600
+
+void N3DS_ShowFatalAssetScreen(const char *assetDir)
+{
+	unsigned int vblanks = 0;
+
+	/*
+	 * Owns the whole gfx lifecycle: this runs before Platform_Init, so no
+	 * screen exists yet and the process exits as soon as the panel is
+	 * dismissed. The failure messages themselves go to stderr, which
+	 * N3DS_EarlyInit pointed at svcOutputDebugString -- invisible on a console
+	 * with no debugger attached, which is why the panel exists at all.
+	 */
+	gfxInitDefault();
+	consoleInit(GFX_TOP, NULL);
+
+	printf("\n  CTR Native\n\n");
+	printf("  Could not find the game's disc image.\n\n");
+	printf("  This port ships no game data. Copy your\n");
+	printf("  own NTSC-U Crash Team Racing disc dump to\n");
+	printf("  the SD card as:\n\n");
+	printf("    /3ds/ctr_native/assets/ctr-u.bin\n\n");
+	printf("  It must be a raw MODE2/2352 .bin dump. A\n");
+	printf("  2048-byte .iso will not work: it drops the\n");
+	printf("  sectors the music and FMV are stored in.\n\n");
+	if (assetDir != NULL)
+	{
+		printf("  Looked in: %s\n\n", assetDir);
+	}
+	printf("  Press START to exit.\n");
+
+	while (aptMainLoop() && (vblanks < N3DS_FATAL_SCREEN_VBLANKS))
+	{
+		hidScanInput();
+		if (hidKeysDown() != 0)
+		{
+			break;
+		}
+
+		gfxFlushBuffers();
+		gfxSwapBuffers();
+		gspWaitForVBlank();
+		vblanks++;
+	}
+
+	gfxExit();
+}
+
 void N3DS_GfxInit(void)
 {
 	/*
