@@ -6,6 +6,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 set(CTR_NATIVE_VERSION "0.1.0-beta.7.1")
+set(CTR_NATIVE_AUTHOR "CTR Native" CACHE STRING "Author shown in the 3DS HOME Menu (SMDH)")
 
 # Host builds target x86-32 with SSE. On the 3DS the devkitPro platform module
 # supplies the ARM11 arch flags (-march=armv6k -mtune=mpcore -mfloat-abi=hard),
@@ -585,7 +586,7 @@ if(NINTENDO_3DS)
     ctr_generate_smdh(ctr_native.smdh
         NAME "CTR-Native"
         DESCRIPTION "Crash Team Racing (native port) ${CTR_NATIVE_VERSION}"
-        AUTHOR "CTR-tools"
+        AUTHOR "${CTR_NATIVE_AUTHOR}"
     )
     ctr_create_3dsx(ctr_native SMDH ctr_native.smdh)
 else()
