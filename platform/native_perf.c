@@ -1338,4 +1338,11 @@ void NativePerf_CountTorch(int listed, int emitted)
 	s_torchFrameListed += listed;
 	s_torchFrameEmitted += emitted;
 }
+#else
+/*
+ * The only piece of the profiler that outlives the debug-surface gate: the
+ * level id instruments stamp their lines with. NativePerf_BeginFrame (the
+ * inline stub in native_perf.h) is the writer.
+ */
+int g_nativePerfLevelID = 0;
 #endif

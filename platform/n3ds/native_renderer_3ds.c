@@ -585,6 +585,7 @@ int g_dbg_trackAfterMerge = 0;
  */
 int g_dbg_statsVerbose = 0;
 
+#ifdef CTR_INTERNAL
 /*
  * AUTOMATED CONFIG SWEEP (dumpreq 'sweep').
  *
@@ -709,6 +710,7 @@ static void N3DS_SweepApply(int idx)
 	 */
 	g_dbg_pktDepthBias = 0;
 }
+#endif /* CTR_INTERNAL */
 
 /*
  * Debug-only, mirrors PC's g_dbg_texturelessMode (native_renderer.c:79,
@@ -5741,6 +5743,10 @@ void NativeRenderer_SwapWindow(void)
 			if (g_dbg_statsVerbose)
 			printf("call   uvb %-8lu dtri %-8lu    \n", (unsigned long)s_updateVertexBufferCalls, (unsigned long)s_drawTrianglesCalls);
 
+#ifdef CTR_INTERNAL
+			/* Everything from here to the end of the block reads the frame
+			 * profiler, which is part of the debug surface and is not compiled
+			 * into a release build. */
 			printf("perf   frame %lu.%lums  work %lu.%lums        \n", (unsigned long)s_perfConsoleTotalUs / 1000UL,
 			       ((unsigned long)s_perfConsoleTotalUs % 1000UL) / 100UL, (unsigned long)s_perfConsoleWorkUs / 1000UL,
 			       ((unsigned long)s_perfConsoleWorkUs % 1000UL) / 100UL);
@@ -5841,6 +5847,7 @@ void NativeRenderer_SwapWindow(void)
 					       (unsigned long)s_perfConsoleUs[i] / 1000UL, ((unsigned long)s_perfConsoleUs[i] % 1000UL) / 100UL);
 				}
 			}
+#endif /* CTR_INTERNAL */
 		}
 
 #undef printf

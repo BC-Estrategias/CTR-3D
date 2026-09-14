@@ -119,11 +119,17 @@ if(NINTENDO_3DS)
     set_source_files_properties(platform/n3ds/n3ds_backend.c platform/n3ds/n3ds_audio_thread.c platform/n3ds/n3ds_render_thread.c platform/n3ds/n3ds_beat.c
         PROPERTIES COMPILE_OPTIONS "-fshort-enums")
 endif()
+# The developer debug surface. OFF strips it from the binary entirely, so a
+# shipped build carries no dumpreq parser, no SELECT chords and no probe
+# instrumentation. Every g_dbg_* default is unchanged by the switch: an OFF
+# build behaves exactly like an ON build that nobody touched.
+option(CTR_INTERNAL "Compile the internal debug surface: dumpreq words, SELECT chords, perf/replay/probe instrumentation" ON)
+
 target_include_directories(ctr_native PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_definitions(ctr_native PRIVATE
     CTR_NATIVE
     BUILD=926
-    CTR_INTERNAL
+    $<$<BOOL:${CTR_INTERNAL}>:CTR_INTERNAL>
     CTR_NATIVE_VERSION=\"${CTR_NATIVE_VERSION}\"
     CTR_NATIVE_BUILD_ID=\"${CTR_NATIVE_BUILD_ID}\"
 )

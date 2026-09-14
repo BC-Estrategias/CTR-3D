@@ -230,6 +230,19 @@ struct NativeOtagSplitStats
 void NativePerf_TakeOtagSplit(struct NativeOtagSplitStats *out);
 #endif
 #else
+/*
+ * Level id for instruments that outlive the profiler. Instrument log lines
+ * that are not themselves part of the debug surface still stamp a level, so
+ * the latch survives the gate even though nothing else in the profiler does;
+ * NativePerf_BeginFrame is the one writer either way.
+ */
+extern int g_nativePerfLevelID;
+
+static inline int NativePerf_CurrentLevelID(void)
+{
+	return g_nativePerfLevelID;
+}
+
 static inline int NativePerf_ConfigureFromArgs(int argc, char **argv)
 {
 	(void)argc;
@@ -247,7 +260,10 @@ static inline void NativePerf_DumpSpikesNow(void)
 
 static inline void NativePerf_BeginFrame(const struct NativePerfFrameInfo *info)
 {
-	(void)info;
+	if (info != NULL)
+	{
+		g_nativePerfLevelID = (int)info->levelID;
+	}
 }
 
 static inline void NativePerf_EndFrame(const struct NativePerfFrameInfo *info)
