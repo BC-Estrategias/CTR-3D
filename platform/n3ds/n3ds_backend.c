@@ -5197,24 +5197,6 @@ unsigned int N3DS_ReadButtons(void)
 					}
 					N3DS_DebugLog(g_reservesMeter ? "[CTR-3DS] reserves meter ON" : "[CTR-3DS] reserves meter OFF");
 				}
-				else if (strncmp(word, "tirepin", 7) == 0)
-				{
-					extern int g_tirehuntPin0;
-
-					/* Invisible-tire hunt: pin all wheels to sprite 0. */
-					g_tirehuntPin0 ^= 1;
-					N3DS_DebugLog(g_tirehuntPin0 ? "[CTR-3DS] tirepin: ON (all wheels sprite 0)" : "[CTR-3DS] tirepin: off");
-				}
-				else if (strncmp(word, "tirelog", 7) == 0)
-				{
-					extern int g_dbg_tireVtxLog;
-
-					/* Invisible-tire hunt: continuous merge-stage trace of
-					 * tire-clut triangles ([TV]/[TS]/[TB]/[TF]/[TT]/[TVBO],
-					 * native_renderer_3ds.c). Needs sdlog ON to reach SD. */
-					g_dbg_tireVtxLog ^= 1;
-					N3DS_DebugLog(g_dbg_tireVtxLog ? "[CTR-3DS] tirelog: ON (merge-stage tire trace)" : "[CTR-3DS] tirelog: off");
-				}
 				else if (strncmp(word, "pdfill", 6) == 0)
 				{
 					extern int g_dbg_pktDepthPartialFill;

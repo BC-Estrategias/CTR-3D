@@ -1510,82 +1510,20 @@ global_variable u32 s_subPageEvictHazards = 0;
  * case this design assumes (design doc "Instrumentation").
  */
 global_variable u32 s_trianglesRoutedSubPage = 0;
-/* Invisible-tire hunt probe: per-clut throttles for [TIREHUNT] resolve
- * logging -- the reference clut resolves ~120x/sec and starves a shared cap. */
-global_variable u32 s_tirehuntLogs0 = 0;   /* clut 0x40c0 (icon 0, the suspect) */
-global_variable u32 s_tirehuntLogsRef = 0; /* clut 0x4001 (icon 1, reference) */
 
-/*
- * Invisible-tire hunt, merge-stage trace (dumpreq `tirelog`). The 36-byte
- * tridump records addressing only (page/clut/uv/xy/atlas); every axis it
- * omits is what this logs, continuously, for every tire-clut triangle
- * (CLUT rows 256-259 = 0x4000..0x40FF, the 17 rotation icons):
- *   [TV]  per triangle at DrawTriangles: texView pass, blend mode, atlas,
- *         path taken (Bbin@used / Rseg@runpos / UI), depth ordinals
- *         (emitOrdinal x3 + parallax), vertex colour -- the depth and
- *         colour a blink could hide in.
- *   [TS]  blend-run close that carried tire verts: cause + the state
- *         RECORDED into the segment (what the GPU will actually get).
- *   [TB]/[TO]/[TF]/[TT] flush-time emits of tire-carrying bins / spilled
- *         opaque segs / blend segs / the open tail run.
- *   [TVBO] frame-VBO append that overlaps an earlier append this frame --
- *         an aliasing clobber would track frame structure (crossings)
- *         while pinned frames stay stable, which fits the paradox.
- * Remove with the hunt. */
+/* Always 0: the merge-stage tire trace that used to drive this has been
+ * removed. Kept because platform/native_gpu.c reads it via extern (the
+ * [PDFILL] forensics block and the FPS-overlay frame bridge in
+ * NativeUiMap_FpsOverlayText). */
 int g_dbg_tireVtxLog = 0;
-/* Mirror of s_frameCounter for the FPS-overlay frame bridge
- * (NativeUiMap_FpsOverlayText, native_gpu.c) -- external linkage on purpose;
- * updated once per BeginScene. Remove with the hunt. */
+/* Always 0, for the same reason: platform/native_gpu.c's
+ * NativeUiMap_FpsOverlayText reads this via extern. */
 unsigned long g_tirelogFrameNow = 0;
-global_variable int s_runHasTire = 0;
-global_variable u8 s_segHasTire[N3DS_MERGE_MAX_BLEND_SEGS];
-global_variable u8 s_osegHasTire[N3DS_MERGE_MAX_OPAQUE_SEGS];
-global_variable u8 s_binHasTire[N3DS_MERGE_BIN_COUNT];
-global_variable int s_tvboLastEnd = 0;
 global_variable u32 s_trianglesRoutedFullPage = 0;
 
-internal int N3DS_TireVtxIsTire(const GrVertex *t, int untextured)
-{
-	return !untextured && (((int)t[0].clut & 0xFF00) == 0x4000);
-}
-
-internal void N3DS_TireVtxLogTri(const GrVertex *t, int texView, int blendMode, int atlasIdx, int pixelBaseU, int pixelBaseV,
-                                 char pathTag, int pathA, int pathB)
-{
-	char msg[192];
-
-	snprintf(msg, sizeof(msg),
-	         "[TV] f=%lu p=%d c=%04x vw=%d bm=%d atl=%d pb=%d,%d %c%d@%d xy=%d,%d e=%04x,%04x,%04x w=%04x rgba=%02x%02x%02x%02x br=%d",
-	         (unsigned long)s_frameCounter, (int)t[0].page, (unsigned)(u16)t[0].clut, texView, blendMode, atlasIdx, pixelBaseU, pixelBaseV,
-	         pathTag, pathA, pathB, (int)t[0].x, (int)t[0].y, (unsigned)t[0].emitOrdinal, (unsigned)t[1].emitOrdinal,
-	         (unsigned)t[2].emitOrdinal, (unsigned)t[0].parallaxOrdinal, t[0].r, t[0].g, t[0].b, t[0].a, (int)t[0].bright);
-	N3DS_DebugLog(msg);
-}
-
-/* Frame-VBO append with a monotonicity tripwire: within one frame every
- * append from this TU should land past the previous one; a base BELOW the
- * running end means two live vertex ranges alias. Identical to the raw
- * call when the trace is off. */
 internal int N3DS_TvboCheckedAppend(const N3DS_Vertex *verts, int count)
 {
-	int base = N3DS_C3DAppendVertices(verts, count);
-
-	if (g_dbg_tireVtxLog && (base >= 0))
-	{
-		if (base < s_tvboLastEnd)
-		{
-			char msg[96];
-
-			snprintf(msg, sizeof(msg), "[TVBO] OVERLAP f=%lu base=%d lastEnd=%d n=%d", (unsigned long)s_frameCounter, base, s_tvboLastEnd,
-			         count);
-			N3DS_DebugLog(msg);
-		}
-		if ((base + count) > s_tvboLastEnd)
-		{
-			s_tvboLastEnd = base + count;
-		}
-	}
-	return base;
+	return N3DS_C3DAppendVertices(verts, count);
 }
 
 /*
@@ -2318,14 +2256,6 @@ decodeIntoSlot:
 				s_texdecFrameWorstClut = (u16)clut;
 				s_texdecFrameWorstIsSub = 0;
 			}
-			if (g_dbg_tireVtxLog)
-			{
-				char upMsg[112];
-
-				snprintf(upMsg, sizeof(upMsg), "[TIREUP] f=%lu fp p=%d c=%04x vw=%d atl=%d cell=%d,%d", (unsigned long)s_frameCounter,
-				         (int)texPage, (unsigned)(u16)clut, (int)view, atlasIdx, cellX, cellY);
-				N3DS_DebugLog(upMsg);
-			}
 		}
 	}
 
@@ -2530,20 +2460,6 @@ internal int N3DS_FindOrDecodeSubPageTexture(s16 texPage, s16 clut, TexFormat fo
 		s_subPageCacheCapacityMisses++;
 	}
 
-#if defined(CTR_INTERNAL)
-	/* Invisible-tire hunt: tire sprites live on 4bpp pages 5-7; misses there
-	 * are rare in steady scenes, so log each with its cause. Remove with the
-	 * hunt. */
-	if ((texPage >= 5) && (texPage <= 7) && (format == TF_4_BIT))
-	{
-		char spMsg[144];
-
-		snprintf(spMsg, sizeof(spMsg), "[TIREMISS] f=%lu p=%d c=%04x vw=%d t=%d,%d stale=%d pg=%d cg=%d cap=%d", (unsigned long)s_frameCounter,
-		         (int)texPage, (unsigned)(u16)clut, (int)view, tileX, tileY, sawStaleKeyMatch, staleSawPageGen, staleSawClutGen, !sawStaleKeyMatch);
-		N3DS_DebugLog(spMsg);
-	}
-#endif
-
 	/* Stale twin not referenced this frame: re-decode into it directly
 	 * (see staleMatchSlot's comment; same-frame guard = the hazard rule). */
 	if ((staleMatchSlot >= 0) && (s_subPageCache[staleMatchSlot].lastUsedFrame != s_frameCounter))
@@ -2655,15 +2571,6 @@ decodeIntoSubSlot:
 				s_texdecFrameWorstIsSub = 1;
 				s_texdecFrameWorstTileX = (s8)tileX;
 				s_texdecFrameWorstTileY = (s8)tileY;
-			}
-			if (g_dbg_tireVtxLog)
-			{
-				char upMsg[128];
-
-				snprintf(upMsg, sizeof(upMsg), "[TIREUP] f=%lu sp p=%d c=%04x vw=%d tile=%d,%d atl=%d cell=%d,%d sub=%d,%d stale=%d",
-				         (unsigned long)s_frameCounter, (int)texPage, (unsigned)(u16)clut, (int)view, tileX, tileY, atlasIdx, physCellX,
-				         physCellY, subX, subY, sawStaleKeyMatch);
-				N3DS_DebugLog(upMsg);
 			}
 		}
 	}
@@ -2875,10 +2782,6 @@ internal void N3DS_MergeCloseBlendRun(enum N3DS_BlendCloseCause cause)
 	if (baseVertex < 0)
 	{
 		s_droppedRuns++;
-		if (g_dbg_tireVtxLog && s_runHasTire)
-		{
-			N3DS_DebugLog("[TS] TIRE RUN DROPPED (frame VBO full)");
-		}
 	}
 	else
 	{
@@ -2889,18 +2792,7 @@ internal void N3DS_MergeCloseBlendRun(enum N3DS_BlendCloseCause cause)
 		seg->atlas = (u8)s_runAtlas;
 		seg->baseVertex = baseVertex;
 		seg->vertCount = s_runVertCount;
-		if (g_dbg_tireVtxLog && s_runHasTire)
-		{
-			char msg[128];
-
-			snprintf(msg, sizeof(msg), "[TS] f=%lu close cause=%d seg=%d bm=%d dbl=%d atl=%d base=%d n=%d",
-			         (unsigned long)s_frameCounter, (int)cause, s_mergeBlendSegCount - 1, (int)seg->blendMode, (int)seg->doubling,
-			         (int)seg->atlas, seg->baseVertex, seg->vertCount);
-			N3DS_DebugLog(msg);
-			s_segHasTire[s_mergeBlendSegCount - 1] = 1;
-		}
 	}
-	s_runHasTire = 0;
 	s_runVertCount = 0;
 	s_runAtlas = -1;
 }
@@ -2957,10 +2849,6 @@ internal void N3DS_MergeFlush(void)
 		if (baseVertex < 0)
 		{
 			s_droppedRuns++;
-			if (g_dbg_tireVtxLog && s_binHasTire[i])
-			{
-				N3DS_DebugLog("[TB] TIRE BIN DROPPED (frame VBO full)");
-			}
 		}
 		else
 		{
@@ -2968,17 +2856,8 @@ internal void N3DS_MergeFlush(void)
 			               (i == N3DS_MERGE_UNTEX_BIN) ? N3DS_WHITE_ATLAS : i, baseVertex, s_mergeBinUsed[i], &lastDoubling);
 			s_mergeEmitOpaque++;
 			s_mergeVertsOpaque += (u32)s_mergeBinUsed[i];
-			if (g_dbg_tireVtxLog && s_binHasTire[i])
-			{
-				char msg[96];
-
-				snprintf(msg, sizeof(msg), "[TB] f=%lu bin=%d base=%d n=%d", (unsigned long)s_frameCounter, i, baseVertex,
-				         s_mergeBinUsed[i]);
-				N3DS_DebugLog(msg);
-			}
 		}
 		s_mergeBinUsed[i] = 0;
-		s_binHasTire[i] = 0;
 	}
 
 	for (i = 0; i < s_mergeOpaqueSegCount; i++)
@@ -2988,15 +2867,6 @@ internal void N3DS_MergeFlush(void)
 		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
 		s_mergeEmitOpaque++;
 		s_mergeVertsOpaque += (u32)seg->vertCount;
-		if (g_dbg_tireVtxLog && s_osegHasTire[i])
-		{
-			char msg[96];
-
-			snprintf(msg, sizeof(msg), "[TO] f=%lu oseg=%d/%d atl=%d base=%d n=%d", (unsigned long)s_frameCounter, i,
-			         s_mergeOpaqueSegCount, (int)seg->atlas, seg->baseVertex, seg->vertCount);
-			N3DS_DebugLog(msg);
-			s_osegHasTire[i] = 0;
-		}
 	}
 	s_mergeOpaqueSegCount = 0;
 
@@ -3007,15 +2877,6 @@ internal void N3DS_MergeFlush(void)
 		N3DS_MergeEmit((int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount, &lastDoubling);
 		s_mergeEmitBlend++;
 		s_mergeVertsBlend += (u32)seg->vertCount;
-		if (g_dbg_tireVtxLog && s_segHasTire[i])
-		{
-			char msg[112];
-
-			snprintf(msg, sizeof(msg), "[TF] f=%lu seg=%d/%d bm=%d dbl=%d atl=%d base=%d n=%d", (unsigned long)s_frameCounter, i,
-			         s_mergeBlendSegCount, (int)seg->blendMode, (int)seg->doubling, (int)seg->atlas, seg->baseVertex, seg->vertCount);
-			N3DS_DebugLog(msg);
-			s_segHasTire[i] = 0;
-		}
 	}
 	s_mergeBlendSegCount = 0;
 
@@ -3026,10 +2887,6 @@ internal void N3DS_MergeFlush(void)
 		if (baseVertex < 0)
 		{
 			s_droppedRuns++;
-			if (g_dbg_tireVtxLog && s_runHasTire)
-			{
-				N3DS_DebugLog("[TT] TIRE TAIL DROPPED (frame VBO full)");
-			}
 		}
 		else
 		{
@@ -3037,17 +2894,8 @@ internal void N3DS_MergeFlush(void)
 			s_mergeEmitBlend++;
 			s_mergeVertsBlend += (u32)s_runVertCount;
 			s_blendCloseFrameEnd++;
-			if (g_dbg_tireVtxLog && s_runHasTire)
-			{
-				char msg[112];
-
-				snprintf(msg, sizeof(msg), "[TT] f=%lu tail bm=%d ut=%d atl=%d base=%d n=%d", (unsigned long)s_frameCounter,
-				         pendingBlendMode, pendingUntextured, s_runAtlas, baseVertex, s_runVertCount);
-				N3DS_DebugLog(msg);
-			}
 		}
 	}
-	s_runHasTire = 0;
 	s_runVertCount = 0;
 	s_runAtlas = -1;
 	/* TEV doubling was left wherever the last emit put it; -1 forces the
@@ -3761,10 +3609,6 @@ internal void N3DS_MergeSpillBin(int bin)
 	if (baseVertex < 0)
 	{
 		s_droppedRuns++;
-		if (g_dbg_tireVtxLog && s_binHasTire[bin])
-		{
-			N3DS_DebugLog("[TO] TIRE SPILL DROPPED (frame VBO full)");
-		}
 	}
 	else
 	{
@@ -3775,18 +3619,8 @@ internal void N3DS_MergeSpillBin(int bin)
 		seg->atlas = (u8)((bin == N3DS_MERGE_UNTEX_BIN) ? N3DS_WHITE_ATLAS : bin);
 		seg->baseVertex = baseVertex;
 		seg->vertCount = s_mergeBinUsed[bin];
-		if (g_dbg_tireVtxLog && s_binHasTire[bin])
-		{
-			char msg[96];
-
-			snprintf(msg, sizeof(msg), "[TO] f=%lu spill bin=%d oseg=%d base=%d n=%d", (unsigned long)s_frameCounter, bin,
-			         s_mergeOpaqueSegCount - 1, baseVertex, seg->vertCount);
-			N3DS_DebugLog(msg);
-			s_osegHasTire[s_mergeOpaqueSegCount - 1] = 1;
-		}
 	}
 	s_mergeBinUsed[bin] = 0;
-	s_binHasTire[bin] = 0;
 }
 
 /* This codebase has no 3-way min/max anywhere -- native_libgte.c's
@@ -4264,26 +4098,6 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 		*outOriginV = tileY0 * N3DS_SUBPAGE_DIM;
 		s_trianglesRoutedSubPage++;
 
-#if defined(CTR_INTERNAL)
-		if ((texPage == 7) && (((clut == 0x40c0) && (s_tirehuntLogs0 < 64)) || ((clut == 0x4001) && (s_tirehuntLogsRef < 6))))
-		{
-			char thMsg[160];
-
-			if (clut == 0x40c0)
-			{
-				s_tirehuntLogs0++;
-			}
-			else
-			{
-				s_tirehuntLogsRef++;
-			}
-			snprintf(thMsg, sizeof(thMsg), "[TIREHUNT] f=%lu sub p=%d c=%04x vw=%d u=%d..%d v=%d..%d atlas=%d pb=%d,%d org=%d,%d",
-			         (unsigned long)s_frameCounter, (int)texPage, (unsigned)clut, (int)view, minU, maxU, minV, maxV, *outAtlasIdx, *outPixelBaseU,
-			         *outPixelBaseV, *outOriginU, *outOriginV);
-			N3DS_DebugLog(thMsg);
-		}
-#endif
-
 		/* Stamp AFTER the decode: FindOrDecode may itself have evicted,
 		 * which moves the sum -- a memo stored with the pre-decode stamp
 		 * would die on its first probe. */
@@ -4326,25 +4140,6 @@ internal int N3DS_ResolveTriangleTexture(const GrVertex *v0, const GrVertex *v1,
 		*outOriginU = 0;
 		*outOriginV = 0;
 		s_trianglesRoutedFullPage++;
-
-#if defined(CTR_INTERNAL)
-		if ((texPage == 7) && (((clut == 0x40c0) && (s_tirehuntLogs0 < 64)) || ((clut == 0x4001) && (s_tirehuntLogsRef < 6))))
-		{
-			char thMsg[160];
-
-			if (clut == 0x40c0)
-			{
-				s_tirehuntLogs0++;
-			}
-			else
-			{
-				s_tirehuntLogsRef++;
-			}
-			snprintf(thMsg, sizeof(thMsg), "[TIREHUNT] full p=%d c=%04x vw=%d u=%d..%d v=%d..%d atlas=%d pb=%d,%d", (int)texPage, (unsigned)clut, (int)view,
-			         minU, maxU, minV, maxV, *outAtlasIdx, *outPixelBaseU, *outPixelBaseV);
-			N3DS_DebugLog(thMsg);
-		}
-#endif
 
 		s_rmemoValid = 1;
 		s_rmemoTier = 2;
@@ -4496,20 +4291,6 @@ void NativeRenderer_BeginScene(void)
 		N3DS_DebugLog(s_triDumpFile ? "[CTR-3DS] triangle dump armed for this frame" : "[CTR-3DS] triangle dump fopen FAILED");
 	}
 #endif
-
-	/* tirelog trace (remove with the hunt): the VBO monotonicity check and
-	 * the tire flags are frame-scope; EndScene's flush clears the flags on
-	 * merge frames, this covers non-merge frames and the toggle turning on
-	 * mid-session. */
-	g_tirelogFrameNow = (unsigned long)s_frameCounter;
-	if (g_dbg_tireVtxLog)
-	{
-		s_tvboLastEnd = 0;
-		s_runHasTire = 0;
-		memset(s_binHasTire, 0, sizeof(s_binHasTire));
-		memset(s_segHasTire, 0, sizeof(s_segHasTire));
-		memset(s_osegHasTire, 0, sizeof(s_osegHasTire));
-	}
 
 	/* Working-set estimate is per frame, so latch its peak and restart the
 	 * count at the frame boundary. BeginScene is guarded against re-entry by
@@ -6790,13 +6571,6 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 						}
 					}
 				}
-				if (g_dbg_tireVtxLog && N3DS_TireVtxIsTire(triVerts, untextured))
-				{
-					/* A tire triangle here means its depth stamp landed in the
-					 * UI band -- a misclassification finding by itself. */
-					N3DS_TireVtxLogTri(triVerts, (int)texView, s_currentBlendMode, atlasIdx, pixelBaseU, pixelBaseV, 'U', 0,
-					                   (uiDst != NULL) ? 1 : 0);
-				}
 				continue;
 			}
 		}
@@ -6817,12 +6591,6 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 #ifdef CTR_INTERNAL
 			N3DS_TriDumpRecord(triVerts, !untextured, untextured ? 255 : (int)s_currentTexFormat, atlasIdx, pixelBaseU, pixelBaseV, originU, originV);
 #endif
-			if (g_dbg_tireVtxLog && N3DS_TireVtxIsTire(triVerts, untextured))
-			{
-				N3DS_TireVtxLogTri(triVerts, (int)texView, s_currentBlendMode, atlasIdx, pixelBaseU, pixelBaseV, 'B', bin,
-				                   s_mergeBinUsed[bin]);
-				s_binHasTire[bin] = 1;
-			}
 
 			if (perfScopes)
 			{
@@ -6864,12 +6632,6 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 #ifdef CTR_INTERNAL
 		N3DS_TriDumpRecord(triVerts, !untextured, untextured ? 255 : (int)s_currentTexFormat, atlasIdx, pixelBaseU, pixelBaseV, originU, originV);
 #endif
-		if (g_dbg_tireVtxLog && N3DS_TireVtxIsTire(triVerts, untextured))
-		{
-			N3DS_TireVtxLogTri(triVerts, (int)texView, s_currentBlendMode, atlasIdx, pixelBaseU, pixelBaseV, 'R', s_mergeBlendSegCount,
-			                   s_runVertCount);
-			s_runHasTire = 1;
-		}
 
 		if (perfScopes)
 		{
