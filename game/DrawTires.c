@@ -335,18 +335,6 @@ static void DrawTiresSolid_LoadCorner(struct DrawTiresScratch *scratch, int vect
 
 static int DrawTiresSolid_SelectSpriteIndex(int angleValue)
 {
-#if defined(CTR_NATIVE) && defined(CTR_INTERNAL)
-	/* Invisible-tire hunt: dumpreq `tirepin` pins every wheel to sprite 0 (the
-	 * suspect frame) so the one-frame blink becomes a steady state. Remove
-	 * with the hunt. */
-	extern int g_tirehuntPin0;
-
-	if (g_tirehuntPin0)
-	{
-		return 0;
-	}
-#endif
-
 	int tableIndex = angleValue >> 5;
 
 	if (angleValue < 0)
