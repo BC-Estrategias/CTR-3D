@@ -224,6 +224,20 @@ int main(int argc, char *argv[])
 	// screen console does not exist until the renderer starts, and startup
 	// errors below report through stderr.
 	N3DS_EarlyInit();
+
+	/*
+	 * SD logging is off by default because the flush costs a stalled frame per
+	 * window. A release build has no chord and no dumpreq to turn it back on,
+	 * so an empty enable-log.txt dropped beside the .3dsx is the switch: the
+	 * check runs before the first header line, so an enabled log is complete
+	 * from boot.
+	 */
+	if (N3DS_AppDirHasFile("enable-log.txt"))
+	{
+		N3DS_SetSdLogEnabled(1);
+		N3DS_DebugLog("[CTR-3DS] logging: enabled by enable-log.txt");
+	}
+
 	N3DS_DebugLog("[CTR-3DS] main() entered");
 #endif
 

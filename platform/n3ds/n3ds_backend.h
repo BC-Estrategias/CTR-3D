@@ -639,6 +639,12 @@ int N3DS_NetloadStreamActive(void);
  * makes -- see the policy note at Platform_LogWrite. */
 int N3DS_SdLogEnabled(void);
 
+/* Turns that same sink on or off. Lives outside the debug-surface gate so a
+ * shipped build can still be asked for a log (see the enable-log.txt check at
+ * boot in main.c); the SELECT+R chord and dumpreq `sdlog` are the CTR_INTERNAL
+ * routes to the same switch. */
+void N3DS_SetSdLogEnabled(int enabled);
+
 /* Registers the emulated PSX VRAM buffer so the debug capture (dumpreq `capture`) in
  * N3DS_ReadButtons can write it to sdmc:/vramdump_<frame>.bin. Called once
  * from the renderer TU (which owns vram[]) since the backend TU can't see

@@ -69,6 +69,11 @@ void SDL_free(void *mem);
  * roots rather than trusting cwd (see sdl3_compat_3ds.c). */
 const char *SDL_GetBasePath(void);
 
+/* True when `name` is readable directly under one of those same candidate
+ * roots. For opt-in marker files dropped next to the .3dsx; presence is the
+ * whole signal, contents are never read. */
+bool N3DS_AppDirHasFile(const char *name);
+
 /* --------------------------------------------------------------- timer --- */
 
 Uint64 SDL_GetPerformanceCounter(void);

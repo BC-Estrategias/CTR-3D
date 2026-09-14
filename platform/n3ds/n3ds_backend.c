@@ -85,6 +85,13 @@ int N3DS_SdLogEnabled(void)
 	return g_dbg_sdLog;
 }
 
+void N3DS_SetSdLogEnabled(int enabled)
+{
+	extern int g_dbg_sdLog;
+
+	g_dbg_sdLog = (enabled != 0);
+}
+
 static void N3DS_NetloadStreamExit(void)
 {
 	if (s_socBuffer != NULL)

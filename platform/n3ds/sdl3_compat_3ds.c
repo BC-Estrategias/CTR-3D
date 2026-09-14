@@ -44,28 +44,61 @@ void SDL_free(void *mem)
 	(void)mem;
 }
 
+/*
+ * The working directory a .3dsx starts in is not dependable: it differs
+ * between the Homebrew Launcher, 3dslink and an emulator. Rather than guess,
+ * probe the plausible roots and use whichever one actually holds the install.
+ * Order matters only in that the working directory is tried first, so a
+ * self-contained install wins. Every consumer that looks for a file "next to
+ * the .3dsx" must walk this same list, or two of them will disagree about
+ * where the app lives.
+ */
+static const char *const s_n3dsAppDirCandidates[] = {
+	".",
+	"sdmc:/3ds/ctr_native",
+	"sdmc:/3ds/ctr-native",
+	"sdmc:/ctr-native",
+	"sdmc:/",
+};
+
+#define N3DS_APP_DIR_CANDIDATE_COUNT (sizeof(s_n3dsAppDirCandidates) / sizeof(s_n3dsAppDirCandidates[0]))
+
+bool N3DS_AppDirHasFile(const char *name)
+{
+	unsigned int i;
+
+	if (name == NULL)
+	{
+		return false;
+	}
+
+	for (i = 0; i < N3DS_APP_DIR_CANDIDATE_COUNT; i++)
+	{
+		char probe[128];
+		FILE *f;
+
+		snprintf(probe, sizeof(probe), "%s/%s", s_n3dsAppDirCandidates[i], name);
+
+		f = fopen(probe, "rb");
+		if (f != NULL)
+		{
+			fclose(f);
+			return true;
+		}
+	}
+
+	return false;
+}
+
 const char *SDL_GetBasePath(void)
 {
-	/*
-	 * The working directory a .3dsx starts in is not dependable: it differs
-	 * between the Homebrew Launcher, 3dslink and an emulator. Rather than
-	 * guess, probe the plausible roots for the disc image and hand the asset
-	 * layer whichever one actually has it. Order matters only in that the
-	 * working directory is tried first, so a self-contained install wins.
-	 */
-	static const char *const candidates[] = {
-		".",
-		"sdmc:/3ds/ctr_native",
-		"sdmc:/3ds/ctr-native",
-		"sdmc:/ctr-native",
-		"sdmc:/",
-	};
 	static char s_resolved[64];
 	unsigned int i;
 	int anyDirReadable = 0;
 
-	for (i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); i++)
+	for (i = 0; i < N3DS_APP_DIR_CANDIDATE_COUNT; i++)
 	{
+		const char *const candidate = s_n3dsAppDirCandidates[i];
 		char probe[96];
 		char note[160];
 		struct stat st;
@@ -73,21 +106,21 @@ const char *SDL_GetBasePath(void)
 		int hasAssets;
 		FILE *f;
 
-		hasDir = (stat(candidates[i], &st) == 0) && S_ISDIR(st.st_mode);
+		hasDir = (stat(candidate, &st) == 0) && S_ISDIR(st.st_mode);
 
-		snprintf(probe, sizeof(probe), "%s/assets", candidates[i]);
+		snprintf(probe, sizeof(probe), "%s/assets", candidate);
 		hasAssets = (stat(probe, &st) == 0) && S_ISDIR(st.st_mode);
 
 		anyDirReadable |= hasDir;
 
-		snprintf(probe, sizeof(probe), "%s/assets/ctr-u.bin", candidates[i]);
+		snprintf(probe, sizeof(probe), "%s/assets/ctr-u.bin", candidate);
 		f = fopen(probe, "rb");
 
 		/* Report each candidate separately: "dir but no assets" means the wrong
 		 * folder, "assets but no bin" means the image was not copied, and no
 		 * readable directory at all means the SD mount itself is the problem. */
 		snprintf(note, sizeof(note), "[CTR-3DS] probe %-24s dir=%s assets=%s bin=%s",
-		         candidates[i], hasDir ? "yes" : "no", hasAssets ? "yes" : "no",
+		         candidate, hasDir ? "yes" : "no", hasAssets ? "yes" : "no",
 		         (f != NULL) ? "YES" : "no");
 		N3DS_DebugLog(note);
 
@@ -95,7 +128,7 @@ const char *SDL_GetBasePath(void)
 		{
 			fclose(f);
 
-			snprintf(s_resolved, sizeof(s_resolved), "%s", candidates[i]);
+			snprintf(s_resolved, sizeof(s_resolved), "%s", candidate);
 			N3DS_DebugLog("[CTR-3DS] using disc image under the root above");
 			return s_resolved;
 		}
