@@ -16,6 +16,7 @@
 
 #if defined(CTR_NATIVE)
 #include <platform/native_audio.h>
+#include <platform/native_log.h>
 // platform/native_options.c -- repoints unused LNG slots for the native
 // options menu once the language table exists (local-extern idiom).
 extern void NativeOptions_InstallStrings(void);
@@ -108,13 +109,6 @@ u32 main(void)
 		LOAD_NextQueuedFile();
 		// NOTE(aalhendi): ASM-verified NTSC-U 926 0x8003c5d0-0x8003c5dc for per-frame XA pause handling.
 		CDSYS_XAPauseAtEnd();
-
-#ifdef CTR_NATIVE
-		// Next to retail's own per-frame file-queue pump for the same reason:
-		// this is the one place every game-thread frame passes through,
-		// whatever state the game is in. Self-gating -- see the function.
-		LOAD_NativeXaWarmBackgroundStep();
-#endif
 
 		switch (sdata->mainGameState)
 		{
@@ -694,14 +688,40 @@ void StateZero()
 	VSyncCallback(MainDrawCb_Vsync);
 
 #ifdef CTR_NATIVE
-	// No disc/SD warm belongs on this thread here: nothing is presenting yet,
-	// so a blocking read freezes the boot splash black for its whole cost.
-	// The crate intro's level extents are pumped per frame from stage 6 of
-	// LOAD_TenStages (LOAD_NativeCrateIntroSplashStep); the XA voice cache and
-	// MUSIC memo are pumped in the background from the main loop
-	// (LOAD_NativeXaWarmBackgroundStep). The "Start your engines" XA line
-	// played a few lines below reads over the cold/uncached path, as does any
-	// voice line that opens before the background warm lands.
+	// The XA voice-line cache is tens of MB of reads, and this is the only
+	// stretch of the boot with nothing on a clock to disturb: the SCEA logo is
+	// already presented, no music has started, and the frame loop has not begun.
+	// Hold here and keep presenting the logo rather than letting the cost land
+	// on the crate load stage (which holds against audible intro music the
+	// crate scene is timed off) or on the menus (which are interactive).
+	// Must stay above Music_SetIntro for that reason.
+	//
+	// The MUSIC sector-count memo is table-fed and reads nothing, so what this
+	// holds for is the GAME and EXTRA voice-line cache alone.
+	{
+		enum
+		{
+			MAIN_SCEA_WARM_SECTORS_PER_FRAME = 64
+		};
+
+		u32 sceaWarmFrames = 0;
+
+		NativeAudio_VoiceCacheEnsureBegin();
+		while (!NativeAudio_VoiceCacheEnsureStep(MAIN_SCEA_WARM_SECTORS_PER_FRAME))
+		{
+			VSync(0);
+			Platform_PresentVRAMDisplay();
+			sceaWarmFrames++;
+		}
+
+		if (sceaWarmFrames > 0)
+		{
+			// Silent on PC and on any 3DS boot with nothing to read: no hold,
+			// nothing to report.
+			Platform_LogInstrument("[XAWARM] scea hold frames=%u sectors=%u\n", (unsigned)sceaWarmFrames,
+			                       (unsigned)(sceaWarmFrames * MAIN_SCEA_WARM_SECTORS_PER_FRAME));
+		}
+	}
 
 	// 3DS boots to speedometer mode (bit 8): the minimap lives on the bottom
 	// screen there (UI_RenderFrame_Racing routes it), so the speedometer is

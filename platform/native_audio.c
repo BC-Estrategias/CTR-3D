@@ -3672,16 +3672,14 @@ internal int NativeAudio_XAVoiceCacheOpen(struct NativeAudioXaSource *source, co
 	return 1;
 }
 
-/* Aggregate progress for the whole boot XA warm (music warm + both
- * voice-cache categories); see NativeAudio_VoiceCacheEnsureBegin/Step. */
+/* Aggregate progress for the whole boot XA warm (music memo + both voice-cache
+ * categories); see NativeAudio_VoiceCacheEnsureBegin/Step. */
 internal struct
 {
 	b32 active;
 	int stage; /* 0=music warm, 1=cache GAME, 2=cache EXTRA, 3=finalize */
 	int tracks;
 	int sectors;
-	u32 warmSteps;
-	u32 warmSectors;
 } s_vce;
 
 /* Resumable state for one category's build pass (GAME then EXTRA). A step
@@ -4203,9 +4201,6 @@ int NativeAudio_VoiceCacheEnsureStep(int budgetSectors)
 	{
 		return 1;
 	}
-	s_vce.warmSteps++;
-	s_vce.warmSectors += (u32)((budgetSectors > 0) ? budgetSectors : NATIVE_DISC_IMAGE_CHUNK_SECTORS);
-
 	switch (s_vce.stage)
 	{
 	case 0:
@@ -4257,23 +4252,12 @@ int NativeAudio_VoiceCacheEnsureStep(int budgetSectors)
 		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] voice cache built: %d tracks, %d sectors, %u KiB of %u KiB budget", s_vce.tracks, s_vce.sectors,
 		                            (unsigned)(s_xaVoiceCache.blobUsed >> 10), (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
 	}
-	NativeAudio_XAVoiceCacheLog("[XAWARMBG] steps=%u sectors=%u", (unsigned)s_vce.warmSteps, (unsigned)s_vce.warmSectors);
 	s_vce.active = 0;
 	return 1;
 #else
 	(void)budgetSectors;
 	return 1;
 #endif
-}
-
-// One-shot fallback for callers outside the load-stage pump (and the sole PC
-// no-op path): runs every step back-to-back with no per-call budget cap.
-void NativeAudio_VoiceCacheEnsure(void)
-{
-	NativeAudio_VoiceCacheEnsureBegin();
-	while (!NativeAudio_VoiceCacheEnsureStep(0))
-	{
-	}
 }
 
 // Core streaming primitive: reads and decodes exactly one more matching XA

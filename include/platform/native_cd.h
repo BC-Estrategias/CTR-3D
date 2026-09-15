@@ -21,9 +21,4 @@ void NativeCD_PrefetchExtent(int encodedLoc, int byteSize);
 int NativeCD_PrefetchExtentBegin(int encodedLoc, int byteSize);
 int NativeCD_PrefetchPump(int maxSectors);
 
-// Nonzero while a begun extent still has sectors left to pump. There is one
-// pending slot, so this is also the answer to "does another caller own the
-// chunked prefetch right now". Always 0 off the 3DS.
-int NativeCD_PrefetchIsPending(void);
-
 #endif

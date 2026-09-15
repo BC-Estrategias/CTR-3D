@@ -21,16 +21,11 @@ void NativeAudio_SpuSetCommonCDReverb(s32 enabled);
 int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volumeRight);
 // One-time (per boot) XA voice-line preload: reads every GAME-category track
 // plus the wrong-way EXTRA barks into RAM so mid-race voice-line opens do zero
-// disc reads. One-shot blocking form (loops the resumable step below with no
-// budget cap); self-gates after the first call. No-op off the 3DS (PC disk
-// reads never stalled a frame).
-void NativeAudio_VoiceCacheEnsure(void);
-// Resumable form, so the caller's frame loop keeps running while the warm
-// happens: call Begin once, then Step once per frame (budgetSectors = max
-// disc/SD sectors read this call, 0 = uncapped) until it returns nonzero.
-// Nothing on screen waits on it -- opens before it completes take the cold
-// path -- so it must be driven from a frame where no other reader owns the
-// card, never from a stage the game is holding.
+// disc reads. Resumable so the caller stays in control of the screen while it
+// runs: Begin once, then Step (budgetSectors = max disc/SD sectors read per
+// call, 0 = uncapped) until it returns nonzero, presenting between calls.
+// Self-gates after the first Begin. No-op off the 3DS (PC disk reads never
+// stalled a frame). Opens that happen before it completes take the cold path.
 void NativeAudio_VoiceCacheEnsureBegin(void);
 int NativeAudio_VoiceCacheEnsureStep(int budgetSectors);
 int NativeAudio_PlayXAFile(const char *relativePath, int channelFilter, int volumeLeft, int volumeRight);

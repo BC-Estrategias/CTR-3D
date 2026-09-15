@@ -16,7 +16,6 @@ void LOAD_StringToUpper(char *path)
 
 #ifdef CTR_NATIVE
 #include <platform/native_cd.h>
-#include <platform/native_audio.h>
 #include <platform/native_log.h>
 
 // Resumable state for the boot crate-intro level-file prefetch (VRAM then LEV)
@@ -81,8 +80,8 @@ int LOAD_NativePrefetchCrateIntroStep(struct BigHeader *bigfile, int budgetSecto
 // own two level-file extents are in the CD read cache. The intro music is
 // already playing and audible while this stage is held, and the crate scene is
 // timed off that music, so only work the crate scene itself needs may run
-// here: anything that merely has to be warm by the time a race ends belongs in
-// the background pump below instead.
+// here: anything else that wants warming belongs at the silent SCEA hold in
+// StateZero, before the music starts.
 //
 // A slow SD card that can't finish inside a reasonable number of held frames
 // forces the rest through synchronously here (bounded, logged) rather than
@@ -122,63 +121,6 @@ int LOAD_NativeCrateIntroSplashStep(struct BigHeader *bigfile)
 
 	s_lfCrateSplashFrames = 0;
 	return 1;
-}
-
-// One disc pump per frame. Every native pump here runs on the game thread and
-// the card is one shared spindle, so a pump nothing is waiting on must stand
-// down for anything that is: a level load, a chunked prefetch another pump
-// already owns, or an XA stream whose next sector the DSP is draining toward.
-internal int LOAD_NativeDiscPumpIsIdle(void)
-{
-	return (sdata->Loading.stage == LOAD_IDLE) && !NativeCD_PrefetchIsPending() && !NativeAudio_IsXAPlaying();
-}
-
-// The boot XA warm -- the MUSIC sector-count memo and the GAME/EXTRA voice-line
-// RAM caches, tens of MB of reads -- continued in the background. Nothing on
-// screen waits for it: until it lands, a voice line or a MUSIC track opens over
-// the cold path exactly as it would with no cache at all, and it only has to be
-// done before the first race ends, which is the once-per-boot hitch it removes.
-// Stepped once per frame from the main loop, and only on a frame where no other
-// reader owns the card.
-//
-// It does not start until the boot intro chain has reached the main menu: each
-// step is a whole bounded SD read, long enough on the slow-card target to be
-// seen, and the crate and Oxide intros are where that would show most.
-void LOAD_NativeXaWarmBackgroundStep(void)
-{
-	enum
-	{
-		LOAD_XA_WARM_SECTORS_PER_FRAME = 64
-	};
-
-	local_persist b32 s_lfXaWarmDone;
-	local_persist b32 s_lfXaWarmArmed;
-
-	if (s_lfXaWarmDone)
-	{
-		return;
-	}
-
-	if (!s_lfXaWarmArmed)
-	{
-		if (sdata->gGT->levelID != MAIN_MENU_LEVEL)
-		{
-			return;
-		}
-		s_lfXaWarmArmed = 1;
-	}
-
-	if (!LOAD_NativeDiscPumpIsIdle())
-	{
-		return;
-	}
-
-	NativeAudio_VoiceCacheEnsureBegin();
-
-	if (NativeAudio_VoiceCacheEnsureStep(LOAD_XA_WARM_SECTORS_PER_FRAME))
-	{
-		s_lfXaWarmDone = 1;
-	}
 }
 
 // Prefetch all nine Oxide-intro cutscene scenes (VRAM/LEV/PTR per scene,

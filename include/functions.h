@@ -356,7 +356,6 @@ void LOAD_LevelFile(int levelID);
 int LOAD_NativePrefetchCrateIntroStep(struct BigHeader *bigfile, int budgetSectors);
 int LOAD_NativeIntroCutscenePrefetchStep(struct BigHeader *bigfile);
 int LOAD_NativeCrateIntroSplashStep(struct BigHeader *bigfile);
-void LOAD_NativeXaWarmBackgroundStep(void);
 #endif
 
 void LOAD_HowlCallback(u8 result, u8 *unk);
