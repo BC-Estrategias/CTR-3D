@@ -3907,10 +3907,35 @@ internal int NativeAudio_XAVoiceCacheBuildCategoryStep(int budgetSectors)
  * pass, each bounded by its own XNF slot exactly as NativeAudio_XAStreamOpenTrack
  * bounds it (an unbounded count would report the whole channel's length for a
  * short track and the game would then play silence out to the fake end).
- * Resumable, and nothing on screen waits for it: it is pumped in the
- * background after boot, so a MUSIC open before it lands still pays its own
- * scan and every open after it does not. */
+ * Resumable, so a caller can spread it across frames. The scan is the fallback
+ * path: on the disc this port accepts, the table below fills the same memo with
+ * the same values and no reads at all. */
 #define NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS 32
+
+/* Every MUSIC track's audio-sector count is a constant of the NTSC-U disc --
+ * the only disc this port accepts -- and discovering them by scanning costs
+ * ~48 MiB of game-thread reads. These are those constants, next to the XNF
+ * fields that identify the disc they were taken from.
+ *
+ * A row is used only when the live XNF entry matches it field for field, and
+ * the match is all-or-nothing: any other disc, or a re-cut XNF, falls through
+ * to the scan rather than playing a track out to a wrong length. Regenerate a
+ * changed disc's rows from the scan's own [XAWARM] music lines. */
+struct NativeAudioMusicCountRow
+{
+	s16 xaID;
+	s16 entryIndex;
+	s16 fileNumber;
+	s16 channelFilter;
+	s16 slotSectors;  /* XNF numSectors: the bound the scan runs to */
+	s16 audioSectors; /* what the scan returns, and what the memo stores */
+};
+
+internal const struct NativeAudioMusicCountRow s_mcTableNtscU[] = {
+    {0, 0, 0, 0, 1162, 146},   {1, 1, 0, 1, 1162, 146},   {2, 2, 0, 2, 1162, 145},   {3, 3, 0, 3, 1162, 145},  {4, 4, 0, 4, 10337, 1292},
+    {5, 5, 0, 5, 10337, 1292}, {6, 6, 0, 6, 252, 31},     {7, 7, 1, 0, 2378, 298},   {8, 8, 1, 1, 2375, 297},  {9, 9, 1, 2, 2410, 301},
+    {10, 10, 1, 3, 2375, 297}, {11, 11, 1, 4, 2385, 298}, {12, 12, 1, 5, 2403, 300},
+};
 
 internal u8 s_mcwChunkBuf[NATIVE_DISC_IMAGE_CHUNK_SECTORS * XA_FULL_SECTOR_SIZE];
 internal struct
@@ -3932,6 +3957,37 @@ internal struct
 		struct NativeAudioXaTrackInfo info;
 	} tracks[NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS];
 } s_mcw;
+
+/* Fills the count memo from the table when every wanted MUSIC track matches its
+ * row. All-or-nothing on purpose: a partial match means the XNF is not the one
+ * these counts came from, and a half-table memo is worse than either half. */
+internal int NativeAudio_MusicCountTableFill(void)
+{
+	int t;
+
+	if (s_mcw.numTracks != (int)len(s_mcTableNtscU))
+	{
+		return 0;
+	}
+
+	for (t = 0; t < s_mcw.numTracks; t++)
+	{
+		const struct NativeAudioMusicCountRow *row = &s_mcTableNtscU[t];
+		const struct NativeAudioXaTrackInfo *info = &s_mcw.tracks[t].info;
+
+		if ((s_mcw.tracks[t].xaID != row->xaID) || (info->entryIndex != row->entryIndex) || (info->fileNumber != row->fileNumber) ||
+		    (info->channelFilter != row->channelFilter) || (info->numSectors != row->slotSectors))
+		{
+			return 0;
+		}
+	}
+
+	for (t = 0; t < s_mcw.numTracks; t++)
+	{
+		s_xaAudioSectorCountMemo[s_mcw.tracks[t].info.entryIndex] = s_mcTableNtscU[t].audioSectors;
+	}
+	return 1;
+}
 
 internal void NativeAudio_MusicCountWarmBegin(void)
 {
@@ -3956,6 +4012,17 @@ internal void NativeAudio_MusicCountWarmBegin(void)
 		s_mcw.numTracks++;
 		s_mcw.filesWanted |= 1u << info.fileNumber;
 	}
+
+	if (NativeAudio_MusicCountTableFill())
+	{
+		NativeAudio_XAVoiceCacheLog("[XAWARM] music counts from table (%d/%d)", s_mcw.numTracks, s_mcw.numTracks);
+		/* Step returns done on its first call: no MUSIC file is ever opened. */
+		s_mcw.warmed = s_mcw.numTracks;
+		s_mcw.active = 0;
+		return;
+	}
+
+	NativeAudio_XAVoiceCacheLog("[XAWARM] music count table mismatch, scanning");
 	s_mcw.active = 1;
 }
 
@@ -4098,7 +4165,8 @@ internal int NativeAudio_MusicCountWarmStep(int budgetSectors)
 /* Orchestrates the resumable boot XA warm: MUSIC sector-count memo, then the
  * GAME and EXTRA voice-line RAM caches, in that order so the caches (bigger,
  * budget-limited) never crowd out the memo that every MUSIC open depends on.
- * Self-gates to a no-op after the first Begin (and on PC). */
+ * Self-gates to a no-op after the first Begin (and on PC). The memo half is
+ * table-fed and costs no reads unless the disc's XNF is an unknown one. */
 void NativeAudio_VoiceCacheEnsureBegin(void)
 {
 #if defined(__3DS__)
