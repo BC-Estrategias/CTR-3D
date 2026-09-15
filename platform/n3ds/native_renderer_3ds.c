@@ -5454,10 +5454,35 @@ void NativeRenderer_SwapWindow(void)
 				 * ndspDrop = cumulative refused submits (pool full / sink
 				 * down). Worker-side lag lives in the [PERF] header's
 				 * audioBacklog/audioDropped, not here. */
-				snprintf(cacheLine, sizeof(cacheLine), "[CTR-3DS] audio voicesX10=%lu vblanks=%lu reverbSamples=%d xaActive=%d ndspQ=%d ndspDrop=%d hwKiB=%d denied=%d",
-				         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive, N3DS_NdspGetQueuedBlocks(), N3DS_NdspGetDroppedBlocks(),
-				         N3DS_HwVoiceStoreGetUsedKiB(), N3DS_HwVoiceGetDenied());
-				N3DS_DebugLog(cacheLine);
+				/* hwKiB = decoded-sample bytes the store is holding right now,
+				 * hwHiKiB its tail-cursor high-water mark (the gap is space
+				 * the free list reclaimed). denied = key-ons that found all 23
+				 * DSP channels sounding; rebind = key-ons that reused an idle
+				 * channel another voice held. storeFull = allocations the
+				 * store refused, storeLost = key-ons silenced because even
+				 * reclaiming could not serve them. */
+				{
+					char audioLine[256];
+
+					snprintf(audioLine, sizeof(audioLine),
+					         "[CTR-3DS] audio voicesX10=%lu vblanks=%lu reverbSamples=%d xaActive=%d ndspQ=%d ndspDrop=%d hwKiB=%d hwHiKiB=%d denied=%d "
+					         "rebind=%d storeFull=%d storeLost=%lu storeResets=%d",
+					         voicesX10, shapeVblanks, s_audioShapeReverbSamples, s_audioShapeXaActive, N3DS_NdspGetQueuedBlocks(),
+					         N3DS_NdspGetDroppedBlocks(), N3DS_HwVoiceStoreGetUsedKiB(), N3DS_HwVoiceStoreGetHiWaterKiB(), N3DS_HwVoiceGetDenied(),
+					         N3DS_HwVoiceGetRebinds(), N3DS_HwVoiceStoreGetDrops(), (unsigned long)s_hwStoreLostKeyOns, N3DS_HwVoiceStoreGetResets());
+					N3DS_DebugLog(audioLine);
+
+#ifdef CTR_INTERNAL
+					/* dupAddr is the store's leak tripwire: a fresh slot taken
+					 * for an address the table already covers means the cache
+					 * key has stopped being the SPU address alone. */
+					snprintf(audioLine, sizeof(audioLine), "[HWSTORE] allocs=%lu allocKiB=%lu dupAddr=%lu dupKiB=%lu grow=%lu released=%lu reclaims=%lu",
+					         (unsigned long)s_hwStoreCensus.allocs, (unsigned long)(s_hwStoreCensus.allocBytes >> 10), (unsigned long)s_hwStoreCensus.dupAddr,
+					         (unsigned long)(s_hwStoreCensus.dupBytes >> 10), (unsigned long)s_hwStoreCensus.growReleases, (unsigned long)s_hwStoreCensus.releases,
+					         (unsigned long)s_hwStoreCensus.reclaimRetries);
+					N3DS_DebugLog(audioLine);
+#endif
+				}
 
 				/*
 				 * The per-wake budget breakdown. An earlier measurement established

@@ -60,17 +60,21 @@
  * key-on (the pre-chunking behavior), for A/B on hardware. */
 int g_dbg_hwSyncDecode = 0;
 
+/*
+ * Keyed on the SPU address alone. NativeAudio_DecodeSpuSample and the extent
+ * scan both walk from addr to the first ADPCM_LOOP_END, so the decoded PCM
+ * and its length are a function of addr and nothing else; a voice's loop
+ * address only shifts loopStart, which every key-on reads from its own scan.
+ * Widening the key would admit the same decoded sample into a second slot.
+ */
 struct NativeAudioHwSampleCacheEntry
 {
 	u32 addr;
-	u32 loopAddr;
 	s16 *pcm;
 	int capacity; /* slot size in samples -- slots outlive their content */
 	int count;
-	int loopStart;
-	int loopEnd;
-	b32 loopEnabled;
 	u32 spuBytes; /* SPU-side extent (16 bytes per 28 samples), for overlap tests */
+	u32 lastUse;  /* claim/hit ordinal -- the reclaim gives up the smallest first */
 	int used;
 	int stale; /* slot allocated but content invalidated by an SpuWrite */
 	/* Chunked-decode cursor: key-on decodes only a head chunk on the game
@@ -85,6 +89,39 @@ struct NativeAudioHwSampleCacheEntry
 };
 
 global_variable struct NativeAudioHwSampleCacheEntry s_hwSampleCache[NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES];
+
+/* Monotonic use ordinal stamped on every cache hit and every claim. The store
+ * runs full once a bank's whole working set is decoded, so which entry the
+ * reclaim gives up decides whether a hot sample has to be decoded twice. */
+global_variable u32 s_hwSampleUseSeq;
+
+/* Key-ons the store could not serve at all -- the sound is lost. Reported as
+ * storeLost on the audio shape line; the store's own allocation-failure count
+ * (storeFull) includes attempts the reclaim below went on to satisfy. */
+global_variable u32 s_hwStoreLostKeyOns;
+
+#ifdef CTR_INTERNAL
+/*
+ * Store-growth census, the instrument for any future "the store is full"
+ * hunt: allocs/allocBytes are what the store was asked to hold, releases and
+ * reclaimRetries how much of it came back. dupAddr is a tripwire -- a fresh
+ * slot taken for an address the table already covers means the cache key has
+ * stopped being the SPU address alone. growReleases is the streaming case:
+ * the same address re-scanned larger than its slot, whose old block would
+ * otherwise be stranded.
+ */
+struct NativeAudioHwStoreCensus
+{
+	u32 allocs;
+	u32 allocBytes;
+	u32 dupAddr;
+	u32 dupBytes;
+	u32 growReleases;
+	u32 releases;
+	u32 reclaimRetries;
+};
+global_variable struct NativeAudioHwStoreCensus s_hwStoreCensus;
+#endif
 
 struct NativeAudioHwVoiceShadow
 {
@@ -2128,14 +2165,15 @@ internal void NativeAudio_FreeVoicePcm(struct NativeAudioVoice *voice)
 }
 
 #if defined(__3DS__)
-internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleCacheLookup(u32 addr, u32 loopAddr)
+internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleCacheLookup(u32 addr)
 {
 	int i;
 
 	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
 	{
-		if (s_hwSampleCache[i].used && !s_hwSampleCache[i].stale && (s_hwSampleCache[i].addr == addr) && (s_hwSampleCache[i].loopAddr == loopAddr))
+		if (s_hwSampleCache[i].used && !s_hwSampleCache[i].stale && (s_hwSampleCache[i].addr == addr))
 		{
+			s_hwSampleCache[i].lastUse = ++s_hwSampleUseSeq;
 			return &s_hwSampleCache[i];
 		}
 	}
@@ -2144,24 +2182,179 @@ internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleCacheLookup(u
 }
 
 /*
- * Get an entry with a slot big enough for sampleCount, preferring (in
- * order): the STALE entry for this same key (streaming rewrites the same
- * address with same-shaped content -- reusing its slot is what bounds
- * store growth), a never-used entry with a fresh allocation, then
- * recycling any stale slot large enough. Recycling clears voices still
- * pointing at the stolen slot so nothing plays recycled memory.
+ * Silence every voice still reading this slot. The DSP keeps reading the
+ * block until its channel is cleared and the mirror's own stop is a vblank
+ * away, so a slot that is about to be freed or overwritten has to be cut
+ * here rather than left to the mirror.
  */
-internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleSlotAcquire(u32 addr, u32 loopAddr, int sampleCount)
+internal void NativeAudio_HwSampleDetachVoices(struct NativeAudioHwSampleCacheEntry *entry)
+{
+	int v;
+
+	for (v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
+	{
+		if (s_audio.voices[v].pcm != entry->pcm)
+		{
+			continue;
+		}
+		N3DS_HwVoiceStop(v);
+		s_hwVoiceShadow[v].started = 0;
+		NativeAudio_FreeVoicePcm(&s_audio.voices[v]);
+		s_audio.voices[v].sampleDirty = 1;
+	}
+}
+
+/* True while a voice is still sounding out of this slot; such an entry is the
+ * one thing in the store that cannot be reclaimed. */
+internal int NativeAudio_HwSampleEntryIsPlaying(const struct NativeAudioHwSampleCacheEntry *entry)
+{
+	int v;
+
+	for (v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
+	{
+		if ((s_audio.voices[v].pcm == entry->pcm) && s_audio.voices[v].active && (s_audio.voices[v].adsrPhase != NATIVE_AUDIO_ADSR_OFF))
+		{
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/* Give an entry's slot back to the store and clear the entry. */
+internal void NativeAudio_HwSampleEntryRelease(struct NativeAudioHwSampleCacheEntry *entry)
+{
+	if (!entry->used)
+	{
+		return;
+	}
+
+	NativeAudio_HwSampleDetachVoices(entry);
+	N3DS_HwVoiceStoreFree(entry->pcm);
+	memset(entry, 0, sizeof(*entry));
+#ifdef CTR_INTERNAL
+	s_hwStoreCensus.releases++;
+#endif
+}
+
+/*
+ * Get an entry whose slot holds sampleCount, preferring in order: the stale
+ * entry for this same address (a streaming rewrite of the same sample --
+ * reusing its slot in place is what keeps the store flat), a never-used
+ * entry with a fresh slot, then the smallest stale slot that fits. A
+ * same-address entry whose slot has become too small is released rather than
+ * stranded, and a store with no room reclaims until it can serve the request,
+ * so exhaustion costs a re-decode instead of a silent sound.
+ */
+internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleSlotAcquire(u32 addr, int sampleCount)
 {
 	struct NativeAudioHwSampleCacheEntry *entry = NULL;
 	int i;
 
 	for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
 	{
-		if (s_hwSampleCache[i].used && s_hwSampleCache[i].stale && (s_hwSampleCache[i].addr == addr) && (s_hwSampleCache[i].loopAddr == loopAddr) &&
-		    (s_hwSampleCache[i].capacity >= sampleCount))
+		if (!s_hwSampleCache[i].used || !s_hwSampleCache[i].stale || (s_hwSampleCache[i].addr != addr))
+		{
+			continue;
+		}
+		if (s_hwSampleCache[i].capacity >= sampleCount)
 		{
 			entry = &s_hwSampleCache[i];
+		}
+		else
+		{
+			NativeAudio_HwSampleEntryRelease(&s_hwSampleCache[i]);
+#ifdef CTR_INTERNAL
+			s_hwStoreCensus.growReleases++;
+#endif
+		}
+		break;
+	}
+
+	if (entry == NULL)
+	{
+		for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+		{
+			s16 *slot;
+
+			if (s_hwSampleCache[i].used)
+			{
+				continue;
+			}
+
+			slot = (s16 *)N3DS_HwVoiceStoreAlloc(sampleCount);
+			if (slot == NULL)
+			{
+				int pass;
+
+				/*
+				 * Nothing in the store is pinned except what is sounding right
+				 * now, so release the coldest victim and retry, giving up only
+				 * as much cached decode as this sample needs: stale entries
+				 * first (their content is already invalid), then live entries
+				 * no voice is playing (a re-key costs a re-decode).
+				 */
+				for (pass = 0; (pass < 2) && (slot == NULL); pass++)
+				{
+					while (slot == NULL)
+					{
+						struct NativeAudioHwSampleCacheEntry *victim = NULL;
+						int j;
+
+						for (j = 0; j < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; j++)
+						{
+							struct NativeAudioHwSampleCacheEntry *candidate = &s_hwSampleCache[j];
+
+							if (!candidate->used)
+							{
+								continue;
+							}
+							if ((pass == 0) ? !candidate->stale : NativeAudio_HwSampleEntryIsPlaying(candidate))
+							{
+								continue;
+							}
+							if ((victim == NULL) || (candidate->lastUse < victim->lastUse))
+							{
+								victim = candidate;
+							}
+						}
+						if (victim == NULL)
+						{
+							break;
+						}
+						NativeAudio_HwSampleEntryRelease(victim);
+						slot = (s16 *)N3DS_HwVoiceStoreAlloc(sampleCount);
+					}
+				}
+#ifdef CTR_INTERNAL
+				s_hwStoreCensus.reclaimRetries++;
+#endif
+			}
+			if (slot == NULL)
+			{
+				break; /* store exhausted -- try recycling a stale slot below */
+			}
+
+#ifdef CTR_INTERNAL
+			{
+				int d;
+
+				for (d = 0; d < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; d++)
+				{
+					if (s_hwSampleCache[d].used && (s_hwSampleCache[d].addr == addr))
+					{
+						s_hwStoreCensus.dupAddr++;
+						s_hwStoreCensus.dupBytes += (u32)sampleCount * 2u;
+						break;
+					}
+				}
+				s_hwStoreCensus.allocs++;
+				s_hwStoreCensus.allocBytes += (u32)sampleCount * 2u;
+			}
+#endif
+			entry = &s_hwSampleCache[i];
+			entry->pcm = slot;
+			entry->capacity = sampleCount;
 			break;
 		}
 	}
@@ -2170,41 +2363,18 @@ internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleSlotAcquire(u
 	{
 		for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
 		{
-			if (!s_hwSampleCache[i].used)
+			if (!s_hwSampleCache[i].used || !s_hwSampleCache[i].stale || (s_hwSampleCache[i].capacity < sampleCount))
 			{
-				s16 *slot = (s16 *)N3DS_HwVoiceStoreAlloc(sampleCount);
-
-				if (slot == NULL)
-				{
-					break; /* store full -- try recycling below */
-				}
+				continue;
+			}
+			if ((entry == NULL) || (s_hwSampleCache[i].capacity < entry->capacity))
+			{
 				entry = &s_hwSampleCache[i];
-				entry->pcm = slot;
-				entry->capacity = sampleCount;
-				break;
 			}
 		}
-	}
-
-	if (entry == NULL)
-	{
-		for (i = 0; i < NATIVE_AUDIO_HW_SAMPLE_CACHE_ENTRIES; i++)
+		if (entry != NULL)
 		{
-			if (s_hwSampleCache[i].used && s_hwSampleCache[i].stale && (s_hwSampleCache[i].capacity >= sampleCount))
-			{
-				int v;
-
-				entry = &s_hwSampleCache[i];
-				for (v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
-				{
-					if (s_audio.voices[v].pcm == entry->pcm)
-					{
-						NativeAudio_FreeVoicePcm(&s_audio.voices[v]);
-						s_audio.voices[v].sampleDirty = 1;
-					}
-				}
-				break;
-			}
+			NativeAudio_HwSampleDetachVoices(entry);
 		}
 	}
 
@@ -2213,7 +2383,7 @@ internal struct NativeAudioHwSampleCacheEntry *NativeAudio_HwSampleSlotAcquire(u
 		entry->used = 1;
 		entry->stale = 0;
 		entry->addr = addr;
-		entry->loopAddr = loopAddr;
+		entry->lastUse = ++s_hwSampleUseSeq;
 	}
 
 	return entry;
@@ -2274,7 +2444,7 @@ internal void NativeAudio_HwStreamInvalidateRange(u32 writeStart, u32 writeEnd)
 			int loopEnd;
 			b32 loopEnabled;
 
-			if (NativeAudio_ScanSpuSampleExtent(entry->addr, entry->loopAddr, &scanCount, &loopStart, &loopEnd, &loopEnabled) &&
+			if (NativeAudio_ScanSpuSampleExtent(entry->addr, 0, &scanCount, &loopStart, &loopEnd, &loopEnabled) &&
 			    (scanCount <= entry->capacity))
 			{
 				struct NativeAudioPcmBuffer pcm;
@@ -2289,9 +2459,6 @@ internal void NativeAudio_HwStreamInvalidateRange(u32 writeStart, u32 writeEnd)
 					/* Refresh is a complete decode: leave no pending tail for
 					 * the pump (a streaming rewrite may land mid-fill). */
 					entry->decoded = pcm.count;
-					entry->loopStart = loopStart;
-					entry->loopEnd = loopEnd;
-					entry->loopEnabled = loopEnabled;
 					entry->spuBytes = ((u32)(pcm.count + 27) / 28u) * 16u;
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 					s_voiceProf.windowHwRefresh++;
@@ -2310,14 +2477,9 @@ internal void NativeAudio_HwStreamInvalidateRange(u32 writeStart, u32 writeEnd)
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 		s_voiceProf.windowHwStaled++;
 #endif
-		for (v = 0; v < NATIVE_AUDIO_SPU_VOICE_COUNT; v++)
-		{
-			if (s_audio.voices[v].pcm == entry->pcm)
-			{
-				NativeAudio_FreeVoicePcm(&s_audio.voices[v]);
-				s_audio.voices[v].sampleDirty = 1;
-			}
-		}
+		/* Cutting the DSP channel here, not a vblank later at the mirror, is
+		 * what lets the slot be reclaimed and refilled safely. */
+		NativeAudio_HwSampleDetachVoices(entry);
 	}
 }
 
@@ -2597,17 +2759,18 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 	 * both table and store via NativeAudio_ResetVoicePcmArenaNoLock.
 	 */
 	{
-		struct NativeAudioHwSampleCacheEntry *entry = NativeAudio_HwSampleCacheLookup(voice->attr.addr, voice->attr.loop_addr);
+		struct NativeAudioHwSampleCacheEntry *entry = NativeAudio_HwSampleCacheLookup(voice->attr.addr);
 
 		(void)arenaMarker;
 		(void)pcm;
 		if (entry == NULL)
 		{
-			entry = NativeAudio_HwSampleSlotAcquire(voice->attr.addr, voice->attr.loop_addr, scanCount);
+			entry = NativeAudio_HwSampleSlotAcquire(voice->attr.addr, scanCount);
 			if (entry == NULL)
 			{
-				/* Store/table exhausted (counted backend-side): same
-				 * failure shape as an arena-exhausted decode on PC. */
+				/* Store and table both exhausted: same failure shape as an
+				 * arena-exhausted decode on PC, and one lost sound. */
+				s_hwStoreLostKeyOns++;
 				NativeAudio_FreeVoicePcm(voice);
 				voice->active = 0;
 				voice->sampleDirty = 0;
@@ -2615,9 +2778,6 @@ internal int NativeAudio_UpdateVoiceSample(struct NativeAudioVoice *voice)
 			}
 
 			entry->count = scanCount;
-			entry->loopStart = loopStart;
-			entry->loopEnd = loopEnd;
-			entry->loopEnabled = loopEnabled;
 			entry->spuBytes = ((u32)(scanCount + 27) / 28u) * 16u;
 			entry->decoded = 0;
 			entry->nextBlock = voice->attr.addr;
