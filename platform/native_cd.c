@@ -425,6 +425,15 @@ int NativeCD_PrefetchPump(int maxSectors)
 #endif
 }
 
+int NativeCD_PrefetchIsPending(void)
+{
+#if defined(__3DS__)
+	return s_cdPrefetchPending.data != NULL;
+#else
+	return 0;
+#endif
+}
+
 internal s32 NativeCD_ReadSectors(s32 sectors, void *dst)
 {
 	size_t byteCount;
