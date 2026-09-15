@@ -25,9 +25,12 @@ int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volume
 // budget cap); self-gates after the first call. No-op off the 3DS (PC disk
 // reads never stalled a frame).
 void NativeAudio_VoiceCacheEnsure(void);
-// Resumable form, driven from a load stage so the caller's frame loop keeps
-// running: call Begin once, then Step once per frame (budgetSectors = max
+// Resumable form, so the caller's frame loop keeps running while the warm
+// happens: call Begin once, then Step once per frame (budgetSectors = max
 // disc/SD sectors read this call, 0 = uncapped) until it returns nonzero.
+// Nothing on screen waits on it -- opens before it completes take the cold
+// path -- so it must be driven from a frame where no other reader owns the
+// card, never from a stage the game is holding.
 void NativeAudio_VoiceCacheEnsureBegin(void);
 int NativeAudio_VoiceCacheEnsureStep(int budgetSectors);
 int NativeAudio_PlayXAFile(const char *relativePath, int channelFilter, int volumeLeft, int volumeRight);

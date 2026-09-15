@@ -3672,16 +3672,16 @@ internal int NativeAudio_XAVoiceCacheOpen(struct NativeAudioXaSource *source, co
 	return 1;
 }
 
-/* Aggregate progress for the whole splash-screen audio warm (music warm +
- * both voice-cache categories); see NativeAudio_VoiceCacheEnsureBegin/Step. */
+/* Aggregate progress for the whole boot XA warm (music warm + both
+ * voice-cache categories); see NativeAudio_VoiceCacheEnsureBegin/Step. */
 internal struct
 {
 	b32 active;
 	int stage; /* 0=music warm, 1=cache GAME, 2=cache EXTRA, 3=finalize */
 	int tracks;
 	int sectors;
-	u32 splashSteps;
-	u32 splashSectors;
+	u32 warmSteps;
+	u32 warmSectors;
 } s_vce;
 
 /* Resumable state for one category's build pass (GAME then EXTRA). A step
@@ -3907,8 +3907,9 @@ internal int NativeAudio_XAVoiceCacheBuildCategoryStep(int budgetSectors)
  * pass, each bounded by its own XNF slot exactly as NativeAudio_XAStreamOpenTrack
  * bounds it (an unbounded count would report the whole channel's length for a
  * short track and the game would then play silence out to the fake end).
- * Resumable, driven from the crate-intro load stage inside the silent splash;
- * the game thread never scans a MUSIC file. */
+ * Resumable, and nothing on screen waits for it: it is pumped in the
+ * background after boot, so a MUSIC open before it lands still pays its own
+ * scan and every open after it does not. */
 #define NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS 32
 
 internal u8 s_mcwChunkBuf[NATIVE_DISC_IMAGE_CHUNK_SECTORS * XA_FULL_SECTOR_SIZE];
@@ -4094,10 +4095,10 @@ internal int NativeAudio_MusicCountWarmStep(int budgetSectors)
 }
 #endif
 
-/* Orchestrates the resumable splash-screen audio warm: MUSIC sector-count
- * memo, then the GAME and EXTRA voice-line RAM caches, in that order so the
- * caches (bigger, budget-limited) never crowd out the memo that every MUSIC
- * open depends on. Self-gates to a no-op after the first Begin (and on PC). */
+/* Orchestrates the resumable boot XA warm: MUSIC sector-count memo, then the
+ * GAME and EXTRA voice-line RAM caches, in that order so the caches (bigger,
+ * budget-limited) never crowd out the memo that every MUSIC open depends on.
+ * Self-gates to a no-op after the first Begin (and on PC). */
 void NativeAudio_VoiceCacheEnsureBegin(void)
 {
 #if defined(__3DS__)
@@ -4134,8 +4135,8 @@ int NativeAudio_VoiceCacheEnsureStep(int budgetSectors)
 	{
 		return 1;
 	}
-	s_vce.splashSteps++;
-	s_vce.splashSectors += (u32)((budgetSectors > 0) ? budgetSectors : NATIVE_DISC_IMAGE_CHUNK_SECTORS);
+	s_vce.warmSteps++;
+	s_vce.warmSectors += (u32)((budgetSectors > 0) ? budgetSectors : NATIVE_DISC_IMAGE_CHUNK_SECTORS);
 
 	switch (s_vce.stage)
 	{
@@ -4188,7 +4189,7 @@ int NativeAudio_VoiceCacheEnsureStep(int budgetSectors)
 		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] voice cache built: %d tracks, %d sectors, %u KiB of %u KiB budget", s_vce.tracks, s_vce.sectors,
 		                            (unsigned)(s_xaVoiceCache.blobUsed >> 10), (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
 	}
-	NativeAudio_XAVoiceCacheLog("[SPLASHIO] steps=%u sectors=%u", s_vce.splashSteps, s_vce.splashSectors);
+	NativeAudio_XAVoiceCacheLog("[XAWARMBG] steps=%u sectors=%u", (unsigned)s_vce.warmSteps, (unsigned)s_vce.warmSectors);
 	s_vce.active = 0;
 	return 1;
 #else

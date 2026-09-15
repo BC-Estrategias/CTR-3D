@@ -109,6 +109,13 @@ u32 main(void)
 		// NOTE(aalhendi): ASM-verified NTSC-U 926 0x8003c5d0-0x8003c5dc for per-frame XA pause handling.
 		CDSYS_XAPauseAtEnd();
 
+#ifdef CTR_NATIVE
+		// Next to retail's own per-frame file-queue pump for the same reason:
+		// this is the one place every game-thread frame passes through,
+		// whatever state the game is in. Self-gating -- see the function.
+		LOAD_NativeXaWarmBackgroundStep();
+#endif
+
 		switch (sdata->mainGameState)
 		{
 		// Initialize Game (happens once)
@@ -687,18 +694,14 @@ void StateZero()
 	VSyncCallback(MainDrawCb_Vsync);
 
 #ifdef CTR_NATIVE
-	// The XA voice-cache warm and crate-intro CD-cache prefetch used to run
-	// synchronously here, before frame 1 -- a large blocking disc/SD read on
-	// this thread that froze the boot splash black for the whole cost (up to
-	// low-teens seconds on a slow card) instead of just ducking the sequencer
-	// for it. Both are now pumped per frame from stage 6 of LOAD_TenStages
-	// (LOAD_NativeCrateIntroSplashStep, held on levelID == NAUGHTY_DOG_CRATE,
-	// same mechanism as the Oxide-intro cutscene prefetch above it) so this
-	// thread's frame loop -- and the VSync-driven music sequencer -- keeps
-	// running while the work happens. The "Start your engines" XA line played
-	// a few lines below reads over the cold/uncached path exactly as it did
-	// before either optimization existed; only the crate intro's own voice
-	// lines and level reads, later, depend on the caches being ready by then.
+	// No disc/SD warm belongs on this thread here: nothing is presenting yet,
+	// so a blocking read freezes the boot splash black for its whole cost.
+	// The crate intro's level extents are pumped per frame from stage 6 of
+	// LOAD_TenStages (LOAD_NativeCrateIntroSplashStep); the XA voice cache and
+	// MUSIC memo are pumped in the background from the main loop
+	// (LOAD_NativeXaWarmBackgroundStep). The "Start your engines" XA line
+	// played a few lines below reads over the cold/uncached path, as does any
+	// voice line that opens before the background warm lands.
 
 	// 3DS boots to speedometer mode (bit 8): the minimap lives on the bottom
 	// screen there (UI_RenderFrame_Racing routes it), so the speedometer is
