@@ -200,26 +200,40 @@ int N3DS_NdspGetDspEmptyEvents(void);
 int N3DS_AudioSetAggTarget(int parcels);
 
 /*
- * Hardware voices (plan B): SPU voices 0..22 play on ndsp's
- * own channels; the parcel sink above becomes the music channel (23). SPU
- * voice 23 is sacrificed (lifecycle only, denials counted). All functions
- * are called from the single mixing thread (worker, or the StepVBlank
- * fallback); pointers passed here must come from N3DS_HwVoiceStoreAlloc,
- * whose linear memory the DSP reads directly.
+ * Hardware voices (plan B): the PS1's 24 SPU voices play on ndsp channels
+ * 0..22, dynamically mapped -- a voice holds a channel from key-on until it
+ * stops or the DSP consumes its last buffer, and a key-on with no channel of
+ * its own takes the idle channel unused longest. Channel 23 is the parcel
+ * sink above (music/XA). Every function here is called under native_audio.c's
+ * output lock, from either the mixing thread's mirror or the game thread's
+ * SpuSetKey/SpuWrite; pointers passed here must come from
+ * N3DS_HwVoiceStoreAlloc, whose linear memory the DSP reads directly.
  *
  * Store contract: Alloc a slot, decode into it, Commit (cache flush) --
- * then it may be handed to N3DS_HwVoiceStart. StoreReset silences every
+ * then it may be handed to N3DS_HwVoiceStart. Free returns a slot to the
+ * store; silence any voice still pointing at it first, because the DSP
+ * reads the block until its channel is cleared. StoreReset silences every
  * hardware channel and recycles the whole store (SPU bank re-upload);
  * callers must re-Alloc afterwards.
  */
 short *N3DS_HwVoiceStoreAlloc(int sampleCount);
+void N3DS_HwVoiceStoreFree(const short *pcm);
 void N3DS_HwVoiceStoreCommit(const short *pcm, int sampleCount);
 void N3DS_HwVoiceStoreReset(void);
 void N3DS_HwVoiceStart(int voice, const short *pcm, int sampleCount, int loopStart, int loopEnd, int loopEnabled, int startSample, float rateHz);
 void N3DS_HwVoiceSetRate(int voice, float rateHz);
 void N3DS_HwVoiceSetMix(int voice, float left, float right);
 void N3DS_HwVoiceStop(int voice);
+/* Key-ons that found every channel still sounding (a lost sound), and key-ons
+ * that reused an idle channel another voice held (the map doing its job). */
 int N3DS_HwVoiceGetDenied(void);
+int N3DS_HwVoiceGetRebinds(void);
+/* Bytes currently held by live slots, and the tail cursor's high-water mark --
+ * the gap between them is reclaimed space. Drops are allocations the store
+ * could not serve; resets are whole-store recycles at a bank reload. */
 int N3DS_HwVoiceStoreGetUsedKiB(void);
+int N3DS_HwVoiceStoreGetHiWaterKiB(void);
+int N3DS_HwVoiceStoreGetDrops(void);
+int N3DS_HwVoiceStoreGetResets(void);
 
 #endif

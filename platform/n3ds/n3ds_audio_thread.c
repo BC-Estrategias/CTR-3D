@@ -142,16 +142,24 @@ extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *life
  */
 #define N3DS_NDSP_AGG_DEFAULT  3
 /*
- * Channel plan (ndsp has exactly 24): SPU voices 0..22 map 1:1 onto ndsp
- * channels 0..22 as MONO_PCM16 hardware voices; channel 23 carries the
- * music/parcel stream (XA + anything else MixFrame still renders). SPU
- * voice 23 therefore has no audible channel -- its lifecycle still runs
- * bit-exact for the game's benefit, and denials are counted
- * (N3DS_HwVoiceGetDenied) so hardware data can tell us whether voice 23
- * matters enough to earn a steal policy.
+ * Channel plan (ndsp has exactly 24): channel 23 carries the music/parcel
+ * stream (XA + anything else MixFrame still renders), leaving 0..22 for the
+ * PS1's 24 SPU voices as MONO_PCM16 hardware voices. The voice->channel map
+ * is dynamic, not 1:1: a voice holds a channel from key-on until it is
+ * stopped or the DSP consumes its last wave buffer, and a key-on with no
+ * channel of its own takes whichever idle channel has gone unused longest.
+ * A fixed 1:1 map leaves one SPU voice permanently mute, and the game keys
+ * every one of them on. Denials -- all 23 channels sounding at once -- are
+ * counted (N3DS_HwVoiceGetDenied).
  */
-#define N3DS_NDSP_CHANNEL     23
-#define N3DS_HW_VOICE_COUNT   23
+#define N3DS_NDSP_CHANNEL      23
+#define N3DS_HW_CHANNEL_COUNT  23
+/*
+ * The PS1's voice count, hand-matched to native_audio.c's
+ * NATIVE_AUDIO_SPU_VOICE_COUNT the same way the parcel frame count above is:
+ * the game-side header cannot cross this TU boundary.
+ */
+#define N3DS_SPU_VOICE_COUNT   24
 
 /*
  * Output-stage gain, applied only where mix levels meet ndsp (the music
@@ -232,11 +240,28 @@ static u32 s_ndspDspEmptyEvents;
  */
 static int s_ndspAggTarget = N3DS_NDSP_AGG_DEFAULT;
 
-/* Hardware-voice linear store (see the plan-B section below for the full
- * story); declared here because N3DS_NdspSinkShutdown frees it. */
-#define N3DS_HW_STORE_BYTES (3 * 1024 * 1024)
-static s16 *s_hwStore;    /* linearAlloc'd; NULL until first use */
-static u32 s_hwStoreUsed; /* bump allocator, bytes */
+/* Hardware-voice linear store (full contract at the plan-B section below);
+ * declared here because N3DS_NdspSinkShutdown frees it. */
+#define N3DS_HW_STORE_BYTES  (3 * 1024 * 1024)
+#define N3DS_HW_STORE_BLOCKS 256
+struct N3DS_HwStoreBlock
+{
+	u32 off;
+	u32 bytes;
+	int inUse;
+};
+static s16 *s_hwStore;         /* linearAlloc'd; NULL until first use */
+static u32 s_hwStoreHiWater;   /* bytes the block table spans; the tail cursor never retreats */
+static u32 s_hwStoreLive;      /* bytes held by allocated blocks right now */
+/* Offset-ordered and contiguous over [0, s_hwStoreHiWater) -- both the
+ * best-fit search and the coalesce on release depend on that order. */
+static struct N3DS_HwStoreBlock s_hwStoreBlocks[N3DS_HW_STORE_BLOCKS];
+static int s_hwStoreBlockCount;
+
+/* Both reset state this file defines further down, next to the hardware
+ * voices that own it. */
+static void N3DS_HwStoreBlocksReset(void);
+static void N3DS_HwVoiceMapReset(void);
 
 static void N3DS_NdspSinkInit(void)
 {
@@ -298,6 +323,8 @@ static void N3DS_NdspSinkInit(void)
 	s_ndspRate = N3DS_NDSP_MIXER_RATE_HZ;
 	s_ndspGainLeft = 1.0f;
 	s_ndspGainRight = 1.0f;
+
+	N3DS_HwVoiceMapReset();
 
 	s_ndspUp = 1;
 	snprintf(line, sizeof(line), "[CTR-3DS] ndsp: up (%d aggs x %d parcels x <=%d frames)", N3DS_NDSP_BLOCK_COUNT, N3DS_NDSP_AGG_PARCELS,
@@ -366,7 +393,7 @@ static void N3DS_NdspSinkShutdown(void)
 	{
 		int v;
 
-		for (v = 0; v < N3DS_HW_VOICE_COUNT; v++)
+		for (v = 0; v < N3DS_HW_CHANNEL_COUNT; v++)
 		{
 			ndspChnWaveBufClear(v);
 		}
@@ -382,8 +409,9 @@ static void N3DS_NdspSinkShutdown(void)
 	{
 		linearFree(s_hwStore);
 		s_hwStore = NULL;
-		s_hwStoreUsed = 0;
+		N3DS_HwStoreBlocksReset();
 	}
+	N3DS_HwVoiceMapReset();
 	s_ndspUp = 0;
 	s_ndspInitAttempted = 0; /* a later re-Init may bring the sink back up */
 	s_ndspNextBuf = 0;
@@ -632,31 +660,75 @@ int N3DS_AudioSetAggTarget(int parcels)
  * state); this side owns everything libctru: the linear-memory sample
  * store the DSP reads from, wave-buffer chains, and the channel calls.
  *
- * Threading: all pokes arrive from the single mixing thread (worker, or
- * the StepVBlank fallback -- never both), same invariant as the sink ring
- * above. ndspChn* calls are internally locked by libctru.
+ * Threading: every entry point here runs under native_audio.c's output
+ * lock -- the mixing thread through the per-vblank mirror, the game thread
+ * through SpuSetKey/SpuWrite -- so the store's block table and the
+ * voice<->channel map need no lock of their own. ndspChn* calls are
+ * internally locked by libctru.
  */
 
-/* Decoded PCM16 the DSP can address must live in linear memory, and linear
- * headroom after the renderer's atlases is ~4MB. The entire PS1 SPU RAM is
- * 512KB of ADPCM ~= 1.75MB decoded, so 3MB (declared above with the sink
- * statics -- shutdown frees it) holds a full bank of decodes with slack;
- * the store resets whenever the game re-uploads over cached regions (bank
- * reload), which also silences every hardware channel first so the DSP
- * never reads freed samples. */
+/*
+ * Decoded PCM16 the DSP can address must live in linear memory, and linear
+ * headroom after the renderer's atlases is ~4MB, so growing the store is not
+ * a lever -- reclaiming is. The entire PS1 SPU RAM is 512KB of ADPCM ~= 1.75MB
+ * decoded, so 3MB (declared above with the sink statics -- shutdown frees it)
+ * holds a full bank of decodes with slack provided abandoned slots come back.
+ * Blocks are handed out best-fit from the table and coalesced with their free
+ * neighbours on release; the tail cursor advances only when nothing free fits.
+ * The whole store also resets when the game re-uploads over cached regions
+ * (bank reload), which silences every hardware channel first so the DSP never
+ * reads freed samples.
+ */
 static u32 s_hwStoreResets;   /* diagnostic */
 static u32 s_hwStoreFullDrops;
-static u32 s_hwVoice23Denied; /* keyons on the sacrificed SPU voice 23 */
+static u32 s_hwVoiceDenied;   /* key-ons dropped because every channel was still sounding */
+static u32 s_hwVoiceRebinds;  /* key-ons that took an idle channel away from another voice */
 
 /* Two wave buffers per channel: [start..loopEnd) once, then [loopStart..
  * loopEnd) looping forever until the CPU says stop. One-shots use only
- * the first. */
-static ndspWaveBuf s_hwBufs[N3DS_HW_VOICE_COUNT][2];
+ * the first. Indexed by CHANNEL: the DSP holds these pointers for as long
+ * as it owns the channel, which outlives any one voice's claim on it. */
+static ndspWaveBuf s_hwBufs[N3DS_HW_CHANNEL_COUNT][2];
+
+/* Voice <-> channel map. -1 means unbound, which is not the zero-init every
+ * other static here gets, so N3DS_HwVoiceMapReset seeds both directions from
+ * sink init, store reset and shutdown. */
+static int s_hwVoiceChan[N3DS_SPU_VOICE_COUNT];
+static int s_hwChanVoice[N3DS_HW_CHANNEL_COUNT];
+/* Key-on ordinal per channel; the victim search takes the smallest, i.e. the
+ * idle channel that has gone unused longest. */
+static u32 s_hwChanSeq[N3DS_HW_CHANNEL_COUNT];
+static u32 s_hwChanSeqNext;
+
+static void N3DS_HwVoiceMapReset(void)
+{
+	int i;
+
+	for (i = 0; i < N3DS_SPU_VOICE_COUNT; i++)
+	{
+		s_hwVoiceChan[i] = -1;
+	}
+	for (i = 0; i < N3DS_HW_CHANNEL_COUNT; i++)
+	{
+		s_hwChanVoice[i] = -1;
+		s_hwChanSeq[i] = 0;
+	}
+	s_hwChanSeqNext = 0;
+}
+
+static void N3DS_HwStoreBlocksReset(void)
+{
+	memset(s_hwStoreBlocks, 0, sizeof(s_hwStoreBlocks));
+	s_hwStoreBlockCount = 0;
+	s_hwStoreHiWater = 0;
+	s_hwStoreLive = 0;
+}
 
 short *N3DS_HwVoiceStoreAlloc(int sampleCount)
 {
-	s16 *slot;
 	u32 bytes;
+	int best = -1;
+	int i;
 
 	if (s_hwStore == NULL)
 	{
@@ -666,6 +738,7 @@ short *N3DS_HwVoiceStoreAlloc(int sampleCount)
 			N3DS_DebugLog("[CTR-3DS] hw-voice store: linearAlloc FAILED -- voices silent");
 			return NULL;
 		}
+		N3DS_HwStoreBlocksReset();
 	}
 	if (sampleCount <= 0)
 	{
@@ -673,15 +746,97 @@ short *N3DS_HwVoiceStoreAlloc(int sampleCount)
 	}
 
 	bytes = ((u32)sampleCount * sizeof(s16) + 31u) & ~31u; /* cache-line align keeps flushes exact */
-	if (s_hwStoreUsed + bytes > N3DS_HW_STORE_BYTES)
+
+	for (i = 0; i < s_hwStoreBlockCount; i++)
+	{
+		if (s_hwStoreBlocks[i].inUse || (s_hwStoreBlocks[i].bytes < bytes))
+		{
+			continue;
+		}
+		if ((best < 0) || (s_hwStoreBlocks[i].bytes < s_hwStoreBlocks[best].bytes))
+		{
+			best = i;
+		}
+	}
+
+	if (best >= 0)
+	{
+		u32 remainder = s_hwStoreBlocks[best].bytes - bytes;
+
+		/* Split only when the tail is big enough to serve a later sample and
+		 * a record is free to track it; otherwise the caller keeps the slack
+		 * rather than stranding an untracked hole. */
+		if ((remainder >= 64u) && (s_hwStoreBlockCount < N3DS_HW_STORE_BLOCKS))
+		{
+			memmove(&s_hwStoreBlocks[best + 2], &s_hwStoreBlocks[best + 1], (size_t)(s_hwStoreBlockCount - best - 1) * sizeof(s_hwStoreBlocks[0]));
+			s_hwStoreBlocks[best + 1].off = s_hwStoreBlocks[best].off + bytes;
+			s_hwStoreBlocks[best + 1].bytes = remainder;
+			s_hwStoreBlocks[best + 1].inUse = 0;
+			s_hwStoreBlocks[best].bytes = bytes;
+			s_hwStoreBlockCount++;
+		}
+		s_hwStoreBlocks[best].inUse = 1;
+		s_hwStoreLive += s_hwStoreBlocks[best].bytes;
+		return (short *)((u8 *)s_hwStore + s_hwStoreBlocks[best].off);
+	}
+
+	if (((s_hwStoreHiWater + bytes) > N3DS_HW_STORE_BYTES) || (s_hwStoreBlockCount >= N3DS_HW_STORE_BLOCKS))
 	{
 		s_hwStoreFullDrops++;
 		return NULL;
 	}
 
-	slot = (s16 *)((u8 *)s_hwStore + s_hwStoreUsed);
-	s_hwStoreUsed += bytes;
-	return slot;
+	s_hwStoreBlocks[s_hwStoreBlockCount].off = s_hwStoreHiWater;
+	s_hwStoreBlocks[s_hwStoreBlockCount].bytes = bytes;
+	s_hwStoreBlocks[s_hwStoreBlockCount].inUse = 1;
+	s_hwStoreBlockCount++;
+	s_hwStoreHiWater += bytes;
+	s_hwStoreLive += bytes;
+
+	return (short *)((u8 *)s_hwStore + s_hwStoreBlocks[s_hwStoreBlockCount - 1].off);
+}
+
+void N3DS_HwVoiceStoreFree(const short *pcm)
+{
+	u32 off;
+	int i;
+
+	if ((s_hwStore == NULL) || (pcm == NULL))
+	{
+		return;
+	}
+
+	off = (u32)((const u8 *)pcm - (const u8 *)s_hwStore);
+	for (i = 0; i < s_hwStoreBlockCount; i++)
+	{
+		if (s_hwStoreBlocks[i].inUse && (s_hwStoreBlocks[i].off == off))
+		{
+			break;
+		}
+	}
+	if (i >= s_hwStoreBlockCount)
+	{
+		/* A pointer from before a store reset: its block is already gone. */
+		return;
+	}
+
+	s_hwStoreBlocks[i].inUse = 0;
+	s_hwStoreLive -= s_hwStoreBlocks[i].bytes;
+
+	/* Coalesce forward first, then backward, so a run of releases leaves one
+	 * block rather than a fragment per sample. */
+	if (((i + 1) < s_hwStoreBlockCount) && !s_hwStoreBlocks[i + 1].inUse)
+	{
+		s_hwStoreBlocks[i].bytes += s_hwStoreBlocks[i + 1].bytes;
+		memmove(&s_hwStoreBlocks[i + 1], &s_hwStoreBlocks[i + 2], (size_t)(s_hwStoreBlockCount - i - 2) * sizeof(s_hwStoreBlocks[0]));
+		s_hwStoreBlockCount--;
+	}
+	if ((i > 0) && !s_hwStoreBlocks[i - 1].inUse)
+	{
+		s_hwStoreBlocks[i - 1].bytes += s_hwStoreBlocks[i].bytes;
+		memmove(&s_hwStoreBlocks[i], &s_hwStoreBlocks[i + 1], (size_t)(s_hwStoreBlockCount - i - 1) * sizeof(s_hwStoreBlocks[0]));
+		s_hwStoreBlockCount--;
+	}
 }
 
 void N3DS_HwVoiceStoreCommit(const short *pcm, int sampleCount)
@@ -691,41 +846,117 @@ void N3DS_HwVoiceStoreCommit(const short *pcm, int sampleCount)
 
 void N3DS_HwVoiceStoreReset(void)
 {
-	int v;
+	int ch;
 
 	/* Channels first: the store's contents are about to be recycled. Skipped
 	 * with the sink down (dumpreq `ndspoff`) -- the DSP owns nothing to
 	 * silence and ndspChnWaveBufClear would touch a torn-down channel. */
 	if (s_ndspUp)
 	{
-		for (v = 0; v < N3DS_HW_VOICE_COUNT; v++)
+		for (ch = 0; ch < N3DS_HW_CHANNEL_COUNT; ch++)
 		{
-			ndspChnWaveBufClear(v);
+			ndspChnWaveBufClear(ch);
 		}
 	}
-	s_hwStoreUsed = 0;
+	memset(s_hwBufs, 0, sizeof(s_hwBufs));
+	N3DS_HwVoiceMapReset();
+	N3DS_HwStoreBlocksReset();
 	s_hwStoreResets++;
+}
+
+/*
+ * A channel is reusable once nothing it was handed is still due to play:
+ * no voice bound, or every wave buffer consumed. libctru's own ndsp thread
+ * writes those statuses from the DSP's frame, so this read is deliberately
+ * unsynchronised -- being one audio frame stale can only delay a rebind,
+ * never hand out a channel that is still sounding. A looping buffer never
+ * leaves PLAYING, so a looping voice holds its channel until the CPU stops it.
+ */
+static int N3DS_HwChannelIsIdle(int ch)
+{
+	int i;
+
+	if (s_hwChanVoice[ch] < 0)
+	{
+		return 1;
+	}
+	for (i = 0; i < 2; i++)
+	{
+		if ((s_hwBufs[ch][i].status == NDSP_WBUF_QUEUED) || (s_hwBufs[ch][i].status == NDSP_WBUF_PLAYING))
+		{
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+/*
+ * Channel for a key-on: the one this voice already holds (retrigger), else
+ * the idle channel unused longest. -1 means all 23 are still sounding, the
+ * only case that costs a sound.
+ */
+static int N3DS_HwChannelAcquire(int voice)
+{
+	int best = -1;
+	int ch;
+
+	if (s_hwVoiceChan[voice] >= 0)
+	{
+		s_hwChanSeq[s_hwVoiceChan[voice]] = ++s_hwChanSeqNext;
+		return s_hwVoiceChan[voice];
+	}
+
+	for (ch = 0; ch < N3DS_HW_CHANNEL_COUNT; ch++)
+	{
+		if (!N3DS_HwChannelIsIdle(ch))
+		{
+			continue;
+		}
+		if ((best < 0) || (s_hwChanSeq[ch] < s_hwChanSeq[best]))
+		{
+			best = ch;
+		}
+	}
+	if (best < 0)
+	{
+		return -1;
+	}
+
+	if (s_hwChanVoice[best] >= 0)
+	{
+		/* The previous owner keeps its lifecycle and loses only its output;
+		 * its later SetRate/SetMix/Stop become no-ops through the map. */
+		s_hwVoiceChan[s_hwChanVoice[best]] = -1;
+		s_hwVoiceRebinds++;
+	}
+	s_hwChanVoice[best] = voice;
+	s_hwVoiceChan[voice] = best;
+	s_hwChanSeq[best] = ++s_hwChanSeqNext;
+
+	return best;
+}
+
+static int N3DS_HwVoiceChannel(int voice)
+{
+	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_SPU_VOICE_COUNT))
+	{
+		return -1;
+	}
+
+	return s_hwVoiceChan[voice];
 }
 
 void N3DS_HwVoiceStart(int voice, const short *pcm, int sampleCount, int loopStart, int loopEnd, int loopEnabled, int startSample, float rateHz)
 {
 	ndspWaveBuf *bufs;
 	int firstEnd;
+	int ch;
 
-	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_HW_VOICE_COUNT) || (pcm == NULL) || (sampleCount <= 0))
+	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_SPU_VOICE_COUNT) || (pcm == NULL) || (sampleCount <= 0))
 	{
-		if (s_ndspUp && (voice == N3DS_HW_VOICE_COUNT))
-		{
-			s_hwVoice23Denied++;
-		}
 		return;
 	}
-
-	bufs = s_hwBufs[voice];
-	ndspChnWaveBufClear(voice); /* retrigger = PS1 keyon semantics */
-	ndspChnSetFormat(voice, NDSP_FORMAT_MONO_PCM16);
-	ndspChnSetInterp(voice, NDSP_INTERP_POLYPHASE);
-	ndspChnSetRate(voice, rateHz);
 
 	if (startSample < 0)
 	{
@@ -736,68 +967,112 @@ void N3DS_HwVoiceStart(int voice, const short *pcm, int sampleCount, int loopSta
 		return;
 	}
 
+	ch = N3DS_HwChannelAcquire(voice);
+	if (ch < 0)
+	{
+		s_hwVoiceDenied++;
+		return;
+	}
+
+	bufs = s_hwBufs[ch];
+	ndspChnWaveBufClear(ch); /* retrigger = PS1 keyon semantics */
+	/* Both slots, not just the one about to be filled: the previous sound on
+	 * this channel may have queued the loop buffer. */
+	memset(bufs, 0, sizeof(s_hwBufs[0]));
+	ndspChnSetFormat(ch, NDSP_FORMAT_MONO_PCM16);
+	ndspChnSetInterp(ch, NDSP_INTERP_POLYPHASE);
+	ndspChnSetRate(ch, rateHz);
+
 	/* First segment: from the start offset up to the loop end (or the
 	 * whole sample when not looping). The PS1 plays [start..loopEnd) then
 	 * jumps to loopStart; a start offset past loopEnd (restored state)
 	 * just plays out the tail before looping normally. */
 	firstEnd = (loopEnabled && (loopEnd > startSample) && (loopEnd <= sampleCount)) ? loopEnd : sampleCount;
 
-	memset(&bufs[0], 0, sizeof(bufs[0]));
 	bufs[0].data_pcm16 = (s16 *)pcm + startSample;
 	bufs[0].nsamples = (u32)(firstEnd - startSample);
 	bufs[0].looping = false;
-	ndspChnWaveBufAdd(voice, &bufs[0]);
+	ndspChnWaveBufAdd(ch, &bufs[0]);
 
 	if (loopEnabled && (loopEnd > loopStart) && (loopEnd <= sampleCount) && (loopStart >= 0))
 	{
-		memset(&bufs[1], 0, sizeof(bufs[1]));
 		bufs[1].data_pcm16 = (s16 *)pcm + loopStart;
 		bufs[1].nsamples = (u32)(loopEnd - loopStart);
 		bufs[1].looping = true;
-		ndspChnWaveBufAdd(voice, &bufs[1]);
+		ndspChnWaveBufAdd(ch, &bufs[1]);
 	}
 }
 
 void N3DS_HwVoiceSetRate(int voice, float rateHz)
 {
-	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_HW_VOICE_COUNT))
+	int ch = N3DS_HwVoiceChannel(voice);
+
+	if (ch < 0)
 	{
 		return;
 	}
-	ndspChnSetRate(voice, rateHz);
+	ndspChnSetRate(ch, rateHz);
 }
 
 void N3DS_HwVoiceSetMix(int voice, float left, float right)
 {
 	float mix[12];
+	int ch = N3DS_HwVoiceChannel(voice);
 
-	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_HW_VOICE_COUNT))
+	if (ch < 0)
 	{
 		return;
 	}
 	memset(mix, 0, sizeof(mix));
 	mix[0] = left * s_ndspOutputGain;
 	mix[1] = right * s_ndspOutputGain;
-	ndspChnSetMix(voice, mix);
+	ndspChnSetMix(ch, mix);
 }
 
 void N3DS_HwVoiceStop(int voice)
 {
-	if (!s_ndspUp || (voice < 0) || (voice >= N3DS_HW_VOICE_COUNT))
+	int ch = N3DS_HwVoiceChannel(voice);
+
+	if (ch < 0)
 	{
 		return;
 	}
-	ndspChnWaveBufClear(voice);
+	ndspChnWaveBufClear(ch);
+	memset(s_hwBufs[ch], 0, sizeof(s_hwBufs[0]));
+	/* Unbind both ways: the channel is free for the next key-on immediately,
+	 * and this voice's pokes stop reaching whoever takes it. */
+	s_hwChanVoice[ch] = -1;
+	s_hwVoiceChan[voice] = -1;
 }
 
 int N3DS_HwVoiceGetDenied(void)
 {
-	return (int)s_hwVoice23Denied;
+	return (int)s_hwVoiceDenied;
+}
+
+int N3DS_HwVoiceGetRebinds(void)
+{
+	return (int)s_hwVoiceRebinds;
 }
 
 int N3DS_HwVoiceStoreGetUsedKiB(void)
 {
-	return (int)(s_hwStoreUsed >> 10);
+	return (int)(s_hwStoreLive >> 10);
+}
+
+int N3DS_HwVoiceStoreGetHiWaterKiB(void)
+{
+	return (int)(s_hwStoreHiWater >> 10);
+}
+
+int N3DS_HwVoiceStoreGetDrops(void)
+{
+	return (int)s_hwStoreFullDrops;
+}
+
+int N3DS_HwVoiceStoreGetResets(void)
+{
+	return (int)s_hwStoreResets;
 }
 
 /*
