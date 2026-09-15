@@ -827,9 +827,9 @@ static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange 
  * overlay pair whose authored draw_order_high bytes are EQUAL (the weight only
  * multiplies the authored gap) and shoves every other face harder in the
  * bargain -- the missing gap is baked instead (native_track_mesh.c pulls
- * turbo-pad faces 8..24 drawOrder steps nearer, sized from the measured
- * relief of the road under each pad). That baked delta scales by THIS value,
- * so it must stay >= 1 for the baked steps to mean world units.
+ * turbo-pad faces 8 drawOrder steps nearer). That baked delta scales by THIS
+ * value, so it must stay >= 1 to keep outranking the base quad's centre-vertex
+ * relief (~5 world units).
  *
  * The shove is per-face and global -- weight * that face's signed drawOrder
  * byte -- so the ceiling below, not this number, is what keeps an extreme

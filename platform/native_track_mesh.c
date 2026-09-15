@@ -2541,18 +2541,6 @@ static void NativeTrackBake_Export(int levelID, int numQuadBlock, int numVertex)
 
 #endif /* CTR_NATIVE_TRACK_BAKE_EXPORT */
 
-/*
- * Turbo-pad census. The bake-time pad bias only helps when it lands on the
- * faces a player actually sees, so this prints, per pad quad, the quad's own
- * key bytes and every quad overlapping it in plan (strict x/z overlap,
- * vertical intervals within 64 units): the base tile it is laid over plus
- * whatever else shares the spot. Read back, it answers whether the visible
- * pad carries the key, whether the tile under it ties on draw_order_high,
- * and how far that tile's relief rises through the pad. Load-time only,
- * bounded by the two caps.
- */
-#define TRACK_PAD_CENSUS_MAX_PADS 16
-#define TRACK_PAD_CENSUS_MAX_UNDER 8
 #define TRACK_PAD_TRIGGERS_MAX 64
 
 static int NativeTrackMesh_QuadIsTurboTrigger(const struct QuadBlock *block)
@@ -2561,16 +2549,15 @@ static int NativeTrackMesh_QuadIsTurboTrigger(const struct QuadBlock *block)
 }
 
 /*
- * The quad carrying TRIGGER + turbo payload is an UNTEXTURED collision
- * volume floating a few units off the road; the pad the player sees is a
- * separate animated-texture quad lying inside that volume's plan footprint
- * (Crash Cove: identical x/z boxes, 16 units apart vertically, with the
- * plain road tile spanning both). So the visible pad is keyed by footprint:
- * an animated-texture, non-trigger quad whose x/z box sits inside a turbo
- * trigger's (4 units of slack) and within 48 units of it vertically. The
- * animated-texture requirement is what separates the pad from a road tile
- * authored to the same footprint; waterfalls and lava are animated too but
- * never sit under a turbo trigger.
+ * The quad carrying TRIGGER + turbo payload is a collision volume floating a
+ * few units off the road, untextured on most tracks; the pad the player sees
+ * is a separate animated-texture quad lying inside that volume's plan
+ * footprint (Crash Cove: identical x/z boxes, 16 units apart vertically). So
+ * the visible pad is keyed by footprint: an animated-texture, non-trigger
+ * quad whose x/z box sits inside a turbo trigger's (4 units of slack) and
+ * within 48 units of it vertically. The animated-texture requirement is what
+ * separates the pad from a road tile authored to the same footprint;
+ * waterfalls and lava are animated too but never sit under a turbo trigger.
  */
 static int NativeTrackMesh_QuadIsVisiblePad(const struct QuadBlock *block, const struct BoundingBox *trig, int trigCount)
 {
@@ -2597,283 +2584,6 @@ static int NativeTrackMesh_QuadIsVisiblePad(const struct QuadBlock *block, const
 		}
 	}
 	return 0;
-}
-
-static int NativeTrackMesh_LeafOfQuad(const struct mesh_info *mesh, const struct QuadBlock *block, u16 *outFlag)
-{
-	for (int n = 0; n < mesh->numBspNodes; n++)
-	{
-		const struct BSP *bsp = &mesh->bspRoot[n];
-
-		if ((bsp->flag & BSP_NODE_FLAG_LEAF) == 0)
-		{
-			continue;
-		}
-		if ((bsp->data.leaf.ptrQuadBlockArray != NULL) && (block >= bsp->data.leaf.ptrQuadBlockArray) &&
-		    (block < bsp->data.leaf.ptrQuadBlockArray + bsp->data.leaf.numQuads))
-		{
-			*outFlag = bsp->flag;
-			return n;
-		}
-	}
-	*outFlag = 0;
-	return -1;
-}
-
-/* Which turbo trigger footprint this quad lies in, or -1. Same test as
- * NativeTrackMesh_QuadIsVisiblePad minus the flag/texture gates, so a
- * textured trigger quad (Sewer authors them visible) also finds itself. */
-static int NativeTrackMesh_PadTriggerOf(const struct QuadBlock *block, const struct BoundingBox *trig, int trigCount)
-{
-	for (int t = 0; t < trigCount; t++)
-	{
-		if ((block->bbox.min.x >= trig[t].min.x - 4) && (block->bbox.max.x <= trig[t].max.x + 4) && (block->bbox.min.z >= trig[t].min.z - 4) &&
-		    (block->bbox.max.z <= trig[t].max.z + 4) && (block->bbox.max.y >= trig[t].min.y - 48) && (block->bbox.min.y <= trig[t].max.y + 48))
-		{
-			return t;
-		}
-	}
-	return -1;
-}
-
-/* Height of a quadblock's surface at plan point (x, z): each of the 3x3
- * grid's four faces split along its (top-left, bottom-right) diagonal and
- * tested in plan with barycentric weights. 0 when (x, z) lies outside the
- * quad, a corner index is out of range, or the face is edge-on in plan (a
- * wall). y is the level's vertical axis. */
-static int NativeTrackMesh_QuadHeightAt(const struct QuadBlock *block, const struct LevVertex *verts, int numVertex, float x, float z, float *outY,
-                                        int *outFace)
-{
-	for (int f = 0; f < 4; f++)
-	{
-		const struct LevVertex *c[4];
-		const struct LevVertex *tri[2][3];
-
-		for (int i = 0; i < 4; i++)
-		{
-			if (block->index[sTrackFaceCorners[f][i]] >= numVertex)
-			{
-				return 0;
-			}
-			c[i] = &verts[block->index[sTrackFaceCorners[f][i]]];
-		}
-		tri[0][0] = c[0];
-		tri[0][1] = c[1];
-		tri[0][2] = c[3];
-		tri[1][0] = c[0];
-		tri[1][1] = c[3];
-		tri[1][2] = c[2];
-		for (int t = 0; t < 2; t++)
-		{
-			float x0 = (float)tri[t][0]->pos.x, z0 = (float)tri[t][0]->pos.z;
-			float e1x = (float)tri[t][1]->pos.x - x0, e1z = (float)tri[t][1]->pos.z - z0;
-			float e2x = (float)tri[t][2]->pos.x - x0, e2z = (float)tri[t][2]->pos.z - z0;
-			float px = x - x0, pz = z - z0;
-			float det = e1x * e2z - e2x * e1z;
-			float l0, l1, l2;
-
-			if ((det < 1.0f) && (det > -1.0f))
-			{
-				continue;
-			}
-			l1 = (px * e2z - e2x * pz) / det;
-			l2 = (e1x * pz - px * e1z) / det;
-			l0 = 1.0f - l1 - l2;
-			if ((l0 < -0.01f) || (l1 < -0.01f) || (l2 < -0.01f))
-			{
-				continue;
-			}
-			*outY = l0 * (float)tri[t][0]->pos.y + l1 * (float)tri[t][1]->pos.y + l2 * (float)tri[t][2]->pos.y;
-			if (outFace != NULL)
-			{
-				*outFace = f;
-			}
-			return 1;
-		}
-	}
-	return 0;
-}
-
-/*
- * How far the road rises through a pad, in world units along y: the road's
- * surface is sampled at every vertex of the pad and the pad's surface at
- * every vertex of each overlapping road quad, so a hump whose peak vertex
- * lies outside the pad -- the usual case, a pad being a quarter of the tile
- * it sits on -- is still seen where its slope crosses the pad. Up is the
- * side the trigger volumes sit on (upSign). Rises past 64 units are a wall's,
- * not the road's, and are ignored. 0 when nothing rises through.
- */
-static int NativeTrackMesh_PadRelief(const struct QuadBlock *pad, const struct QuadBlock *quads, int numQuadBlock, const struct LevVertex *verts,
-                                     int numVertex, const struct BoundingBox *trig, int trigCount, int upSign)
-{
-	float relief = 0.0f;
-
-	for (int j = 0; j < numQuadBlock; j++)
-	{
-		const struct QuadBlock *other = &quads[j];
-
-		if ((other == pad) || NativeTrackMesh_QuadIsTurboTrigger(other) || NativeTrackMesh_QuadIsVisiblePad(other, trig, trigCount))
-		{
-			continue;
-		}
-		if ((other->bbox.min.x >= pad->bbox.max.x) || (pad->bbox.min.x >= other->bbox.max.x) || (other->bbox.min.z >= pad->bbox.max.z) ||
-		    (pad->bbox.min.z >= other->bbox.max.z))
-		{
-			continue;
-		}
-		for (int v = 0; v < 9; v++)
-		{
-			float y, s;
-
-			if ((pad->index[v] < numVertex) &&
-			    NativeTrackMesh_QuadHeightAt(other, verts, numVertex, (float)verts[pad->index[v]].pos.x, (float)verts[pad->index[v]].pos.z, &y, NULL))
-			{
-				s = (y - (float)verts[pad->index[v]].pos.y) * (float)upSign;
-				if ((s > relief) && (s <= 64.0f))
-				{
-					relief = s;
-				}
-			}
-			if ((other->index[v] < numVertex) &&
-			    NativeTrackMesh_QuadHeightAt(pad, verts, numVertex, (float)verts[other->index[v]].pos.x, (float)verts[other->index[v]].pos.z, &y, NULL))
-			{
-				s = ((float)verts[other->index[v]].pos.y - y) * (float)upSign;
-				if ((s > relief) && (s <= 64.0f))
-				{
-					relief = s;
-				}
-			}
-		}
-	}
-	return (int)(relief + 0.999f);
-}
-
-/* Pull sizing: floor for the flat-pad case; ceiling below the ground-decal
- * bracket (kart shadows/skids ride 32 units nearer than the road, and a pad
- * pulled past them would win the tie against the decals riding it). */
-#define TRACK_PAD_BIAS_MIN 8
-#define TRACK_PAD_BIAS_MAX 24
-#define TRACK_PAD_BIAS_MARGIN 4
-
-static int NativeTrackMesh_PadBiasFor(int relief)
-{
-	int bias = relief + TRACK_PAD_BIAS_MARGIN;
-
-	return (bias < TRACK_PAD_BIAS_MIN) ? TRACK_PAD_BIAS_MIN : (bias > TRACK_PAD_BIAS_MAX) ? TRACK_PAD_BIAS_MAX : bias;
-}
-
-#define TRACK_PAD_MOVES_MAX 256
-#define TRACK_PAD_COPIES_MAX 6
-
-/* One pad quad's faces re-homed into another leaf's range (the pre-pass in
- * NativeTrackMesh_Frame explains why). */
-struct NativeTrackPadMove
-{
-	int quad;     /* index into mesh->ptrQuadBlockArray */
-	int leaf;     /* bsp node index whose range takes the faces */
-	u32 faceMask; /* which of the quad's four faces */
-};
-
-/* Faces of `quad` that live in some other leaf's range, and (optionally) the
- * first such leaf. */
-static u32 NativeTrackMesh_PadMovedMask(const struct NativeTrackPadMove *mv, int count, int quad, int *outLeaf)
-{
-	u32 mask = 0;
-
-	if (outLeaf != NULL)
-	{
-		*outLeaf = -1;
-	}
-	for (int k = 0; k < count; k++)
-	{
-		if (mv[k].quad == quad)
-		{
-			mask |= mv[k].faceMask;
-			if ((outLeaf != NULL) && (*outLeaf < 0))
-			{
-				*outLeaf = mv[k].leaf;
-			}
-		}
-	}
-	return mask;
-}
-
-static void NativeTrackMesh_PadCensusLine(const struct mesh_info *mesh, const struct QuadBlock *block, const char *tag, int levelID, int relief, int bias,
-                                          const char *mv)
-{
-	u16 bspFlag;
-	int bsp = NativeTrackMesh_LeafOfQuad(mesh, block, &bspFlag);
-	const u8 *dord = (const u8 *)&block->draw_order_high;
-	char tex[5];
-
-	for (int f = 0; f < 4; f++)
-	{
-		uintptr_t t = (uintptr_t)block->ptr_texture_mid[f];
-
-		tex[f] = (t == 0) ? 'N' : ((t & 1) != 0) ? 'A' : 'T';
-	}
-	tex[4] = '\0';
-
-	Platform_Log("[TRKPAD] lvl=%d %s qb=%d id=%d bsp=%d bspflag=%04x flags=%04x terr=%02x dord=%d,%d,%d,%d tex=%s box=%d,%d,%d..%d,%d,%d relief=%d bias=%d "
-	             "mv=%s\n",
-	             levelID, tag, (int)(block - mesh->ptrQuadBlockArray), (int)block->blockID, bsp, (unsigned)bspFlag, (unsigned)CTR_ReadU16LE(&block->quadFlags),
-	             (unsigned)block->terrain_type, (int)(s8)dord[0], (int)(s8)dord[1], (int)(s8)dord[2], (int)(s8)dord[3], tex, (int)block->bbox.min.x,
-	             (int)block->bbox.min.y, (int)block->bbox.min.z, (int)block->bbox.max.x, (int)block->bbox.max.y, (int)block->bbox.max.z, relief, bias, mv);
-}
-
-static void NativeTrackMesh_PadCensus(const struct mesh_info *mesh, const int *padIdx, int padCount, int levelID, const struct BoundingBox *trig, int trigCount,
-                                      int upSign, const struct NativeTrackPadMove *mv, int mvCount)
-{
-	for (int i = 0; i < padCount; i++)
-	{
-		const struct QuadBlock *pad;
-		int under = 0, relief, entries = 0;
-		char tag[16], mvStr[48];
-
-		if ((padIdx[i] < 0) || (padIdx[i] >= mesh->numQuadBlock))
-		{
-			continue;
-		}
-		pad = &mesh->ptrQuadBlockArray[padIdx[i]];
-		relief = NativeTrackMesh_PadRelief(pad, mesh->ptrQuadBlockArray, mesh->numQuadBlock, mesh->ptrVertexArray, mesh->numVertex, trig, trigCount, upSign);
-		mvStr[0] = '\0';
-		for (int k = 0; k < mvCount; k++)
-		{
-			if (mv[k].quad == padIdx[i])
-			{
-				size_t len = strlen(mvStr);
-
-				snprintf(mvStr + len, sizeof(mvStr) - len, "%s%x@%d", (entries++ != 0) ? "+" : "", (unsigned)mv[k].faceMask, mv[k].leaf);
-			}
-		}
-		if (entries == 0)
-		{
-			snprintf(mvStr, sizeof(mvStr), "-");
-		}
-		snprintf(tag, sizeof(tag), "pad%d", i);
-		NativeTrackMesh_PadCensusLine(mesh, pad, tag, levelID, relief, NativeTrackMesh_PadBiasFor(relief), mvStr);
-
-		for (int j = 0; (j < mesh->numQuadBlock) && (under < TRACK_PAD_CENSUS_MAX_UNDER); j++)
-		{
-			const struct QuadBlock *other = &mesh->ptrQuadBlockArray[j];
-
-			if (j == padIdx[i])
-			{
-				continue;
-			}
-			if ((other->bbox.min.x >= pad->bbox.max.x) || (pad->bbox.min.x >= other->bbox.max.x) || (other->bbox.min.z >= pad->bbox.max.z) ||
-			    (pad->bbox.min.z >= other->bbox.max.z))
-			{
-				continue;
-			}
-			if (((int)other->bbox.min.y > (int)pad->bbox.max.y + 64) || ((int)pad->bbox.min.y > (int)other->bbox.max.y + 64))
-			{
-				continue;
-			}
-			NativeTrackMesh_PadCensusLine(mesh, other, "  under", levelID, -1, 0, "-");
-			under++;
-		}
-	}
 }
 
 void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
@@ -2977,211 +2687,15 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		}
 	}
 
-	/* Turbo-pad census (NativeTrackMesh_PadCensus): quads/faces the bias
-	 * landed on, how many sit in water-flagged leaves, and TRIGGER quads that
-	 * are not pads. */
-	int padQuads = 0, padFaces = 0, padQuadsWater = 0, trigNonPad = 0;
-	int padIdx[TRACK_PAD_CENSUS_MAX_PADS];
-	/* Turbo trigger footprints, gathered up front because the visible pad is
-	 * keyed by lying inside one (NativeTrackMesh_QuadIsVisiblePad) and the
-	 * trigger may sit in a different leaf. */
-	struct BoundingBox padTrig[TRACK_PAD_TRIGGERS_MAX];
-	int padTrigCount = 0, padTrigOverflow = 0;
-	/* Which way is "up" for a textured trigger quad's relief: the side the
-	 * trigger volumes sit on relative to their visible pads (every observed
-	 * level: +y), defaulting to +y when a level pairs none. */
-	int padUpSum = 0, padUpSign;
-
-	for (int i = 0; i < numQuadBlock; i++)
-	{
-		if (NativeTrackMesh_QuadIsTurboTrigger(&quadBlocks[i]))
-		{
-			if (padTrigCount < TRACK_PAD_TRIGGERS_MAX)
-			{
-				padTrig[padTrigCount++] = quadBlocks[i].bbox;
-			}
-			else
-			{
-				padTrigOverflow++;
-			}
-		}
-	}
-	for (int i = 0; i < numQuadBlock; i++)
-	{
-		int isPad = NativeTrackMesh_QuadIsVisiblePad(&quadBlocks[i], padTrig, padTrigCount);
-		int t = isPad ? NativeTrackMesh_PadTriggerOf(&quadBlocks[i], padTrig, padTrigCount) : -1;
-		u16 flag;
-
-		if (t >= 0)
-		{
-			padUpSum += (padTrig[t].min.y + padTrig[t].max.y) - (quadBlocks[i].bbox.min.y + quadBlocks[i].bbox.max.y);
-		}
-		if (isPad || NativeTrackMesh_QuadIsTurboTrigger(&quadBlocks[i]))
-		{
-			if (padQuads < TRACK_PAD_CENSUS_MAX_PADS)
-			{
-				padIdx[padQuads] = i;
-			}
-			padQuads++;
-			NativeTrackMesh_LeafOfQuad(mesh, &quadBlocks[i], &flag);
-			padQuadsWater += (flag & BSP_LEAF_FLAG_WATER) != 0;
-		}
-		else if ((CTR_ReadU16LE(&quadBlocks[i].quadFlags) & QUADBLOCK_FLAG_TRIGGER) != 0)
-		{
-			trigNonPad++;
-		}
-	}
-	padUpSign = (padUpSum < 0) ? -1 : 1;
-
-	/* Pad faces drawn inside the leaf of EVERY road tile under them. The draw
-	 * side maps depth PER LEAF (depthRange is a per-leaf uniform fitted
-	 * between that leaf's own near and far ordinals), so a pad and the road
-	 * it lies on get different depths for the same point whenever they live
-	 * in different leaves -- a discrepancy that moves with the camera and
-	 * that no constant pull can beat. A copy of the pad's face emitted inside
-	 * a road tile's leaf range shares that tile's mapping and beats it by the
-	 * pull; where two road layers overlap under a pad in different leaves,
-	 * one copy per leaf covers whichever layer wins at that pixel, and the
-	 * copies never fight each other (same pixels). Keyed per face by every
-	 * road quad whose surface passes within 64 units under the face's
-	 * centre; a face with no such tile stays in its own leaf. Trigger quads
-	 * stay put: untextured, or (Sewer) the pad itself. Sized here, before the
-	 * buffers, because each copy is extra geometry. */
-	struct NativeTrackPadMove padMove[TRACK_PAD_MOVES_MAX];
-	int padMoveCount = 0, padMoveOverflow = 0, padMoveFaces = 0;
-
-	for (int i = 0; i < numQuadBlock; i++)
-	{
-		const struct QuadBlock *pad = &quadBlocks[i];
-
-		if (!NativeTrackMesh_QuadIsVisiblePad(pad, padTrig, padTrigCount))
-		{
-			continue;
-		}
-		for (int f = 0; f < 4; f++)
-		{
-			/* Nine samples across the face -- its four corners, the four edge
-			 * midpoints and the centre -- so a road tile that covers only a
-			 * corner or an edge strip of the face still gets its copy. */
-			static const u8 sEdges[4][2] = {{0, 1}, {0, 2}, {1, 3}, {2, 3}};
-			float sx[9], sy[9], sz[9];
-			int targets[TRACK_PAD_COPIES_MAX], nTargets = 0, ok = 1;
-
-			for (int c = 0; c < 4; c++)
-			{
-				u16 vi = pad->index[sTrackFaceCorners[f][c]];
-
-				if (vi >= numVertex)
-				{
-					ok = 0;
-					break;
-				}
-				sx[c] = (float)vertexArray[vi].pos.x;
-				sy[c] = (float)vertexArray[vi].pos.y;
-				sz[c] = (float)vertexArray[vi].pos.z;
-			}
-			if (!ok)
-			{
-				continue;
-			}
-			for (int e = 0; e < 4; e++)
-			{
-				sx[4 + e] = 0.5f * (sx[sEdges[e][0]] + sx[sEdges[e][1]]);
-				sy[4 + e] = 0.5f * (sy[sEdges[e][0]] + sy[sEdges[e][1]]);
-				sz[4 + e] = 0.5f * (sz[sEdges[e][0]] + sz[sEdges[e][1]]);
-			}
-			sx[8] = 0.25f * (sx[0] + sx[1] + sx[2] + sx[3]);
-			sy[8] = 0.25f * (sy[0] + sy[1] + sy[2] + sy[3]);
-			sz[8] = 0.25f * (sz[0] + sz[1] + sz[2] + sz[3]);
-			for (int j = 0; (j < numQuadBlock) && (nTargets < TRACK_PAD_COPIES_MAX); j++)
-			{
-				const struct QuadBlock *other = &quadBlocks[j];
-				u16 flag;
-				int t, k, hit = 0;
-
-				if ((j == i) || NativeTrackMesh_QuadIsTurboTrigger(other) || NativeTrackMesh_QuadIsVisiblePad(other, padTrig, padTrigCount))
-				{
-					continue;
-				}
-				for (int s = 0; (s < 9) && !hit; s++)
-				{
-					float h, dd;
-
-					if ((sx[s] < (float)other->bbox.min.x) || (sx[s] > (float)other->bbox.max.x) || (sz[s] < (float)other->bbox.min.z) ||
-					    (sz[s] > (float)other->bbox.max.z))
-					{
-						continue;
-					}
-					if (!NativeTrackMesh_QuadHeightAt(other, vertexArray, numVertex, sx[s], sz[s], &h, NULL))
-					{
-						continue;
-					}
-					dd = (h > sy[s]) ? (h - sy[s]) : (sy[s] - h);
-					hit = (dd <= 64.0f);
-				}
-				if (!hit)
-				{
-					continue;
-				}
-				t = NativeTrackMesh_LeafOfQuad(mesh, other, &flag);
-				if (t < 0)
-				{
-					continue;
-				}
-				for (k = 0; k < nTargets; k++)
-				{
-					if (targets[k] == t)
-					{
-						break;
-					}
-				}
-				if (k == nTargets)
-				{
-					targets[nTargets++] = t;
-				}
-			}
-			for (int n = 0; n < nTargets; n++)
-			{
-				int k;
-
-				for (k = 0; k < padMoveCount; k++)
-				{
-					if ((padMove[k].quad == i) && (padMove[k].leaf == targets[n]))
-					{
-						padMove[k].faceMask |= 1u << f;
-						break;
-					}
-				}
-				if (k < padMoveCount)
-				{
-					padMoveFaces++;
-				}
-				else if (padMoveCount < TRACK_PAD_MOVES_MAX)
-				{
-					padMove[padMoveCount].quad = i;
-					padMove[padMoveCount].leaf = targets[n];
-					padMove[padMoveCount].faceMask = 1u << f;
-					padMoveCount++;
-					padMoveFaces++;
-				}
-				else
-				{
-					padMoveOverflow++;
-				}
-			}
-		}
-	}
-
 	/* Worst case: every quadblock in a static leaf, 4 faces x 4 verts and
-	 * 4 faces x 6 indices, plus the pad copies. Allocate flat, log the real
-	 * usage. */
-	size_t maxVerts = (size_t)numQuadBlock * 16 + (size_t)padMoveFaces * 4;
+	 * 4 faces x 6 indices. Allocate flat, log the real usage. */
+	size_t maxVerts = (size_t)numQuadBlock * 16;
 	/* Backface culling gives triangles and
 	 * double-sided faces a reverse-wound copy (see the index emission below), so
 	 * the worst case is 4 double-sided quads/block = 48. Temporary bake buffer --
 	 * compacted to the actual index count after the draw-bin sort, so the extra
 	 * is only held during the build, not in the resident mesh. */
-	size_t maxIndices = (size_t)numQuadBlock * 48 + (size_t)padMoveFaces * 12;
+	size_t maxIndices = (size_t)numQuadBlock * 48;
 
 	s_trackMesh.verts = (struct NativeTrackVert *)malloc(maxVerts * sizeof(struct NativeTrackVert));
 	s_trackMesh.indices = (u16 *)malloc(maxIndices * sizeof(u16));
@@ -3270,6 +2784,25 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	 * tpage word. Two raw samples of the bad-tpage case ride in the log. */
 	int notexNull = 0, notexAnimNull = 0, notexBadWord = 0;
 	u32 notexSample[2] = {0, 0};
+	/* Turbo trigger footprints, gathered up front because the visible pad is
+	 * keyed by lying inside one (NativeTrackMesh_QuadIsVisiblePad) and the
+	 * trigger may sit in a different leaf. padFaces is the self-check: the
+	 * bias landing on zero faces means the key missed the visible pads. */
+	struct BoundingBox padTrig[TRACK_PAD_TRIGGERS_MAX];
+	int padTrigCount = 0, padQuads = 0, padFaces = 0;
+
+	for (int i = 0; i < numQuadBlock; i++)
+	{
+		if (NativeTrackMesh_QuadIsTurboTrigger(&quadBlocks[i]) && (padTrigCount < TRACK_PAD_TRIGGERS_MAX))
+		{
+			padTrig[padTrigCount++] = quadBlocks[i].bbox;
+		}
+	}
+	for (int i = 0; i < numQuadBlock; i++)
+	{
+		padQuads += NativeTrackMesh_QuadIsTurboTrigger(&quadBlocks[i]) || NativeTrackMesh_QuadIsVisiblePad(&quadBlocks[i], padTrig, padTrigCount);
+	}
+
 	for (int n = 0; n < mesh->numBspNodes; n++)
 	{
 		struct BSP *bsp = &mesh->bspRoot[n];
@@ -3353,48 +2886,9 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 		leafRange->drawOrderMin = 127;
 		leafRange->drawOrderMax = -128;
 
-		/* Work items: this leaf's own quads (minus faces re-homed elsewhere),
-		 * then the pad faces re-homed INTO this leaf (padMove). */
-		int extraCount = 0;
-
-		for (int k = 0; k < padMoveCount; k++)
+		for (int q = 0; q < numQuads; q++)
 		{
-			extraCount += (padMove[k].leaf == n);
-		}
-
-		for (int w = 0; w < numQuads + extraCount; w++)
-		{
-			struct QuadBlock *block;
-			u32 faceMask;
-
-			if (w < numQuads)
-			{
-				block = &range[w];
-				faceMask = 0xfu & ~NativeTrackMesh_PadMovedMask(padMove, padMoveCount, (int)(block - quadBlocks), NULL);
-			}
-			else
-			{
-				int k, seen = 0;
-
-				for (k = 0; k < padMoveCount; k++)
-				{
-					if ((padMove[k].leaf == n) && (seen++ == (w - numQuads)))
-					{
-						break;
-					}
-				}
-				if (k == padMoveCount)
-				{
-					continue;
-				}
-				block = &quadBlocks[padMove[k].quad];
-				faceMask = padMove[k].faceMask;
-			}
-			if (faceMask == 0)
-			{
-				continue;
-			}
-
+			struct QuadBlock *block = &range[q];
 			u32 drawOrderLow = CTR_ReadU32LE(&block->draw_order_low);
 			int doubleSided = (drawOrderLow & QUADBLOCK_DRAW_ORDER_LOW_DOUBLE_SIDED) != 0;
 
@@ -3406,26 +2900,13 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 			 * instead. 8 steps times the shipped weight (hParam.w, 1 view.z
 			 * unit/step -- the baked delta scales by it, so that weight must
 			 * stay >= 1) outranks the base quad's centre-vertex relief (~5
-			 * world units on a flat pad; a pad laid on a humped or sloping
-			 * tile needs more, so the pull is sized from the measured relief,
-			 * NativeTrackMesh_PadRelief). The trigger quad itself is normally
-			 * untextured (no faces to bias); the visible pad is keyed by
-			 * footprint, see NativeTrackMesh_QuadIsVisiblePad. */
-			int padDrawOrderBias = 0;
-
-			if (NativeTrackMesh_QuadIsTurboTrigger(block) || NativeTrackMesh_QuadIsVisiblePad(block, padTrig, padTrigCount))
-			{
-				padDrawOrderBias = NativeTrackMesh_PadBiasFor(
-				    NativeTrackMesh_PadRelief(block, quadBlocks, numQuadBlock, vertexArray, numVertex, padTrig, padTrigCount, padUpSign));
-			}
+			 * world units). The trigger quad itself is normally untextured
+			 * (no faces to bias); the visible pad is keyed by footprint, see
+			 * NativeTrackMesh_QuadIsVisiblePad. */
+			int padDrawOrderBias = (NativeTrackMesh_QuadIsTurboTrigger(block) || NativeTrackMesh_QuadIsVisiblePad(block, padTrig, padTrigCount)) ? 8 : 0;
 
 			for (int face = 0; face < 4; face++)
 			{
-				if ((faceMask & (1u << face)) == 0)
-				{
-					continue;
-				}
-
 				uintptr_t texPtr = (uintptr_t)block->ptr_texture_mid[face];
 				const struct TextureLayout *layout = NULL;
 				int faceIsWater = 0;
@@ -4097,11 +3578,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	             facesAnimTex, facesNoTexture, facesModeTri, facesMode3, facesWater,
 	             (s_trackMesh.waterEnvLayout != NULL) ? (unsigned)CTR_ReadU16LE(&s_trackMesh.waterEnvLayout->tpage) : 0u, weldCount);
 
-	Platform_Log("[TRKPAD] lvl=%d triggers=%d(+%d over cap) quads=%d faces=%d inWaterLeaf=%d triggerNonPad=%d copies=%d entries=%d(+%d over cap)\n",
-	             NativePerf_CurrentLevelID(), padTrigCount, padTrigOverflow, padQuads, padFaces, padQuadsWater, trigNonPad, padMoveFaces, padMoveCount,
-	             padMoveOverflow);
-	NativeTrackMesh_PadCensus(mesh, padIdx, (padQuads < TRACK_PAD_CENSUS_MAX_PADS) ? padQuads : TRACK_PAD_CENSUS_MAX_PADS, NativePerf_CurrentLevelID(), padTrig,
-	                          padTrigCount, padUpSign, padMove, padMoveCount);
+	Platform_Log("[TRKPAD] lvl=%d triggers=%d quads=%d faces=%d\n", NativePerf_CurrentLevelID(), padTrigCount, padQuads, padFaces);
 
 	Platform_Log("[TRKWELD] lvl=%d on=%d welds=%d mag[<1=%d <4=%d <16=%d <64=%d <256=%d 256+=%d]\n", NativePerf_CurrentLevelID(), g_dbg_trackWeld, weldCount,
 	             s_trkWeldDiag.mag[0], s_trkWeldDiag.mag[1], s_trkWeldDiag.mag[2], s_trkWeldDiag.mag[3], s_trkWeldDiag.mag[4], s_trkWeldDiag.mag[5]);
