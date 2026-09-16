@@ -1,6 +1,6 @@
 /*
  * Render worker thread OS primitives -- see n3ds_render_thread.h for the
- * boundary contract and docs/RENDER_THREAD_DESIGN.md for the design. This TU
+ * boundary contract. This TU
  * is compiled with -fshort-enums (libctru's ABI), like n3ds_audio_thread.c;
  * it must never include a decomp header.
  */

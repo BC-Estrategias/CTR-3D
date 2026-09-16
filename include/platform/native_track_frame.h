@@ -4,7 +4,7 @@
 #include <macros.h>
 
 // Per-frame camera + visibility snapshot for the native track renderer's draw
-// side (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b). Recording only counts
+// side. Recording only counts
 // what it would draw -- no pixels move here; NativeTrackDraw_IssueForWalk
 // (declared below) consumes NativeTrackFrame_ForWalk() to project and draw
 // the resident mesh.
@@ -101,7 +101,7 @@ struct NativeTrackFrameSnapshot
 	u8 valid;     // 0 = never recorded (or invalidated by NativeTrackFrame_Clear)
 };
 
-// Runtime toggle, three states (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12b):
+// Runtime toggle, three states:
 //   0 = off. Retail path draws the track exactly as today. Record() still
 //       runs every frame (cheap, count-only) but leaves
 //       `valid` at 0, so the draw consumer must treat state 0 as "draw
@@ -156,8 +156,8 @@ void NativeTrackFrame_Clear(void);
 // NativeTrackFrame_Clear all leave a published buffer with valid=0.
 const struct NativeTrackFrameSnapshot *NativeTrackFrame_ForWalk(void);
 
-// The CPU-side per-frame draw issuer (docs/NATIVE_TRACK_RENDERER_DESIGN.md
-// 4.2/4.3/12b). Reads NativeTrackFrame_ForWalk()'s snapshot, composes the
+// The CPU-side per-frame draw issuer. Reads NativeTrackFrame_ForWalk()'s
+// snapshot, composes the
 // camera projection rows the shader needs, and issues one N3DS_TrackDraw_Leaf
 // per visible resident leaf with its own per-leaf OT-bucket depth-range
 // uniform. 3DS-only (CTR_NATIVE_TRACK_RENDERER && __3DS__).

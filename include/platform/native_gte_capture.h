@@ -5,7 +5,7 @@
 
 // Per-frame side table of GTE sub-pixel fractions discarded by the >>16 in
 // GTE_RotTransPers, keyed by the exact truncated screen coordinate written to
-// the primitive packet. See docs/GTE_CAPTURE_DESIGN.md. Declarations are
+// the primitive packet. Declarations are
 // always visible; each caller gates its own use behind CTR_NATIVE_GTE_CAPTURE,
 // so a flag-off build never emits a call and these never need to be defined.
 
@@ -113,7 +113,7 @@ void NativeGpu_ClearSkyRange(void);
 // OTWALK_PROFILE retainability instrument; the retained-geometry play proper
 // will grow its own keyed-by-content variant.
 // True view-space depth (SZ3) for a packet's screen coordinate -- the shared
-// depth axis the track renderer already uses. docs/PACKET_DEPTH_DESIGN.md.
+// depth axis the track renderer already uses.
 int GTECapture_LookupDepth(s16 sx, s16 sy, u16 *outSz3);
 // Same, plus the matrix-state id the stored projection ran under (s32 sinking
 // racers). The packet-depth path uses it as PROVENANCE: an entry stored under
@@ -240,7 +240,7 @@ void GTECapture_SetStoreDepthRemap(int active);
 // THIS frame, registered by RaceFlag_DrawSelf (double-buffered with the UI
 // band, cleared by Clear).
 //
-// Since the occlusion/parallax channel split (docs/FLAG_SPLIT_CHANNEL_SPEC.md)
+// Since the occlusion/parallax channel split
 // this range no longer changes any OCCLUSION stamp -- it marks the primitives
 // whose PARALLAX depth must come from the (remapped) capture entries rather
 // than from the stamp they occlude by. The flag's screen coordinates DO come

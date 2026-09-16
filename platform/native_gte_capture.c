@@ -9,7 +9,7 @@
 
 #include <string.h>
 
-// Direct-mapped, verify-by-stored-key side table (docs/GTE_CAPTURE_DESIGN.md).
+// Direct-mapped, verify-by-stored-key side table.
 // A collision or a stale (last frame's) entry is always a miss, never a wrong
 // value -- callers fall back to today's exact snapped behavior on a miss.
 //
@@ -52,7 +52,7 @@ typedef struct
 // under, numbered 0.. in order of first appearance within the frame. The
 // full retained form needs to know whether a stable node was projected
 // under the frame's dominant (camera) matrix or a per-object one -- that
-// decides its v1 coverage (docs/RETAINED_GEOMETRY_FULL_DESIGN.md, open Q1).
+// decides its coverage in the full retained form.
 // Ids above the cap collapse into the last slot; a frame with >63 real
 // matrix states would make "dominant share" mushy, not wrong.
 #define GTE_CAPTURE_MTX_IDS 64
@@ -1004,8 +1004,7 @@ int GTECapture_LookupModel(s16 sx, s16 sy, s16 outV[3])
 // axis retail quantises into an OT index: ctr_track.v.pica's header and
 // native_gte_core.c:319-328 (C2_SZ3 = Lm_D(m_mac3, 1), clamped to unsigned
 // 16-bit) establish that SZ3 is a linear view depth, NOT a reciprocal. That is
-// what makes one shared depth axis possible at all -- see
-// docs/PACKET_DEPTH_DESIGN.md.
+// what makes one shared depth axis possible at all.
 //
 // Same key, same generation/collision test, same miss semantics as every other
 // lookup here: a miss is always a miss, never a wrong value.
@@ -1246,7 +1245,7 @@ int GTECapture_LookupSuppressed(void)
 
 /*
  * Is the walk currently inside the registered flag prim range? (channel
- * split, docs/FLAG_SPLIT_CHANNEL_SPEC.md.)
+ * split.)
  *
  * Read by PacketDepth_ResolveXY for TWO things, and the pairing is the whole
  * design:

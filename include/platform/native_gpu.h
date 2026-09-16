@@ -41,7 +41,7 @@ int NativeGpu_GetStateSize(void);
 int NativeGpu_CaptureState(void *dst, int dstSize);
 int NativeGpu_RestoreState(const void *src, int srcSize);
 
-// Track-renderer accessor (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12):
+// Track-renderer accessor:
 // per-draw CPU-side lookup of the bucket->ordinal table recorded during the
 // OT walk. Returns 0 -- nothing written to the outputs -- unless ALL of:
 // the recorder was latched active for the walk that most recently ran

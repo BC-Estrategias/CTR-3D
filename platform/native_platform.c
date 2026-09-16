@@ -348,8 +348,7 @@ internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[]
 
 #if defined(CTR_INTERNAL) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
 // --model-render 0|1|2: PC surface for g_dbg_modelRender, the PICA-native
-// model renderer's runtime toggle (docs/NATIVE_MODEL_RENDERER_DESIGN.md
-// section 9). A toggle with no PC setter can never leave 0 here, and PC is
+// model renderer's runtime toggle. A toggle with no PC setter can never leave 0 here, and PC is
 // where rung 1 is verified.
 internal void NativePlatform_ModelRenderConfigureFromArgs(int argc, char *argv[])
 {

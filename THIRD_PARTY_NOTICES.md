@@ -1,19 +1,19 @@
 # Third-Party Notices
 
 This project vendors third-party software and contains modified third-party
-derivatives. Keep this file with source and binary distributions of CTR Native.
+derivatives. Keep this file with source and binary distributions of CTR 3D.
 
 ## PsyCross / Psy-X
 
 Source: <https://github.com/OpenDriver2/PsyCross>
 
-PsyCross provided the starting point for parts of CTR Native's
+PsyCross provided the starting point for parts of CTR 3D's
 Psy-Q-compatible PS1 hardware abstraction layer, including compatible GPU, GTE,
-SPU, CD, and controller library interfaces. CTR Native now owns those headers
+SPU, CD, and controller library interfaces. CTR 3D now owns those headers
 and native platform implementations in `include/` and `platform/` while
 preserving Psy-Q-shaped APIs.
 
-CTR Native contains modified/project-owned PsyCross derivatives in these
+CTR 3D contains modified/project-owned PsyCross derivatives in these
 component areas:
 
 - `include/psx/`: Psy-Q-compatible facade headers
@@ -52,12 +52,12 @@ Source: <https://github.com/Lameguy64/PSn00bSDK>
 
 Path: `include/psn00bsdk`
 
-CTR Native vendors a small PSn00bSDK header subset for PS1/Psy-Q-compatible
-types, constants, and inline helpers used by the shared source. CTR Native does
+CTR 3D vendors a small PSn00bSDK header subset for PS1/Psy-Q-compatible
+types, constants, and inline helpers used by the shared source. CTR 3D does
 not vendor or link `libpsn00b` into the native PC executable.
 
 This notice applies to PSn00bSDK core files only. `mkpsxiso` and `dumpsxiso`
-are separate GPLv2-or-later tools and are not distributed as part of CTR Native.
+are separate GPLv2-or-later tools and are not distributed as part of CTR 3D.
 
 License: Mozilla Public License 2.0
 
@@ -70,7 +70,7 @@ A copy of the MPL 2.0 license can be obtained at:
 Path: `externals/SDL`
 
 SDL3 provides cross-platform host windowing, input, timing, and audio device
-support for CTR Native.
+support for CTR 3D.
 
 Vendored version: 3.4.10 (`release-3.4.10`)
 
@@ -78,6 +78,59 @@ Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
 This software is provided 'as-is', without any express or implied
 warranty.  In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+
+## libctru
+
+Source: <https://github.com/devkitPro/libctru>
+
+libctru is the Nintendo 3DS user-mode system library. The 3DS build links it
+statically for system services, threads, the SD card filesystem, input, and
+the DSP audio interface. It is not part of the PC build.
+
+License (zlib-style, as stated in the libctru README):
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+
+## citro3d
+
+Source: <https://github.com/devkitPro/citro3d>
+
+citro3d is the 3DS GPU (PICA200) library the 3DS renderer is built on. The
+3DS build links it statically. It is not part of the PC build.
+
+Copyright (C) 2014-2018 fincs
+
+License: zlib
+
+This software is provided 'as-is', without any express or implied
+warranty. In no event will the authors be held liable for any damages
 arising from the use of this software.
 
 Permission is granted to anyone to use this software for any purpose,

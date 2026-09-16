@@ -15,10 +15,10 @@ for arg in "$@"; do
             ;;
     esac
 done
-VERSION="${VERSION:-beta-7_1}"
+VERSION="${VERSION:-1.0.0-beta.1}"
 
 DIST_DIR="${DIST_DIR:-dist}"
-PACKAGE_NAME="ctr-native-${VERSION}-3ds"
+PACKAGE_NAME="ctr3d-${VERSION}"
 PACKAGE_DIR="${DIST_DIR}/${PACKAGE_NAME}"
 CTR_3DSX="${CTR_3DSX:-build-3ds/ctr_native.3dsx}"
 MIN_SIZE_BYTES=$((1024 * 1024))
@@ -58,10 +58,10 @@ legally-owned disc dump.
 EOF
 
 cat >"${PACKAGE_DIR}/README.txt" <<EOF
-CTR Native New Nintendo 3DS ${VERSION} build
+CTR 3D ${VERSION} for New Nintendo 3DS
 
-A homebrew build of CTR Native, a native port of Crash Team Racing
-(PS1, 1999) built on the CTR-ModSDK decompilation project.
+A homebrew port of Crash Team Racing (PS1, 1999). CTR 3D is a fork of
+CTR Native, the native PC port built on the CTR-ModSDK decompilation.
 
 Requirements:
 - New Nintendo 3DS, New 3DS XL, or New 2DS XL only -- the original
@@ -76,11 +76,24 @@ Install:
    layout, so the game ends up at /3ds/ctr_native/ctr_native.3dsx.
 2. Copy your disc image to /3ds/ctr_native/assets/ctr-u.bin -- raw
    MODE2/2352 BIN, not a cooked ISO.
-3. Launch "ctr_native" from the Homebrew Launcher.
+3. Launch "CTR 3D" from the Homebrew Launcher.
 
-Controls: the bottom screen shows the in-race minimap. The main menu
-has an OPTIONS entry for PAL Penta stats, the reserves meter, the
-bottom-screen map, and texture filtering.
+Saves are written to /3ds/ctr_native/memcards/, the same files the PC
+port uses.
+
+Controls follow the button's position on the PlayStation pad:
+  B = accelerate (Cross)      A = use weapon (Circle)
+  Y = brake / reverse (Square)   X = map / speedometer (Triangle)
+  L, R = hop and power-slide (L1, R1)   START = pause
+In menus, A and B confirm; X and Y go back.
+
+Screens: the bottom screen always shows the in-race map. The top screen
+starts on the speedometer; X switches it to the map, as Triangle does on
+PS1. The 3D slider works in real time.
+
+The main menu has an OPTIONS entry with four toggles: PAL PENTA,
+RESERVES METER, BOTTOM MAP, and TEXTURE FILTER. VS and Battle modes are
+not offered.
 
 Reporting a bug: create an empty file at
 /3ds/ctr_native/enable-log.txt, reproduce the problem, then attach

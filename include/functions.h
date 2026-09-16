@@ -1159,7 +1159,7 @@ void MM_Cheat_SuperTurboPads(void);
 void MM_Cheat_OneLap(void);
 void MM_Cheat_TurboCounter(void);
 #if defined(CTR_NATIVE)
-/* Native-only flag easter eggs -- docs/EASTER_EGGS.md. SpyroFlag replaces
+/* Native-only flag easter eggs. SpyroFlag replaces
  * MainKillGame_LaunchSpyro2 as SOAR's handler (that function hard-locks on
  * native); PrideFlag is reached by the WONDER sequence, matched in
  * MM_ParseCheatCodes rather than from the full D230 cheat table. */

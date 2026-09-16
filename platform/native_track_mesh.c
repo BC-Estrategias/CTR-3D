@@ -1,6 +1,5 @@
 /*
  * Native track renderer -- load-time mesh builder.
- * docs/NATIVE_TRACK_RENDERER_DESIGN.md sections 4.1/4.2.
  *
  * Builds the resident-mesh representation -- per-static-leaf vertex/index
  * ranges over the game's own quadblock data -- and logs a [TRKMESH] block.
@@ -67,7 +66,7 @@ struct NativeTrackLeafRange
 CTR_STATIC_ASSERT(sizeof(struct NativeTrackLeafRange) == 28);
 
 /*
- * Track atlas LAYOUT (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12): platform-neutral half of the
+ * Track atlas LAYOUT: platform-neutral half of the
  * dedicated track atlas -- per-(tpage,clut) union UV rectangles gathered from the resident verts,
  * shelf-packed into 512x512 atlas units, with a translation entry per rect so upload can rewrite
  * baked page-space UVs into atlas coordinates. The census bound the working set (<=120 pairs,
@@ -102,7 +101,7 @@ struct NativeTrackAtlasRect
 	u16 allocW, allocH; /* (maxU-minU+1)/(maxV-minV+1) rounded UP to multiples of 8 and capped at 256 (one PSX page) -- the
 	                      * shelf-packed/uploaded size, distinct from the true bbox above (upload needs 8x8-tile-
 	                      * aligned rects) */
-	/* SEMI-TRANSPARENCY (docs/TRANSPARENCY_DESIGN.md 3): a rect whose tpage ABR
+	/* SEMI-TRANSPARENCY: a rect whose tpage ABR
 	 * field is not 3 draws in TWO passes on PS1 -- its non-STP texels opaque,
 	 * its STP texels blended -- so it needs two decoded views, not one. The
 	 * primary placement above then holds N3DS_TEXVIEW_PASS1 (the opaque body)
@@ -123,7 +122,7 @@ struct NativeTrackAtlasRect
 };
 
 /* Retail's own semi-transparency test, lifted to the rect because the rect key
- * (tpage, clut) already contains it -- see docs/TRANSPARENCY_DESIGN.md 1.
+ * (tpage, clut) already contains it.
  * DrawLevelOvr1P_SelectRawPrimitiveCode (game/226/226_00_DrawLevelOvr1P.c:2133,
  * six call sites) selects the semi-transparent primitive code when
  * (uv1 & 0x00600000) != 0x00600000, and uv1's high halfword IS the layout's
@@ -1604,7 +1603,7 @@ static u16 s_trackAtlasStaging[256 * 256]; /* one PSX page, RGBA5551 tiled -- 12
  * draw untextured rather than sampling whatever happens to sit at atlas origin.
  */
 /*
- * Bin space, widened for semi-transparency (docs/TRANSPARENCY_DESIGN.md 3-4).
+ * Bin space, widened for semi-transparency.
  *
  *   0 .. N3DS_TRACK_ATLAS_MAX_UNITS      OPAQUE content, binned per atlas unit
  *                                        (unchanged; the top value is the
@@ -1871,8 +1870,7 @@ static int NativeTrackAtlas_UploadToBackend(struct mesh_info *mesh, int numQuadB
 		format = GetTPageFormat(rect->tpage);
 
 		/*
-		 * Which STP view the primary placement gets (docs/TRANSPARENCY_DESIGN.md
-		 * 3). An OPAQUE rect keeps N3DS_TEXVIEW_OPAQUE -- any non-zero texel
+		 * Which STP view the primary placement gets. An OPAQUE rect keeps N3DS_TEXVIEW_OPAQUE -- any non-zero texel
 		 * visible, punch-through alpha, exactly as before this feature existed.
 		 *
 		 * A SEMI-TRANSPARENT rect instead splits into the two views that
@@ -3640,7 +3638,7 @@ void NativeTrackMesh_Frame(struct Level *level, struct mesh_info *mesh)
 	}
 
 	/*
-	 * Semi-transparency census (docs/TRANSPARENCY_DESIGN.md 3). Platform-neutral
+	 * Semi-transparency census. Platform-neutral
 	 * and load-time, so it runs on a PC attract lap -- no hardware, no Azahar,
 	 * no frame timing involved. This is the number that GATES the track half of
 	 * the transparency work: a semi-transparent rect needs TWO baked atlas views

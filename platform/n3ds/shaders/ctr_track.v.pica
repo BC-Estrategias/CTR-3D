@@ -1,5 +1,4 @@
 ; CTR-Native PICA200 vertex shader -- native track renderer, rung 3a STEP 2.
-; docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b.
 ;
 ; Projects model-space track vertices (NativeTrackVert, via the GPU-side
 ; N3DS_TrackVertex mirror -- n3ds_backend.h) with a REAL perspective camera,
@@ -104,7 +103,7 @@
                      ; (s41, dumpreq `dorder N`; seeded from bucketToDepth's
                      ; 1.0 -- see the depth-compose block). y/z are the runtime
                      ; A/B between the ordinal lerp and the true-depth axis
-                     ; (docs/PACKET_DEPTH_DESIGN.md) -- see the TRUE DEPTH block
+                     ; -- see the TRUE DEPTH block
                      ; in main. Both paths are computed and blended rather than
                      ; branched: PICA200 branching on a uniform would need two
                      ; shader variants or a real jump, and a handful of extra
@@ -112,7 +111,7 @@
                      ; which is the only way this gets accepted. Collapse to the
                      ; winner once the owner has ruled.
 .fvec depthRange     ; (-otIndexLo, ordinalLo, ordinalSpan, invIndexSpan) -- per leaf
-; SEMI-TRANSPARENCY (docs/TRANSPARENCY_DESIGN.md 3). x/y = the UV delta, in this
+; SEMI-TRANSPARENCY. x/y = the UV delta, in this
 ; file's own ENCODED units (2x fixed point -- the CPU doubles the texel delta
 ; before it gets here, see N3DS_TrackDraw_Leaf), from a rect's primary placement
 ; to its PASS2 placement. z/w unused.
@@ -160,7 +159,7 @@
 .alias  colorScale      trackConst.zzzz
 .alias  zOrdBias        trackConst.wwww
 
-; TRUE-DEPTH path constants (docs/PACKET_DEPTH_DESIGN.md 3.6).
+; TRUE-DEPTH path constants.
 ; x = 1 -- drawOrder tie-break weight, in view.z units. WAS 64 (one OT bucket,
 ;     the inverse of retail's >>6) with a comment claiming that gave "FINER
 ;     granularity than retail's own quantiser". It gave exactly retail's
@@ -299,7 +298,7 @@
 	add r3.w, depthRange.yyyy, r3.z     ; ordinal
 	add r6.x, zOrdBias, r3.w            ; zOrd_ordinal = ordinal - 32768
 
-	; ---- TRUE DEPTH path (docs/PACKET_DEPTH_DESIGN.md) --------------------
+	; ---- TRUE DEPTH path --------------------
 	; Everything above maps this vertex's real depth onto the packet path's
 	; QUANTISED ordinal axis, per leaf, by lerping between two recorded
 	; ordinals. s28 measured why that cannot be made seam-stable: the true

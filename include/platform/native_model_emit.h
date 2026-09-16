@@ -3,7 +3,7 @@
 
 #include <macros.h>
 
-// Rung 1 of the PICA-native model renderer (docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+// Rung 1 of the PICA-native model renderer.
 //
 // The track renderer's equivalent pair is NativeTrackFrame_Record (game thread
 // builds a snapshot) and NativeTrackDraw_IssueForWalk (render worker reads it).
@@ -108,7 +108,7 @@ int NativeModelEmit_BeginInstance(const struct InstDrawPerPlayer *idpp, const st
 // with their own replace-mode test rather than assuming a capture implies a
 // draw -- the two diverge on snapshot overflow and on semi-transparent textures,
 // and treating them as identical silently deleted geometry in both cases. See
-// the implementation comment and docs/TRANSPARENCY_DESIGN.md section 5.
+// the implementation comment.
 int NativeModelEmit_Triangle(const u32 *packedXY3, const u32 *packedZ3, const int *color3, const struct TextureLayout *tex, int blendOverride);
 
 // Runtime toggle for the specular writer treatment above (dumpreq 'spec',

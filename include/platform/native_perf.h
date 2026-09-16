@@ -54,8 +54,8 @@ enum NativePerfBucket
 	 * Voice-start ADPCM decode/scan on the key-on path (NativeAudio_
 	 * UpdateVoiceSample, both call sites). Runs on the game thread inside
 	 * game logic, so without its own bucket its cost lands invisibly in
-	 * game_logic_ms -- which is how the sound-start frame spikes hid
-	 * (docs/VOICE_START_DECODE_DESIGN.md). Appended, never inserted:
+	 * game_logic_ms -- which is how the sound-start frame spikes hid.
+	 * Appended, never inserted:
 	 * s_bucketInfo is indexed by this enum.
 	 */
 	NATIVE_PERF_BUCKET_AUDIO_VOICE_START,

@@ -4,7 +4,7 @@
  * Replaces platform/native_renderer.c (OpenGL 3.3 + glad), which cannot run on
  * the PICA200. This file satisfies every signature in
  * include/platform/native_renderer.h so the rest of the unity build compiles
- * unmodified. Design: docs/CITRO3D_RENDERER_DESIGN.md.
+ * unmodified.
  *
  * What is REAL here: the CPU-side PSX VRAM mirror and every operation that
  * only touches it (clear/copy/read/save-state); citro3d init, the compiled
@@ -66,7 +66,7 @@ global_variable unsigned int s_frameCounterForDump = 0;
  * positions, resolved atlas cell) records, armed alongside the capture set,
  * for diffing the ADDRESSING side against the same records from PC
  * (--tri-dump) at a matched scene. Record layout (LE, 36 bytes, mirrored in
- * native_offscreen_capture.c and tools/texdump/tridump_diff.py):
+ * native_offscreen_capture.c):
  *   u16 page, clut; u8 fmt, textured; u8 u0,u1,u2, v0,v1,v2;
  *   s16 x0,x1,x2, y0,y1,y2;
  *   s16 atlasIdx, pixelBaseU, pixelBaseV, originU, originV; u16 pad
@@ -165,7 +165,7 @@ global_variable int s_currentBlendMode = 0; /* BM_NONE */
 global_variable int s_semiTransPass = 0;
 /*
  * Pending-run state, FRAME scope, not per-DrawTriangles-call (cross-split
- * run persistence -- docs/DRAW_CALL_BATCH_SURVEY.md). The survey's finding:
+ * run persistence). The survey's finding:
  * draw count ~= split count because every DrawTriangles
  * call ended with an unconditional flush, while the whole frame's texture
  * working set lives in ~3 atlases -- so consecutive splits usually bind
@@ -797,7 +797,7 @@ int g_dbg_resolveMemo = 1;
  * a shipping mode). Runtime A/B: dumpreq 'fbtest' (dumpreq-only, no chord).
  * If the A/B pays, the shippable form is arm-time invalidation
  * of display-region cache entries (once per frame) instead of a per-
- * triangle test -- see docs/NATIVE_TRACK_RENDERER_DESIGN.md section 9. */
+ * triangle test. */
 int g_dbg_skipFbTriTest = 0;
 global_variable int s_rmemoValid = 0;
 global_variable u8 s_rmemoTier; /* 1 = sub-page, 2 = full-page */
@@ -918,7 +918,7 @@ internal void N3DS_DirtyVRAMRect(int x, int y, int w, int h)
 }
 
 /*
- * Lazy framebuffer-region mirror refresh -- docs/PAUSE_FREEZE_FRAME_DESIGN.md.
+ * Lazy framebuffer-region mirror refresh.
  *
  * PC refreshes the mirror's framebuffer region from the rendered frame every
  * Platform_EndScene (StoreFrameBuffer -> readback -> pack, the FBREAD writer).
@@ -1141,7 +1141,7 @@ typedef struct
 #define N3DS_WHITE_CELL_Y 0
 
 /*
- * Sub-page decode cache (docs/SUBPAGE_DECODE_CACHE_DESIGN.md): a static split
+ * Sub-page decode cache: a static split
  * of the same N3DS_TOTAL_CELLS physical atlas cells, not a separate memory
  * budget. Cell 0 stays the reserved white cell; cells 1..N3DS_FULLPAGE_RESERVED_CELLS
  * back the whole-page tier below (unchanged logic, just a smaller array); the
@@ -1638,8 +1638,8 @@ global_variable u32 s_droppedRuns = 0;
  * Decodes PSX texture page `texPage` (through CLUT `clut` for 4/8-bit) into
  * a 256x256 RGBA8 buffer, applying the PICA200 8x8 Z-order (Morton) tile
  * swizzle inline -- citro3d's C3D_TexLoadImage is a raw memcpy and does not
- * tile for you (verified directly against citro3d's upstream source, see
- * docs/CITRO3D_RENDERER_DESIGN.md section 1). The intra-tile bit-interleave
+ * tile for you (verified directly against citro3d's upstream
+ * source). The intra-tile bit-interleave
  * below (x supplies the even bits, y the odd bits) was cross-checked
  * position-by-position against tex3ds's own reference swizzle table
  * (source/swizzle.cpp) rather than assumed.
@@ -1907,7 +1907,7 @@ internal void N3DS_DilateTransparentRGB(u16 *tiled, int width, int height, int d
  * fresh (matching VRAM dirty-cell generations), or decodes into the
  * least-recently-used atlas cell on a miss. Returns a flat cell index (see
  * N3DS_CellIndexToAtlasCoord). Linear scan over 1+N3DS_FULLPAGE_RESERVED_CELLS
- * (this tier's whole-page cell budget, since docs/SUBPAGE_DECODE_CACHE_DESIGN.md's
+ * (this tier's whole-page cell budget since the
  * two-tier split -- was N3DS_TOTAL_CELLS before) -- fine for a
  * correctness-first pass at this count; the design doc explicitly leaves
  * perf tuning for after on-device measurement. Note "cell" means two
@@ -3750,8 +3750,8 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
 		dst->z = (s16)((int)src->emitOrdinal - 32768);
 		/* Parallax channel, biased identically (s40b channel split). Equal to
 		 * z for everything except the checkered flag, whose stereo depth is
-		 * deliberately not the depth it occludes by --
-		 * docs/FLAG_SPLIT_CHANNEL_SPEC.md. Read by ctr.v.pica as inpos.w. */
+		 * deliberately not the depth it occludes by.
+		 * Read by ctr.v.pica as inpos.w. */
 		dst->w = (s16)((int)src->parallaxOrdinal - 32768);
 
 		/* Offset into the resolved region of the atlas, not the whole
@@ -3852,7 +3852,7 @@ internal void N3DS_ConvertTriangleVerts(N3DS_Vertex *dst3, const GrVertex *triVe
  * floor/wall/sky surface). GrVertex.u/.v are raw u8 (0-255) with no alignment
  * guarantee, so this bbox-vs-tile test must run per triangle, not once per
  * (page,clut): two triangles sharing a texture can still have different UV
- * footprints (docs/SUBPAGE_DECODE_CACHE_DESIGN.md). Both branches resolve to
+ * footprints. Both branches resolve to
  * the same output shape (pixelBase/origin), so the caller's UV assignment is
  * one formula for both tiers -- see NativeRenderer_DrawTriangles.
  */
@@ -4430,7 +4430,7 @@ void NativeRenderer_EndScene(void)
 
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
 	/*
-	 * Rung 3a step 2 (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b): resident
+	 * Rung 3a step 2: resident
 	 * track draws, issued IMMEDIATELY BEFORE the merge-bin barrier below.
 	 * MergeFlush emits opaque bins/segments first and blend segments last,
 	 * so track geometry submitted just before it is opaque-with-opaque
@@ -4502,7 +4502,7 @@ void NativeRenderer_EndScene(void)
 
 #if defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
 	/*
-	 * PICA-native model instances (rung 2, docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+	 * PICA-native model instances (rung 2).
 	 *
 	 * AFTER the merge flush, deliberately, unlike the track draw above. Model
 	 * draws append into the SAME per-frame vertex buffer the merge bins hold
@@ -4947,8 +4947,8 @@ void NativeRenderer_SwapWindow(void)
 		       nowX10 / 10UL, nowX10 % 10UL, avgX10 / 10UL, avgX10 % 10UL);
 		/* Break the heap down: XA now reports ring occupancy (sectors buffered
 		 * / ring depth) and underrun count instead of arena KiB -- this is the
-		 * same instrumentation that originally proved the old arena-growth bug
-		 * (docs/archive/BUGREPORT_audio_arena_growth.md); after the fix it should show a
+		 * same instrumentation that originally proved the old arena-growth bug;
+		 * after the fix it should show a
 		 * small number that stays flat across track transitions instead of
 		 * one that doubles over a session. */
 		printf("heap   %-6lu KiB  xa %d/%d ur %-4lu\n", heapKiB, NativeAudio_XAStreamSectorsBuffered(), NATIVE_AUDIO_XA_RING_SECTORS,
@@ -5229,8 +5229,7 @@ void NativeRenderer_SwapWindow(void)
 
 			/*
 			 * Sub-page tier diagnostics -- mirrors the full-page block just
-			 * above, field-for-field (docs/SUBPAGE_DECODE_CACHE_DESIGN.md
-			 * "Instrumentation"). Full per-tier breakdown goes to the log
+			 * above, field-for-field. Full per-tier breakdown goes to the log
 			 * only; the console gets one compact routing-summary line below
 			 * instead of a full duplicate block -- this console has already
 			 * hit its practical width/line limit once before (see the
@@ -5825,7 +5824,7 @@ void NativeRenderer_PresentVRAMRect(int displayX, int displayY, int displayW, in
 			 * Pre-scaled by (1024/maxChunk), not left as a plain [0,1]
 			 * fraction like the old float u1/v1 were: ctr.v.pica now applies
 			 * a single, unconditional *1/1024 to every vertex's texcoord
-			 * (design doc "Lever 2"/docs/VERTEX_FORMAT_DESIGN.md) because one
+			 * (design doc "Lever 2") because one
 			 * vertex shader is shared by every draw call in this renderer,
 			 * not just DrawTriangles' atlas-cell path. This quad samples a
 			 * dedicated, non-atlas s_vramDisplayTex directly in [0,1]
@@ -6453,7 +6452,7 @@ void NativeRenderer_DrawTriangles(int startVertex, int triangles)
 			 * triangle, not once per (page,clut): two triangles sharing a
 			 * texture can still have different UV footprints (e.g. a small
 			 * decal vs. a large floor triangle both sampling the same page).
-			 * See N3DS_ResolveTriangleTexture / docs/SUBPAGE_DECODE_CACHE_DESIGN.md. */
+			 * See N3DS_ResolveTriangleTexture. */
 			if (g_dbg_forceSingleTexture)
 			{
 				/* Diagnostic: pin every textured triangle to one fixed texture
@@ -6715,8 +6714,8 @@ internal void N3DS_MetaWriteU32(FILE *f, u32 v)
 
 /*
  * Dumps both decode-cache tiers' metadata + the VRAM dirty-cell generation
- * grid to sdmc:/cachemeta.bin, for the offline cell-by-cell verification loop
- * (tools/texdump/cache_verify.py). Captured alongside the VRAM + atlas dumps
+ * grid to sdmc:/cachemeta.bin, for offline cell-by-cell verification.
+ * Captured alongside the VRAM + atlas dumps
  * so all three describe the same instant: every `used` entry's atlas bytes
  * were uploaded synchronously before the entry was stamped, so entry+atlas
  * are consistent per-cell at any capture point.

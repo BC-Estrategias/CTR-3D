@@ -89,7 +89,7 @@ void NativePerf_TakeOtagSplit(struct NativeOtagSplitStats *out)
 // NativeRenderQueue_Route says so) and a CtrGpu_Exec* body (the pre-queue
 // implementation, unchanged -- the direct path when the queue is inactive,
 // which is always the case on PC). Exec bodies call only other Exec bodies
-// and renderer internals, never wrappers. docs/RENDER_THREAD_DESIGN.md.
+// and renderer internals, never wrappers.
 
 int g_dbg_emulatorPaused = 0;
 void (*drawsync_callback)(void) = NULL;

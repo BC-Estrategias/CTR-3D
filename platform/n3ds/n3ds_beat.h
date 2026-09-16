@@ -2,8 +2,8 @@
 #define N3DS_BEAT_H
 
 /*
- * Cross-thread heartbeat counters (Rosalina-freeze hardening,
- * docs/PORT_FEASIBILITY_3DS.md). Each of the three threads that can wedge on
+ * Cross-thread heartbeat counters (Rosalina-freeze hardening). Each of the
+ * three threads that can wedge on
  * an untimed GX/gsp wait -- game/main, audio, render worker -- stamps its own
  * slot every time it passes a known point; a watchdog on the audio thread
  * (whose own wait is time-bounded, so it can never wedge itself) and a

@@ -20,7 +20,7 @@
 /*
  * Below this the idle-arena reclaim leaves decoded voice PCM alone, so a
  * re-triggered sound between-sounds re-keys for free instead of paying a
- * full re-decode (docs/VOICE_START_DECODE_DESIGN.md step 4). With the
+ * full re-decode. With the
  * exact-size reservations of step 2 a normal SFX working set sits well under
  * this, so the unbounded-growth defence the reclaim was added for only has
  * to fire in genuinely pathological sessions; the bank-reload path
@@ -164,7 +164,7 @@ global_variable struct NativeAudioWorkerProfile s_workerProfile;
 
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 /*
- * Voice-start decode counters (docs/VOICE_START_DECODE_DESIGN.md step 1).
+ * Voice-start decode counters.
  * Window-scoped ones reset when the [PERF-VOICE] line is emitted; frameKeyOns
  * is consumed by native_perf.c once per frame for the worst-frame/key-on
  * correlation test. Same unity TU, so `internal` linkage crosses the files.
@@ -459,8 +459,7 @@ struct NativeAudioXaSource
 };
 
 // NOTE(aalhendi): Fixed-size streaming ring for one XA track's decoded PCM.
-// Replaces the old ever-growing xaPcmArena/xaPendingPcmArena (see
-// docs/archive/BUGREPORT_audio_arena_growth.md). ringPcm points at a static backing array
+// Replaces the old ever-growing xaPcmArena/xaPendingPcmArena. ringPcm points at a static backing array
 // (not inline -- see s_xaRingPcmLive/s_xaRingPcmPending), assigned once,
 // lazily, by NativeAudio_XAStreamInitRingBackingIfNeeded.
 //
@@ -1400,7 +1399,7 @@ internal b32 NativeAudio_AdsrRateIsAllOnes(int shiftValue, int stepValue, int bi
  * counter overflows?" from the SAME arithmetic rather than a copy of it --
  * a copy would silently drift the moment either is touched. Pure extraction:
  * the body below is the original code verbatim, and the golden mixer test
- * (docs/REPLAYS.md) is what proves it.
+ * is what proves it.
  */
 struct NativeAudioAdsrStep
 {
@@ -2050,7 +2049,7 @@ internal int NativeAudio_DecodeAdpcmNibble(u8 soundParameter, int nibble, int *o
  * logic and stop condition as NativeAudio_DecodeSpuSample below, but reads
  * only each block's flags byte and counts XA_SAMPLES_PER_SOUND_UNIT per block
  * -- no nibble math, no PCM writes, roughly 1/28th the work
- * (docs/VOICE_START_DECODE_DESIGN.md step 2). Gives UpdateVoiceSample the
+ *. Gives UpdateVoiceSample the
  * exact sample count to reserve (killing the old worst-case multi-MB arena
  * reservation) and owns the loop metadata so the decode below is a pure fill.
  * The two walks MUST agree on sample positions; any edit to one's loop/stop
@@ -2654,8 +2653,7 @@ internal void NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock(void)
 	 * Reset only fires once idle usage exceeds
 	 * NATIVE_AUDIO_VOICE_ARENA_RECLAIM_KEEP, not the instant nothing is
 	 * sounding: below the high-water mark, decoded PCM survives idle gaps so a
-	 * re-triggered sound re-keys for free (docs/VOICE_START_DECODE_DESIGN.md
-	 * step 4). The reset still runs -- only ever with no voice live -- once a
+	 * re-triggered sound re-keys for free. The reset still runs -- only ever with no voice live -- once a
 	 * genuinely large session pushes past the mark.
 	 */
 	if (s_audio.voicePcmArena.used <= NATIVE_AUDIO_VOICE_ARENA_RECLAIM_KEEP)
@@ -2680,8 +2678,8 @@ internal void NativeAudio_ReclaimVoicePcmArenaIfIdleNoLock(void)
  * Reserves exactly sampleCount samples -- the count comes from
  * NativeAudio_ScanSpuSampleExtent, so this no longer books the worst case
  * from addr to the end of SPU RAM (up to ~1.8 MB per key-on, the multi-MB
- * malloc+memcpy spike docs/VOICE_START_DECODE_DESIGN.md step 2 removes; the
- * 128 MiB arena peak in docs/archive/BUGREPORT_audio_arena_growth.md was this mechanism).
+ * malloc+memcpy spike the lazy decode removes; the
+ * 128 MiB arena peak of the old arena-growth bug was this mechanism).
  */
 internal int NativeAudio_PrepareVoicePcmBuffer(int sampleCount, struct NativeAudioPcmBuffer *pcm, int *markerOut)
 {
@@ -6292,8 +6290,7 @@ int NativeAudio_RenderXAParcelForAudioThread(void)
  * needs to cross the boundary at all -- NativeAudio_XAStreamPump is already
  * void->void, so this wrapper is a pure pass-through.
  *
- * Caller discipline (not enforced by the compiler -- see
- * docs/AUDIO_THREADING_DESIGN.md, "Verification findings"): this must be
+ * Caller discipline (not enforced by the compiler): this must be
  * called AFTER the worker thread has released s_audioRenderLock, never while
  * still holding it. NativeAudio_XAStreamPump() internally takes
  * NativeAudio_LockOutput()/UnlockOutput(), which resolve to the same
@@ -7104,8 +7101,7 @@ void NativeAudio_StepVBlank(void)
 		 * itself after releasing s_audioRenderLock (n3ds_audio_thread.c),
 		 * restoring the single-thread invariant between XA decode-pump and
 		 * XA position-advance (already inside MixFrame, worker-side) that
-		 * made this safe before lever 3 existed. See
-		 * docs/AUDIO_THREADING_DESIGN.md, "Verification findings". */
+		 * made this safe before lever 3 existed.. */
 		NativeAudio_XAStreamPump();
 	}
 #else
@@ -7324,7 +7320,7 @@ s32 NativeAudio_SpuInit(void)
 
 	// 3DS audio subsystem finishing initialization: bring up the ndsp sink
 	// and try to spin up the dedicated core-1 mixer thread
-	// (docs/AUDIO_THREADING_DESIGN.md). Safe to call every time this function
+	//. Safe to call every time this function
 	// runs, including the repeat calls NativeAudio_PlayXATrack/PlayXAFile
 	// make on every XA playback request -- N3DS_AudioThreadInit no-ops if a
 	// worker is already running, and always initializes the locks

@@ -5,8 +5,6 @@
  * Single home for the PSX texture-page texel addressing math, shared by the
  * decode cache (N3DS_DecodeAndTilePage) and the offscreen software raster
  * (n3ds_offscreen_raster.c) so there is exactly one copy to get wrong.
- * tools/texdump/cache_verify.py is the independent host-side reference
- * implementation this must keep agreeing with.
  *
  * Units, since they have bitten before: page origins are VRAM WORDS
  * (u16 columns), texel coordinates are TEXELS. A page is 256 TEXELS wide in

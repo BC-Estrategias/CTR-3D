@@ -8,7 +8,7 @@
  * struct-typed from either side may cross it. The job queue itself (storage,
  * tickets, executors) lives in the unity TU (platform/native_render_queue.c);
  * this side owns only the OS objects: the thread, the queue lock, and the
- * work/done events. Design: docs/RENDER_THREAD_DESIGN.md.
+ * work/done events.
  */
 
 /* Starts the worker on core 2 (New3DS-only core; core 1 belongs to the audio

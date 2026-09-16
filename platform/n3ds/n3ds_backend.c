@@ -451,7 +451,7 @@ void N3DS_ShowFatalAssetScreen(const char *assetDir)
 	gfxInitDefault();
 	consoleInit(GFX_TOP, NULL);
 
-	printf("\n  CTR Native\n\n");
+	printf("\n  CTR 3D\n\n");
 	printf("  Could not find the game's disc image.\n\n");
 	printf("  This port ships no game data. Copy your\n");
 	printf("  own NTSC-U Crash Team Racing disc dump to\n");
@@ -719,8 +719,8 @@ void N3DS_GfxPresent(void)
 /*
  * Copies the top screen's last completed gfx framebuffer into dstRGB as
  * row-major RGB triplets, nearest-resampled from the pillarboxed CONTENT
- * region (N3DS_TOP_CONTENT_*, header) to dstW x dstH
- * (docs/PAUSE_FREEZE_FRAME_DESIGN.md). The source costs nothing
+ * region (N3DS_TOP_CONTENT_*, header) to dstW x dstH.
+ * The source costs nothing
  * to produce: citro3d's C3D_FrameEnd already display-transfers every frame
  * into the linear-heap gfx framebuffers (GSP_BGR8_OES via gfxInitDefault;
  * the transfer's OUT_FORMAT is RGB8, which is what fills that byte layout),
@@ -857,7 +857,7 @@ static C3D_Tex s_trackAtlasTexturesNearest[N3DS_TRACK_ATLAS_MAX_UNITS];
 
 #ifdef CTR_NATIVE_MODEL_RENDERER
 /*
- * Rung 2 model program (docs/NATIVE_MODEL_RENDERER_DESIGN.md). Only the program
+ * Rung 2 model program. Only the program
  * and its uniform locations live here -- no attribute layout and no buffer
  * info, because model draws deliberately reuse the packet path's. See
  * n3ds_backend.h's N3DS_ModelDraw_* comment for why that is safe and what it
@@ -901,7 +901,7 @@ static int s_trackULocProjection = -1, s_trackULocH = -1, s_trackULocDepthRange 
 
 /*
  * The track's drawOrder tie-break weight, in view.z units per drawOrder step,
- * uploaded as hParam.w (docs/GROUND_DECAL_PASS_DESIGN.md 3/4).
+ * uploaded as hParam.w.
  *
  * 1.0 is the shipped scale. Raising it globally cannot separate a coplanar
  * overlay pair whose authored draw_order_high bytes are EQUAL (the weight only
@@ -1330,8 +1330,8 @@ int g_dbg_widescreen = 2;
 int g_dbg_trackAlphaRef = 1;
 
 /*
- * Bounded C3D_FrameBegin with stall recovery (Rosalina-freeze hardening,
- * docs/PORT_FEASIBILITY_3DS.md). Rosalina's kernel extension freezes ALL app
+ * Bounded C3D_FrameBegin with stall recovery (Rosalina-freeze hardening).
+ * Rosalina's kernel extension freezes ALL app
  * threads AND the GSP sysmodule's own threads together (svcKernelSetState
  * 0x10000, mask 2|1), thawing both on menu close; HOME/lid suspend only
  * freeze the app side and thaw cleanly. The one place this port can wait
@@ -2203,7 +2203,7 @@ void N3DS_C3DDrawTriangles(int startVertex, int triangleCount)
  * so one memcpy per tile-row is exact and correct, not an approximation.
  *
  * Shared by the whole-cell (32x32-tile) and sub-cell (8x8-tile) decode-cache
- * upload wrappers below (docs/SUBPAGE_DECODE_CACHE_DESIGN.md), AND by the
+ * upload wrappers below, AND by the
  * native track renderer's dedicated atlas pool (N3DS_TrackAtlas_UploadRect,
  * rung 2b) -- generalized from a hardcoded s_atlasTextures[]/
  * N3DS_ATLAS_DIM to an explicit destination texture + tiles-per-row so both
@@ -2857,7 +2857,7 @@ void N3DS_TrackDraw_Begin(const float *qx, const float *qy, const float *qw, flo
 #endif
 
 		/* hParam.w: drawOrder tie-break weight, in view.z units per drawOrder
-		 * step (docs/GROUND_DECAL_PASS_DESIGN.md 3/4). Was the
+		 * step. Was the
 		 * `bucketToDepth` shader constant at 1.0; moved onto the uniform so
 		 * the sweep is dumpreq `dorder N` instead of a rebuild per leg, for
 		 * the same reason the depth-axis selector above is a uniform: this
@@ -3082,7 +3082,7 @@ void N3DS_TrackDraw_Leaf(int firstIndex, int indexCount, float otIndexLo, float 
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_trackULocDepthRange, -otIndexLo, ordinalLo, ordinalSpan, invIndexSpan);
 
 	/*
-	 * SEMI-TRANSPARENCY (docs/TRANSPARENCY_DESIGN.md 3-4).
+	 * SEMI-TRANSPARENCY.
 	 *
 	 * blend is the rect's PSX ABR mode for a range the blend pass owns, or 3
 	 * (TRACK_ABR_OPAQUE) for ordinary content. uvDx/uvDy are the TEXEL delta to
@@ -3398,7 +3398,7 @@ void N3DS_ModelDraw_Run(int startVertex, int triangleCount, int atlasIndex, int 
 	}
 
 	/*
-	 * Semi-transparency (docs/TRANSPARENCY_DESIGN.md 5). blend is a BlendMode:
+	 * Semi-transparency. blend is a BlendMode:
 	 * 0 = opaque, 1..4 the PSX modes. A blended run is the PASS2 half of a
 	 * semi-transparent face and must not WRITE depth -- its PASS1 half already
 	 * wrote it in pass 0, and letting the blended half write again would make two
@@ -5144,7 +5144,7 @@ unsigned int N3DS_ReadButtons(void)
 					/* Ground-decal 4x depth-axis unscale (shadows, skid
 					 * marks, tires). Bare token toggles; this is the A/B the
 					 * fix gets judged on, so 0 must reproduce the pre-fix behaviour
-					 * exactly. docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+					 * exactly. */
 					g_dbg_decalAxisFix ^= 1;
 					N3DS_DebugLog(g_dbg_decalAxisFix ? "[CTR-3DS] decal depth axis: FIXED (4x unscaled)"
 					                                : "[CTR-3DS] decal depth axis: off (pre-s41 behaviour)");
@@ -5161,7 +5161,7 @@ unsigned int N3DS_ReadButtons(void)
 					 * leg is one token. Integer-only on purpose: atoi is what
 					 * every sibling token here uses, and sub-unit weights are
 					 * not what this measurement is asking about.
-					 * docs/GROUND_DECAL_PASS_DESIGN.md 4. */
+					 */
 					if (word[6] == ' ')
 					{
 						int n = atoi(&word[7]);
@@ -5229,8 +5229,7 @@ unsigned int N3DS_ReadButtons(void)
 
 					/* Menu/loading flag style. 'flagstyle N' sets, bare token
 					 * cycles 0->1->2->0. Both non-retail styles are also
-					 * reachable in-game by their cheat codes (WONDER, SOAR) --
-					 * docs/EASTER_EGGS.md. */
+					 * reachable in-game by their cheat codes (WONDER, SOAR). */
 					if (word[9] == ' ')
 					{
 						const int n = atoi(&word[10]);
@@ -5840,7 +5839,7 @@ unsigned long N3DS_LinearFreeBytes(void)
 
 /*
  * Once-per-frame main-thread heartbeat, thaw detector, and light watchdog
- * (Rosalina-freeze hardening, docs/PORT_FEASIBILITY_3DS.md). Called exactly
+ * (Rosalina-freeze hardening). Called exactly
  * once per frame regardless of render-thread routing, so it is the one place
  * guaranteed to run on the game thread every frame.
  */
