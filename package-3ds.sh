@@ -15,7 +15,8 @@ for arg in "$@"; do
             ;;
     esac
 done
-VERSION="${VERSION:-1.0.0-beta.1}"
+VERSION="${VERSION:-beta-1.0}"
+VERSION_LABEL="${VERSION//-/ }" # filename form uses dashes; prose uses spaces
 
 DIST_DIR="${DIST_DIR:-dist}"
 PACKAGE_NAME="ctr3d-${VERSION}"
@@ -58,7 +59,7 @@ legally-owned disc dump.
 EOF
 
 cat >"${PACKAGE_DIR}/README.txt" <<EOF
-CTR 3D ${VERSION} for New Nintendo 3DS
+CTR 3D ${VERSION_LABEL} for New Nintendo 3DS
 
 A homebrew port of Crash Team Racing (PS1, 1999). CTR 3D is a fork of
 CTR Native, the native PC port built on the CTR-ModSDK decompilation.

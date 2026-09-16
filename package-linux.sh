@@ -3,7 +3,8 @@
 
 set -euo pipefail
 
-VERSION="${1:-1.0.0-beta.1}"
+VERSION="${1:-beta-1.0}"
+VERSION_LABEL="${VERSION//-/ }" # filename form uses dashes; prose uses spaces
 BUILD_DIR="${BUILD_DIR:-build}"
 DIST_DIR="${DIST_DIR:-dist}"
 PACKAGE_NAME="ctr3d-${VERSION}-linux-x86"
@@ -24,7 +25,7 @@ cp LICENSE "${PACKAGE_DIR}/"
 cp THIRD_PARTY_NOTICES.md "${PACKAGE_DIR}/"
 
 cat >"${PACKAGE_DIR}/README.txt" <<EOF
-CTR 3D ${VERSION} -- Linux x86 build of the PC port
+CTR 3D ${VERSION_LABEL} -- Linux x86 build of the PC port
 
 Game assets are not included.
 
