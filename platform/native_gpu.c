@@ -175,7 +175,7 @@ typedef struct
 	u32 lastStampedZ;
 
 	/*
-	 * v2 bucket->ordinal table (docs/NATIVE_TRACK_RENDERER_DESIGN.md 12).
+	 * v2 bucket->ordinal table.
 	 * v1's widened STAMP was falsified by its own [OTZ] occupancy line
 	 * (intraMax 81-168 vs a 6-bit cap; ~1500 "crossings" because len-0
 	 * PACKETS are not OT slots; z saturating 65535 mid-walk) -- so v2
@@ -245,7 +245,7 @@ typedef struct
 int g_dbg_otzWiden = 0;
 
 /*
- * Menu/loading flag STYLE (owner easter eggs -- docs/EASTER_EGGS.md):
+ * Menu/loading flag STYLE (owner easter eggs):
  *   0 = retail grey checkers (default; the port's look stays close to retail)
  *   1 = six-colour pride stripes   -- cheat WONDER, or a June date check
  *   2 = purple checkers ("respect the dragon") -- cheat SOAR, retail's dead
@@ -1358,7 +1358,7 @@ void NativeGpu_RegisterOTRange(uint32_t *ot, int n)
  * falsified the encoding (see the v2 table comment in NativeGpuState);
  * v2 records instead of restamping, so this stays byte-identical to the
  * pre-rung-1 behavior. */
-/* Escape detector for the depth model (docs/PACKET_DEPTH_DESIGN.md 3.4b).
+/* Escape detector for the depth model.
  * NextDepthStamp is the single stamp source for BOTH emit paths, so counting
  * here gives the true number of stamped primitives per frame. [PKTDEPTH]
  * compares it against the number the resolver actually saw: if any emit path
@@ -1505,16 +1505,17 @@ int g_dbg_hudShine = 1;
  * parks the backdrop at effectively infinite parallax. Setting this pulls the
  * PARALLAX plane forward without disturbing any layering.
  *
- * 0 = follow the occlusion stamp (backdrop at infinity). Otherwise the view.z
- * plane the strips sit at: 1232 is the flag's anchor, 32 units behind the
- * screen plane; larger values sit deeper. dumpreq 'menubdpar N'.
+ * 0 (default) = the UI band, flattened to the screen plane exactly like the
+ * window border. Otherwise the view.z plane the strips sit at, for pushing the
+ * backdrop back into the box: 1232 is the flag's anchor just behind the screen,
+ * larger values sit deeper. dumpreq 'menubdpar N'.
  */
 int g_dbg_menuBdParZ = 0;
 
 /* ------------------------------------------------------------------------- */
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-/* Packet depth from GTE sz3 -- docs/PACKET_DEPTH_DESIGN.md.
+/* Packet depth from GTE sz3.
  *
  * OFF by default and inert until enabled: with g_dbg_packetDepth == 0 nothing
  * here runs and NativeGpu_StampEmitOrdinal writes exactly what it writes today.
@@ -1708,7 +1709,7 @@ global_variable int s_pendingDepthValid;
 /* 6, not 4: TriangulateQuad expands a 4-corner face into 6 vertices and
  * expands this array alongside it, in place. See its comment. */
 global_variable u16 s_pendingDepthPerVert[6];
-/* PARALLAX channel twin (docs/FLAG_SPLIT_CHANNEL_SPEC.md). Same length, same
+/* PARALLAX channel twin. Same length, same
  * indices, same TriangulateQuad permutation -- it rides alongside the
  * occlusion array everywhere rather than being derived from it, because for
  * the flag the two genuinely differ and any "recompute it later" scheme would
@@ -2284,8 +2285,7 @@ internal void PacketDepth_NoteExtent(u16 stamp, u16 *lo, u16 *hi)
 }
 
 /*
- * PARALLAX-channel fill for flag-range primitives (channel split,
- * docs/FLAG_SPLIT_CHANNEL_SPEC.md).
+ * PARALLAX-channel fill for flag-range primitives (channel split).
  *
  * These primitives resolved their OCCLUSION above as if their captures did not
  * exist -- that is the point, it hands layering back to retail's OT order --
@@ -2322,7 +2322,7 @@ internal void PacketDepth_FillParallaxFromCapture(const s16 *xs, const s16 *ys, 
  * just split by code path instead of by content type, and therefore much harder
  * to see in a screenshot.
  *
- * perVertPar is the PARALLAX channel (docs/FLAG_SPLIT_CHANNEL_SPEC.md): it
+ * perVertPar is the PARALLAX channel: it
  * receives a copy of the occlusion depths for every primitive in the game
  * except the checkered flag's, which get their remapped ripple band instead.
  * Callers that cannot carry a second channel pass NULL and lose nothing.
@@ -2412,9 +2412,19 @@ internal int PacketDepth_ResolveXY(const s16 *xs, const s16 *ys, int n, u16 *out
 		 * their raw emit ordinal and the flag would bury them. Flat across
 		 * the primitive; a backdrop panel has no per-vertex relief.
 		 */
-		u16 par = PKTDEPTH_MENU_BACKDROP;
+		/*
+		 * PARALLAX = the UI band, so the shader's band mask flattens these to
+		 * the screen plane -- the SAME treatment the window border around them
+		 * gets, because that border is UI. Anything else and the two separate
+		 * horizontally as the 3D slider comes up: the border sits at zero
+		 * disparity while the strips carry their occlusion depth's parallax,
+		 * and the backdrop slides out of its own frame. Band, not a depth near
+		 * the convergence plane, so the two stay locked if `stereoconv` moves.
+		 * Same idiom as the paint-on-top flat-overlay flavor below.
+		 */
+		u16 par = PKTDEPTH_UI_BASE;
 
-		/* Parallax rides its own plane when asked -- see g_dbg_menuBdParZ. */
+		/* Override with an explicit view.z plane -- see g_dbg_menuBdParZ. */
 		if (g_dbg_menuBdParZ > 0)
 		{
 			par = PacketDepth_ClampWorld(0xFFFFu - (u16)g_dbg_menuBdParZ);
@@ -3137,7 +3147,7 @@ internal void NativeGpu_StampEmitOrdinal(int firstVertex)
 }
 
 /*
- * Depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3): call
+ * Depth-compose fix: call
  * at every point real primitive content actually advances the emit ordinal --
  * the parse loop's two NativeGpu_StampEmitOrdinal call sites below (tagged
  * first primitive, tagless primitives loop) and the direct-emit fast path's
@@ -3655,8 +3665,8 @@ void MakeLineArray(GrVertex *vertex, VERTTYPE *p0, VERTTYPE *p1)
 }
 
 // Draws geometry at its true GTE sub-pixel position instead of snapping to
-// whole pixels, by looking up the fraction GTE_RotTransPers discarded (see
-// docs/GTE_CAPTURE_DESIGN.md) and carrying it in the otherwise-dead
+// whole pixels, by looking up the fraction GTE_RotTransPers discarded
+// and carrying it in the otherwise-dead
 // GrVertex._p0/_p1 padding bytes. A miss (table cleared, or these vertices
 // were never captured -- e.g. built from a synthesized/HUD coordinate) just
 // leaves _p0/_p1 at the memset default of 0, i.e. today's exact behavior.
