@@ -1,6 +1,6 @@
 /*
  * Native track renderer -- per-frame camera + visibility snapshot recorder
- * and draw side (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b).
+ * and draw side.
  *
  * There is no pre-existing "recorded leaf list the mesh builder already
  * latches" to read from. The mesh builder (native_track_mesh.c) only knows
@@ -808,7 +808,7 @@ int NativeTrackFrame_SkipRetailDraw(void)
 
 #if defined(__3DS__)
 /*
- * The CPU-side per-frame draw issuer (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b). Turns
+ * The CPU-side per-frame draw issuer. Turns
  * the double-buffered snapshot above into the resident track's actual draw calls via the
  * plain-scalar N3DS_TrackDraw_* API -- ordinary game-domain math, never a citro3d/libctru call,
  * matching this project's TU/ABI boundary rule. Called from NativeRenderer_EndScene, which on
@@ -911,7 +911,7 @@ internal int NativeTrackDraw_ComputeLeafDepthRange(const struct NativeTrackFrame
 	if (otIndexHiInt > DRAW_LEVEL_OVR1P_MAX_OT_INDEX) { otIndexHiInt = DRAW_LEVEL_OVR1P_MAX_OT_INDEX; }
 
 	/*
-	 * Depth-compose fix (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.3): a bucket nearer than all real
+	 * Depth-compose fix: a bucket nearer than all real
 	 * packet content is not a meaningful depth anchor. The camera sits on the track, so a leaf's
 	 * own box can reach bucket 0 -- a bucket retail never draws into -- and the otBucketOrdinal
 	 * table's entry for it is just whatever the emit counter had reached by the END of the walk,
@@ -1089,7 +1089,7 @@ void NativeTrackDraw_IssueForWalk(void)
 	float dbgLeaf0ViewZLo = 0.0f, dbgLeaf0ViewZHi = 0.0f;
 
 	/*
-	 * TWO PASSES, opaque then blended (docs/TRANSPARENCY_DESIGN.md 4).
+	 * TWO PASSES, opaque then blended.
 	 *
 	 * pass 0 draws every range whose bin is opaque, with depth writes on, exactly
 	 * as this loop always has. pass 1 draws the semi-transparent ranges, with

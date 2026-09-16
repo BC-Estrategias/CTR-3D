@@ -1,7 +1,6 @@
 /*
  * Bake-parity diff -- see include/platform/native_bake_parity.h for the
- * contract and docs/PORT_FEASIBILITY_3DS.md "track bake pre-export" for the
- * campaign context. Unity-TU file, included from main.c AFTER
+ * contract. Unity-TU file, included from main.c AFTER
  * native_track_mesh.c on purpose: the perm-conviction report reads that
  * file's sTrackUvPerm table directly (same-TU file-scope access, the same
  * arrangement native_track_frame.c uses for the mesh accessors).

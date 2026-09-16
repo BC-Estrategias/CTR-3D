@@ -292,7 +292,7 @@ global_variable const char *s_windowCfg;
 #if CTR_NATIVE_AUDIO_DECODE_PROFILE
 /*
  * Worst single frame in the window plus the key-on count ON THAT FRAME --
- * the voice-start correlation test (docs/VOICE_START_DECODE_DESIGN.md).
+ * the voice-start correlation test.
  * The window's 64-frame averages smear a one-frame decode spike into
  * nothing, which is exactly how it went unnoticed; the hypothesis is
  * confirmed iff worst frames consistently coincide with keyOns > 0 in race

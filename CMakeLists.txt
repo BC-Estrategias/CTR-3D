@@ -5,8 +5,8 @@ include(CheckCCompilerFlag)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
-set(CTR_NATIVE_VERSION "0.1.0-beta.7.1")
-set(CTR_NATIVE_AUTHOR "CTR Native" CACHE STRING "Author shown in the 3DS HOME Menu (SMDH)")
+set(CTR_NATIVE_VERSION "1.0.0-beta.1")
+set(CTR_NATIVE_AUTHOR "CTR 3D" CACHE STRING "Author shown under the icon in the Homebrew Launcher (SMDH publisher field)")
 
 # Host builds target x86-32 with SSE. On the 3DS the devkitPro platform module
 # supplies the ARM11 arch flags (-march=armv6k -mtune=mpcore -mfloat-abi=hard),
@@ -255,7 +255,6 @@ endif()
 # block per level load: vertex-pool edge sharing (the no-crack premise),
 # water/animated-vertex exclusion share, AnimTex inventory, and texture
 # working set per LOD variant. Read-only over game structs; golden unchanged.
-# Design + what each number decides: docs/NATIVE_TRACK_RENDERER_DESIGN.md 7.
 option(CTR_NATIVE_TRACK_CENSUS
     "[TRKCENSUS] level-geometry censuses for the native track renderer"
     OFF)
@@ -263,7 +262,7 @@ if(CTR_NATIVE_TRACK_CENSUS)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_TRACK_CENSUS=1)
 endif()
 
-# Native track renderer (s27+, docs/NATIVE_TRACK_RENDERER_DESIGN.md). Current
+# Native track renderer (s27+). Current
 # state: ladder step 1 -- load-time resident-mesh builder, count-only ([TRKMESH]
 # line per level), draws nothing on any platform yet. The 3DS draw side lands
 # behind this same gate.
@@ -325,7 +324,7 @@ if(CTR_NATIVE_TRACK_RENDERER)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_TRACK_RENDERER=1)
 endif()
 
-# PICA-native model renderer (s30-s32, docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+# PICA-native model renderer (s30-s32).
 # Current state: rung 1.
 #   rung 0 -- load-time per-ModelHeader topology scan ([MODELMESH]/[MODELGATE]
 #             per level) plus a per-frame instance sampler ([MODELFRAME]).
@@ -379,8 +378,7 @@ endif()
 # Azahar session that cannot press SEL+START was silently exercising the RETAIL
 # path, so every "verified in Azahar" claim about packet depth was vacuous --
 # g_dbg_packetDepth was 0 and the whole resolver early-returned. That is how the
-# s40b UI-band striping reached hardware unnoticed. See the 3DS defaults note in
-# docs/PORT_FEASIBILITY_3DS.md.
+# UI-band striping reached hardware unnoticed.
 option(CTR_NATIVE_RENDERER_DEFAULT_ON
     "Boot the track/model/packet-depth toggles ON (the port's real config; SEL+START still A/Bs to retail)"
     ON)
@@ -399,7 +397,7 @@ endif()
 # 'renderthread'. Falls back to today's synchronous path on old 3DS or core-2
 # refusal. (GTE-capture builds ran sync until s26 double-buffered the capture
 # table -- native_gte_capture.c -- so capture and the worker now coexist.)
-# PC builds compile none of this. Design: docs/RENDER_THREAD_DESIGN.md.
+# PC builds compile none of this.
 option(CTR_NATIVE_RENDER_THREAD
     "3DS: render pipeline on a core-2 worker thread (runtime A/B: dumpreq renderthread)"
     ON)
@@ -407,8 +405,8 @@ if(NINTENDO_3DS AND CTR_NATIVE_RENDER_THREAD)
     target_compile_definitions(ctr_native PRIVATE CTR_NATIVE_RENDER_THREAD=1)
 endif()
 
-# Direct-emit fast path (retained-geometry campaign, transitional form --
-# docs/RETAINED_GEOMETRY_V2_DESIGN.md, session 26). OT nodes whose payload is
+# Direct-emit fast path (retained-geometry campaign, transitional form). OT
+# nodes whose payload is
 # purely opaque poly prims go packet -> merge bin on the 3DS walk directly,
 # skipping the GrVertex intermediate, the split machinery, and the scratch
 # copies -- the translate/convert half the core-2 profile showed as the
@@ -422,7 +420,7 @@ endif()
 # machinery, NOT the per-triangle emit work, which just moved buckets:
 # draw_all_splits 42.1->27.6ms but draw_otag_parse 2.7->15.5ms) and promoted
 # to default ON the same night. The per-triangle work itself is the full
-# retained form's target (docs/RETAINED_GEOMETRY_V2_DESIGN.md).
+# retained form's target.
 option(CTR_NATIVE_DIRECT_EMIT
     "Direct packet->bin emit for all-opaque-poly OT nodes (3DS fast path; PC counts only)"
     ON)
@@ -439,7 +437,7 @@ if(CTR_NATIVE_AUDIO_ARENA_LOG)
 endif()
 
 # Per-window voice-start decode counters + [PERF-VOICE] report line + the
-# worst-frame/key-on correlation (docs/VOICE_START_DECODE_DESIGN.md step 1).
+# worst-frame/key-on correlation.
 # The 64-frame [PERF] averages smear a one-frame key-on decode spike into
 # nothing, which is how the sound-start hitches hid; this is the
 # instrumentation that has to confirm the cause before optimizing further.
@@ -478,7 +476,7 @@ endif()
 
 # Populate + clear a per-frame side table of GTE sub-pixel fractions, keyed by
 # the exact truncated screen coordinate the GTE writes to the packet. No
-# visible effect alone -- see docs/GTE_CAPTURE_DESIGN.md. Shared
+# visible effect alone. Shared
 # infrastructure for CTR_NATIVE_VERTEX_DESNAP and later stereo/perspective-UV.
 #
 # ON by default on 3DS: stereo 3D is built on the capture table, and the 3DS
@@ -629,8 +627,8 @@ if(NINTENDO_3DS)
     # symbols out of ctru.
     target_link_libraries(ctr_native citro3d ctru)
     ctr_generate_smdh(ctr_native.smdh
-        NAME "CTR-Native"
-        DESCRIPTION "Crash Team Racing (native port) ${CTR_NATIVE_VERSION}"
+        NAME "CTR 3D"
+        DESCRIPTION "Crash Team Racing for New 3DS ${CTR_NATIVE_VERSION}"
         AUTHOR "${CTR_NATIVE_AUTHOR}"
     )
     ctr_create_3dsx(ctr_native SMDH ctr_native.smdh)

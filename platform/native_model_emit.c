@@ -1,5 +1,5 @@
 /*
- * native_model_emit.c -- per-frame model triangle capture. docs/NATIVE_MODEL_RENDERER_DESIGN.md
+ * native_model_emit.c -- per-frame model triangle capture.
  * documents the capture hooks and design; this file is the buffer and its ownership rules.
  * Produces a double-buffered snapshot of one frame's model geometry in model space plus
  * per-instance camera records, captured alongside the packet path so it can be checked against a
@@ -354,8 +354,8 @@ global_variable u32 s_modelEmitWinSemiTris; /* declined to the packet path -- se
  *
  * Untextured faces (tex == NULL) have no tpage and cannot be semi-transparent
  * by this rule; retail's untextured model primitives carry their own ABE bit,
- * which this capture never sees. See docs/TRANSPARENCY_DESIGN.md section 5 --
- * closing that gap is what turns this decline into a real blended draw.
+ * which this capture never sees.
+ * Closing that gap is what turns this decline into a real blended draw.
  */
 internal int NativeModelEmit_TexIsSemiTrans(const struct TextureLayout *tex)
 {
@@ -1227,7 +1227,7 @@ internal void NativeModelDraw_FlushRun(struct NativeModelDrawRun *run, u32 *draw
 /*
  * A face's PSX ABR (semi-transparency mode), or 3 for opaque.
  *
- * Same rule and same citation as the track's (docs/TRANSPARENCY_DESIGN.md 1):
+ * Same rule and same citation as the track's:
  * tpage bits 5-6, with 3 as CTR's "this page is opaque" sentinel. Reads the
  * face's own captured tpage, so nothing new had to be recorded at emit time.
  *
@@ -1312,7 +1312,7 @@ void NativeModelDraw_IssueForWalk(void)
 
 	/*
 	 * TWO PASSES, opaque then blended -- the same shape as the resident track's
-	 * (docs/TRANSPARENCY_DESIGN.md 4-5), and for the same reason: a blended
+	 * and for the same reason: a blended
 	 * surface must composite over everything opaque behind it, and "behind"
 	 * spans instances, so the split cannot be per instance.
 	 *

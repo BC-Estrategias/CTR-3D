@@ -8,8 +8,6 @@
  * n3ds_audio_thread.c is therefore compiled as its own translation unit,
  * same as n3ds_backend.c -- it sees libctru and never sees the game headers.
  * Everything crossing this line uses plain C scalar types.
- *
- * See docs/AUDIO_THREADING_DESIGN.md for the full design this implements.
  */
 
 #ifndef N3DS_AUDIO_THREAD_H

@@ -899,7 +899,7 @@ void RenderAllNormalParticles(struct GameTracker *gGT)
 	 * Torch's heat-warp list is NOT in this bracket and must not be: it reads
 	 * the same particle fields with `>> 8` instead of `>> 6` (Torch.c:565),
 	 * which already divides the 4x back out.
-	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	 */
 	GTECapture_BeginFixedDepthShift(2);
 #endif
 
@@ -962,7 +962,7 @@ void RenderAllFlag0x40(struct GameTracker *gGT)
 	 * translation vector -- 4x regime axis, outside RenderBucket. Brackets the
 	 * whole player loop: every iteration projects the same way, and the
 	 * bracket carries no per-instance state.
-	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	 */
 	GTECapture_BeginFixedDepthShift(2);
 #endif
 	for (i = 0; i < gGT->numPlyrCurrGame; i++)
@@ -1030,7 +1030,7 @@ void RenderAllTires(struct GameTracker *gGT)
 	 * (DrawTiresSolid_SetupGteState, `<< 2`) with a zero translation vector,
 	 * so its SZ3 lands on the 4x regime axis. Outside RenderBucket, so the
 	 * dispatch-site bracket never covered it.
-	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	 */
 	GTECapture_BeginFixedDepthShift(2);
 #endif
 
@@ -1091,7 +1091,7 @@ void RenderAllShadows(struct GameTracker *gGT)
 	/* s41: VehGroundShadow scales its camera delta by 4
 	 * (VEH_GROUND_SHADOW_CAMERA_DELTA_SCALE) and projects with a zero
 	 * translation vector -- 4x regime axis, outside RenderBucket.
-	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	 */
 	GTECapture_BeginFixedDepthShift(2);
 	VehGroundShadow_Main();
 	GTECapture_EndInstanceDepth();
@@ -1422,7 +1422,7 @@ void RenderAllLevelGeometry(struct GameTracker *gGT, struct Level *level1, struc
 
 		// 226-229
 		//
-		// Rung 3a step 2's gate (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/12b):
+		// Rung 3a step 2's gate:
 		// toggle state 1 (resident) REPLACES this retail draw -- the resident
 		// path (platform/native_track_frame.c's NativeTrackDraw_IssueForWalk,
 		// called later from NativeRenderer_EndScene) draws the track instead.

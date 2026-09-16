@@ -493,7 +493,7 @@ void RaceFlag_DrawLoadingString(void)
  * idiom used for NativeWide_CullMarginX below, because the use site is deep
  * inside RaceFlag_DrawSelf's nested loops and a block-scoped declaration
  * would not be visible there. 0 = retail checkers, 1 = pride stripes,
- * 2 = purple checkers. See docs/EASTER_EGGS.md. */
+ * 2 = purple checkers. */
 extern int g_dbg_flagStyle;
 
 /*
@@ -1060,7 +1060,7 @@ SKIP_LOADING_TEXT:
 	 * take their STEREO depth from these (remapped) captures while their
 	 * OCCLUSION depth comes from retail's OT layering like it always did
 	 * -- flag over everything mid-wipe, behind the models in menus. See
-	 * GTECapture_NodeExempt and docs/FLAG_SPLIT_CHANNEL_SPEC.md for the
+	 * GTECapture_NodeExempt for the
 	 * two-channel contract. primMem.cursor still holds this draw's first
 	 * prim here (it advances only below), so [cursor, p) is the flag's
 	 * packets and nothing else. */

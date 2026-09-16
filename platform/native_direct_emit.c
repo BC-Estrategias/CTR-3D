@@ -1,6 +1,5 @@
 /*
- * Direct-emit fast path (retained-geometry campaign, transitional form --
- * docs/RETAINED_GEOMETRY_V2_DESIGN.md). For an OT node whose payload is
+ * Direct-emit fast path (retained-geometry campaign, transitional form). For an OT node whose payload is
  * nothing but opaque poly prims, emits packet -> merge bin directly, skipping
  * the GrVertex/split path. Byte-parity with the normal path is the design
  * invariant (see DirectEmit_WalkNode). A node with any draw-env prim,
@@ -177,7 +176,7 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				u16 ordinal;
 				s16 z;
 				s16 zPerVert[4];
-				/* Parallax channel twin (docs/FLAG_SPLIT_CHANNEL_SPEC.md):
+				/* Parallax channel twin:
 				 * same indices, same validity flag -- the resolver fills both
 				 * or neither. */
 				s16 wPerVert[4];
@@ -213,7 +212,7 @@ internal int DirectEmit_WalkNode(const u32 *words, u32 len, int emit)
 				zPerVertValid = 0;
 
 #if defined(CTR_NATIVE) && CTR_NATIVE_GTE_CAPTURE
-				/* Depth model (docs/PACKET_DEPTH_DESIGN.md 3.4b). This path
+				/* Depth model. This path
 				 * writes its own z and handles most of a heavy track's opaque
 				 * content, so it MUST resolve depth exactly as the parse path
 				 * does -- if only one of the two moves onto the true-depth

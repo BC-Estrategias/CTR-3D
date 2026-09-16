@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a problem with CTR Native
+description: Report a problem with CTR 3D
 title: "[Bug]: "
 labels: ["bug"]
 body:
@@ -40,9 +40,9 @@ body:
     attributes:
       label: Game version
       description: >-
-        3DS: the version shown in the HOME Menu description.
+        3DS: the version string shown under the game's name in the Homebrew Launcher.
         PC: the output of `ctr_native --version`.
-      placeholder: e.g. beta-7_1 (a1b2c3d)
+      placeholder: e.g. 0.1.0-beta.7.1 (3DS), or the --version output (PC)
     validations:
       required: true
 

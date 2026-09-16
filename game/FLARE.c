@@ -70,7 +70,7 @@ void FLARE_ThTick(struct Thread *th)
 	 * dispatch-site bracket never covered it). Opened after both early returns
 	 * so a rejected flare never leaves it dangling; GTECapture_Clear closes any
 	 * leak at the frame edge regardless.
-	 * docs/GROUND_DECAL_PASS_DESIGN.md 3. */
+	 */
 	GTECapture_BeginFixedDepthShift(2);
 #endif
 

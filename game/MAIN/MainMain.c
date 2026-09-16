@@ -194,8 +194,7 @@ u32 main(void)
 			// process memory kept growing to 710 MB. The real growth was the XA
 			// arena pair (xaPcmArena / xaPendingPcmArena), whose capacity used to
 			// ratchet up and never release -- it has since been replaced by a
-			// fixed-size streaming ring in native_audio.c, see
-			// docs/archive/BUGREPORT_audio_arena_growth.md for history. Keeping this reset is
+			// fixed-size streaming ring in native_audio.c. Keeping this reset is
 			// defensible tidiness, but do not mistake it for the fix.
 			NativeAudio_ResetVoicePcmArena();
 #endif

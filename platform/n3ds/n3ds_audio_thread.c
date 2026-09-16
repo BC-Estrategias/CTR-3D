@@ -1,10 +1,9 @@
 /*
  * libctru side of the audio-thread boundary. This file is its own
  * translation unit and must never include game headers -- see
- * n3ds_backend.h for why (same collision, same isolation style). See
- * docs/AUDIO_THREADING_DESIGN.md for the full design this implements,
- * including "What changed from v1" -- the lock-scoping and core-selection
- * fixes below are not incidental, they are the actual point of the design.
+ * n3ds_backend.h for why (same collision, same isolation style). The
+ * lock-scoping and core-selection choices below are not incidental; they
+ * are the point of the design.
  *
  * This file also owns the ndsp output sink: a small ring of linear-memory
  * wave buffers the mixer (worker thread, or the StepVBlank fallback) submits
@@ -54,8 +53,7 @@ extern void NativeAudio_RenderVBlankForAudioThread(void);
  * the render call above takes. LightLock is non-recursive, so this must
  * only be called AFTER s_audioRenderLock has been released, never nested
  * inside that lock's held span, or the worker thread self-deadlocks trying
- * to re-lock a lock it already holds. See docs/AUDIO_THREADING_DESIGN.md,
- * "Verification findings".
+ * to re-lock a lock it already holds.
  */
 extern void NativeAudio_XAPumpForAudioThread(void);
 
@@ -90,8 +88,7 @@ extern void NativeAudio_TakeWorkerProfileForAudioThread(unsigned long long *life
 /*
  * Reuses NATIVE_VSYNC_CATCHUP_MAX's existing value and precedent (the
  * render-side vblank catch-up loop, native_platform.c) -- same shape of
- * problem, same answer, not a new arbitrary number. See
- * docs/AUDIO_THREADING_DESIGN.md, "The XA lag question".
+ * problem, same answer, not a new arbitrary number..
  */
 #define NATIVE_AUDIO_THREAD_MAX_BACKLOG_VBLANKS 8
 
@@ -1167,8 +1164,8 @@ static int N3DS_NdspCushionTarget(void)
 }
 
 /*
- * Cross-thread stall watchdog (Rosalina-freeze hardening,
- * docs/PORT_FEASIBILITY_3DS.md). This thread's own wait (svcWaitSynchronization
+ * Cross-thread stall watchdog (Rosalina-freeze hardening). This
+ * thread's own wait (svcWaitSynchronization
  * above) is capped at one XA period, so it can never wedge itself -- which is
  * what makes it a trustworthy place to notice ANOTHER thread that has: if
  * main or the render worker's heartbeat counter has not moved since the last
@@ -1342,8 +1339,7 @@ static void N3DS_AudioThreadMain(void *arg)
 		NativeAudio_XAPumpForAudioThread(); /* once per wake, burst-refilling inside; run with NO
 		                                        locks held -- NativeAudio_XAStreamPump takes the
 		                                        render lock itself via N3DS_AudioLock, and LightLock
-		                                        is non-recursive (docs/AUDIO_THREADING_DESIGN.md,
-		                                        "Verification findings"). */
+		                                        is non-recursive. */
 		s_profPumpTicks += svcGetSystemTick() - now;
 
 		NativeAudio_HwDecodePumpForAudioThread(); /* once per wake, no locks held -- takes the

@@ -1,6 +1,5 @@
 /*
- * Track censuses for the native track renderer --
- * docs/NATIVE_TRACK_RENDERER_DESIGN.md section 7, INST-1/2/3/6.
+ * Track censuses for the native track renderer (INST-1/2/3/6).
  *
  * Read-only over the game's own level structs, once per level (keyed on the
  * mesh_info pointer changing), behind CTR_NATIVE_TRACK_CENSUS. Compiled out

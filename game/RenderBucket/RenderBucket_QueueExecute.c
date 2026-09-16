@@ -4565,7 +4565,7 @@ void RenderBucket_DrawFunc_Normal(struct RenderBucketDrawContext *ctx)
 	u32 *pCmd;
 
 #if defined(CTR_NATIVE) && defined(CTR_NATIVE_MODEL_RENDERER) && CTR_NATIVE_MODEL_RENDERER
-	// PICA-native model renderer, rung 1 (docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+	// PICA-native model renderer, rung 1.
 	// Opened here rather than in RenderBucket_DispatchDrawFunc so the result is
 	// a LOCAL the per-triangle site can test: with the toggle off this is 0 and
 	// the capture costs one call per instance, not one per triangle. Toggle 0

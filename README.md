@@ -1,34 +1,110 @@
-# CTR Native
+# CTR 3D
 
-A native PC port of Crash Team Racing (PS1, 1999), built on top of the [CTR-ModSDK](https://github.com/CTR-tools/CTR-ModSDK) decompilation project.
+A New Nintendo 3DS homebrew port of Crash Team Racing (PS1, 1999).
+
+This is a fork of [CTR Native](https://github.com/CTR-tools/ctr-native), the native PC port of the game built on the [CTR-ModSDK](https://github.com/CTR-tools/CTR-ModSDK) decompilation. It starts from CTR Native beta 7.1 and adds a 3DS platform layer and a renderer for the 3DS GPU. The game runs at full speed on a New 3DS, with stereoscopic 3D on the slider, a genuinely widescreen top screen, and the map on the bottom screen.
+
+As far as we can determine, this is the first PlayStation decompilation ported to 3DS homebrew. Fittingly, CTR was Nintendo's internal codename for the 3DS.
+
+The PC port is still here and still builds; see [PC builds](#pc-builds-windows-and-linux) at the bottom. Everything above that section is about the 3DS.
 
 ## Philosophy
 
-- **No byte budget.** Game source lives in `game/` as our own copies. Edit freely.
-- **No PSX toolchain.** Targets Windows and Linux with SDL3. No MIPS compiler needed.
-- **Clean platform layer.** `main.c` owns process startup; host details stay in `platform/native_*`.
-- **No build system nonsense.** Just `build.bat` / `build.sh`.
-- **Fully static build.** Single executable, zero dependencies. SDL3 is compiled from vendored source and linked statically.
+The goal is a game that could pass for a retail 3DS port: faithful to the original where it counts, and willing to leave PlayStation hardware quirks behind where the 3DS can do better.
 
-## Directory Layout
+- The track and the karts are transformed and textured by the 3DS GPU, so the PS1's vertex wobble and texture warping are gone.
+- Performance wins over pixel-for-pixel parity. The close-up "mosaic" texture tier is not rendered and the full-screen blur effect is gone, because a steady frame rate matters more.
+- Clear bugs in the original get fixed. The mirrored tires in ice reflections sit where the modellers intended, not where a PS1 branch delay slot put them.
+- Enhancements are options, not mandates. Texture filtering exists, and defaults off, because players preferred crisp textures to mud.
+- Nothing of the game ships with this project. You bring your own disc image.
+
+## Requirements
+
+- A **New** Nintendo 3DS, New 3DS XL, or New 2DS XL. The original 3DS and 2DS do not have the CPU for it and are not supported.
+- Custom firmware with the Homebrew Launcher ([Luma3DS](https://github.com/LumaTeam/Luma3DS)). If your console is not modded yet, [3ds.hacks.guide](https://3ds.hacks.guide/) is the place to start.
+- A one-time DSP firmware dump, or the game will be silent: open the Rosalina menu (default **L + Down + Select**), choose Miscellaneous options, then Dump DSP firmware.
+- Your own NTSC-U (North American) retail CTR disc image, in the common raw PSX BIN layout: MODE2/2352 sectors, data track starting at byte 0. A cooked 2048-byte `.iso` drops the XA and STR sectors that music, voices and video need.
+
+## Install
+
+1. Download the zip from the Releases page and extract it onto the root of your SD card. It mirrors the card's layout, so the game lands at `/3ds/ctr_native/ctr_native.3dsx`.
+2. Copy your disc image to `/3ds/ctr_native/assets/ctr-u.bin`. The `assets` folder contains a text file marking the spot.
+3. Launch it from the Homebrew Launcher, where it appears as CTR 3D.
+
+Saves are written to `/3ds/ctr_native/memcards/`, in the same files the PC port uses, so progress can be copied between console and PC.
+
+The Sony logo screen holds for several seconds after launch while the game's audio is cached; a `Loading audio` line shows its progress. On a slow SD card it takes longer. It happens once per launch.
+
+## Playing
+
+Buttons follow their position on the PlayStation pad, not their letter:
+
+| 3DS | PS1 | In a race | In menus |
+|---|---|---|---|
+| B | Cross | Accelerate | Confirm |
+| A | Circle | Use weapon | Confirm |
+| Y | Square | Brake, reverse | Back |
+| X | Triangle | Switch the top screen between speedometer and map | Back |
+| L, R | L1, R1 | Hop, power-slide | |
+| ZL | L2 | Change camera view | |
+| ZR | R2 | Hold to look behind | |
+| Circle Pad, D-Pad | D-pad | Steer | Navigate |
+| START | Start | Pause | |
+
+The screens:
+
+- The bottom screen always shows the in-race map, enlarged. The top screen starts in speedometer mode; X puts the map there too, as Triangle does on PS1. In Adventure mode the hub map moves to the bottom screen as well.
+- A frame-rate readout sits in the top-right corner of the bottom screen.
+- The 3D slider works in real time.
+
+The main menu has an **OPTIONS** entry with four toggles: PAL PENTA (Penta Penguin's PAL/Japanese stats), RESERVES METER (the boost-reserves bar), BOTTOM MAP, and TEXTURE FILTER. They return to their defaults on every launch. VS and Battle modes are not on the menu; one console has one controller.
+
+## Reporting a bug
+
+Open an issue on the repository's Issues page. The bug-report form asks for what it needs: console model, Luma3DS version, SD card make and size, the version string shown under the game's name in the Homebrew Launcher, and what you were doing.
+
+To attach a log, create an empty file named `enable-log.txt` next to `ctr_native.3dsx`, launch the game, reproduce the problem, then attach `/ctr3ds.log` from the SD card root. Logging costs a small stutter every couple of seconds, so delete `enable-log.txt` afterwards.
+
+## Changes from the original game
+
+Everything here is on by default unless it says otherwise. The toggles are the OPTIONS menu rows.
+
+- **Widescreen.** The top screen renders a wider field of view, not a stretched 4:3 image.
+- **Stereoscopic 3D** on the slider.
+- **The map on the bottom screen**, with the top-screen slot switching between speedometer and map. Toggle.
+- **Penta Penguin has his PAL and Japanese stats**, the maximum in every class, instead of the NTSC-U ones. Toggle.
+- **A boost-reserves meter** next to the power-slide meter, following the community ReservesMeter mod's design. Toggle.
+- **Texture filtering.** Toggle, off by default.
+- **Ice reflections no longer merge each kart's mirrored wheel pairs onto its centreline.** That is a bug in the shipped PS1 game.
+- **The full-screen feedback blur** used by the clock item and the intro flyby's ghost trail is removed. The clock's flash and slowdown remain.
+- **The close-up "mosaic" texture tier is not rendered.** Near surfaces use the standard texture.
+- **The Spyro 2 demo cheat code does something else now**, since a native build cannot launch the demo off the disc. One new cheat code has been added.
+- **VS and Battle modes** are not offered.
+
+The PC build from this repository carries the changes that are not 3DS-specific: PAL Penta, the reserves meter, the ice-reflection fix and the cheat codes. On PC they are always on; only the 3DS build has the OPTIONS menu.
+
+## Building from source
+
+### New Nintendo 3DS
+
+Install [devkitPro](https://devkitpro.org/) with the `3ds-dev` package group, then:
 
 ```
-ctr_native/
-  main.c              Entrypoint and native platform boundary
-  platform/           Native-owned audio, input, memcard, CD, and PSX facade glue
-  build.bat           Windows build (MinGW32)
-  build.sh            Linux build
-  README.md           This file
-  game/               Our copies of all decompiled game source (943 files)
-    game_unity.h      Ordered unity include chain for all game source files
-  include/            Project headers (structs, globals, declarations, platform facade)
-  externals/
-    SDL/              SDL3 source (static build)
+cmake -S . -B build-3ds -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/3DS.cmake -DCMAKE_BUILD_TYPE=Release
+cmake --build build-3ds
 ```
 
-## Prerequisites
+Output: `build-3ds/ctr_native.3dsx`. That build includes the internal debug surface; add `-DCTR_INTERNAL=OFF` to the configure line to build what the release ships.
 
-### Windows
+On Windows, run both commands from devkitPro's MSYS2 shell using the `msys` `cmake` and `make` packages, not the mingw ones. From plain Git Bash the cross-compiler fails with a temporary-file error.
+
+## PC builds (Windows and Linux)
+
+Ignore this section if you just want to play on 3DS. The PC port is CTR Native beta 7.1 plus the changes listed above.
+
+### Prerequisites
+
+Windows:
 
 1. Install [MSYS2](https://www.msys2.org/)
 2. In an MSYS2 terminal:
@@ -38,18 +114,17 @@ ctr_native/
    ```
    If the update asks you to close the terminal, reopen MSYS2 and run the install command.
 3. Add `C:\msys64\mingw32\bin` to your system PATH
-4. Open a new Command Prompt or PowerShell and run `build.bat`
 
-That's it. SDL3 is compiled from vendored source -- no separate install needed.
-
-### Linux (Debian/Ubuntu)
+Linux (Debian/Ubuntu):
 
 ```
 sudo apt install gcc-multilib
 sudo apt install libx11-dev libxext-dev libgl1-mesa-dev libasound2-dev libudev-dev libdbus-1-dev
 ```
 
-## Building
+SDL3 is compiled from vendored source, so nothing else needs installing.
+
+### Building
 
 ```
 build.bat            # Windows
@@ -57,117 +132,53 @@ chmod +x build.sh
 ./build.sh           # Linux
 ```
 
-First build compiles SDL3 from source. This is cached as a static library in `build/` -- subsequent builds only recompile touched native sources.
+The first build compiles SDL3 and caches it as a static library in `build/`; later builds recompile only touched sources. For a clean rebuild, delete `build/` first.
 
-Output: `build/ctr_native.exe` (Windows) or `build/ctr_native` (Linux)
+Output: `build/ctr_native.exe` (Windows) or `build/ctr_native` (Linux).
 
-### Clean build
+### Running
 
-```
-rmdir /s /q build    # Windows: delete cached libraries
-build.bat            # Windows: rebuild everything
-
-rm -rf build/        # Linux: delete cached libraries
-./build.sh           # Linux: rebuild everything
-```
-
-## Running
-
-### Normal Setup
-
-If you downloaded a release build, you only need two things for normal play:
-
-1. The game executable:
-   - `ctr_native.exe` on Windows
-   - `ctr_native` on Linux
-2. Your own NTSC-U retail CTR disc image, named (put in directory called `assets`):
-   - `assets/ctr-u.bin`
-
-Example:
+A release build needs only the executable and your disc image beside it:
 
 ```
-CTR-Native/
+CTR-3D/
   ctr_native.exe
   assets/
     ctr-u.bin
 ```
 
-Then run `ctr_native.exe`.
+For a development build run from `build/`, put `assets/` at the repository root, next to `build/`. The disc image rules are the same as for the 3DS.
 
-The disc image must be the common single-track raw PSX BIN layout: MODE2/2352 sectors, with the data track starting at byte 0. A cooked 2048-byte `.iso` does not preserve the XA/STR sector data needed for audio and video playback.
+Extracted asset files are supported for development and modding, and override the disc image when present: `assets/BIGFILE.BIG`, `assets/SOUNDS/KART.HWL`, `assets/TEST.STR`, `assets/XA/ENG.XNF`, and the `XA/ENG/EXTRA`, `XA/ENG/GAME` and `XA/MUSIC` streams.
 
-For development builds run from `build/`, put the same `assets/ctr-u.bin` next to the source tree:
+Internal builds can record and replay input for bug reports; see [docs/REPLAYS.md](docs/REPLAYS.md).
 
-```
-ctr-native/
-  build/
-    ctr_native.exe
-  assets/
-    ctr-u.bin
-```
-
-### Extracted Asset Override
-
-You do not need extracted assets for normal play.
-
-Extracted files are still supported for development, modding, and debugging. If present, they override files from `ctr-u.bin`.
-
-Extracted-asset override structure:
+## Architecture and documentation
 
 ```
-CTR-Native/
-  ctr_native.exe
-  assets/
-    BIGFILE.BIG
-    SOUNDS/KART.HWL
-    TEST.STR
-    XA/
-      ENG.XNF
-      ENG/EXTRA/S00.XA ... S05.XA
-      ENG/GAME/S00.XA ... S20.XA
-      MUSIC/S00.XA ... S01.XA
-```
-
-The full extracted asset list is:
-
-- `BIGFILE.BIG`
-- `SOUNDS/KART.HWL`
-- `TEST.STR`
-- `XA/ENG.XNF`
-- `XA/ENG/EXTRA/S00.XA` through `S05.XA`
-- `XA/ENG/GAME/S00.XA` through `S20.XA`
-- `XA/MUSIC/S00.XA` through `S01.XA`
-
-## Bug Replays
-
-Internal builds can record a small bug report folder. See `docs/REPLAYS.md`.
-
-## Architecture
-
-```
-main.c (entrypoint)
-  |
-  +-- platform/native_* (platform shell, audio, input, memcard, CD, renderer, PSX facade glue)
-  |
+main.c (entrypoint; one unity translation unit)
+  +-- platform/native_*.c      native platform: audio, input, memcard, CD, renderer, PSX facade glue
+  +-- platform/n3ds/           3DS backend: libctru/citro3d renderer, audio and render threads
   +-- game/game_unity.h
-        |
-        +-- game/ (all decompiled game source)
-              |
-              +-- include/ (headers: structs, globals, declarations)
+        +-- game/**            decompiled game source (CTR-ModSDK derived)
+              +-- include/**   structs, globals, declarations, platform facade headers
 ```
 
-- `CTR_NATIVE` is defined for native host/platform-specific code
-- The default build uses 32-bit mode while remaining PSX address-shaped data and host-pointer contracts are audited. GPU primitive links are bridged through 24-bit native tokens; see `docs/MEMORY_MODEL.md`.
+The game code talks to the host only through the PlayStation library surface and a small platform contract; `CTR_NATIVE` marks native-side code. The 3DS renderer reimplements the PC renderer's contract against the PICA200's fixed-function GPU, which has neither fragment shaders nor an indexed-texture format, so palette lookup happens in a CPU-side decode cache.
 
-## Roadmap
+- [docs/3DS_PORT.md](docs/3DS_PORT.md): how the 3DS port works, from threads to renderer to audio.
+- [docs/MEMORY_MODEL.md](docs/MEMORY_MODEL.md), [docs/DATA_SECTIONS.md](docs/DATA_SECTIONS.md), [docs/OVERLAYS.md](docs/OVERLAYS.md): how the PS1-shaped memory model survives on a native host, inherited from CTR Native.
 
-- Clean up `game/` copies strip byte budget hacks and route platform-specific code through `CTR_NATIVE`
-- Keep reducing 32-bit host-pointer assumptions in PSX-shaped data, and keep pruning inherited compatibility code now owned in `include/` and `platform/`.
+## License
+
+GPL-3.0, inherited from CTR Native and CTR-ModSDK; see [LICENSE](LICENSE). Third-party components and their licenses are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No game data is included or distributed; you need your own copy of the game.
 
 ## Credits
 
-- [CTR-ModSDK](https://github.com/CTR-tools/CTR-ModSDK) — the decompilation project this is built on
+- [CTR Native](https://github.com/CTR-tools/ctr-native) — the native PC port this project is a fork of
+- [CTR-ModSDK](https://github.com/CTR-tools/CTR-ModSDK) — the decompilation project both are built on
 - [ReservesMeter](https://github.com/CTR-tools/CTR-ModSDK/tree/main/mods/Modules/ReservesMeter) by Superstarxalien — the in-race boost-reserves meter's design (geometry, fill scale, colors) follows this community mod
-- [PsyCross](https://github.com/OpenDriver2/PsyCross) — original PS1 compatibility code from which parts of CTR Native's owned platform layer and PsyQ facade headers are derived
-- [SDL3](https://github.com/libsdl-org/SDL) — cross-platform multimedia
+- [PsyCross](https://github.com/OpenDriver2/PsyCross) — original PS1 compatibility code from which parts of the owned platform layer and PsyQ facade headers are derived
+- [SDL3](https://github.com/libsdl-org/SDL) — cross-platform multimedia for the PC build
+- [devkitPro](https://devkitpro.org/), libctru and citro3d — the 3DS homebrew toolchain and GPU library the 3DS port is built on
 - Crash Team Racing is a trademark of Sony Computer Entertainment / Naughty Dog

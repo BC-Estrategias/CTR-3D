@@ -1,5 +1,4 @@
 ; CTR-Native PICA200 vertex shader -- native MODEL renderer, rung 2.
-; docs/NATIVE_MODEL_RENDERER_DESIGN.md sections 4 and 7.
 ;
 ; Third vertex program in the build, after ctr.v.pica (packet path: remaps
 ; already-CPU-projected screen positions through an ortho matrix) and

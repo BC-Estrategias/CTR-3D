@@ -3,7 +3,7 @@
 
 /*
  * PC-side dfe=0 (offscreen render-to-VRAM) split capture, Phase 0 of
- * docs/OFFSCREEN_RENDER_VRAM_DESIGN.md. CTR_INTERNAL, PC only.
+ * CTR_INTERNAL, PC only.
  *
  * Two outputs from one instrumented run, both armed by
  * `--offscreen-capture <file>`:
@@ -66,8 +66,7 @@ void NativeVramTrace_Op(const char *op, int x, int y, int w, int h, int srcX, in
  * documented in native_renderer_3ds.c; atlas-resolution fields are -1 on
  * PC). Content dumps proved the 3DS caches byte-correct while
  * the screen quilts, so the platforms must disagree on the ADDRESSING side
- * -- per-triangle page/clut/UV -- and this is the PC half of that diff
- * (tools/texdump/tridump_diff.py compares).
+ * -- per-triangle page/clut/UV -- and this is the PC half of that diff.
  */
 void NativeOffscreenCapture_OnAnySplit(const GrVertex *verts, int numVerts, int texFormat, int textured);
 

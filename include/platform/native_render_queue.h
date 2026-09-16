@@ -11,7 +11,7 @@
  * the worker is unavailable (old 3DS, core-2 refusal, GTE-capture build) or
  * runtime-disabled (dumpreq 'renderthread'), every facade entry point calls
  * its Exec body directly -- byte-identical to the pre-queue code by
- * construction. Design + hazard list: docs/RENDER_THREAD_DESIGN.md.
+ * construction.
  */
 
 #include <string.h>

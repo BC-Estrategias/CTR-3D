@@ -4,7 +4,7 @@
 #include <macros.h>
 
 // Read-only accessor surface over platform/native_track_mesh.c's resident
-// track mesh (docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.1/4.2/12b). Declarations
+// track mesh. Declarations
 // are always visible; every accessor is a no-op/zero-returning stub reader
 // when CTR_NATIVE_TRACK_RENDERER is off (the .c file's gate simply never
 // populates s_trackMesh), so callers don't need their own #ifdef.
@@ -65,7 +65,7 @@ int NativeTrackMesh_LeafAt(unsigned i, unsigned *outBspIndex, unsigned *outFirst
 // this entirely.
 unsigned NativeTrackMesh_LeafAtlasBin(unsigned i, int wantPass2);
 
-// Semi-transparency (docs/TRANSPARENCY_DESIGN.md). 3 means opaque -- the normal
+// Semi-transparency. 3 means opaque -- the normal
 // case and the value returned for an out-of-range i. 0/1/2 are the PSX ABR blend
 // modes (B/2+F/2, B+F, B-F) and mark a range the BLEND pass owns: it must be
 // drawn after all opaque content, with blending on and depth writes off.
