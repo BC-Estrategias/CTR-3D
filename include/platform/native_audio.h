@@ -26,8 +26,14 @@ int NativeAudio_PlayXATrack(int categoryID, int xaID, int volumeLeft, int volume
 // call, 0 = uncapped) until it returns nonzero, presenting between calls.
 // Self-gates after the first Begin. No-op off the 3DS (PC disk reads never
 // stalled a frame). Opens that happen before it completes take the cold path.
+// Steps that only open a file or advance a stage read nothing; a caller that
+// presents a frame per step pays a refresh for each of those. Compare
+// SectorsRead across a Step to tell the two apart, and show WarmPercent (0..99
+// against the read plan) while holding. Both stay 0 off the 3DS.
 void NativeAudio_VoiceCacheEnsureBegin(void);
 int NativeAudio_VoiceCacheEnsureStep(int budgetSectors);
+u32 NativeAudio_VoiceCacheWarmSectorsRead(void);
+int NativeAudio_VoiceCacheWarmPercent(void);
 int NativeAudio_PlayXAFile(const char *relativePath, int channelFilter, int volumeLeft, int volumeRight);
 int NativeAudio_GetXATrackLength(int categoryID, int xaID);
 int NativeAudio_IsXAPlaying(void);

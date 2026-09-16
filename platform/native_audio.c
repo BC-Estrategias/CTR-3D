@@ -3680,6 +3680,8 @@ internal struct
 	int stage; /* 0=music warm, 1=cache GAME, 2=cache EXTRA, 3=finalize */
 	int tracks;
 	int sectors;
+	u32 readSectors;    /* disc/SD sectors this warm has actually read */
+	u32 plannedSectors; /* what it set out to read; 0 until the plan is known */
 } s_vce;
 
 /* Resumable state for one category's build pass (GAME then EXTRA). A step
@@ -3700,6 +3702,45 @@ internal struct
 	int span;
 	int pos;
 } s_xacb;
+
+/* Disc sectors one category's build pass sets out to read: each wanted file is
+ * read once, across the longest slot any wanted track occupies in it -- the
+ * same rule NativeAudio_XAVoiceCacheBuildCategoryStep applies at open time,
+ * minus the clamp to the file's real length, which is not known until the open.
+ * Slot sizes come from the XNF, so this is a plan, not an outcome. */
+internal u32 NativeAudio_XAVoiceCachePlannedSectors(int categoryID)
+{
+	int fileMax[32];
+	u32 total = 0;
+	int xaID;
+	int f;
+
+	memset(fileMax, 0, sizeof(fileMax));
+
+	for (xaID = 0; xaID < NATIVE_AUDIO_XA_TRACK_INDEX_MAX; xaID++)
+	{
+		struct NativeAudioXaTrackInfo info;
+
+		if (!NativeAudio_XAVoiceCacheWantsTrack(categoryID, xaID) || !NativeAudio_LookupXATrackInfo(categoryID, xaID, &info))
+		{
+			continue;
+		}
+		if ((info.fileNumber < 0) || (info.fileNumber >= 32) || (info.entryIndex >= NATIVE_AUDIO_XA_TRACK_INDEX_MAX))
+		{
+			continue;
+		}
+		if (info.numSectors > fileMax[info.fileNumber])
+		{
+			fileMax[info.fileNumber] = info.numSectors;
+		}
+	}
+
+	for (f = 0; f < 32; f++)
+	{
+		total += (u32)fileMax[f];
+	}
+	return total;
+}
 
 internal void NativeAudio_XAVoiceCacheBuildCategoryBegin(int categoryID)
 {
@@ -3818,6 +3859,7 @@ internal int NativeAudio_XAVoiceCacheBuildCategoryStep(int budgetSectors)
 			return 0;
 		}
 
+		s_vce.readSectors += (u32)chunk;
 		s_xacb.pos += chunk;
 		if (s_xacb.pos < s_xacb.span)
 		{
@@ -4135,6 +4177,8 @@ internal int NativeAudio_MusicCountWarmStep(int budgetSectors)
 		return 0;
 	}
 
+	s_vce.readSectors += (u32)chunk;
+
 	for (i = 0; i < chunk; i++)
 	{
 		const u8 *raw = &s_mcwChunkBuf[(size_t)i * (size_t)s_mcw.src.sectorSize];
@@ -4189,6 +4233,69 @@ void NativeAudio_VoiceCacheEnsureBegin(void)
 	/* Independent of the RAM cache below (MUSIC is never cached): fills the
 	 * per-track sector-count memo so no MUSIC open ever scans mid-game. */
 	NativeAudio_MusicCountWarmBegin();
+
+	/* Read plan for the whole warm, so a caller holding the screen can show
+	 * honest progress. The memo half costs nothing while its table matches
+	 * the disc; only the fallback scan reads. */
+	if (s_xaVoiceCache.blob != NULL)
+	{
+		s_vce.plannedSectors = NativeAudio_XAVoiceCachePlannedSectors(NATIVE_AUDIO_XA_CATEGORY_GAME) +
+		                       NativeAudio_XAVoiceCachePlannedSectors(NATIVE_AUDIO_XA_CATEGORY_EXTRA);
+	}
+	if (s_mcw.active)
+	{
+		int fileMax[32];
+		int t;
+		int f;
+
+		memset(fileMax, 0, sizeof(fileMax));
+		for (t = 0; t < s_mcw.numTracks; t++)
+		{
+			int file = s_mcw.tracks[t].info.fileNumber;
+
+			if ((file >= 0) && (file < 32) && (s_mcw.tracks[t].info.numSectors > fileMax[file]))
+			{
+				fileMax[file] = s_mcw.tracks[t].info.numSectors;
+			}
+		}
+		for (f = 0; f < 32; f++)
+		{
+			s_vce.plannedSectors += (u32)fileMax[f];
+		}
+	}
+#endif
+}
+
+/* Disc/SD sectors the boot XA warm has read so far. A caller driving the warm
+ * uses the change in this to tell a step that did I/O from one that only
+ * opened a file or changed stage. Always 0 off the 3DS. */
+u32 NativeAudio_VoiceCacheWarmSectorsRead(void)
+{
+#if defined(__3DS__)
+	return s_vce.readSectors;
+#else
+	return 0;
+#endif
+}
+
+/* 0..99 progress of the boot XA warm against its read plan, for a hold screen.
+ * Capped below 100 because the plan is built from XNF slot sizes: a file
+ * shorter than its slot reads less than planned, so only completion -- the
+ * Step returning nonzero -- means done. Always 0 off the 3DS. */
+int NativeAudio_VoiceCacheWarmPercent(void)
+{
+#if defined(__3DS__)
+	u32 pct;
+
+	if (s_vce.plannedSectors == 0)
+	{
+		return 0;
+	}
+
+	pct = (u32)(((u64)s_vce.readSectors * 100u) / s_vce.plannedSectors);
+	return (pct > 99u) ? 99 : (int)pct;
+#else
+	return 0;
 #endif
 }
 
@@ -6983,8 +7090,12 @@ internal int NativeAudio_OpenDevice(void)
 		return 0;
 	}
 
-	printf("[CTR Native] SDL audio stream opened: driver=%s src=%d Hz/%d ch dst=%d Hz/%d ch device=%d Hz/%d ch sampleFrames=%d\n", SDL_GetCurrentAudioDriver(),
-	       srcSpec.freq, srcSpec.channels, dstSpec.freq, dstSpec.channels, deviceSpec.freq, deviceSpec.channels, deviceSampleFrames);
+	// Through the log sink, not a bare printf: on 3DS a raw printf paints the
+	// bottom-screen console with no gate, and this line lands after the first
+	// present -- past the point the panel stops being a boot surface.
+	Platform_Log("[CTR Native] SDL audio stream opened: driver=%s src=%d Hz/%d ch dst=%d Hz/%d ch device=%d Hz/%d ch sampleFrames=%d\n",
+	             SDL_GetCurrentAudioDriver(), srcSpec.freq, srcSpec.channels, dstSpec.freq, dstSpec.channels, deviceSpec.freq, deviceSpec.channels,
+	             deviceSampleFrames);
 	NativeAudio_ClearOutputQueueNoLock();
 	if (!SDL_ResumeAudioStreamDevice(s_audio.output.stream))
 	{

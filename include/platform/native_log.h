@@ -30,4 +30,19 @@ void Platform_LogInstrument(const char *fmt, ...) CTR_PRINTF_FORMAT(1, 2);
 void Platform_LogWarn(const char *fmt, ...) CTR_PRINTF_FORMAT(1, 2);
 void Platform_LogError(const char *fmt, ...) CTR_PRINTF_FORMAT(1, 2);
 
+/*
+ * "<label> NN%" on one 3DS bottom-screen console row, for a pre-game hold long
+ * enough that a still screen reads as a hung console. It claims the first free
+ * row under the boot text already on the panel and repaints THAT row in place:
+ * no clear, no scroll, no SD write, no netload send -- none of the paths that
+ * have made console text a frame hitch here.
+ *
+ * Call it only when the text changes. Each call blits one row of glyph cells
+ * into a column-major rotated framebuffer; a full-screen console repaint is
+ * what cost ~50ms a window. Clear blanks the row and releases it, so the line
+ * does not survive into the game. Both are no-ops off the 3DS.
+ */
+void NativeLog_BootStatus(const char *label, int percent);
+void NativeLog_BootStatusClear(void);
+
 #endif
