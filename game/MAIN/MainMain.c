@@ -709,14 +709,19 @@ void StateZero()
 			MAIN_SCEA_WARM_STEPS_PER_FRAME = 16
 		};
 
+		// Wording of the hold's progress line. Nothing else prints it.
+		const char *sceaWarmLabel = "Loading audio";
+
 		u32 sceaWarmFrames = 0;
 		u32 sceaWarmSteps = 0;
 		int sceaWarmDone = 0;
+		int sceaWarmShown = -1;
 
 		NativeAudio_VoiceCacheEnsureBegin();
 		while (!sceaWarmDone)
 		{
 			u32 sectorsBefore = NativeAudio_VoiceCacheWarmSectorsRead();
+			int percent;
 			int step;
 
 			for (step = 0; step < MAIN_SCEA_WARM_STEPS_PER_FRAME; step++)
@@ -734,9 +739,24 @@ void StateZero()
 				break;
 			}
 
+			// A still screen this long reads as a hung console. Repaint only on
+			// the integer percent, so the whole hold costs about a hundred
+			// console rows rather than one per frame.
+			percent = NativeAudio_VoiceCacheWarmPercent();
+			if (percent != sceaWarmShown)
+			{
+				sceaWarmShown = percent;
+				NativeLog_BootStatus(sceaWarmLabel, percent);
+			}
+
 			VSync(0);
 			Platform_PresentVRAMDisplay();
 			sceaWarmFrames++;
+		}
+
+		if (sceaWarmShown >= 0)
+		{
+			NativeLog_BootStatusClear();
 		}
 
 		if (sceaWarmFrames > 0)

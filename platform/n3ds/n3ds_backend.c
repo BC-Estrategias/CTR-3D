@@ -560,6 +560,7 @@ static int s_consoleQuietArmed = 0;
  */
 int N3DS_ConsolePaintAllowed(void)
 {
+#ifdef CTR_INTERNAL
 	extern int g_dbg_statsConsole; /* renderer TU, dumpreq 'stats' */
 
 	if (s_bottomMapOwnFrames > 0)
@@ -571,6 +572,85 @@ int N3DS_ConsolePaintAllowed(void)
 		return 1; /* dev sitting */
 	}
 	return !s_consoleQuietArmed; /* boot text until the game presents */
+#else
+	/* Release: log text is developer output on a player's screen. It still
+	 * reaches the log file and the netload mirror; the panel carries only the
+	 * game's own surfaces (the map, and a pre-game hold's status row). */
+	return 0;
+#endif
+}
+
+/* 1-based console row this line owns; 0 until the first paint claims one. */
+static int s_consoleStatusRow = 0;
+/* Columns the row is painted across. Clamped so the format below cannot be
+ * handed an absurd width by a console whose metrics did not initialise. */
+#define N3DS_CONSOLE_STATUS_MAX_COLS 64
+
+/* Claims the first free row under whatever text is already on the panel, so a
+ * status line lands below the boot output rather than over it. */
+static void N3DS_ConsoleStatusClaimRow(const PrintConsole *con)
+{
+	int rows = ((con != NULL) && (con->consoleHeight > 0)) ? con->consoleHeight : 30;
+
+	s_consoleStatusRow = ((con != NULL) ? con->cursorY : 0) + 1;
+	if (s_consoleStatusRow < 1)
+	{
+		s_consoleStatusRow = 1;
+	}
+	if (s_consoleStatusRow > rows)
+	{
+		s_consoleStatusRow = rows;
+	}
+}
+
+/*
+ * Repaints one console row in place: absolute cursor position to column 1,
+ * then the text padded out to the console's full width. The padding is what
+ * makes the row OWNED -- an overwrite only replaces the cells it prints, so a
+ * shorter update would otherwise leave a longer predecessor's tail standing to
+ * its right. No consoleClear and no newline: a full repaint erases all 40x30
+ * cells before drawing any text and cost ~50ms a window when the stats block
+ * did it (these glyph cells go into a column-major rotated framebuffer), and a
+ * newline would scroll the text above this row away.
+ *
+ * One call is one row of cells, so the caller owns the update rate.
+ *
+ * Not routed through N3DS_ConsolePaintAllowed: that gate keeps log text off a
+ * player's panel, and reserves it for the game's own surfaces, which a
+ * pre-game hold's status row is one of. The map TTL still applies, since that
+ * pass shares the framebuffer.
+ */
+void N3DS_ConsoleStatusLine(const char *text)
+{
+	const PrintConsole *con = consoleGetDefault();
+	int width;
+
+	if (s_bottomMapOwnFrames > 0)
+	{
+		return;
+	}
+	if (s_consoleStatusRow == 0)
+	{
+		N3DS_ConsoleStatusClaimRow(con);
+	}
+
+	width = ((con != NULL) && (con->consoleWidth > 0)) ? con->consoleWidth : 40;
+	if (width > N3DS_CONSOLE_STATUS_MAX_COLS)
+	{
+		width = N3DS_CONSOLE_STATUS_MAX_COLS;
+	}
+	printf("\x1b[%d;1H%-*.*s", s_consoleStatusRow, width, width, (text != NULL) ? text : "");
+}
+
+/* Blanks the status row and releases it, so the line does not survive into the
+ * game and a later hold claims its own row. */
+void N3DS_ConsoleStatusClear(void)
+{
+	if ((s_consoleStatusRow != 0) && (s_bottomMapOwnFrames == 0))
+	{
+		N3DS_ConsoleStatusLine("");
+	}
+	s_consoleStatusRow = 0;
 }
 
 void N3DS_GfxPresent(void)

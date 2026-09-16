@@ -7090,8 +7090,12 @@ internal int NativeAudio_OpenDevice(void)
 		return 0;
 	}
 
-	printf("[CTR Native] SDL audio stream opened: driver=%s src=%d Hz/%d ch dst=%d Hz/%d ch device=%d Hz/%d ch sampleFrames=%d\n", SDL_GetCurrentAudioDriver(),
-	       srcSpec.freq, srcSpec.channels, dstSpec.freq, dstSpec.channels, deviceSpec.freq, deviceSpec.channels, deviceSampleFrames);
+	// Through the log sink, not a bare printf: on 3DS a raw printf paints the
+	// bottom-screen console with no gate, and this line lands after the first
+	// present -- past the point the panel stops being a boot surface.
+	Platform_Log("[CTR Native] SDL audio stream opened: driver=%s src=%d Hz/%d ch dst=%d Hz/%d ch device=%d Hz/%d ch sampleFrames=%d\n",
+	             SDL_GetCurrentAudioDriver(), srcSpec.freq, srcSpec.channels, dstSpec.freq, dstSpec.channels, deviceSpec.freq, deviceSpec.channels,
+	             deviceSampleFrames);
 	NativeAudio_ClearOutputQueueNoLock();
 	if (!SDL_ResumeAudioStreamDevice(s_audio.output.stream))
 	{

@@ -600,6 +600,14 @@ int N3DS_BottomMapOwnsScreen(void);
  * false once the game is presenting unless the stats console is toggled on
  * (dumpreq 'stats'), true during boot so pre-game errors stay readable. */
 int N3DS_ConsolePaintAllowed(void);
+/* One console row for a pre-game hold's progress, claimed under the boot text
+ * already on the panel and repainted in place -- no clear, no scroll, no SD
+ * write and no netload send. Each call blits that row's glyph cells into the
+ * column-major rotated console framebuffer, so call it only when the text
+ * changes. Deliberately outside N3DS_ConsolePaintAllowed; see the definition.
+ * Clear blanks the row and releases it. */
+void N3DS_ConsoleStatusLine(const char *text);
+void N3DS_ConsoleStatusClear(void);
 
 /* ---------------------------------------------------------------- input --- */
 
