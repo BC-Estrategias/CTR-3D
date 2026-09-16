@@ -3,10 +3,10 @@
 
 set -euo pipefail
 
-VERSION="${1:-beta-7_1}"
+VERSION="${1:-1.0.0-beta.1}"
 BUILD_DIR="${BUILD_DIR:-build}"
 DIST_DIR="${DIST_DIR:-dist}"
-PACKAGE_NAME="ctr-native-${VERSION}-linux-x86"
+PACKAGE_NAME="ctr3d-${VERSION}-linux-x86"
 PACKAGE_DIR="${DIST_DIR}/${PACKAGE_NAME}"
 BINARY_PATH="${BUILD_DIR}/ctr_native"
 
@@ -24,7 +24,7 @@ cp LICENSE "${PACKAGE_DIR}/"
 cp THIRD_PARTY_NOTICES.md "${PACKAGE_DIR}/"
 
 cat >"${PACKAGE_DIR}/README.txt" <<EOF
-CTR Native Linux x86 ${VERSION} build
+CTR 3D ${VERSION} -- Linux x86 build of the PC port
 
 Game assets are not included.
 

@@ -1,7 +1,6 @@
 /*
  * CPU software raster for dfe=0 (offscreen render-to-VRAM) splits -- the 3DS
  * implementation of the compositing path PC serves with an FBO + readback.
- * Design and evidence chain: docs/OFFSCREEN_RENDER_VRAM_DESIGN.md.
  *
  * Consumes the exact same post-expansion GrVertex triangle stream that
  * NativeRenderer_DrawTriangles receives (positions clip-rect-local, see

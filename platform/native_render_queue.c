@@ -1,7 +1,7 @@
 /*
  * Render-job queue -- storage, tickets, worker drain loop, dispatcher. See
- * include/platform/native_render_queue.h for the contract and
- * docs/RENDER_THREAD_DESIGN.md for the design. OS primitives (thread, lock,
+ * include/platform/native_render_queue.h for the contract.
+ * OS primitives (thread, lock,
  * events) live across the plain-scalar boundary in
  * platform/n3ds/n3ds_render_thread.c; this file is part of the unity TU and
  * may call Exec bodies directly.

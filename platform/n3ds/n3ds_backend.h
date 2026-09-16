@@ -48,7 +48,7 @@ void N3DS_GfxPresent(void);
 /* citro3d lives entirely behind this boundary too, for the same reason as
  * everything else here -- see the file comment. Types crossing it are plain
  * scalars only. This is the mechanical GPU boundary for
- * docs/CITRO3D_RENDERER_DESIGN.md; it grows as native_renderer_3ds.c needs
+ * the renderer; it grows as native_renderer_3ds.c needs
  * new operations, phase by phase, rather than being designed complete
  * up front. */
 
@@ -112,8 +112,8 @@ typedef struct
  *
  * w is the PARALLAX channel (GrVertex.parallaxOrdinal, biased identically) --
  * the depth the STEREO shader uses, which is not always the depth the test
- * occludes by. See native_renderer_types.h's field comment and
- * docs/FLAG_SPLIT_CHANNEL_SPEC.md; for everything except the menu/loading
+ * occludes by. See native_renderer_types.h's field comment;
+ * for everything except the menu/loading
  * flag it equals z exactly. It is NOT a homogeneous w: ctr.v.pica sets the
  * position's own w to a constant 1.0 and reads this only for parallax, so
  * nothing here divides by it.
@@ -322,7 +322,7 @@ int N3DS_C3DFrameVertexHighWater(void);
 
 /* tiled256 buffer is RGBA5551 (2 bytes/texel), not RGBA8 -- see N3DS_TILE_BYTES. */
 void N3DS_C3DUploadDecodedCell(int atlasIndex, int cellX, int cellY, const void *tiled256);
-/* Sub-page counterpart (docs/SUBPAGE_DECODE_CACHE_DESIGN.md) -- writes an
+/* Sub-page counterpart -- writes an
  * 8x8-tile (64x64 texel) sub-cell at physical cell (physCellX,physCellY)'s
  * (subX,subY) quadrant-of-16, instead of a whole 32x32-tile cell. tiled64 is
  * RGBA5551, same tiling convention as tiled256 above, just a quarter the
@@ -376,8 +376,7 @@ void N3DS_C3DBindVramDisplayTex(int slotIndex);
 
 /* -------------------------------------------------- native track atlas --- */
 /* Dedicated pool for the native track renderer's atlas layout
- * (platform/native_track_mesh.c, docs/NATIVE_TRACK_RENDERER_DESIGN.md
- * section 12). Separate from the decode-cache atlases above --
+ * (platform/native_track_mesh.c). Separate from the decode-cache atlases above --
  * smaller units (512x512 vs 1024x1024), matching the packer's own
  * TRACK_ATLAS_DIM -- and (re)allocated per level load rather than once at
  * boot, since the packed layout itself is computed per level from that
@@ -422,7 +421,7 @@ void N3DS_TrackAtlas_UploadRect(int unit, int dstX, int dstY, int wTexels, int h
 void N3DS_TrackAtlas_Bind(int unit);
 
 /* -------------------------------------------------- native track draw --- */
-/* docs/NATIVE_TRACK_RENDERER_DESIGN.md 4.2/4.3/12b: the
+/* The
  * resident-mesh draw path, a SECOND vertex format/shader/attribute layout
  * living alongside the packet path's N3DS_Vertex/ctr.v.pica above. Plain
  * scalars only, same TU-boundary rule as everything else in this header.
@@ -501,7 +500,7 @@ void N3DS_TrackGeom_FlushPatched(void);
  * list. No-op (Leaf silently skips its draw) if Upload was never called or
  * last failed. */
 /* -------------------------------------------------- native model draw --- */
-/* docs/NATIVE_MODEL_RENDERER_DESIGN.md: model instances drawn from
+/* Model instances drawn from
  * model-space geometry through ctr_model.v.pica, on the same depth axis as the
  * packets and the resident track.
  *
@@ -560,7 +559,7 @@ void N3DS_SetTopContentFullWidth(int fullWidth);
  * nearest-resampled from the pillarboxed CONTENT region (N3DS_TOP_CONTENT_*,
  * above -- NOT the full 400-wide panel) to dstW x dstH. May be one
  * presentation old. Returns 0 if no framebuffer.
- * docs/PAUSE_FREEZE_FRAME_DESIGN.md. */
+ */
 int N3DS_CopyDisplayedTopFrame(unsigned char *dstRGB, int dstW, int dstH);
 
 /* ------------------------------------------------ bottom-screen minimap --- */

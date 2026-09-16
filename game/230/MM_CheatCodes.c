@@ -2,7 +2,7 @@
 
 #if defined(CTR_NATIVE)
 /*
- * Native-only flag easter eggs (docs/EASTER_EGGS.md). The style selector lives
+ * Native-only flag easter eggs. The style selector lives
  * platform-side (native_gpu.c): 0 retail checkers, 1 pride stripes, 2 purple.
  *
  * MM_Cheat_SpyroFlag REPLACES MainKillGame_LaunchSpyro2 as the SOAR handler,

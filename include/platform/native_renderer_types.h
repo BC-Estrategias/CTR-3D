@@ -47,7 +47,7 @@ typedef struct
 	u16 emitOrdinal;
 
 	/*
-	 * PARALLAX channel (docs/FLAG_SPLIT_CHANNEL_SPEC.md). Owner's framing:
+	 * PARALLAX channel. Owner's framing:
 	 * "game world depth and 3d output depth don't need to be the same."
 	 *
 	 * Normally identical to emitOrdinal -- the depth a thing occludes at IS

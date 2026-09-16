@@ -102,7 +102,7 @@ static void MainFrame_PrimMemWatermarkSample(struct DB *db)
 }
 #endif
 
-// Per-frame clear for the GTE sub-pixel capture table (docs/GTE_CAPTURE_DESIGN.md).
+// Per-frame clear for the GTE sub-pixel capture table.
 // This is the right place: it runs before any of this frame's GTE_RotTransPers
 // calls and after the previous frame's rendering already consumed the table,
 // so every capture this frame is looked up before it goes stale. Deliberately

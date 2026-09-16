@@ -6,11 +6,10 @@
 ; clip-space remap (the "projection" uniform is an orthographic matrix, not a
 ; camera), plus rescaling texcoord/color from their packed integer vertex
 ; format back to the float range the old all-float vertex passed directly
-; (docs/VERTEX_FORMAT_DESIGN.md, "Lever 2" -- PICA200 vertex fetch does not
+; ("Lever 2" -- PICA200 vertex fetch does not
 ; normalize GPU_SHORT/GPU_UNSIGNED_BYTE, so the raw integers must be scaled
 ; here, not on the CPU). No page/clut reaches the GPU at all -- texture
-; resolution happens on the CPU before binding (see
-; docs/CITRO3D_RENDERER_DESIGN.md, sections 1 and 6). No blending.
+; resolution happens on the CPU before binding. No blending.
 ;
 ; STEREO (the "later phase" the original header deferred): each eye adds a
 ; per-vertex horizontal parallax p = k - kC/d, where d is the vertex's depth
@@ -24,7 +23,7 @@
 ; the mask below: HUD/menus sit at screen depth, which is both correct and
 ; the M2 3D-Classics convention.
 ;
-; CHANNEL SPLIT (docs/FLAG_SPLIT_CHANNEL_SPEC.md): parallax reads inpos.W,
+; CHANNEL SPLIT: parallax reads inpos.W,
 ; not inpos.z. z is the OCCLUSION depth (what the PICA depth test compares);
 ; w is the PARALLAX depth (where the eye should place it). They are equal for
 ; all content except the menu/loading checkered flag, whose retail layering

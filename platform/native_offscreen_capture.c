@@ -1,6 +1,6 @@
 /*
  * dfe=0 offscreen-split capture -- see include/platform/native_offscreen_capture.h
- * for the format and purpose (see docs/OFFSCREEN_RENDER_VRAM_DESIGN.md).
+ * for the format and purpose.
  * PC only: the 3DS is the platform whose missing compositing this data exists
  * to build and verify, so it has nothing to capture.
  */
@@ -13,8 +13,7 @@
 /* v2: GrVertex grew emitOrdinal (depth substrate), so raw vertex records are
  * 22 bytes now. The header always recorded sizeof(GrVertex), so readers can
  * self-adjust; the bump is so a v1 capture is rejected rather than misread.
- * v3: GrVertex grew parallaxOrdinal (occlusion/parallax depth split, see
- * docs/FLAG_SPLIT_CHANNEL_SPEC.md) -- 24 bytes. Same bump for the same
+ * v3: GrVertex grew parallaxOrdinal (occlusion/parallax depth split) -- 24 bytes. Same bump for the same
  * reason: a v2 reader would walk this file's vertex array off by 2 bytes
  * per record, which is silent corruption rather than an error. */
 #define OFSCAP_VERSION        3u

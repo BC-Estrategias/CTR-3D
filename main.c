@@ -106,21 +106,21 @@
 // track mesh builder -- it must run on a plain PC build, where
 // CTR_NATIVE_TRACK_RENDERER is off.
 // Model topology scan + per-frame instance sampler for the PICA-native model
-// renderer (docs/NATIVE_MODEL_RENDERER_DESIGN.md). The scanner comes FIRST so
+// renderer. The scanner comes FIRST so
 // the census below can fold each header's triangle counts into the same walk
 // that already has the deduped model population; the frame sampler comes after
 // both because it looks scans up rather than producing them. Both are
 // count-only and stubbed out when CTR_NATIVE_MODEL_RENDERER is off.
 #include "platform/native_model_mesh.c"
-// Load-time texture pre-warm (docs/PORT_FEASIBILITY_3DS.md's crate-intro
-// first-frame hitch): after native_renderer_3ds.c (needs its internal decode
+// Load-time texture pre-warm (the crate-intro first-frame hitch): after
+// native_renderer_3ds.c (needs its internal decode
 // cache entry points) and native_gpu.c (GetTPageFormat), before the census so
 // a level-load block reads warm-then-count in source order. __3DS__-only; a
 // no-op stub on PC.
 #include "platform/native_model_texwarm.c"
 #include "platform/native_model_census.c"
 #include "platform/native_model_frame.c"
-// Per-frame model triangle capture (docs/NATIVE_MODEL_RENDERER_DESIGN.md).
+// Per-frame model triangle capture.
 // After the two above only for readability -- it shares no symbols with them,
 // unlike the track pair below.
 #include "platform/native_model_emit.c"
@@ -214,7 +214,7 @@ int main(int argc, char *argv[])
 	{
 		if (NativeArg_IsVersion(argv[argIndex]))
 		{
-			printf("CTR Native %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
+			printf("CTR 3D %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
 			return 0;
 		}
 	}
@@ -340,8 +340,8 @@ int main(int argc, char *argv[])
 	NativeRenderer_VramCaptureConfigureFromArgs(argc, argv);
 #endif
 
-	// --offscreen-capture arms the dfe=0 split inventory + golden stream
-	// (docs/OFFSCREEN_RENDER_VRAM_DESIGN.md Phase 0/1). No-op stub on 3DS.
+	// --offscreen-capture arms the dfe=0 split inventory + golden stream.
+	// No-op stub on 3DS.
 	NativeOffscreenCapture_ConfigureFromArgs(argc, argv);
 
 #if defined(CTR_NATIVE_LOD_BIAS) && CTR_NATIVE_LOD_BIAS

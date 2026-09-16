@@ -270,7 +270,7 @@ struct OverlayDATA_230 D230 =
                  * hangs in `while (1) {}`, so entering SOAR froze the console.
                  * Repointed at the purple/white flag egg, which removes the
                  * hard-lock (this row was that function's only caller) and
-                 * respects the dragon. docs/EASTER_EGGS.md */
+                 * respects the dragon. */
                 {4, {CHEAT_S, CHEAT_O, CHEAT_A, CHEAT_R}, MM_Cheat_SpyroFlag},
 #else
                 {4, {CHEAT_S, CHEAT_O, CHEAT_A, CHEAT_R}, MainKillGame_LaunchSpyro2},

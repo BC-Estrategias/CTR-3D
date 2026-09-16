@@ -580,7 +580,7 @@ const char *gte_shader_32_rgba = "	uniform sampler2D s_texture;\n"
 
 // De-snapped variant reconstructs the GTE's discarded sub-pixel fraction from
 // a_extra.zw (GrVertex._p0/_p1, carried unnormalized -- see MakeVertexTriangle
-// /Quad in native_gpu.c and docs/GTE_CAPTURE_DESIGN.md) and adds it to
+// /Quad in native_gpu.c) and adds it to
 // a_position.xy, in the same pixel-space units, before the Projection
 // multiply. _p0/_p1 hold a u8 fraction bit-reinterpreted into a signed byte;
 // mod(...,256) undoes that reinterpretation losslessly (e.g. a shader-side
@@ -1732,7 +1732,7 @@ int NativeRenderer_CaptureVRAMState(void *dst, int dstSize)
  * --vram-capture <file> [--vram-capture-vblank N]: dump the CPU-side PSX VRAM
  * mirror (via CaptureVRAMState) to a raw 1024x512xu16-LE file at vblank N,
  * then exit. Same format as the 3DS debug capture's vramdump.bin (dumpreq `capture`), so
- * tools/texdump/* work on both -- built for PC-vs-3DS same-scene VRAM diffs,
+ * one host-side reader handles both -- built for PC-vs-3DS same-scene VRAM diffs,
  * since texture mapping is established at load time and reshuffles per
  * reload.
  */
