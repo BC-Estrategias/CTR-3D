@@ -4174,8 +4174,8 @@ int NativeRenderer_InitialiseRender(char *windowName, int width, int height, int
 	s_rendererInitialised = 1;
 
 	printf("\x1b[2J");
-	printf("CTR-Native / Nintendo 3DS\n");
-	printf("-------------------------\n");
+	printf("CTR 3D / Nintendo 3DS\n");
+	printf("---------------------\n");
 	printf("%s\n", (windowName != NULL) ? windowName : "(no title)");
 	/* width/height here are the PC path's SDL window request (main.c passes
 	 * 800x600) -- nothing on 3DS renders at them, and echoing them as "PSX

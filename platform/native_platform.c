@@ -107,7 +107,7 @@ internal void Platform_CalcFPS(void)
 		const f64 elapsedSeconds = (f64)(now - s_fpsLastCounter) / (f64)freq;
 		const f64 fps = (f64)s_fpsFrameCount / elapsedSeconds;
 
-		Platform_Log("[CTR Native] FPS: %.2f (last %d frames)\n", fps, s_fpsFrameCount);
+		Platform_Log("[CTR 3D] FPS: %.2f (last %d frames)\n", fps, s_fpsFrameCount);
 	}
 
 	s_fpsFrameCount = 0;
@@ -237,7 +237,7 @@ internal void NativePlatform_LodBiasConfigureFromArgs(int argc, char *argv[])
 
 		if ((i + 1) >= argc)
 		{
-			Platform_LogWarn("[CTR Native] %s needs a percentage (100 = retail)\n", argv[i]);
+			Platform_LogWarn("[CTR 3D] %s needs a percentage (100 = retail)\n", argv[i]);
 			continue;
 		}
 
@@ -247,7 +247,7 @@ internal void NativePlatform_LodBiasConfigureFromArgs(int argc, char *argv[])
 
 	if ((g_ctrLodGeoScale != 100) || (g_ctrLodTexScale != 100))
 	{
-		Platform_LogWarn("[CTR Native] LOD scale: level %d%%, texture %d%%\n", g_ctrLodGeoScale, g_ctrLodTexScale);
+		Platform_LogWarn("[CTR 3D] LOD scale: level %d%%, texture %d%%\n", g_ctrLodGeoScale, g_ctrLodTexScale);
 	}
 }
 #endif
@@ -270,7 +270,7 @@ internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[]
 
 		if ((i + 1) >= argc)
 		{
-			Platform_LogWarn("[CTR Native] --track-render needs a state (0=off 1=on 2=both)\n");
+			Platform_LogWarn("[CTR 3D] --track-render needs a state (0=off 1=on 2=both)\n");
 			continue;
 		}
 
@@ -310,7 +310,7 @@ internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[]
 			{
 				g_dbg_trackRender = 1;
 			}
-			Platform_LogWarn("[CTR Native] track near census: on\n");
+			Platform_LogWarn("[CTR 3D] track near census: on\n");
 		}
 	}
 
@@ -335,14 +335,14 @@ internal void NativePlatform_TrackRenderConfigureFromArgs(int argc, char *argv[]
 			{
 				g_dbg_trackRender = 1;
 			}
-			Platform_LogWarn("[CTR Native] track depth check: on\n");
+			Platform_LogWarn("[CTR 3D] track depth check: on\n");
 		}
 	}
 
 	// Always log the resulting state (even the default 0), same as the
 	// dumpreq/button handlers do on 3DS -- this is the line the verification
 	// loop greps for to confirm the flag actually took.
-	Platform_LogWarn("[CTR Native] track render: %d\n", g_dbg_trackRender);
+	Platform_LogWarn("[CTR 3D] track render: %d\n", g_dbg_trackRender);
 }
 #endif
 
@@ -364,7 +364,7 @@ internal void NativePlatform_ModelRenderConfigureFromArgs(int argc, char *argv[]
 
 		if ((i + 1) >= argc)
 		{
-			Platform_LogWarn("[CTR Native] --model-render needs a state (0=off 1=on 2=both)\n");
+			Platform_LogWarn("[CTR 3D] --model-render needs a state (0=off 1=on 2=both)\n");
 			continue;
 		}
 
@@ -393,13 +393,13 @@ internal void NativePlatform_ModelRenderConfigureFromArgs(int argc, char *argv[]
 
 		if (g_dbg_modelDepthCheck)
 		{
-			Platform_LogWarn("[CTR Native] model depth check: on\n");
+			Platform_LogWarn("[CTR 3D] model depth check: on\n");
 		}
 	}
 
 	// Logged even at the default 0 -- this is the line the verification loop
 	// greps for to confirm the flag took.
-	Platform_LogWarn("[CTR Native] model render: %d\n", g_dbg_modelRender);
+	Platform_LogWarn("[CTR 3D] model render: %d\n", g_dbg_modelRender);
 }
 #endif
 
@@ -423,7 +423,7 @@ internal void NativePlatform_GteCaptureConfigureFromArgs(int argc, char *argv[])
 
 		if ((i + 1) >= argc)
 		{
-			Platform_LogWarn("[CTR Native] --gte-capture needs 0 (ablate), 1 (full) or 2 (store only)\n");
+			Platform_LogWarn("[CTR 3D] --gte-capture needs 0 (ablate), 1 (full) or 2 (store only)\n");
 			continue;
 		}
 
@@ -435,7 +435,7 @@ internal void NativePlatform_GteCaptureConfigureFromArgs(int argc, char *argv[])
 		}
 	}
 
-	Platform_LogWarn("[CTR Native] gte capture: %d\n", g_dbg_gteCapture);
+	Platform_LogWarn("[CTR 3D] gte capture: %d\n", g_dbg_gteCapture);
 }
 
 // --sz-probe arms the [SZPROBE] stamp-time hit-rate counters (native_gpu.c).
@@ -454,7 +454,7 @@ internal void NativePlatform_SzProbeConfigureFromArgs(int argc, char *argv[])
 		}
 	}
 
-	Platform_LogWarn("[CTR Native] sz probe: %d\n", g_dbg_szProbe);
+	Platform_LogWarn("[CTR 3D] sz probe: %d\n", g_dbg_szProbe);
 }
 #endif
 
@@ -476,12 +476,12 @@ internal void Platform_HandleKey(int key, char down)
 		{
 		case SDL_SCANCODE_F1:
 			g_dbg_wireframeMode ^= 1;
-			Platform_LogWarn("[CTR Native] wireframe mode: %d\n", g_dbg_wireframeMode);
+			Platform_LogWarn("[CTR 3D] wireframe mode: %d\n", g_dbg_wireframeMode);
 			break;
 
 		case SDL_SCANCODE_F2:
 			g_dbg_texturelessMode ^= 1;
-			Platform_LogWarn("[CTR Native] textureless mode: %d\n", g_dbg_texturelessMode);
+			Platform_LogWarn("[CTR 3D] textureless mode: %d\n", g_dbg_texturelessMode);
 			break;
 		case SDL_SCANCODE_UP:
 		case SDL_SCANCODE_DOWN:
@@ -500,16 +500,16 @@ internal void Platform_HandleKey(int key, char down)
 			NativeReplayScheduler_RequestStop();
 			break;
 		case SDL_SCANCODE_F7:
-			Platform_LogWarn("[CTR Native] saving VRAM.TGA\n");
+			Platform_LogWarn("[CTR 3D] saving VRAM.TGA\n");
 			NativeRenderer_SaveVRAM("VRAM.TGA", 0, 0, VRAM_WIDTH, VRAM_HEIGHT, 1);
 			break;
 		case SDL_SCANCODE_F12:
-			Platform_LogWarn("[CTR Native] Saving screenshot...\n");
+			Platform_LogWarn("[CTR 3D] Saving screenshot...\n");
 			Platform_TakeScreenshot();
 			break;
 		case SDL_SCANCODE_F3:
 			g_cfg_bilinearFiltering ^= 1;
-			Platform_LogWarn("[CTR Native] filtering mode: %d\n", g_cfg_bilinearFiltering);
+			Platform_LogWarn("[CTR 3D] filtering mode: %d\n", g_cfg_bilinearFiltering);
 			break;
 		case SDL_SCANCODE_F5:
 			NativeSaveState_RequestSave();
@@ -524,11 +524,11 @@ internal void Platform_HandleKey(int key, char down)
 		// before Platform_HandleKey is called. Use --lod-geo/--lod-tex instead.
 		case SDL_SCANCODE_F4:
 			g_ctrLodGeoScale = CTR_LodBias_Step(g_ctrLodGeoScale);
-			Platform_LogWarn("[CTR Native] level LOD scale: %d%%\n", g_ctrLodGeoScale);
+			Platform_LogWarn("[CTR 3D] level LOD scale: %d%%\n", g_ctrLodGeoScale);
 			break;
 		case SDL_SCANCODE_F6:
 			g_ctrLodTexScale = CTR_LodBias_Step(g_ctrLodTexScale);
-			Platform_LogWarn("[CTR Native] texture LOD scale: %d%%\n", g_ctrLodTexScale);
+			Platform_LogWarn("[CTR 3D] texture LOD scale: %d%%\n", g_ctrLodTexScale);
 			break;
 #endif
 #if defined(CTR_NATIVE_TRACK_RENDERER) && CTR_NATIVE_TRACK_RENDERER
@@ -542,7 +542,7 @@ internal void Platform_HandleKey(int key, char down)
 			extern int g_dbg_trackRender;
 
 			g_dbg_trackRender = (g_dbg_trackRender + 1) % 3;
-			Platform_LogWarn("[CTR Native] track render: %d\n", g_dbg_trackRender);
+			Platform_LogWarn("[CTR 3D] track render: %d\n", g_dbg_trackRender);
 			break;
 		}
 #endif
@@ -558,11 +558,11 @@ void Platform_Init(const char *title, int width, int height)
 	Platform_LogInit(title);
 	Platform_GetWindowName(title, windowName, sizeof(windowName));
 
-	Platform_Log("[CTR Native] Initialising platform\n");
+	Platform_Log("[CTR 3D] Initialising platform\n");
 
 	if (SDL_Init(SDL_INIT_VIDEO) == 0)
 	{
-		Platform_LogError("[CTR Native] Failed to initialise SDL\n");
+		Platform_LogError("[CTR 3D] Failed to initialise SDL\n");
 		Platform_LogShutdown();
 		return;
 	}
@@ -571,14 +571,14 @@ void Platform_Init(const char *title, int width, int height)
 
 	if (!NativeRenderer_InitialiseRender(windowName, width, height, 0))
 	{
-		Platform_LogError("[CTR Native] Failed to initialise window\n");
+		Platform_LogError("[CTR 3D] Failed to initialise window\n");
 		Platform_Shutdown();
 		return;
 	}
 
 	if (!NativeRenderer_InitialisePSX())
 	{
-		Platform_LogError("[CTR Native] Failed to initialise PSX renderer state\n");
+		Platform_LogError("[CTR 3D] Failed to initialise PSX renderer state\n");
 		Platform_Shutdown();
 		return;
 	}
@@ -853,7 +853,7 @@ void Platform_PollHostEvents(void)
 			if ((key == SDL_SCANCODE_F4) && (down == 0))
 			{
 #ifdef CTR_INTERNAL
-				Platform_LogWarn("[CTR Native] Keyboard assigned to player %d\n", Platform_InputCycleKeyboardController());
+				Platform_LogWarn("[CTR 3D] Keyboard assigned to player %d\n", Platform_InputCycleKeyboardController());
 #endif
 				break;
 			}
@@ -864,11 +864,11 @@ void Platform_PollHostEvents(void)
 				int player = Platform_InputCycleGamepadController();
 				if (player == 0)
 				{
-					Platform_LogWarn("[CTR Native] No gamepad connected\n");
+					Platform_LogWarn("[CTR 3D] No gamepad connected\n");
 				}
 				else
 				{
-					Platform_LogWarn("[CTR Native] Gamepad assigned to player %d\n", player);
+					Platform_LogWarn("[CTR 3D] Gamepad assigned to player %d\n", player);
 				}
 #endif
 				break;

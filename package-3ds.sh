@@ -43,6 +43,32 @@ if [[ "${DUMPREQ_COUNT}" -gt 0 && "${ALLOW_INTERNAL}" -ne 1 ]]; then
     exit 1
 fi
 
+# The Homebrew Launcher shows the SMDH publisher under the icon. It comes from the
+# CTR_NATIVE_AUTHOR cache variable, and a build directory configured before a rename
+# keeps the old value until it is reconfigured with -DCTR_NATIVE_AUTHOR=...
+EXPECTED_AUTHOR="${CTR_AUTHOR:-CTR 3D}"
+mapfile -t SMDH_TEXT < <(python - "${CTR_3DSX}" <<'PYEOF'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+smdh_off = struct.unpack_from('<I', data, 0x20)[0]
+if data[smdh_off:smdh_off + 4] != b'SMDH':
+    sys.exit('no SMDH in ' + sys.argv[1])
+title = smdh_off + 8  # first title slot; smdhtool writes the same text to every language slot
+for off, size in ((0, 0x80), (0x80, 0x100), (0x180, 0x80)):
+    text = data[title + off:title + off + size].decode('utf-16-le').rstrip('\0')
+    sys.stdout.buffer.write((text + '\n').encode('utf-8'))
+PYEOF
+)
+if (( ${#SMDH_TEXT[@]} != 3 )); then
+    echo "ERROR: could not read the SMDH strings from ${CTR_3DSX}" >&2
+    exit 1
+fi
+echo "SMDH: name='${SMDH_TEXT[0]}' description='${SMDH_TEXT[1]}' author='${SMDH_TEXT[2]}'"
+if [[ "${SMDH_TEXT[2]}" != "${EXPECTED_AUTHOR}" ]]; then
+    echo "refusing: SMDH author is '${SMDH_TEXT[2]}', expected '${EXPECTED_AUTHOR}'; reconfigure with -DCTR_NATIVE_AUTHOR='${EXPECTED_AUTHOR}' (a cached value outlives a changed default)" >&2
+    exit 1
+fi
+
 rm -rf "${PACKAGE_DIR}"
 mkdir -p "${PACKAGE_DIR}/3ds/ctr_native/assets"
 

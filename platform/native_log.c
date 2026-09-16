@@ -109,7 +109,7 @@ int Platform_LogSetPath(const char *path)
 	if ((written < 0) || ((size_t)written >= sizeof(s_logPath)))
 	{
 		s_logPath[0] = '\0';
-		fprintf(stderr, "[CTR Native] Error: log path is too long\n");
+		fprintf(stderr, "[CTR 3D] Error: log path is too long\n");
 		return 0;
 	}
 
@@ -129,7 +129,7 @@ void Platform_LogInit(const char *appName)
 
 		if ((written < 0) || ((size_t)written >= sizeof(s_logPath)))
 		{
-			fprintf(stderr, "[CTR Native] Error: log filename is too long\n");
+			fprintf(stderr, "[CTR 3D] Error: log filename is too long\n");
 			s_logPath[0] = '\0';
 			return;
 		}
@@ -139,7 +139,7 @@ void Platform_LogInit(const char *appName)
 
 	if (s_logStream == NULL)
 	{
-		fprintf(stderr, "[CTR Native] Error: cannot create log file '%s'\n", s_logPath);
+		fprintf(stderr, "[CTR 3D] Error: cannot create log file '%s'\n", s_logPath);
 	}
 }
 

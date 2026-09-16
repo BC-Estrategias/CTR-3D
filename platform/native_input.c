@@ -773,7 +773,7 @@ int Platform_InputInit(void)
 
 	if (SDL_InitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_HAPTIC) == 0)
 	{
-		fprintf(stderr, "[CTR Native] Failed to initialise SDL input subsystem: %s\n", SDL_GetError());
+		fprintf(stderr, "[CTR 3D] Failed to initialise SDL input subsystem: %s\n", SDL_GetError());
 		return 0;
 	}
 

@@ -128,7 +128,7 @@ void NativeGpuLinks_RegisterRangeChecked(const char *label, const void *hostStar
 		return;
 	}
 
-	fprintf(stderr, "[CTR Native] GPU link bridge failed to register %s range start=%p size=%zu\n", label, hostStart, size);
+	fprintf(stderr, "[CTR 3D] GPU link bridge failed to register %s range start=%p size=%zu\n", label, hostStart, size);
 	abort();
 }
 
@@ -172,7 +172,7 @@ uint32_t NativeGpuLinks_FromHostPointer(const void *hostPtr)
 		return range->tokenStart + (uint32_t)(host - range->hostStart);
 	}
 
-	fprintf(stderr, "[CTR Native] GPU link bridge has no token for host pointer %p\n", hostPtr);
+	fprintf(stderr, "[CTR 3D] GPU link bridge has no token for host pointer %p\n", hostPtr);
 	abort();
 }
 
