@@ -7180,7 +7180,7 @@ void NativeAudio_StepVBlank(void)
 			N3DS_DebugLog(line);
 		}
 #else
-		printf("[CTR Native] Audio output stats: underrunFrames=%d overflowFrames=%d queuedFrames=%d callbackMaxRequestFrames=%d\n", underrunFrames,
+		printf("[CTR 3D] Audio output stats: underrunFrames=%d overflowFrames=%d queuedFrames=%d callbackMaxRequestFrames=%d\n", underrunFrames,
 		       overflowFrames, queuedFrames, s_audio.output.callbackMaxRequestFrames);
 #endif
 	}
@@ -7218,7 +7218,7 @@ internal int NativeAudio_OpenDevice(void)
 	s_audio.output.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, NativeAudio_StreamCallback, NULL);
 	if (s_audio.output.stream == NULL)
 	{
-		fprintf(stderr, "[CTR Native] SDL audio unavailable: %s\n", SDL_GetError());
+		fprintf(stderr, "[CTR 3D] SDL audio unavailable: %s\n", SDL_GetError());
 		return 0;
 	}
 
@@ -7229,7 +7229,7 @@ internal int NativeAudio_OpenDevice(void)
 	}
 	if (!SDL_GetAudioStreamFormat(s_audio.output.stream, &srcSpec, &dstSpec))
 	{
-		fprintf(stderr, "[CTR Native] SDL audio stream format unavailable: %s\n", SDL_GetError());
+		fprintf(stderr, "[CTR 3D] SDL audio stream format unavailable: %s\n", SDL_GetError());
 		SDL_DestroyAudioStream(s_audio.output.stream);
 		s_audio.output.stream = NULL;
 		s_audio.output.device = 0;
@@ -7238,7 +7238,7 @@ internal int NativeAudio_OpenDevice(void)
 
 	if ((srcSpec.freq != want.freq) || (srcSpec.format != want.format) || (srcSpec.channels != want.channels))
 	{
-		fprintf(stderr, "[CTR Native] SDL audio rejected fixed PCM contract: got %d Hz format 0x%x channels %d\n", srcSpec.freq, srcSpec.format,
+		fprintf(stderr, "[CTR 3D] SDL audio rejected fixed PCM contract: got %d Hz format 0x%x channels %d\n", srcSpec.freq, srcSpec.format,
 		        srcSpec.channels);
 		SDL_DestroyAudioStream(s_audio.output.stream);
 		s_audio.output.stream = NULL;
@@ -7249,13 +7249,13 @@ internal int NativeAudio_OpenDevice(void)
 	// Through the log sink, not a bare printf: on 3DS a raw printf paints the
 	// bottom-screen console with no gate, and this line lands after the first
 	// present -- past the point the panel stops being a boot surface.
-	Platform_Log("[CTR Native] SDL audio stream opened: driver=%s src=%d Hz/%d ch dst=%d Hz/%d ch device=%d Hz/%d ch sampleFrames=%d\n",
+	Platform_Log("[CTR 3D] SDL audio stream opened: driver=%s src=%d Hz/%d ch dst=%d Hz/%d ch device=%d Hz/%d ch sampleFrames=%d\n",
 	             SDL_GetCurrentAudioDriver(), srcSpec.freq, srcSpec.channels, dstSpec.freq, dstSpec.channels, deviceSpec.freq, deviceSpec.channels,
 	             deviceSampleFrames);
 	NativeAudio_ClearOutputQueueNoLock();
 	if (!SDL_ResumeAudioStreamDevice(s_audio.output.stream))
 	{
-		fprintf(stderr, "[CTR Native] SDL audio stream resume failed: %s\n", SDL_GetError());
+		fprintf(stderr, "[CTR 3D] SDL audio stream resume failed: %s\n", SDL_GetError());
 		SDL_DestroyAudioStream(s_audio.output.stream);
 		s_audio.output.stream = NULL;
 		s_audio.output.device = 0;

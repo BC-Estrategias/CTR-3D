@@ -190,7 +190,7 @@ static s32 NativeConsole_Return(const u32 result)
 	{
 		fflush(stdout);
 		fflush(stderr);
-		fprintf(stderr, "\n[CTR Native] Press Enter to close this window...");
+		fprintf(stderr, "\n[CTR 3D] Press Enter to close this window...");
 		fflush(stderr);
 
 		while (getchar() != '\n' && !feof(stdin))
@@ -241,16 +241,16 @@ int main(int argc, char *argv[])
 	N3DS_DebugLog("[CTR-3DS] main() entered");
 #endif
 
-	printf("[CTR Native] Starting...\n");
+	printf("[CTR 3D] Starting...\n");
 	fflush(stdout);
 
 	const char *sdlBasePath = SDL_GetBasePath();
-	printf("[CTR Native] SDL base path: %s\n", sdlBasePath ? sdlBasePath : "(null)");
+	printf("[CTR 3D] SDL base path: %s\n", sdlBasePath ? sdlBasePath : "(null)");
 	fflush(stdout);
 
 	if (!NativeAssets_Init(sdlBasePath))
 	{
-		fprintf(stderr, "[CTR Native] Failed to initialize asset paths.\n");
+		fprintf(stderr, "[CTR 3D] Failed to initialize asset paths.\n");
 #if defined(__3DS__)
 		N3DS_DebugLog("[CTR-3DS] FAIL: NativeAssets_Init");
 		N3DS_ShowFatalAssetScreen(NULL);
@@ -274,15 +274,15 @@ int main(int argc, char *argv[])
 	Platform_LogInstrument("[BUILD] %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
 #endif
 
-	printf("[CTR Native] Version: %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
-	printf("[CTR Native] Built with: " CC "\n");
-	printf("[CTR Native] Base: %s\n", NativeAssets_GetBaseDir());
-	printf("[CTR Native] Assets: %s\n", NativeAssets_GetAssetDir());
+	printf("[CTR 3D] Version: %s (%s)\n", CTR_NATIVE_VERSION, CTR_NATIVE_BUILD_ID);
+	printf("[CTR 3D] Built with: " CC "\n");
+	printf("[CTR 3D] Base: %s\n", NativeAssets_GetBaseDir());
+	printf("[CTR 3D] Assets: %s\n", NativeAssets_GetAssetDir());
 	fflush(stdout);
 
 	if (chdir(NativeAssets_GetBaseDir()) != 0)
 	{
-		fprintf(stderr, "[CTR Native] Failed to enter base directory: %s\n", NativeAssets_GetBaseDir());
+		fprintf(stderr, "[CTR 3D] Failed to enter base directory: %s\n", NativeAssets_GetBaseDir());
 #if defined(__3DS__)
 		N3DS_DebugLog("[CTR-3DS] FAIL: chdir to base dir");
 #endif
@@ -309,10 +309,10 @@ int main(int argc, char *argv[])
 #endif
 
 #ifdef USE_16BY9
-	printf("[CTR Native] Widescreen\n");
+	printf("[CTR 3D] Widescreen\n");
 	Platform_Init("Crash Team Racing", 1280, 720);
 #else
-	printf("[CTR Native] 4:3\n");
+	printf("[CTR 3D] 4:3\n");
 	Platform_Init("Crash Team Racing", 800, 600);
 #endif
 
