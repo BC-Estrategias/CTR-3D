@@ -16,6 +16,7 @@
 
 #if defined(CTR_NATIVE)
 #include <platform/native_audio.h>
+#include <platform/native_log.h>
 // platform/native_options.c -- repoints unused LNG slots for the native
 // options menu once the language table exists (local-extern idiom).
 extern void NativeOptions_InstallStrings(void);
@@ -687,18 +688,85 @@ void StateZero()
 	VSyncCallback(MainDrawCb_Vsync);
 
 #ifdef CTR_NATIVE
-	// The XA voice-cache warm and crate-intro CD-cache prefetch used to run
-	// synchronously here, before frame 1 -- a large blocking disc/SD read on
-	// this thread that froze the boot splash black for the whole cost (up to
-	// low-teens seconds on a slow card) instead of just ducking the sequencer
-	// for it. Both are now pumped per frame from stage 6 of LOAD_TenStages
-	// (LOAD_NativeCrateIntroSplashStep, held on levelID == NAUGHTY_DOG_CRATE,
-	// same mechanism as the Oxide-intro cutscene prefetch above it) so this
-	// thread's frame loop -- and the VSync-driven music sequencer -- keeps
-	// running while the work happens. The "Start your engines" XA line played
-	// a few lines below reads over the cold/uncached path exactly as it did
-	// before either optimization existed; only the crate intro's own voice
-	// lines and level reads, later, depend on the caches being ready by then.
+	// The XA voice-line cache is tens of MB of reads, and this is the only
+	// stretch of the boot with nothing on a clock to disturb: the SCEA logo is
+	// already presented, no music has started, and the frame loop has not begun.
+	// Hold here and keep presenting the logo rather than letting the cost land
+	// on the crate load stage (which holds against audible intro music the
+	// crate scene is timed off) or on the menus (which are interactive).
+	// Must stay above Music_SetIntro for that reason.
+	//
+	// The MUSIC sector-count memo is table-fed and reads nothing, so what this
+	// holds for is the GAME and EXTRA voice-line cache alone.
+	{
+		enum
+		{
+			MAIN_SCEA_WARM_SECTORS_PER_FRAME = 64,
+			// A step that only opens a file or advances a stage reads nothing,
+			// and presenting a frame for it costs a whole refresh. Keep
+			// stepping until one reads, then present -- bounded so a state
+			// that never reads still yields the screen.
+			MAIN_SCEA_WARM_STEPS_PER_FRAME = 16
+		};
+
+		// Wording of the hold's progress line. Nothing else prints it.
+		const char *sceaWarmLabel = "Loading audio";
+
+		u32 sceaWarmFrames = 0;
+		u32 sceaWarmSteps = 0;
+		int sceaWarmDone = 0;
+		int sceaWarmShown = -1;
+
+		NativeAudio_VoiceCacheEnsureBegin();
+		while (!sceaWarmDone)
+		{
+			u32 sectorsBefore = NativeAudio_VoiceCacheWarmSectorsRead();
+			int percent;
+			int step;
+
+			for (step = 0; step < MAIN_SCEA_WARM_STEPS_PER_FRAME; step++)
+			{
+				sceaWarmDone = NativeAudio_VoiceCacheEnsureStep(MAIN_SCEA_WARM_SECTORS_PER_FRAME);
+				sceaWarmSteps++;
+				if (sceaWarmDone || (NativeAudio_VoiceCacheWarmSectorsRead() != sectorsBefore))
+				{
+					break;
+				}
+			}
+
+			if (sceaWarmDone)
+			{
+				break;
+			}
+
+			// A still screen this long reads as a hung console. Repaint only on
+			// the integer percent, so the whole hold costs about a hundred
+			// console rows rather than one per frame.
+			percent = NativeAudio_VoiceCacheWarmPercent();
+			if (percent != sceaWarmShown)
+			{
+				sceaWarmShown = percent;
+				NativeLog_BootStatus(sceaWarmLabel, percent);
+			}
+
+			VSync(0);
+			Platform_PresentVRAMDisplay();
+			sceaWarmFrames++;
+		}
+
+		if (sceaWarmShown >= 0)
+		{
+			NativeLog_BootStatusClear();
+		}
+
+		if (sceaWarmFrames > 0)
+		{
+			// Silent on PC and on any 3DS boot with nothing to read: no hold,
+			// nothing to report.
+			Platform_LogInstrument("[XAWARM] scea hold frames=%u steps=%u sectors=%u\n", (unsigned)sceaWarmFrames, (unsigned)sceaWarmSteps,
+			                       (unsigned)NativeAudio_VoiceCacheWarmSectorsRead());
+		}
+	}
 
 	// 3DS boots to speedometer mode (bit 8): the minimap lives on the bottom
 	// screen there (UI_RenderFrame_Racing routes it), so the speedometer is

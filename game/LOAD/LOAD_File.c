@@ -16,7 +16,7 @@ void LOAD_StringToUpper(char *path)
 
 #ifdef CTR_NATIVE
 #include <platform/native_cd.h>
-#include <platform/native_audio.h>
+#include <platform/native_log.h>
 
 // Resumable state for the boot crate-intro level-file prefetch (VRAM then LEV)
 // into the native CD read cache. The crate group has no PTR entry (BI_NDBOX +
@@ -76,50 +76,47 @@ int LOAD_NativePrefetchCrateIntroStep(struct BigHeader *bigfile, int budgetSecto
 	return 1;
 }
 
-// Orchestrates the two resumable boot-splash disc jobs for the crate intro:
-// the XA voice-cache warm (MUSIC memo + GAME/EXTRA RAM caches) must finish
-// before the CD-cache prefetch starts, so the crate intro's own voice lines
-// never contend with its level-file reads for the same SD bandwidth. Held at
-// the stage-6 call site (see LOAD_TenStages) until both report done.
+// Held at the stage-6 call site (see LOAD_TenStages) until the crate intro's
+// own two level-file extents are in the CD read cache. The intro music is
+// already playing and audible while this stage is held, and the crate scene is
+// timed off that music, so only work the crate scene itself needs may run
+// here: anything else that wants warming belongs at the silent SCEA hold in
+// StateZero, before the music starts.
 //
 // A slow SD card that can't finish inside a reasonable number of held frames
 // forces the rest through synchronously here (bounded, logged) rather than
-// letting the crate intro's audio start against a half-built cache -- same
-// blocking cost the un-split code always paid, just as a last resort instead
-// of the default path.
+// starting the crate intro against a half-filled cache.
 int LOAD_NativeCrateIntroSplashStep(struct BigHeader *bigfile)
 {
 	enum
 	{
 		LOAD_CRATE_SPLASH_SECTORS_PER_FRAME = 64,
-		LOAD_CRATE_SPLASH_FALLBACK_FRAMES = 2400, // ~40s at 60fps: generous even for the slow-card target
+		LOAD_CRATE_SPLASH_FALLBACK_FRAMES = 240, // the two extents are a handful of chunks; ~10x their worst slow-card cost
 	};
 
 	local_persist u32 s_lfCrateSplashFrames;
 
-	NativeAudio_VoiceCacheEnsureBegin();
 	s_lfCrateSplashFrames++;
 
 	if (s_lfCrateSplashFrames > LOAD_CRATE_SPLASH_FALLBACK_FRAMES)
 	{
-		Platform_Log("[SPLASHIO] fallback: forcing synchronous completion after %u held frames\n", s_lfCrateSplashFrames);
-		while (!NativeAudio_VoiceCacheEnsureStep(0))
-		{
-		}
+		Platform_LogInstrument("[SPLASHIO] fallback: forcing synchronous completion after %u held frames\n", (unsigned)s_lfCrateSplashFrames);
 		while (!LOAD_NativePrefetchCrateIntroStep(bigfile, 0))
 		{
 		}
-		s_lfCrateSplashFrames = 0;
-		return 1;
+	}
+	else if (!LOAD_NativePrefetchCrateIntroStep(bigfile, LOAD_CRATE_SPLASH_SECTORS_PER_FRAME))
+	{
+		return 0;
 	}
 
-	if (!NativeAudio_VoiceCacheEnsureStep(LOAD_CRATE_SPLASH_SECTORS_PER_FRAME))
+	if (s_lfCrateSplashFrames > 1)
 	{
-		return 0;
-	}
-	if (!LOAD_NativePrefetchCrateIntroStep(bigfile, LOAD_CRATE_SPLASH_SECTORS_PER_FRAME))
-	{
-		return 0;
+		// Only when the stage actually held: an already-cached extent (and
+		// every PC boot) completes on the first call, with no hold to report.
+		unsigned steps = (unsigned)s_lfCrateSplashFrames;
+
+		Platform_LogInstrument("[SPLASHIO] steps=%u sectors=%u\n", steps, steps * LOAD_CRATE_SPLASH_SECTORS_PER_FRAME);
 	}
 
 	s_lfCrateSplashFrames = 0;

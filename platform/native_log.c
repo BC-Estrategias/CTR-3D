@@ -217,3 +217,38 @@ void Platform_LogError(const char *fmt, ...)
 	Platform_LogV(stderr, fmt, args);
 	va_end(args);
 }
+
+void NativeLog_BootStatus(const char *label, int percent)
+{
+#ifdef __3DS__
+	char line[40];
+
+	if (label == NULL)
+	{
+		return;
+	}
+	if (percent < 0)
+	{
+		percent = 0;
+	}
+	if (percent > 100)
+	{
+		percent = 100;
+	}
+
+	/* Percent right-aligned so the sign holds its column as the number
+	 * widens and the row does not jitter. */
+	snprintf(line, sizeof(line), "%s %3d%%", label, percent);
+	N3DS_ConsoleStatusLine(line);
+#else
+	(void)label;
+	(void)percent;
+#endif
+}
+
+void NativeLog_BootStatusClear(void)
+{
+#ifdef __3DS__
+	N3DS_ConsoleStatusClear();
+#endif
+}

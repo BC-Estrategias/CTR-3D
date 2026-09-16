@@ -3832,16 +3832,16 @@ internal int NativeAudio_XAVoiceCacheOpen(struct NativeAudioXaSource *source, co
 	return 1;
 }
 
-/* Aggregate progress for the whole splash-screen audio warm (music warm +
- * both voice-cache categories); see NativeAudio_VoiceCacheEnsureBegin/Step. */
+/* Aggregate progress for the whole boot XA warm (music memo + both voice-cache
+ * categories); see NativeAudio_VoiceCacheEnsureBegin/Step. */
 internal struct
 {
 	b32 active;
 	int stage; /* 0=music warm, 1=cache GAME, 2=cache EXTRA, 3=finalize */
 	int tracks;
 	int sectors;
-	u32 splashSteps;
-	u32 splashSectors;
+	u32 readSectors;    /* disc/SD sectors this warm has actually read */
+	u32 plannedSectors; /* what it set out to read; 0 until the plan is known */
 } s_vce;
 
 /* Resumable state for one category's build pass (GAME then EXTRA). A step
@@ -3862,6 +3862,45 @@ internal struct
 	int span;
 	int pos;
 } s_xacb;
+
+/* Disc sectors one category's build pass sets out to read: each wanted file is
+ * read once, across the longest slot any wanted track occupies in it -- the
+ * same rule NativeAudio_XAVoiceCacheBuildCategoryStep applies at open time,
+ * minus the clamp to the file's real length, which is not known until the open.
+ * Slot sizes come from the XNF, so this is a plan, not an outcome. */
+internal u32 NativeAudio_XAVoiceCachePlannedSectors(int categoryID)
+{
+	int fileMax[32];
+	u32 total = 0;
+	int xaID;
+	int f;
+
+	memset(fileMax, 0, sizeof(fileMax));
+
+	for (xaID = 0; xaID < NATIVE_AUDIO_XA_TRACK_INDEX_MAX; xaID++)
+	{
+		struct NativeAudioXaTrackInfo info;
+
+		if (!NativeAudio_XAVoiceCacheWantsTrack(categoryID, xaID) || !NativeAudio_LookupXATrackInfo(categoryID, xaID, &info))
+		{
+			continue;
+		}
+		if ((info.fileNumber < 0) || (info.fileNumber >= 32) || (info.entryIndex >= NATIVE_AUDIO_XA_TRACK_INDEX_MAX))
+		{
+			continue;
+		}
+		if (info.numSectors > fileMax[info.fileNumber])
+		{
+			fileMax[info.fileNumber] = info.numSectors;
+		}
+	}
+
+	for (f = 0; f < 32; f++)
+	{
+		total += (u32)fileMax[f];
+	}
+	return total;
+}
 
 internal void NativeAudio_XAVoiceCacheBuildCategoryBegin(int categoryID)
 {
@@ -3980,6 +4019,7 @@ internal int NativeAudio_XAVoiceCacheBuildCategoryStep(int budgetSectors)
 			return 0;
 		}
 
+		s_vce.readSectors += (u32)chunk;
 		s_xacb.pos += chunk;
 		if (s_xacb.pos < s_xacb.span)
 		{
@@ -4067,9 +4107,35 @@ internal int NativeAudio_XAVoiceCacheBuildCategoryStep(int budgetSectors)
  * pass, each bounded by its own XNF slot exactly as NativeAudio_XAStreamOpenTrack
  * bounds it (an unbounded count would report the whole channel's length for a
  * short track and the game would then play silence out to the fake end).
- * Resumable, driven from the crate-intro load stage inside the silent splash;
- * the game thread never scans a MUSIC file. */
+ * Resumable, so a caller can spread it across frames. The scan is the fallback
+ * path: on the disc this port accepts, the table below fills the same memo with
+ * the same values and no reads at all. */
 #define NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS 32
+
+/* Every MUSIC track's audio-sector count is a constant of the NTSC-U disc --
+ * the only disc this port accepts -- and discovering them by scanning costs
+ * ~48 MiB of game-thread reads. These are those constants, next to the XNF
+ * fields that identify the disc they were taken from.
+ *
+ * A row is used only when the live XNF entry matches it field for field, and
+ * the match is all-or-nothing: any other disc, or a re-cut XNF, falls through
+ * to the scan rather than playing a track out to a wrong length. Regenerate a
+ * changed disc's rows from the scan's own [XAWARM] music lines. */
+struct NativeAudioMusicCountRow
+{
+	s16 xaID;
+	s16 entryIndex;
+	s16 fileNumber;
+	s16 channelFilter;
+	s16 slotSectors;  /* XNF numSectors: the bound the scan runs to */
+	s16 audioSectors; /* what the scan returns, and what the memo stores */
+};
+
+internal const struct NativeAudioMusicCountRow s_mcTableNtscU[] = {
+    {0, 0, 0, 0, 1162, 146},   {1, 1, 0, 1, 1162, 146},   {2, 2, 0, 2, 1162, 145},   {3, 3, 0, 3, 1162, 145},  {4, 4, 0, 4, 10337, 1292},
+    {5, 5, 0, 5, 10337, 1292}, {6, 6, 0, 6, 252, 31},     {7, 7, 1, 0, 2378, 298},   {8, 8, 1, 1, 2375, 297},  {9, 9, 1, 2, 2410, 301},
+    {10, 10, 1, 3, 2375, 297}, {11, 11, 1, 4, 2385, 298}, {12, 12, 1, 5, 2403, 300},
+};
 
 internal u8 s_mcwChunkBuf[NATIVE_DISC_IMAGE_CHUNK_SECTORS * XA_FULL_SECTOR_SIZE];
 internal struct
@@ -4091,6 +4157,37 @@ internal struct
 		struct NativeAudioXaTrackInfo info;
 	} tracks[NATIVE_AUDIO_MUSIC_WARM_MAX_TRACKS];
 } s_mcw;
+
+/* Fills the count memo from the table when every wanted MUSIC track matches its
+ * row. All-or-nothing on purpose: a partial match means the XNF is not the one
+ * these counts came from, and a half-table memo is worse than either half. */
+internal int NativeAudio_MusicCountTableFill(void)
+{
+	int t;
+
+	if (s_mcw.numTracks != (int)len(s_mcTableNtscU))
+	{
+		return 0;
+	}
+
+	for (t = 0; t < s_mcw.numTracks; t++)
+	{
+		const struct NativeAudioMusicCountRow *row = &s_mcTableNtscU[t];
+		const struct NativeAudioXaTrackInfo *info = &s_mcw.tracks[t].info;
+
+		if ((s_mcw.tracks[t].xaID != row->xaID) || (info->entryIndex != row->entryIndex) || (info->fileNumber != row->fileNumber) ||
+		    (info->channelFilter != row->channelFilter) || (info->numSectors != row->slotSectors))
+		{
+			return 0;
+		}
+	}
+
+	for (t = 0; t < s_mcw.numTracks; t++)
+	{
+		s_xaAudioSectorCountMemo[s_mcw.tracks[t].info.entryIndex] = s_mcTableNtscU[t].audioSectors;
+	}
+	return 1;
+}
 
 internal void NativeAudio_MusicCountWarmBegin(void)
 {
@@ -4115,6 +4212,17 @@ internal void NativeAudio_MusicCountWarmBegin(void)
 		s_mcw.numTracks++;
 		s_mcw.filesWanted |= 1u << info.fileNumber;
 	}
+
+	if (NativeAudio_MusicCountTableFill())
+	{
+		NativeAudio_XAVoiceCacheLog("[XAWARM] music counts from table (%d/%d)", s_mcw.numTracks, s_mcw.numTracks);
+		/* Step returns done on its first call: no MUSIC file is ever opened. */
+		s_mcw.warmed = s_mcw.numTracks;
+		s_mcw.active = 0;
+		return;
+	}
+
+	NativeAudio_XAVoiceCacheLog("[XAWARM] music count table mismatch, scanning");
 	s_mcw.active = 1;
 }
 
@@ -4229,6 +4337,8 @@ internal int NativeAudio_MusicCountWarmStep(int budgetSectors)
 		return 0;
 	}
 
+	s_vce.readSectors += (u32)chunk;
+
 	for (i = 0; i < chunk; i++)
 	{
 		const u8 *raw = &s_mcwChunkBuf[(size_t)i * (size_t)s_mcw.src.sectorSize];
@@ -4254,10 +4364,11 @@ internal int NativeAudio_MusicCountWarmStep(int budgetSectors)
 }
 #endif
 
-/* Orchestrates the resumable splash-screen audio warm: MUSIC sector-count
- * memo, then the GAME and EXTRA voice-line RAM caches, in that order so the
- * caches (bigger, budget-limited) never crowd out the memo that every MUSIC
- * open depends on. Self-gates to a no-op after the first Begin (and on PC). */
+/* Orchestrates the resumable boot XA warm: MUSIC sector-count memo, then the
+ * GAME and EXTRA voice-line RAM caches, in that order so the caches (bigger,
+ * budget-limited) never crowd out the memo that every MUSIC open depends on.
+ * Self-gates to a no-op after the first Begin (and on PC). The memo half is
+ * table-fed and costs no reads unless the disc's XNF is an unknown one. */
 void NativeAudio_VoiceCacheEnsureBegin(void)
 {
 #if defined(__3DS__)
@@ -4282,6 +4393,69 @@ void NativeAudio_VoiceCacheEnsureBegin(void)
 	/* Independent of the RAM cache below (MUSIC is never cached): fills the
 	 * per-track sector-count memo so no MUSIC open ever scans mid-game. */
 	NativeAudio_MusicCountWarmBegin();
+
+	/* Read plan for the whole warm, so a caller holding the screen can show
+	 * honest progress. The memo half costs nothing while its table matches
+	 * the disc; only the fallback scan reads. */
+	if (s_xaVoiceCache.blob != NULL)
+	{
+		s_vce.plannedSectors = NativeAudio_XAVoiceCachePlannedSectors(NATIVE_AUDIO_XA_CATEGORY_GAME) +
+		                       NativeAudio_XAVoiceCachePlannedSectors(NATIVE_AUDIO_XA_CATEGORY_EXTRA);
+	}
+	if (s_mcw.active)
+	{
+		int fileMax[32];
+		int t;
+		int f;
+
+		memset(fileMax, 0, sizeof(fileMax));
+		for (t = 0; t < s_mcw.numTracks; t++)
+		{
+			int file = s_mcw.tracks[t].info.fileNumber;
+
+			if ((file >= 0) && (file < 32) && (s_mcw.tracks[t].info.numSectors > fileMax[file]))
+			{
+				fileMax[file] = s_mcw.tracks[t].info.numSectors;
+			}
+		}
+		for (f = 0; f < 32; f++)
+		{
+			s_vce.plannedSectors += (u32)fileMax[f];
+		}
+	}
+#endif
+}
+
+/* Disc/SD sectors the boot XA warm has read so far. A caller driving the warm
+ * uses the change in this to tell a step that did I/O from one that only
+ * opened a file or changed stage. Always 0 off the 3DS. */
+u32 NativeAudio_VoiceCacheWarmSectorsRead(void)
+{
+#if defined(__3DS__)
+	return s_vce.readSectors;
+#else
+	return 0;
+#endif
+}
+
+/* 0..99 progress of the boot XA warm against its read plan, for a hold screen.
+ * Capped below 100 because the plan is built from XNF slot sizes: a file
+ * shorter than its slot reads less than planned, so only completion -- the
+ * Step returning nonzero -- means done. Always 0 off the 3DS. */
+int NativeAudio_VoiceCacheWarmPercent(void)
+{
+#if defined(__3DS__)
+	u32 pct;
+
+	if (s_vce.plannedSectors == 0)
+	{
+		return 0;
+	}
+
+	pct = (u32)(((u64)s_vce.readSectors * 100u) / s_vce.plannedSectors);
+	return (pct > 99u) ? 99 : (int)pct;
+#else
+	return 0;
 #endif
 }
 
@@ -4294,9 +4468,6 @@ int NativeAudio_VoiceCacheEnsureStep(int budgetSectors)
 	{
 		return 1;
 	}
-	s_vce.splashSteps++;
-	s_vce.splashSectors += (u32)((budgetSectors > 0) ? budgetSectors : NATIVE_DISC_IMAGE_CHUNK_SECTORS);
-
 	switch (s_vce.stage)
 	{
 	case 0:
@@ -4348,23 +4519,12 @@ int NativeAudio_VoiceCacheEnsureStep(int budgetSectors)
 		NativeAudio_XAVoiceCacheLog("[XAPRELOAD] voice cache built: %d tracks, %d sectors, %u KiB of %u KiB budget", s_vce.tracks, s_vce.sectors,
 		                            (unsigned)(s_xaVoiceCache.blobUsed >> 10), (unsigned)(NATIVE_AUDIO_XA_VOICE_CACHE_MAX_BYTES >> 10));
 	}
-	NativeAudio_XAVoiceCacheLog("[SPLASHIO] steps=%u sectors=%u", s_vce.splashSteps, s_vce.splashSectors);
 	s_vce.active = 0;
 	return 1;
 #else
 	(void)budgetSectors;
 	return 1;
 #endif
-}
-
-// One-shot fallback for callers outside the load-stage pump (and the sole PC
-// no-op path): runs every step back-to-back with no per-call budget cap.
-void NativeAudio_VoiceCacheEnsure(void)
-{
-	NativeAudio_VoiceCacheEnsureBegin();
-	while (!NativeAudio_VoiceCacheEnsureStep(0))
-	{
-	}
 }
 
 // Core streaming primitive: reads and decodes exactly one more matching XA
@@ -7090,8 +7250,12 @@ internal int NativeAudio_OpenDevice(void)
 		return 0;
 	}
 
-	printf("[CTR Native] SDL audio stream opened: driver=%s src=%d Hz/%d ch dst=%d Hz/%d ch device=%d Hz/%d ch sampleFrames=%d\n", SDL_GetCurrentAudioDriver(),
-	       srcSpec.freq, srcSpec.channels, dstSpec.freq, dstSpec.channels, deviceSpec.freq, deviceSpec.channels, deviceSampleFrames);
+	// Through the log sink, not a bare printf: on 3DS a raw printf paints the
+	// bottom-screen console with no gate, and this line lands after the first
+	// present -- past the point the panel stops being a boot surface.
+	Platform_Log("[CTR Native] SDL audio stream opened: driver=%s src=%d Hz/%d ch dst=%d Hz/%d ch device=%d Hz/%d ch sampleFrames=%d\n",
+	             SDL_GetCurrentAudioDriver(), srcSpec.freq, srcSpec.channels, dstSpec.freq, dstSpec.channels, deviceSpec.freq, deviceSpec.channels,
+	             deviceSampleFrames);
 	NativeAudio_ClearOutputQueueNoLock();
 	if (!SDL_ResumeAudioStreamDevice(s_audio.output.stream))
 	{
