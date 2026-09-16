@@ -90,14 +90,42 @@ if [[ -f .ctr-progress/tools/data_parity.py && -x build/ctr_native && -f ../CTR-
         --max-runs 40
 fi
 
+# Risky-pattern scans run under rg when present, falling back to grep -E
+# (GNU grep, POSIX ERE) on any of the four fixed patterns below -- none of
+# them need PCRE-only features, so grep -P is never required. The scan is
+# mandatory: if neither tool exists, the audit fails instead of silently
+# skipping coverage.
+if command -v rg >/dev/null 2>&1; then
+    RISK_SCAN_TOOL="rg"
+elif command -v grep >/dev/null 2>&1; then
+    RISK_SCAN_TOOL="grep"
+else
+    echo
+    echo "ERROR: neither rg nor grep is available; cannot run risky-pattern scans." >&2
+    exit 1
+fi
+
+echo
+echo "== Risk-scan tool =="
+if [[ "${RISK_SCAN_TOOL}" == "rg" ]]; then
+    echo "using: rg"
+else
+    echo "using: grep -E (rg not found on PATH; falling back)"
+fi
+
 scan_diff() {
     local title="$1"
     local pattern="$2"
     local tmp
 
     tmp="$(mktemp)"
-    git diff -U0 "${BASE_REF}..HEAD" -- game include platform main.c \
-        | rg "${pattern}" >"${tmp}" || true
+    if [[ "${RISK_SCAN_TOOL}" == "rg" ]]; then
+        git diff -U0 "${BASE_REF}..HEAD" -- game include platform main.c \
+            | rg "${pattern}" >"${tmp}" || true
+    else
+        git diff -U0 "${BASE_REF}..HEAD" -- game include platform main.c \
+            | grep -E "${pattern}" >"${tmp}" || true
+    fi
 
     local count
     count="$(wc -l <"${tmp}")"
@@ -115,27 +143,22 @@ scan_diff() {
     rm -f "${tmp}"
 }
 
-if command -v rg >/dev/null 2>&1; then
-    scan_diff "packed/matrix copies and narrow stores" \
-        '^\+[^+].*(memcpy|memmove|sizeof\([^)]*(MATRIX|matrix|struct)|MatrixRotate|ConvertRotToMatrix|MatrixND|CTR_WriteU(16|32)LE|CTR_ReadU(16|32)LE|= \*|\(MATRIX \*\))'
+scan_diff "packed/matrix copies and narrow stores" \
+    '^\+[^+].*(memcpy|memmove|sizeof\([^)]*(MATRIX|matrix|struct)|MatrixRotate|ConvertRotToMatrix|MatrixND|CTR_WriteU(16|32)LE|CTR_ReadU(16|32)LE|= \*|\(MATRIX \*\))'
 
-    scan_diff "native divergence gates" \
-        '^\+[^+].*(CTR_NATIVE|#if defined\(CTR_NATIVE\)|#ifdef CTR_NATIVE)'
+scan_diff "native divergence gates" \
+    '^\+[^+].*(CTR_NATIVE|#if defined\(CTR_NATIVE\)|#ifdef CTR_NATIVE)'
 
-    scan_diff "retail state width/type edits" \
-        '^\+[^+].*(typedef|enum|struct|s8|u8|s16|u16|s32|u32|b32|bool)'
+scan_diff "retail state width/type edits" \
+    '^\+[^+].*(typedef|enum|struct|s8|u8|s16|u16|s32|u32|b32|bool)'
 
-    # Comments must state standing constraints, not history (see CLAUDE.md,
-    # Code style). This flags NEW comment lines carrying session tags, dates,
-    # or review-fix framing. The s-number class skips s16/s32 (integer types).
-    # Acceptable matches exist: "rung N" as renderer-design phase vocabulary
-    # and live-hunt instrumentation docs -- eyeball, don't auto-reject.
-    scan_diff "session-history comments" \
-        '^\+[^+].*(//|/\*| \* ).*\b(s(1[0-57-9]|2[0-9]|3[013-9]|4[0-9])\b|[Ss]ession [0-9]|[Rr]ung [0-9]|[Ss]itting [0-9]|20[0-9]{2}-[01][0-9]-[0-3][0-9]|[Rr]eview fix|REVIEW FIX|[Rr]eview finding)'
-else
-    echo
-    echo "WARN: rg not found; skipped risky-pattern scans."
-fi
+# Comments must state standing constraints, not history (see CLAUDE.md,
+# Code style). This flags NEW comment lines carrying session tags, dates,
+# or review-fix framing. The s-number class skips s16/s32 (integer types).
+# Acceptable matches exist: "rung N" as renderer-design phase vocabulary
+# and live-hunt instrumentation docs -- eyeball, don't auto-reject.
+scan_diff "session-history comments" \
+    '^\+[^+].*(//|/\*| \* ).*\b(s(1[0-57-9]|2[0-9]|3[013-9]|4[0-9])\b|[Ss]ession [0-9]|[Rr]ung [0-9]|[Ss]itting [0-9]|20[0-9]{2}-[01][0-9]-[0-3][0-9]|[Rr]eview fix|REVIEW FIX|[Rr]eview finding)'
 
 # The 3DS release artifact is built with -DCTR_INTERNAL=OFF, which strips the
 # dumpreq parser. Its word table is the only source of the literal "dumpreq" in
