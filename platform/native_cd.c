@@ -425,6 +425,35 @@ int NativeCD_PrefetchPump(int maxSectors)
 #endif
 }
 
+int NativeCD_PrefetchExtentCached(int encodedLoc, int byteSize)
+{
+#if defined(__3DS__)
+	s32 fileIndex;
+	u32 startSector;
+	u32 sectorCount;
+
+	if (byteSize <= 0)
+	{
+		return 0;
+	}
+
+	fileIndex = (encodedLoc >> 24) & 0xff;
+	startSector = (u32)(encodedLoc & 0xffffff);
+	sectorCount = ((u32)byteSize + (NATIVE_CD_SECTOR_SIZE - 1)) / NATIVE_CD_SECTOR_SIZE;
+
+	if ((fileIndex < 0) || (fileIndex >= s_nativeCdFileCount) || (s_nativeCdFiles[fileIndex].source != NATIVE_CD_FILE_DISC))
+	{
+		return 0;
+	}
+
+	return NativeCD_PrefetchLookup(fileIndex, startSector, (s32)sectorCount) != NULL;
+#else
+	(void)encodedLoc;
+	(void)byteSize;
+	return -1;
+#endif
+}
+
 internal s32 NativeCD_ReadSectors(s32 sectors, void *dst)
 {
 	size_t byteCount;

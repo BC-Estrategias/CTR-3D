@@ -688,16 +688,17 @@ void StateZero()
 	VSyncCallback(MainDrawCb_Vsync);
 
 #ifdef CTR_NATIVE
-	// The XA voice-line cache is tens of MB of reads, and this is the only
-	// stretch of the boot with nothing on a clock to disturb: the SCEA logo is
-	// already presented, no music has started, and the frame loop has not begun.
-	// Hold here and keep presenting the logo rather than letting the cost land
-	// on the crate load stage (which holds against audible intro music the
-	// crate scene is timed off) or on the menus (which are interactive).
-	// Must stay above Music_SetIntro for that reason.
+	// Every boot read that would otherwise land on a clock belongs here: the XA
+	// voice-line cache (tens of MB) and the crate intro's own level files. This
+	// is the only stretch of the boot with nothing on a clock to disturb -- the
+	// SCEA logo is already presented, no music has started, and the frame loop
+	// has not begun. Hold here and keep presenting the logo rather than letting
+	// the cost land on the crate load stage (which holds against audible intro
+	// music the crate scene is timed off) or on the menus (which are
+	// interactive). Must stay above Music_SetIntro for that reason.
 	//
 	// The MUSIC sector-count memo is table-fed and reads nothing, so what this
-	// holds for is the GAME and EXTRA voice-line cache alone.
+	// holds for is the GAME and EXTRA voice-line cache and the crate extents.
 	{
 		enum
 		{
@@ -706,7 +707,10 @@ void StateZero()
 			// and presenting a frame for it costs a whole refresh. Keep
 			// stepping until one reads, then present -- bounded so a state
 			// that never reads still yields the screen.
-			MAIN_SCEA_WARM_STEPS_PER_FRAME = 16
+			MAIN_SCEA_WARM_STEPS_PER_FRAME = 16,
+			// Where NativeAudio_VoiceCacheWarmPercent caps: reaching it means
+			// the read plan is spent, not that the hold is over.
+			MAIN_SCEA_WARM_PERCENT_CAP = 99
 		};
 
 		// Wording of the hold's progress line. Nothing else prints it.
@@ -714,6 +718,7 @@ void StateZero()
 
 		u32 sceaWarmFrames = 0;
 		u32 sceaWarmSteps = 0;
+		u32 sceaWarmCrateFrames = 0;
 		int sceaWarmDone = 0;
 		int sceaWarmShown = -1;
 
@@ -754,6 +759,29 @@ void StateZero()
 			sceaWarmFrames++;
 		}
 
+		// The crate intro's level files, for the same reason: its load stage
+		// runs with the intro music audible and the crate scene timed off it,
+		// so the reads belong on this side of Music_SetIntro. Published read-
+		// cache extents are held for the life of the process, so nothing
+		// between here and the crate load can take them back.
+		while (!LOAD_NativePrefetchCrateIntroStep(sdata->ptrBigfile1, MAIN_SCEA_WARM_SECTORS_PER_FRAME))
+		{
+			// The percent belongs to the voice-cache read plan, which is spent
+			// by now. Hold the row at that plan's cap for the rest of the hold
+			// rather than starting a second count, which reads as progress
+			// running backwards.
+			if (sceaWarmShown != MAIN_SCEA_WARM_PERCENT_CAP)
+			{
+				sceaWarmShown = MAIN_SCEA_WARM_PERCENT_CAP;
+				NativeLog_BootStatus(sceaWarmLabel, sceaWarmShown);
+			}
+
+			VSync(0);
+			Platform_PresentVRAMDisplay();
+			sceaWarmFrames++;
+			sceaWarmCrateFrames++;
+		}
+
 		if (sceaWarmShown >= 0)
 		{
 			NativeLog_BootStatusClear();
@@ -762,9 +790,10 @@ void StateZero()
 		if (sceaWarmFrames > 0)
 		{
 			// Silent on PC and on any 3DS boot with nothing to read: no hold,
-			// nothing to report.
-			Platform_LogInstrument("[XAWARM] scea hold frames=%u steps=%u sectors=%u\n", (unsigned)sceaWarmFrames, (unsigned)sceaWarmSteps,
-			                       (unsigned)NativeAudio_VoiceCacheWarmSectorsRead());
+			// nothing to report. sectors= counts the voice-cache plan only;
+			// crate= is how many of the frames went to the crate extents.
+			Platform_LogInstrument("[XAWARM] scea hold frames=%u steps=%u sectors=%u crate=%u\n", (unsigned)sceaWarmFrames, (unsigned)sceaWarmSteps,
+			                       (unsigned)NativeAudio_VoiceCacheWarmSectorsRead(), (unsigned)sceaWarmCrateFrames);
 		}
 	}
 

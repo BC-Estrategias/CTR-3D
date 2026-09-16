@@ -26,6 +26,12 @@ internal struct
 	int groupIndex; /* 0 = VRAM, 1 = LEV, 2 = done */
 } s_lfCratePrefetch;
 
+internal void LOAD_NativeCrateIntroExtents(int *group)
+{
+	group[0] = LOAD_GetBigfileIndex(NAUGHTY_DOG_CRATE, LOAD_LEVEL_LOD_1P, LVI_VRAM);
+	group[1] = LOAD_GetBigfileIndex(NAUGHTY_DOG_CRATE, LOAD_LEVEL_LOD_1P, LVI_LEV);
+}
+
 // Begin/step form of the crate-intro prefetch: call once per frame with a
 // per-call sector budget (0 = uncapped) until it returns nonzero. Served from
 // RAM, the mid-load disc/SD reads for these files cost nothing once cached,
@@ -45,8 +51,7 @@ int LOAD_NativePrefetchCrateIntroStep(struct BigHeader *bigfile, int budgetSecto
 	}
 
 	entry = BIG_GETENTRY(bigfile);
-	group[0] = LOAD_GetBigfileIndex(NAUGHTY_DOG_CRATE, LOAD_LEVEL_LOD_1P, LVI_VRAM);
-	group[1] = LOAD_GetBigfileIndex(NAUGHTY_DOG_CRATE, LOAD_LEVEL_LOD_1P, LVI_LEV);
+	LOAD_NativeCrateIntroExtents(group);
 
 	while (s_lfCratePrefetch.groupIndex < 2)
 	{
@@ -76,12 +81,63 @@ int LOAD_NativePrefetchCrateIntroStep(struct BigHeader *bigfile, int budgetSecto
 	return 1;
 }
 
-// Held at the stage-6 call site (see LOAD_TenStages) until the crate intro's
-// own two level-file extents are in the CD read cache. The intro music is
-// already playing and audible while this stage is held, and the crate scene is
-// timed off that music, so only work the crate scene itself needs may run
-// here: anything else that wants warming belongs at the silent SCEA hold in
-// StateZero, before the music starts.
+// Whether the crate intro's level files will be served from RAM at the moment
+// the crate load wants them. The SCEA hold in StateZero is what makes them
+// resident; this reports at the one point where a miss has a cost, since from
+// here on the reads land against audible intro music.
+internal void LOAD_NativeCrateIntroCacheReport(struct BigHeader *bigfile)
+{
+	struct BigEntry *entry;
+	int group[2];
+	int hit = 0;
+	int miss = 0;
+	int i;
+
+	if (bigfile == NULL)
+	{
+		return;
+	}
+
+	entry = BIG_GETENTRY(bigfile);
+	LOAD_NativeCrateIntroExtents(group);
+
+	for (i = 0; i < 2; i++)
+	{
+		int cached;
+
+		if ((group[i] < 0) || (group[i] >= bigfile->numEntry))
+		{
+			continue;
+		}
+
+		cached = NativeCD_PrefetchExtentCached(bigfile->cdpos + entry[group[i]].offset, entry[group[i]].size);
+		if (cached < 0)
+		{
+			// no CD read cache on this platform: nothing to report
+			return;
+		}
+
+		if (cached)
+		{
+			hit++;
+		}
+		else
+		{
+			miss++;
+		}
+	}
+
+	Platform_LogInstrument("[SPLASHIO] crate extents at load: hit=%d miss=%d\n", hit, miss);
+}
+
+// Safety net at the stage-6 call site (see LOAD_TenStages): the crate intro's
+// own two level-file extents are read at the silent SCEA hold in StateZero,
+// and this stage is expected to find them already in the CD read cache and
+// hold zero frames. It still pumps whatever is missing rather than starting
+// the crate intro against a cold cache -- but the intro music is playing and
+// audible by now and the crate scene is timed off it, so every frame held here
+// is a frame of music the player loses. The hit/miss line above says which
+// happened.
 //
 // A slow SD card that can't finish inside a reasonable number of held frames
 // forces the rest through synchronously here (bounded, logged) rather than
@@ -97,6 +153,11 @@ int LOAD_NativeCrateIntroSplashStep(struct BigHeader *bigfile)
 	local_persist u32 s_lfCrateSplashFrames;
 
 	s_lfCrateSplashFrames++;
+
+	if (s_lfCrateSplashFrames == 1)
+	{
+		LOAD_NativeCrateIntroCacheReport(bigfile);
+	}
 
 	if (s_lfCrateSplashFrames > LOAD_CRATE_SPLASH_FALLBACK_FRAMES)
 	{

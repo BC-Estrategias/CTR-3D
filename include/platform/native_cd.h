@@ -21,4 +21,11 @@ void NativeCD_PrefetchExtent(int encodedLoc, int byteSize);
 int NativeCD_PrefetchExtentBegin(int encodedLoc, int byteSize);
 int NativeCD_PrefetchPump(int maxSectors);
 
+// Whether the whole extent is resident in the read cache, for a consumer that
+// must know its reads will not reach the disc. Published extents are held for
+// the life of the process -- nothing evicts them -- so a 0 means the range was
+// never cached, not that it was dropped. Returns -1 where the platform has no
+// CD read cache at all and the question has no answer.
+int NativeCD_PrefetchExtentCached(int encodedLoc, int byteSize);
+
 #endif
