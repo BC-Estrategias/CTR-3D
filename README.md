@@ -96,6 +96,35 @@ cmake --build build-3ds
 
 Output: `build-3ds/ctr_native.3dsx`. That build includes the internal debug surface; add `-DCTR_INTERNAL=OFF` to the configure line to build what the release ships.
 
+### Installing from the HOME Menu (CIA)
+
+The fork also includes `package-cia.sh`, which packages the native 3DS ELF as
+an installable CIA with a HOME Menu icon and banner. It does not include the
+disc image: the CIA still reads your own raw BIN from
+`/3ds/ctr_native/assets/ctr-u.bin` on the SD card.
+
+After installing the `3ds-dev` tools and placing `makerom` and `bannertool` on
+`PATH`, build the release ELF and run:
+
+```sh
+cmake -S . -B build-3ds -DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/3DS.cmake" \
+  -DCMAKE_BUILD_TYPE=Release -DCTR_INTERNAL=OFF
+cmake --build build-3ds
+./package-cia.sh beta-1.0
+```
+
+The resulting `dist/ctr3d-beta-1.0.cia` can be installed with FBI. Set
+`CTR_ART=/path/to/art.png` to use different artwork, or set
+`CTR_BANNER_PNG=/path/to/banner.png` when a precomposed 256x128 banner is
+preferred. The included artwork is kept local to the fork and should be
+replaced or removed before publishing a public release.
+
+### Downloading the CIA with a QR code
+
+The QR code below opens the CIA download for this fork. Scan it with a phone or a 3DS browser, download the file, and install it with FBI. The QR code points only to the download; it does not contain the game data.
+
+![CTR 3D beta 1.0 CIA download QR code](docs/ctr3d-beta-1.0-qr.png)
+
 On Windows, run both commands from devkitPro's MSYS2 shell using the `msys` `cmake` and `make` packages, not the mingw ones. From plain Git Bash the cross-compiler fails with a temporary-file error.
 
 ## PC builds (Windows and Linux)
