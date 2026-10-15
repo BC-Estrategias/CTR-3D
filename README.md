@@ -116,8 +116,7 @@ cmake --build build-3ds
 The resulting `dist/ctr3d-beta-1.0.cia` can be installed with FBI. Set
 `CTR_ART=/path/to/art.png` to use different artwork, or set
 `CTR_BANNER_PNG=/path/to/banner.png` when a precomposed 256x128 banner is
-preferred. The included artwork is kept local to the fork and should be
-replaced or removed before publishing a public release.
+preferred. The included artwork is stored in `cia-assets/ctr3d-art-source.png` and is used by the published CIA banner and icon.
 
 ### Downloading the CIA with a QR code
 
